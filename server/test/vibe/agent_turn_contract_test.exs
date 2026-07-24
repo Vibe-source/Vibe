@@ -206,7 +206,8 @@ defmodule Vibe.AgentTurnContractTest do
 
     outputs = StandaloneAgent.tool_outputs_from_result("search_music", result)
     assert Enum.map(outputs, & &1.metadata["videoId"]) == ["first", "second"]
-    assert hd(outputs).mediaUrl == "https://cdn.example/first.mp3"
+    # Playback always goes through /api/music/stream (cache + re-resolve), not the raw CDN.
+    assert String.ends_with?(hd(outputs).mediaUrl, "/api/music/stream/first")
     assert String.ends_with?(Enum.at(outputs, 1).mediaUrl, "/api/music/stream/second")
     assert hd(outputs).metadata["durationSeconds"] == 185
 

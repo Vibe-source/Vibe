@@ -482,10 +482,10 @@ defmodule Vibe.AI.Agent do
   - If you can do it with search_music / search_google / analyze_* / get|update_current_agent_config
     / call_platform / etc., do that yourself. Do not wrap it in delegate_to_subagent.
 
-  CRITICAL TOOL USAGE RULES:
-  1. WHEN USING ANY TOOL: Call the tool IMMEDIATELY without ANY intro text.
-     - WRONG: "Sure, let me search for that..." then tool call
-     - CORRECT: Just call the tool directly, no text before it
+  CRITICAL TOOL USAGE RULES (AGENTIC LOOP):
+  1. TOOL-FIRST when action is clear: call the tool immediately (no long preamble).
+     - Prefer action over empty stalling. The UI already shows live tool progress labels.
+     - Optional: one short line of intent is OK only when it helps ("I'll pull that track.") — never multi-paragraph before the tool.
 
   2. search_music: YOU handle music yourself. Use when user asks for songs, music, artists, albums, OR pastes a music link.
      - SOUNDCLOUD / YOUTUBE / music page URLs: pass the full URL as `query` (or `url`). The tool resolves it and the app sends a playable audio cell — do this immediately, do not only describe the link, and do NOT delegate to music_specialist.
@@ -496,7 +496,9 @@ defmodule Vibe.AI.Agent do
      - RETURN ONE TRACK BY DEFAULT: omit max_results or set it to 1. The user asked for a song, not a list.
      - ASK BEFORE GUESSING: if the request is genuinely ambiguous — several well-known songs, versions (live/remix/cover), or artists could match — call ask_user with concrete options FIRST, instead of searching and dumping several tracks. Only skip the question when the intended track is clear.
      - Only set max_results > 1 when the user EXPLICITLY asks for multiple options, alternatives, "a few", or a playlist.
-     - After results: acknowledge in ONE short, natural line, written in your own words for THIS request. Never reuse a fixed template phrase.
+     - AFTER the tool returns successfully: write 1–2 short agentic lines in your own words
+       (e.g. that you found it / fetched it / are sending the playable card). The music cell is attached by the app.
+     - AFTER a tool error: say briefly what failed; for music you MAY try ONE alternate query (title+artist, cleaned URL, or typo fix) then stop.
      - NEVER list track names, artists, URLs, or links in your text — the UI shows them automatically.
 
   3. search_google: YOU handle web lookup yourself. Use when user needs current info, facts, or web lookup.
@@ -509,8 +511,9 @@ defmodule Vibe.AI.Agent do
      - ALWAYS provide "document_url" and "task" parameters.
 
   ON ERRORS:
-  - If a tool returns an error, inform the user briefly. Do NOT retry.
-  - Example: "Sorry, couldn't find that."
+  - Inform the user briefly what failed.
+  - For search_music / search_google only: one intelligent retry is allowed (better query). Then stop.
+  - Example after final failure: "Sorry, I couldn't load that track."
 
   6. post_to_channel: Use when user asks to post/publish something to their channel.
      - ALWAYS provide "channel_id" and "content" parameters.
@@ -600,13 +603,14 @@ defmodule Vibe.AI.Agent do
 
   IMPORTANT:
   - Prefer direct tools. Subagents are for complex multi-part work, not default routing.
-  - NEVER write text before a tool call.
+  - Agentic loop: (optional short intent) → tool → read tool result → short outcome text.
+    Do not dump empty final replies after a successful tool; always acknowledge in 1–2 lines.
   - For music results: NEVER include URLs, track names, or album names in your response text.
   - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
   - For simple current-agent prompt or name changes, use `update_current_agent_config` instead of delegating.
   - Use `ask_user` for required structured choices; never simulate waiting inside a tool call.
   - For simple greetings, respond naturally WITHOUT tools.
-  - Keep responses VERY short (1-2 sentences max) - this is mobile chat.
+  - Keep each prose beat short (1–2 sentences) — mobile chat — but DO speak after tools succeed or fail.
   """
 
   @doc """
@@ -1027,6 +1031,18 @@ defmodule Vibe.AI.Agent do
       status: "done"
     })
 
+    # Extra agentic beat for music so the client feed shows "checked result → sending"
+    # even when the model is sparse with post-tool prose.
+    if tool_name == "search_music" and not tool_result_error?(result) do
+      callback.(%{
+        type: :progress,
+        label: "Sending playable card…",
+        tool: "search_music_send",
+        tool_call_id: "#{tool["id"]}-send",
+        status: "done"
+      })
+    end
+
     # Send tool result with completion status
     callback.(%{
       type: :tool_result,
@@ -1051,31 +1067,31 @@ defmodule Vibe.AI.Agent do
 
     cond do
       is_binary(url) and String.contains?(url, "soundcloud") ->
-        "Resolving SoundCloud…"
+        "Looking up SoundCloud…"
 
       is_binary(query) and String.contains?(query, "soundcloud") ->
-        "Resolving SoundCloud…"
+        "Looking up SoundCloud…"
 
       is_binary(url) and (String.starts_with?(url, "http://") or String.starts_with?(url, "https://")) ->
-        "Fetching track…"
+        "Fetching that track…"
 
       is_binary(query) and (String.starts_with?(query, "http://") or String.starts_with?(query, "https://")) ->
-        "Fetching track…"
+        "Fetching that track…"
 
       is_binary(query) and String.trim(query) != "" ->
-        "Searching music…"
+        "Searching for the track…"
 
       true ->
-        "Searching music…"
+        "Searching for the track…"
     end
   end
 
-  defp music_progress_label(_), do: "Searching music…"
+  defp music_progress_label(_), do: "Searching for the track…"
 
   defp tool_complete_label("search_music", _input, result) when is_map(result) do
     cond do
       is_binary(Map.get(result, :error) || Map.get(result, "error")) ->
-        "Music not found"
+        "Couldn't load that track"
 
       true ->
         tracks = Map.get(result, :tracks) || Map.get(result, "tracks") || []
@@ -1088,7 +1104,11 @@ defmodule Vibe.AI.Agent do
               nil
           end
 
-        if is_binary(title) and title != "", do: "Found · #{String.slice(title, 0, 40)}", else: "Music ready"
+        if is_binary(title) and title != "" do
+          "Found · #{String.slice(title, 0, 40)}"
+        else
+          "Track ready to send"
+        end
     end
   end
 
