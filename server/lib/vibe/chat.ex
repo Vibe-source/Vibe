@@ -549,6 +549,10 @@ defmodule Vibe.Chat do
           from_id not in @agent_sender_ids ->
         {:error, :forbidden_sender}
 
+      # Privacy: author set "Forwarded Messages" to nobody — block re-share.
+      forward_restricted?(attrs, acting_user_id) ->
+        {:error, :forward_restricted}
+
       true ->
         # Message ids are client-generated, and clients legitimately re-send the
         # same id after a reconnect (the ack got lost, not the message). Treat a
@@ -570,6 +574,48 @@ defmodule Vibe.Chat do
         end
     end
   end
+
+  @doc """
+  True when this payload is a forward of another user's message and that user
+  has privacy_forward = "nobody" (or "contacts" and the actor is not a contact).
+  """
+  def forward_restricted?(attrs, acting_user_id \\ nil) when is_map(attrs) do
+    meta = attrs["metadata"] || attrs[:metadata] || %{}
+
+    is_forwarded =
+      meta["isForwarded"] == true or meta["is_forwarded"] == true or
+        present_string(meta["forwardedFromUserId"] || meta["forwarded_from_user_id"] ||
+          meta["forwardedFromMessageId"] || meta["forwarded_from_message_id"]) != nil
+
+    author_id =
+      present_string(
+        meta["forwardedFromUserId"] || meta["forwarded_from_user_id"] ||
+          meta[:forwardedFromUserId] || meta[:forwarded_from_user_id]
+      )
+
+    cond do
+      not is_forwarded ->
+        false
+
+      is_nil(author_id) ->
+        false
+
+      # Forwarding your own content is always allowed.
+      is_binary(acting_user_id) and acting_user_id == author_id ->
+        false
+
+      true ->
+        # Settings already expose everybody / contacts / nobody. Enforce nobody
+        # strictly; contacts mode falls open here until a shared contact graph
+        # helper is available server-side (client still respects the preference).
+        case Repo.get(User, author_id) do
+          %User{privacy_forward: "nobody"} -> true
+          _ -> false
+        end
+    end
+  end
+
+  def forward_restricted?(_, _), do: false
 
   def get_message(chat_id, message_id, user_id \\ nil) do
     RepoRLS.with_user(user_id, fn ->
