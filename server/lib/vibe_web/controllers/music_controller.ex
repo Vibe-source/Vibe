@@ -145,11 +145,15 @@ defmodule VibeWeb.MusicController do
       %MusicCache{cached_file_path: url} when is_binary(url) and url != "" ->
         {:ok, SupabaseStorage.rewrite_public_url(url)}
 
-      # Fresh ephemeral extractor URL is still usable when we have not yet
-      # uploaded a permanent copy (or upload previously failed).
+      # Fresh ephemeral extractor URL is still usable when we have not yet uploaded a
+      # permanent copy — BUT only when the client can actually fetch it. YouTube hands back
+      # a progressive googlevideo file the phone can GET directly; SoundCloud hands back a
+      # session/cookie-bound HLS `.m3u8` on its CDN that 403s "Forbidden" for anyone but the
+      # yt-dlp session that resolved it. Never short-circuit to that — fall through to
+      # download_and_upload so we serve a stable Supabase copy the phone can fetch.
       %MusicCache{stream_url: url} = entry
       when is_binary(url) and url != "" ->
-        if MusicCache.stream_url_fresh?(entry) do
+        if MusicCache.stream_url_fresh?(entry) and not client_unfetchable_stream_url?(url) do
           {:ok, url}
         else
           :not_cached
@@ -159,6 +163,18 @@ defmodule VibeWeb.MusicController do
         :not_cached
     end
   end
+
+  # SoundCloud (and any HLS) URLs are session/CDN-bound and 403 for the mobile client, so we
+  # must download + re-host them rather than redirect the phone to them.
+  defp client_unfetchable_stream_url?(url) when is_binary(url) do
+    lower = String.downcase(url)
+
+    String.contains?(lower, ".m3u8") or
+      String.contains?(lower, "soundcloud.cloud") or
+      String.contains?(lower, "media-streaming")
+  end
+
+  defp client_unfetchable_stream_url?(_), do: false
 
   # Prefer stored webpage URL (SoundCloud/etc). Fall back to YouTube watch URL.
   defp resolve_source_url(video_id) do
