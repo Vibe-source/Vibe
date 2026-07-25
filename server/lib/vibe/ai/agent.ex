@@ -482,10 +482,33 @@ defmodule Vibe.AI.Agent do
   - If you can do it with search_music / search_google / analyze_* / get|update_current_agent_config
     / call_platform / etc., do that yourself. Do not wrap it in delegate_to_subagent.
 
+  HOW A TURN READS (this is the shape the UI renders):
+  intent line → tool steps (live notes) → short specific summary.
+  - Open with ONE short intent line (max ~12 words) saying what you are about to do, then
+    call the tool. Skip it only for a greeting or a one-word answer.
+  - Close with a summary that is SPECIFIC to this result. Name what you found (title,
+    version, artist, count, file name) — that is what makes the answer useful.
+  - NEVER reuse a sentence you have already used in this conversation. If your previous
+    reply said "Here it is again", you may not say it again. Vary the wording every turn.
+  - Do not narrate the tool machinery ("calling search_music") — the notes already show it.
+
+  CONTINUITY (READ BEFORE ANY TOOL CALL):
+  - A "RECENT TURN MEMORY" section may appear at the end of this prompt listing what you
+    produced in earlier turns (track title + id, file name, …). It is authoritative.
+  - If the user says "again", "the same one", "resend", "one more time": reuse the EXACT
+    item from the newest memory entry — for music, call search_music with that track's
+    stored title so the same track comes back. Do NOT start a fresh open-ended search, and
+    never claim it is "the same" if you searched for something new.
+  - If the user asks for "another version / a different one" and memory holds what you last
+    sent, that is NOT ambiguous — do NOT ask which one. Pick a concrete different variant
+    yourself (live, acoustic, remix, cover, remaster), send it, and say how it differs. Ask
+    only when there is nothing in memory to differ from.
+  - That memory block is internal. Never quote it, never reproduce its format in a reply.
+
   CRITICAL TOOL USAGE RULES (AGENTIC LOOP):
-  1. TOOL-FIRST when action is clear: call the tool immediately (no long preamble).
-     - Prefer action over empty stalling. The UI already shows live tool progress labels.
-     - Optional: one short line of intent is OK only when it helps ("I'll pull that track.") — never multi-paragraph before the tool.
+  1. TOOL-FIRST when action is clear: intent line, then call the tool immediately.
+     - Prefer action over stalling. The UI shows live tool progress notes.
+     - Never write multiple paragraphs before a tool call.
 
   2. search_music: YOU handle music yourself. Use when user asks for songs, music, artists, albums, OR pastes a music link.
      - SOUNDCLOUD / YOUTUBE / music page URLs: pass the full URL as `query` (or `url`). The tool resolves it and the app sends a playable audio cell — do this immediately, do not only describe the link, and do NOT delegate to music_specialist.
@@ -494,12 +517,15 @@ defmodule Vibe.AI.Agent do
      - Correct typos intelligently (e.g., "tylor swift" → "Taylor Swift").
      - ALWAYS provide the "query" parameter (use the URL itself when they shared a link).
      - RETURN ONE TRACK BY DEFAULT: omit max_results or set it to 1. The user asked for a song, not a list.
-     - ASK BEFORE GUESSING: if the request is genuinely ambiguous — several well-known songs, versions (live/remix/cover), or artists could match — call ask_user with concrete options FIRST, instead of searching and dumping several tracks. Only skip the question when the intended track is clear.
+     - ASK BEFORE GUESSING: only when the request is genuinely ambiguous on its own — several well-known songs or artists could match a bare title ("play hello") — call ask_user with concrete options FIRST. Never ask when the intended track is clear, when the user pasted a link, or when TURN MEMORY already tells you what this refers to ("again", "another version").
      - Only set max_results > 1 when the user EXPLICITLY asks for multiple options, alternatives, "a few", or a playlist.
-     - AFTER the tool returns successfully: write 1–2 short agentic lines in your own words
-       (e.g. that you found it / fetched it / are sending the playable card). The music cell is attached by the app.
-     - AFTER a tool error: say briefly what failed; for music you MAY try ONE alternate query (title+artist, cleaned URL, or typo fix) then stop.
-     - NEVER list track names, artists, URLs, or links in your text — the UI shows them automatically.
+     - EVERY successful search_music call ships its track to the user as a playable card, and
+       the card that lands is the one from your LAST successful call. So the last call you make
+       IS the track you send. Never say you "did not send it" after a successful call, and
+       never call the tool for a track you do not want to send.
+     - AFTER the tool returns successfully: 1–2 short lines naming the track/version you sent
+       (e.g. "Sent the 2012 live version — 9:21."). The playable cell is attached by the app.
+     - You MAY name the title, artist and version. Do NOT paste URLs or links.
 
   3. search_google: YOU handle web lookup yourself. Use when user needs current info, facts, or web lookup.
      - ALWAYS provide the "query" parameter. Do not delegate one search to document_specialist.
@@ -510,10 +536,18 @@ defmodule Vibe.AI.Agent do
   5. analyze_document: YOU handle this yourself when user shares a document URL.
      - ALWAYS provide "document_url" and "task" parameters.
 
-  ON ERRORS:
-  - Inform the user briefly what failed.
-  - For search_music / search_google only: one intelligent retry is allowed (better query). Then stop.
-  - Example after final failure: "Sorry, I couldn't load that track."
+  ON ERRORS (a failed tool does NOT end the turn — you decide what happens next):
+  - A failed tool returns `{"ok": false, "error": {"code", "message", "retryable", "hint"}}`.
+    READ IT. The decision is yours and it is made from those fields:
+      * `retryable: true`  → you MAY retry ONCE, with genuinely better input. Then stop.
+      * `retryable: false` → do NOT retry and do NOT substitute something else. Say what
+        failed in one line and, if useful, ask the user for what you need.
+    Always follow `hint` when it is present.
+  - Never invent a replacement result to cover a failure. Sending an unrelated track for a
+    dead link is worse than saying the link did not work.
+  - If one tool of several fails, finish the work you CAN do and report the failed part.
+  - Name the failed thing concretely ("that SoundCloud link is unavailable"), not "something
+    went wrong".
 
   6. post_to_channel: Use when user asks to post/publish something to their channel.
      - ALWAYS provide "channel_id" and "content" parameters.
@@ -603,9 +637,9 @@ defmodule Vibe.AI.Agent do
 
   IMPORTANT:
   - Prefer direct tools. Subagents are for complex multi-part work, not default routing.
-  - Agentic loop: (optional short intent) → tool → read tool result → short outcome text.
-    Do not dump empty final replies after a successful tool; always acknowledge in 1–2 lines.
-  - For music results: NEVER include URLs, track names, or album names in your response text.
+  - Agentic loop: short intent → tool → READ the tool result → short specific summary.
+    Never end a turn with empty text after a tool ran.
+  - For music: you may name the track/version you sent; never paste URLs or links.
   - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
   - For simple current-agent prompt or name changes, use `update_current_agent_config` instead of delegating.
   - Use `ask_user` for required structured choices; never simulate waiting inside a tool call.
@@ -623,10 +657,17 @@ defmodule Vibe.AI.Agent do
     requester_user_id = Keyword.get(opts, :requester_user_id, nil)
     chat_id = Keyword.get(opts, :chat_id, nil)
     agent_id = Keyword.get(opts, :agent_id, nil)
-    system_prompt = Keyword.get(opts, :system_prompt, @system_prompt)
+    system_prompt =
+      opts
+      |> Keyword.get(:system_prompt, @system_prompt)
+      |> with_turn_memory(Keyword.get(opts, :turn_memory, []))
+
     enabled_tools = Keyword.get(opts, :enabled_tools, available_tool_names())
     max_tokens = Keyword.get(opts, :max_tokens, 4096)
-    max_depth = Keyword.get(opts, :max_depth, 3)
+    # 3 was too tight for a real agentic loop: resolve → fails → retry → answer is already 4
+    # rounds, and hitting the cap used to surface as a hard error with the streamed text
+    # thrown away. Depth exhaustion now returns the partial answer (see AgentRuntime.do_run).
+    max_depth = Keyword.get(opts, :max_depth, 6)
     model_provider = Keyword.get(opts, :model_provider, "anthropic")
     model_id = Keyword.get(opts, :model_id, @claude_model)
     thinking_level = Keyword.get(opts, :thinking_level, "medium")
@@ -659,6 +700,40 @@ defmodule Vibe.AI.Agent do
       }
     )
   end
+
+  # Turn memory rides in the SYSTEM prompt, not in the assistant history. Putting it in the
+  # message content (as a `[did: …]` line) worked, but the model copied the format straight
+  # into its user-visible reply — internal state must not live where the model is imitating
+  # style.
+  @turn_memory_limit 6
+
+  defp with_turn_memory(system_prompt, memory) when is_binary(system_prompt) do
+    entries =
+      memory
+      |> List.wrap()
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.take(-@turn_memory_limit)
+
+    if entries == [] do
+      system_prompt
+    else
+      lines = Enum.map_join(entries, "\n", &"- #{&1}")
+
+      system_prompt <>
+        """
+
+        RECENT TURN MEMORY (internal — what you already produced in this chat, oldest first):
+        #{lines}
+
+        Use it to honour "again" / "the same one", to avoid resending something you already
+        sent, and to avoid repeating your own wording. Never quote this block to the user.
+        """
+    end
+  end
+
+  defp with_turn_memory(system_prompt, _memory), do: system_prompt
 
   def available_tools do
     (@tools ++ GroupAgent.standalone_available_tools())
@@ -784,93 +859,7 @@ defmodule Vibe.AI.Agent do
     Enum.each(tool_calls, fn tool ->
       tool_name = tool["name"]
       tool_input = tool["input"] || %{}
-
-      label =
-        case tool_name do
-          "search_music" ->
-            music_progress_label(tool_input)
-
-          "search_google" ->
-            "Searching the web..."
-
-          "analyze_image" ->
-            "Analyzing image..."
-
-          "analyze_document" ->
-            "Reading document..."
-
-          "create_document" ->
-            "Preparing document..."
-
-          "find_rows" ->
-            "Inspecting rows..."
-
-          "edit_rows" ->
-            "Updating rows..."
-
-          "delete_rows" ->
-            "Deleting rows..."
-
-          "export_rows" ->
-            "Exporting file..."
-
-          "delete_document" ->
-            "Removing document..."
-
-          "post_to_channel" ->
-            "Posting to channel..."
-
-          "get_channel_analytics" ->
-            "Fetching channel analytics..."
-
-          "schedule_channel_post" ->
-            "Scheduling post..."
-
-          "query_event_inbox" ->
-            "Reviewing the inbox..."
-
-          "configure_event_inbox" ->
-            "Updating inbox mode..."
-
-          "call_connected_app" ->
-            "Checking the connected app..."
-
-          "list_platform_connections" ->
-            "Checking connected platforms..."
-
-          "call_platform" ->
-            "Calling platform connector..."
-
-          "get_current_agent_config" ->
-            "Reading this agent's config..."
-
-          "update_current_agent_config" ->
-            "Updating this agent..."
-
-          "create_chat_space" ->
-            "Creating the chat space..."
-
-          "attach_current_agent_to_chat" ->
-            "Attaching this agent..."
-
-          "inspect_current_agent_tools" ->
-            "Inspecting this agent's tools..."
-
-          "test_current_agent_tool" ->
-            "Checking the tool safely..."
-
-          "ask_user" ->
-            "Preparing a question..."
-
-          "delegate_to_subagent" ->
-            SubagentRegistry.progress_label(
-              tool_input["subagent_id"] || "",
-              tool_input["task"]
-            )
-
-          _ ->
-            "Working..."
-        end
+      label = tool_running_label(tool_name, tool_input)
 
       callback.(%{
         type: :progress,
@@ -888,30 +877,140 @@ defmodule Vibe.AI.Agent do
       })
     end)
 
-    # Run tool calls in parallel using Task.async for concurrent execution
+    # Run tool calls concurrently. async_nolink + an explicit {:exit, _} clause so ONE
+    # broken tool becomes an error the model can read instead of killing the whole turn:
+    # Task.async links, so a raising tool used to take the runtime process down with it
+    # (no done, no error, no DB finalize — the turn just evaporated).
     tasks =
       Enum.map(tool_calls, fn tool ->
-        Task.async(fn ->
-          execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id)
-        end)
+        {tool,
+         Task.Supervisor.async_nolink(Vibe.TaskSupervisor, fn ->
+           execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id)
+         end)}
       end)
 
     # Await all tasks with a generous timeout (120s per tool)
-    Enum.map(tasks, fn task ->
+    Enum.map(tasks, fn {tool, task} ->
       case Task.yield(task, 120_000) || Task.shutdown(task) do
         {:ok, result} ->
           result
 
-        nil ->
-          Logger.error("[Agent] Tool execution timed out after 120s")
+        {:exit, reason} ->
+          Logger.error("[Agent] Tool #{tool["name"]} crashed: #{inspect(reason)}")
+          crash_tool_result(tool, callback, reason)
 
-          %{
-            type: "tool_result",
-            tool_use_id: "unknown",
-            content: Jason.encode!(%{error: "Tool timed out"})
-          }
+        nil ->
+          Logger.error("[Agent] Tool #{tool["name"]} timed out after 120s")
+          timeout_tool_result(tool, callback)
       end
     end)
+  end
+
+  # Re-emits the running node with a new label. Same id + same tool, so the client updates
+  # the row in place rather than appending another step.
+  defp tool_step_reporter(tool, callback) do
+    fn label ->
+      callback.(%{
+        type: :progress,
+        label: label,
+        tool: tool["name"],
+        tool_call_id: tool["id"],
+        status: "running"
+      })
+
+      :ok
+    end
+  end
+
+  # A crashed tool still owes the model a tool_result for its tool_use id (a missing or
+  # "unknown" id makes the provider reject the whole follow-up request), and still owes
+  # the UI a failed step.
+  defp crash_tool_result(tool, callback, reason) do
+    result =
+      tool_error_envelope(
+        "tool_crashed",
+        "#{tool["name"]} failed unexpectedly.",
+        retryable: false,
+        hint:
+          "This tool is currently broken — do not retry it. Tell the user plainly that it " <>
+            "failed and offer an alternative if one exists.",
+        detail: inspect(reason) |> String.slice(0, 300)
+      )
+
+    emit_tool_failure(tool, callback, result, tool_failed_label(tool["name"]))
+    encoded_tool_result(tool, result)
+  end
+
+  defp timeout_tool_result(tool, callback) do
+    result =
+      tool_error_envelope("tool_timeout", "#{tool["name"]} timed out after 120s.",
+        retryable: true,
+        hint: "Retry at most once with a simpler input, then stop and tell the user."
+      )
+
+    emit_tool_failure(tool, callback, result, "Timed out")
+    encoded_tool_result(tool, result)
+  end
+
+  defp emit_tool_failure(tool, callback, result, label) do
+    callback.(%{
+      type: :progress,
+      label: label,
+      tool: tool["name"],
+      tool_call_id: tool["id"],
+      status: "error"
+    })
+
+    callback.(%{
+      type: :tool_result,
+      tool: tool["name"],
+      tool_call_id: tool["id"],
+      result: result,
+      status: "error"
+    })
+  end
+
+  defp encoded_tool_result(tool, result) do
+    %{
+      type: "tool_result",
+      tool_use_id: tool["id"] || "unknown",
+      content: Jason.encode!(result)
+    }
+  end
+
+  # Progress labels are single-line shimmer rows. Keep them SHORT (verb + object, ≤ 24
+  # chars) so nothing is clipped downstream — AgenticEventShape.compact_label is a safety
+  # net, not the intended shortener.
+  defp tool_running_label(tool_name, tool_input) do
+    case tool_name do
+      "search_music" -> music_progress_label(tool_input)
+      "search_google" -> "Searching the web…"
+      "analyze_image" -> "Reading image…"
+      "analyze_document" -> "Reading document…"
+      "create_document" -> "Making file…"
+      "find_rows" -> "Checking rows…"
+      "edit_rows" -> "Updating rows…"
+      "delete_rows" -> "Deleting rows…"
+      "export_rows" -> "Exporting file…"
+      "delete_document" -> "Removing file…"
+      "post_to_channel" -> "Posting…"
+      "get_channel_analytics" -> "Reading stats…"
+      "schedule_channel_post" -> "Scheduling…"
+      "query_event_inbox" -> "Checking inbox…"
+      "configure_event_inbox" -> "Updating inbox…"
+      "call_connected_app" -> "Calling your app…"
+      "list_platform_connections" -> "Checking apps…"
+      "call_platform" -> "Calling connector…"
+      "get_current_agent_config" -> "Reading config…"
+      "update_current_agent_config" -> "Updating agent…"
+      "create_chat_space" -> "Creating space…"
+      "attach_current_agent_to_chat" -> "Attaching agent…"
+      "inspect_current_agent_tools" -> "Checking tools…"
+      "test_current_agent_tool" -> "Testing tool…"
+      "ask_user" -> "Asking you…"
+      "delegate_to_subagent" -> SubagentRegistry.progress_label(tool_input["subagent_id"] || "", tool_input["task"])
+      _ -> "Working…"
+    end
   end
 
   defp execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id) do
@@ -919,12 +1018,18 @@ defmodule Vibe.AI.Agent do
     tool_input = tool["input"] || %{}
     start_time = System.monotonic_time(:millisecond)
 
+    # Long-running tools report their own intermediate beats on the SAME node, so a 3-5s
+    # lookup reads "Opening SoundCloud… → Reading metadata… → Found · X" instead of sitting
+    # on one frozen label.
+    on_step = tool_step_reporter(tool, callback)
+
     result =
       cond do
         tool_name == "search_music" ->
-          Vibe.AI.Tools.Music.search(tool["input"])
+          Vibe.AI.Tools.Music.search(tool["input"], on_step: on_step)
 
         tool_name == "search_google" ->
+          on_step.("Reading results…")
           Vibe.AI.Tools.Search.google(tool["input"])
 
         tool_name == "analyze_image" ->
@@ -1020,7 +1125,11 @@ defmodule Vibe.AI.Agent do
     duration_ms = System.monotonic_time(:millisecond) - start_time
     Logger.info("[Agent] Tool #{tool_name} completed in #{duration_ms}ms")
 
-    # Codex-like terminal item: running → done with a short human label
+    # Failures are reported as failures. The old code sent status "done"/"complete" for
+    # error results too, so the UI could never show a failed step and the model had only
+    # a bare error string to reason about.
+    failed? = tool_result_error?(result)
+    result = if failed?, do: enrich_tool_error(tool_name, tool_input, result), else: result
     complete_label = tool_complete_label(tool_name, tool_input, result)
 
     callback.(%{
@@ -1028,91 +1137,206 @@ defmodule Vibe.AI.Agent do
       label: complete_label,
       tool: tool_name,
       tool_call_id: tool["id"],
-      status: "done"
+      status: if(failed?, do: "error", else: "done")
     })
 
-    # Extra agentic beat for music so the client feed shows "checked result → sending"
-    # even when the model is sparse with post-tool prose.
-    if tool_name == "search_music" and not tool_result_error?(result) do
-      callback.(%{
-        type: :progress,
-        label: "Sending playable card…",
-        tool: "search_music_send",
-        tool_call_id: "#{tool["id"]}-send",
-        status: "done"
-      })
-    end
-
-    # Send tool result with completion status
     callback.(%{
       type: :tool_result,
       tool: tool_name,
       tool_call_id: tool["id"],
       result: result,
-      status: "complete",
+      status: if(failed?, do: "error", else: "complete"),
       duration_ms: duration_ms,
       label: complete_label
     })
 
+    encoded_tool_result(tool, result)
+  rescue
+    error ->
+      Logger.error(
+        "[Agent] Tool #{tool["name"]} raised: #{Exception.format(:error, error, __STACKTRACE__)}"
+      )
+
+      crash_tool_result(tool, callback, error)
+  catch
+    kind, reason ->
+      Logger.error("[Agent] Tool #{tool["name"]} #{kind}: #{inspect(reason)}")
+      crash_tool_result(tool, callback, {kind, reason})
+  end
+
+  # Turn a bare `%{error: "..."}` into something the model can DECIDE on:
+  # retryable? which code? what should it do next? Without this the prompt's "one
+  # intelligent retry is allowed" made the model keyword-search a dead URL's slug and
+  # ship an unrelated track as "a likely match".
+  defp enrich_tool_error(tool_name, tool_input, result) when is_map(result) do
+    message = Map.get(result, :error) || Map.get(result, "error") || "Tool failed"
+    {code, retryable, hint} = classify_tool_error(tool_name, tool_input, to_string(message))
+
+    result
+    |> Map.drop([:error, "error"])
+    |> Map.merge(tool_error_envelope(code, message, retryable: retryable, hint: hint))
+  end
+
+  defp enrich_tool_error(_tool_name, _tool_input, result), do: result
+
+  # A dead / private / removed link is TERMINAL — there is nothing to retry, and
+  # re-searching the URL text is how we ended up sending deadmau5 for a 404 slug.
+  defp classify_tool_error("search_music", tool_input, message) do
+    url = tool_input["url"] || tool_input["link"] || tool_input["query"] || ""
+    link_request? = is_binary(url) and String.starts_with?(to_string(url), "http")
+
+    cond do
+      link_request? ->
+        {"link_unavailable", false,
+         "That exact link cannot be resolved. Do NOT keyword-search the URL text or " <>
+           "substitute a different track. Say the link did not work and ask for another one."}
+
+      String.contains?(message, "Missing search query") ->
+        {"missing_query", true, "Call the tool again with a real `query` string."}
+
+      true ->
+        {"no_results", true,
+         "You may retry ONCE with a better query (title + artist, or a typo fix). " <>
+           "If that also finds nothing, say so plainly — never send an unrelated track."}
+    end
+  end
+
+  defp classify_tool_error(_tool_name, _tool_input, message) do
+    if String.contains?(message, "not available") or String.contains?(message, "not found") do
+      {"unavailable", false, "This is not retryable. Tell the user what is missing."}
+    else
+      {"tool_error", true, "You may retry once with corrected input, then stop."}
+    end
+  end
+
+  defp tool_error_envelope(code, message, opts) do
     %{
-      type: "tool_result",
-      tool_use_id: tool["id"],
-      content: Jason.encode!(result)
+      "ok" => false,
+      "error" => %{
+        "code" => code,
+        "message" => to_string(message),
+        "retryable" => Keyword.get(opts, :retryable, false),
+        "hint" => Keyword.get(opts, :hint),
+        "detail" => Keyword.get(opts, :detail)
+      }
     }
   end
 
   defp music_progress_label(input) when is_map(input) do
     url = input["url"] || input["link"]
     query = input["query"] || ""
+    link = if is_binary(url), do: url, else: query
 
     cond do
-      is_binary(url) and String.contains?(url, "soundcloud") ->
-        "Looking up SoundCloud…"
-
-      is_binary(query) and String.contains?(query, "soundcloud") ->
-        "Looking up SoundCloud…"
-
-      is_binary(url) and (String.starts_with?(url, "http://") or String.starts_with?(url, "https://")) ->
-        "Fetching that track…"
-
-      is_binary(query) and (String.starts_with?(query, "http://") or String.starts_with?(query, "https://")) ->
-        "Fetching that track…"
-
-      is_binary(query) and String.trim(query) != "" ->
-        "Searching for the track…"
-
-      true ->
-        "Searching for the track…"
+      is_binary(link) and String.contains?(link, "soundcloud") -> "Opening SoundCloud…"
+      is_binary(link) and String.starts_with?(link, "http") -> "Opening link…"
+      true -> "Searching music…"
     end
   end
 
-  defp music_progress_label(_), do: "Searching for the track…"
+  defp music_progress_label(_), do: "Searching music…"
+
+  # Done labels are single-line notes: keep the whole string short enough that the client
+  # never has to clip mid-word ("Found · Anathema - Flying [Live…" was the old output), but
+  # long enough to stay informative ("Found · Flying…" told the user nothing).
+  @done_label_limit 30
 
   defp tool_complete_label("search_music", _input, result) when is_map(result) do
-    cond do
-      is_binary(Map.get(result, :error) || Map.get(result, "error")) ->
-        "Couldn't load that track"
+    if tool_result_error?(result) do
+      "No track found"
+    else
+      case first_track_title(result) do
+        title when is_binary(title) and title != "" ->
+          "Found · #{clip_words(title, @done_label_limit - 8)}"
 
-      true ->
-        tracks = Map.get(result, :tracks) || Map.get(result, "tracks") || []
-        title =
-          case List.first(List.wrap(tracks)) do
-            t when is_map(t) ->
-              Map.get(t, :title) || Map.get(t, "title")
-
-            _ ->
-              nil
-          end
-
-        if is_binary(title) and title != "" do
-          "Found · #{String.slice(title, 0, 40)}"
-        else
-          "Track ready to send"
-        end
+        _ ->
+          "Track ready"
+      end
     end
   end
 
-  defp tool_complete_label(_name, _input, _result), do: "Done"
+  defp tool_complete_label(tool_name, _input, result) do
+    if is_map(result) and tool_result_error?(result) do
+      tool_failed_label(tool_name)
+    else
+      tool_done_label(tool_name)
+    end
+  end
+
+  defp tool_done_label(tool_name) do
+    case tool_name do
+      "search_google" -> "Web results in"
+      "analyze_image" -> "Image read"
+      "analyze_document" -> "Document read"
+      "create_document" -> "File ready"
+      "find_rows" -> "Rows checked"
+      "edit_rows" -> "Rows updated"
+      "delete_rows" -> "Rows deleted"
+      "export_rows" -> "File exported"
+      "delete_document" -> "File removed"
+      "post_to_channel" -> "Posted"
+      "get_channel_analytics" -> "Stats in"
+      "schedule_channel_post" -> "Scheduled"
+      "query_event_inbox" -> "Inbox checked"
+      "configure_event_inbox" -> "Inbox updated"
+      "call_connected_app" -> "App replied"
+      "list_platform_connections" -> "Apps listed"
+      "call_platform" -> "Connector replied"
+      "get_current_agent_config" -> "Config read"
+      "update_current_agent_config" -> "Agent updated"
+      "create_chat_space" -> "Space created"
+      "attach_current_agent_to_chat" -> "Agent attached"
+      "inspect_current_agent_tools" -> "Tools checked"
+      "test_current_agent_tool" -> "Tool tested"
+      "ask_user" -> "Question ready"
+      "delegate_to_subagent" -> "Specialist done"
+      _ -> "Step done"
+    end
+  end
+
+  defp tool_failed_label(tool_name) do
+    case to_string(tool_name) do
+      "search_music" -> "No track found"
+      "search_google" -> "Search failed"
+      "analyze_image" -> "Image failed"
+      "analyze_document" -> "Document failed"
+      "delegate_to_subagent" -> "Specialist failed"
+      "call_connected_app" -> "App call failed"
+      "call_platform" -> "Connector failed"
+      "post_to_channel" -> "Post failed"
+      "create_document" -> "File failed"
+      _ -> "Step failed"
+    end
+  end
+
+  defp first_track_title(result) do
+    (Map.get(result, :tracks) || Map.get(result, "tracks") || [])
+    |> List.wrap()
+    |> List.first()
+    |> case do
+      track when is_map(track) -> Map.get(track, :title) || Map.get(track, "title")
+      _ -> nil
+    end
+  end
+
+  # Trim on a word boundary so a note never ends mid-word.
+  defp clip_words(text, limit) do
+    trimmed = text |> to_string() |> String.split(~r/\s+/u, trim: true) |> Enum.join(" ")
+
+    if String.length(trimmed) <= limit do
+      trimmed
+    else
+      cut = String.slice(trimmed, 0, limit - 1)
+      on_word = String.replace(cut, ~r/\s+\S*$/u, "")
+      # Keep the word boundary only while it preserves most of the label (a single long token
+      # would otherwise be erased entirely).
+      base = if String.length(on_word) >= div(limit * 3, 5), do: on_word, else: cut
+
+      base
+      |> String.trim_trailing(" -–—·,:(")
+      |> Kernel.<>("…")
+    end
+  end
 
   defp waiting_for_user_result?(%{content: content}) when is_binary(content) do
     case Jason.decode(content) do
@@ -1592,8 +1816,13 @@ defmodule Vibe.AI.Agent do
     }
   end
 
-  defp tool_result_error?(result) when is_map(result),
-    do: is_binary(result[:error] || result["error"])
+  defp tool_result_error?(result) when is_map(result) do
+    case result[:error] || result["error"] do
+      value when is_binary(value) -> true
+      %{} -> true
+      _ -> (result[:ok] || result["ok"]) == false
+    end
+  end
 
   defp tool_result_error?(_), do: false
 

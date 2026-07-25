@@ -297,8 +297,8 @@ defmodule Vibe.AI.SubagentRegistry do
 
         cond do
           is_nil(job) -> fallback_sentence(trimmed)
-          detail == "" -> "#{job}..."
-          true -> "#{job} #{truncate_detail(detail)}..."
+          detail == "" -> "#{job}…"
+          true -> "#{job} #{truncate_detail(detail)}…"
         end
 
       _ ->
@@ -307,11 +307,16 @@ defmodule Vibe.AI.SubagentRegistry do
   end
 
   defp fallback_sentence(""), do: nil
-  defp fallback_sentence(text), do: "#{truncate_detail(text)}..."
+  defp fallback_sentence(text), do: "#{truncate_detail(text)}…"
 
   # Progress chips must stay short — they render in a single-line shimmer row.
   # Keep at most a few words of detail and trim any dangling partial word.
-  @progress_detail_limit 36
+  #
+  # This budget is for the DETAIL only; a verb ("Reviewing ") and an ellipsis are added on
+  # top. It used to be 36, which produced ~48-char labels that AgenticEventShape then clipped
+  # at 32 — every delegated step arrived cut mid-word. Keep verb + detail + "…" under the
+  # downstream safety net.
+  @progress_detail_limit 20
 
   defp truncate_detail(detail) do
     detail
@@ -325,20 +330,18 @@ defmodule Vibe.AI.SubagentRegistry do
     if String.length(text) <= limit do
       text
     else
-      text
-      |> String.slice(0, limit)
-      |> String.replace(~r/\s+\S*$/u, "")
-      |> String.trim()
-      |> case do
-        "" -> String.slice(text, 0, limit) |> String.trim()
-        shortened -> shortened
-      end
+      cut = text |> String.slice(0, limit) |> String.trim()
+      on_word = cut |> String.replace(~r/\s+\S*$/u, "") |> String.trim()
+
+      # Word-boundary trim only while it keeps most of the detail; a single long token would
+      # otherwise collapse to a stub ("Creating a new..." for "Creating a new draft agent").
+      if String.length(on_word) >= div(limit * 3, 5), do: on_word, else: cut
     end
   end
 
-  defp fallback_progress_label("builder_assistant"), do: "Reviewing your agent setup..."
-  defp fallback_progress_label("integration_advisor"), do: "Gathering integration details..."
-  defp fallback_progress_label("music_specialist"), do: "Checking music results..."
-  defp fallback_progress_label("document_specialist"), do: "Reviewing documents and research..."
-  defp fallback_progress_label(_id), do: "Working on the request..."
+  defp fallback_progress_label("builder_assistant"), do: "Reviewing agent setup…"
+  defp fallback_progress_label("integration_advisor"), do: "Checking integration…"
+  defp fallback_progress_label("music_specialist"), do: "Checking music…"
+  defp fallback_progress_label("document_specialist"), do: "Reviewing documents…"
+  defp fallback_progress_label(_id), do: "Working on it…"
 end

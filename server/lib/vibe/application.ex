@@ -58,6 +58,9 @@ defmodule Vibe.Application do
       # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)
       {Task.Supervisor,
        name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()},
+      # Unlinked pool for in-turn agent tool calls: a raising tool must surface as an
+      # error the model can read, never take the whole agent turn down with it.
+      {Task.Supervisor, name: Vibe.TaskSupervisor},
       # Zero-token watchdogs for coordinated team runs (one transient GenServer
       # per {chat_id, team_run_id}; docs/team-architecture-v2.md §4)
       {Registry, keys: :unique, name: Vibe.AI.TeamRunRegistry},

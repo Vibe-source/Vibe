@@ -34,15 +34,24 @@ defmodule Vibe.Agents do
 
   def quota_for_user(user_id) do
     used =
-      Repo.one(
-        from a in Agent,
-          where: a.owner_user_id == ^user_id and a.status != "archived",
-          select: count(a.id)
-      ) || 0
+      if is_nil(user_id) do
+        # Ecto raises on `== nil`; an ownerless caller simply has no agents.
+        0
+      else
+        Repo.one(
+          from a in Agent,
+            where: a.owner_user_id == ^user_id and a.status != "archived",
+            select: count(a.id)
+        ) || 0
+      end
 
     limit = agent_limit_for_user(user_id)
     %{used: used, limit: limit, remaining: max(limit - used, 0)}
   end
+
+  # A nil owner has no agents. Ecto raises ArgumentError on `== nil` ("comparing with nil is
+  # forbidden"), and that raise used to travel all the way out and kill the whole agent turn.
+  def list_agents(nil), do: []
 
   def list_agents(owner_user_id) do
     Repo.all(
@@ -981,7 +990,32 @@ defmodule Vibe.Agents do
 
   defp create_shadow_user(_owner_user_id, attrs) do
     display_name = display_name_from_attrs(attrs)
-    username = requested_or_generated_username(display_name, attrs)
+
+    # `create_agent/2` is NOT wrapped in a transaction, so the rollback-based validator used
+    # to blow up with "cannot call rollback outside of transaction" whenever a username was
+    # taken or invalid — an ordinary user mistake surfacing as a RuntimeError that unwound
+    # the whole agent-creation turn. Resolve the username with the tagged validator instead
+    # and let `with` in create_agent/2 return the error.
+    with {:ok, username} <- resolve_shadow_username(display_name, attrs) do
+      insert_shadow_user(display_name, username, attrs)
+    end
+  end
+
+  defp resolve_shadow_username(display_name, attrs) do
+    case Map.get(attrs, "username") || Map.get(attrs, :username) do
+      value when is_binary(value) ->
+        if String.trim(value) == "" do
+          {:ok, generate_available_username(display_name)}
+        else
+          username_availability(value, nil)
+        end
+
+      _ ->
+        {:ok, generate_available_username(display_name)}
+    end
+  end
+
+  defp insert_shadow_user(display_name, username, attrs) do
     user_id = UUID.uuid4()
 
     Accounts.create_user(%{
@@ -1026,22 +1060,6 @@ defmodule Vibe.Agents do
         {:ok, _updated_user} -> :ok
         {:error, changeset} -> Repo.rollback(changeset)
       end
-    end
-  end
-
-  defp requested_or_generated_username(display_name, attrs) do
-    requested = Map.get(attrs, "username") || Map.get(attrs, :username)
-
-    case requested do
-      value when is_binary(value) ->
-        if String.trim(value) == "" do
-          generate_available_username(display_name)
-        else
-          ensure_valid_username!(value)
-        end
-
-      _ ->
-        generate_available_username(display_name)
     end
   end
 

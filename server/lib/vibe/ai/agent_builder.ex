@@ -954,43 +954,43 @@ defmodule Vibe.AI.AgentBuilder do
   end
 
   defp builder_tool_progress_label("get_builder_context", _input),
-    do: "Reading your current agents and builder context..."
+    do: "Reading your agents…"
 
   defp builder_tool_progress_label("create_agent", _input),
-    do: "Creating the agent draft..."
+    do: "Creating draft…"
 
   defp builder_tool_progress_label("select_agent", _input),
-    do: "Opening the selected agent..."
+    do: "Opening agent…"
 
   defp builder_tool_progress_label("update_agent", _input),
-    do: "Updating the agent draft..."
+    do: "Updating draft…"
 
   defp builder_tool_progress_label("publish_agent", _input),
-    do: "Publishing the agent..."
+    do: "Publishing agent…"
 
   defp builder_tool_progress_label("generate_system_prompt", _input),
-    do: "Writing the system prompt..."
+    do: "Writing prompt…"
 
   defp builder_tool_progress_label("set_agent_status", _input),
-    do: "Updating the agent status..."
+    do: "Updating status…"
 
   defp builder_tool_progress_label("archive_agent", _input),
-    do: "Removing the agent..."
+    do: "Removing agent…"
 
   defp builder_tool_progress_label("rotate_secret", _input),
-    do: "Rotating the agent secret..."
+    do: "Rotating secret…"
 
   defp builder_tool_progress_label("get_integration_details", _input),
-    do: "Reading the agent integration details..."
+    do: "Reading integration…"
 
   defp builder_tool_progress_label("ensure_destination_chat", _input),
-    do: "Preparing a real Vibe destination chat..."
+    do: "Preparing chat…"
 
   defp builder_tool_progress_label("validate_destination_chat", _input),
-    do: "Re-checking the live destination chat..."
+    do: "Re-checking chat…"
 
   defp builder_tool_progress_label(_tool_name, _input),
-    do: "Working on the agent setup..."
+    do: "Setting up agent…"
 
   defp build_create_attrs(input) do
     %{}

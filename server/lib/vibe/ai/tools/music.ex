@@ -25,20 +25,23 @@ defmodule Vibe.AI.Tools.Music do
   - `type` — track | album | artist (search only)
   - `max_results` — 1..5 (default 1)
   """
-  def search(params) when is_map(params) do
+  def search(params, opts \\ [])
+
+  def search(params, opts) when is_map(params) do
     url = extract_url(params)
     query = extract_query(params)
     max_results = normalize_max_results(params["max_results"] || params[:max_results])
     type = params["type"] || "track"
+    step = step_reporter(opts)
 
     cond do
       is_binary(url) ->
         Logger.info("[Music] Resolving URL: #{url}")
-        resolve_page_url(url)
+        resolve_page_url(url, step)
 
       is_binary(query) and YtDlp.music_page_url?(query) ->
         Logger.info("[Music] Resolving music page from query: #{query}")
-        resolve_page_url(String.trim(query))
+        resolve_page_url(String.trim(query), step)
 
       is_binary(query) ->
         Logger.info("[Music] Searching for: #{query} (type: #{type}, max_results: #{max_results})")
@@ -47,10 +50,12 @@ defmodule Vibe.AI.Tools.Music do
           case check_cache(query) do
             {:ok, cached_tracks} when cached_tracks != [] ->
               Logger.info("[Music] Cache hit! Returning #{length(cached_tracks)} cached tracks")
+              step.("Reading saved track…")
               format_cached_results(cached_tracks)
 
             _ ->
-              search_fresh(query, type)
+              step.("Asking YouTube…")
+              search_fresh(query, type, step)
           end
 
         limit_tracks(result, max_results)
@@ -61,14 +66,25 @@ defmodule Vibe.AI.Tools.Music do
     end
   end
 
-  def search(params) do
+  def search(params, _opts) do
     Logger.error("[Music] Called with invalid params: #{inspect(params)}")
     %{error: "Missing search query"}
   end
 
+  # Intermediate progress beats. A URL resolve or a fresh search takes 2-5s; the caller passes
+  # `on_step` so the note can advance while it waits instead of freezing on one label.
+  defp step_reporter(opts) do
+    case Keyword.get(opts, :on_step) do
+      fun when is_function(fun, 1) -> fn label -> fun.(label) end
+      _ -> fn _label -> :ok end
+    end
+  end
+
   # ── URL resolve (SoundCloud / YouTube / …) ──────────────────────────────
 
-  defp resolve_page_url(url) do
+  defp resolve_page_url(url, step) do
+    step.("Reading track info…")
+
     case YtDlp.resolve_url(url) do
       {:ok, track} ->
         # Guarantee a resolvable page URL survives into the payload + cache. A bare
@@ -86,6 +102,7 @@ defmodule Vibe.AI.Tools.Music do
         # leaving no cache row — then the stream endpoint falls back to the bare sc_*
         # id and 500s ("Missing SoundCloud source URL in cache"). For SoundCloud a
         # committed row is mandatory for playback.
+        step.("Preparing audio…")
         cached? = cache_track_now(url, track)
 
         if streamable?(track, cached?) do
@@ -221,9 +238,16 @@ defmodule Vibe.AI.Tools.Music do
   end
 
   # Trim the emitted track list to the requested count without losing the
-  # source/primary metadata the rest of the pipeline expects.
+  # source/primary metadata the rest of the pipeline expects. `count` and `alternatives`
+  # must be clamped too: leaving them at the unclamped values told the model it had 3
+  # results and handed it two extra tracks it was instructed not to mention.
   defp limit_tracks(%{tracks: tracks} = result, max_results) when is_list(tracks) do
-    Map.put(result, :tracks, Enum.take(tracks, max_results))
+    kept = Enum.take(tracks, max_results)
+
+    result
+    |> Map.put(:tracks, kept)
+    |> Map.put(:count, length(kept))
+    |> Map.put(:alternatives, kept |> Enum.drop(1))
   end
 
   defp limit_tracks(result, _max_results), do: result
@@ -268,7 +292,7 @@ defmodule Vibe.AI.Tools.Music do
   end
 
   # Fresh search using yt-dlp - FAST mode (metadata only, no stream extraction)
-  defp search_fresh(query, _type) do
+  defp search_fresh(query, _type, step) do
     # Use fast flat-playlist search (just metadata, no stream URLs)
     # Stream URLs will be fetched on-demand when user plays
     # Return 1 primary result + up to 2 alternatives
@@ -277,6 +301,7 @@ defmodule Vibe.AI.Tools.Music do
     case YtDlp.search(query, limit: limit) do
       {:ok, tracks} when tracks != [] ->
         Logger.info("[Music] yt-dlp returned #{length(tracks)} results (fast mode)")
+        step.("Reading results…")
 
         # Cache metadata for future requests
         spawn(fn -> cache_results(query, tracks, "youtube") end)
@@ -286,6 +311,7 @@ defmodule Vibe.AI.Tools.Music do
       {:ok, []} ->
         # If exact match fails, try adding "audio" to query
         Logger.info("[Music] Initial search failed, trying with 'audio' suffix")
+        step.("Widening search…")
         retry_search(query <> " audio")
 
       {:error, reason} ->

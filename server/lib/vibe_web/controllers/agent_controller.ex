@@ -37,6 +37,15 @@ defmodule VibeWeb.AgentController do
 
       %{type: :subagent} = event ->
         send_sse_event(conn, "subagent", Map.delete(event, :type))
+
+      # Catch-all: the loop can emit :agent_cards / :state / :ui_request / :review_ready
+      # (reachable via delegate_to_subagent → AgentBuilder). An unmatched clause raised
+      # FunctionClauseError *inside* the runtime and took the whole turn down.
+      %{type: type} = event ->
+        send_sse_event(conn, to_string(type), Map.delete(event, :type))
+
+      _other ->
+        :ok
     end
 
     case AiAgent.stream_response(

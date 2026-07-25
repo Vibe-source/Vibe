@@ -135,7 +135,7 @@ defmodule Vibe.AI.AgentModelSelectionTest do
     payload = AgentRuntime.openai_request_payload([%{role: "user", content: "Hello"}], config)
 
     assert payload["model"] == "gpt-5.6-sol"
-    assert payload["reasoning"] == %{"effort" => "max"}
+    assert payload["reasoning"] == %{"effort" => "max", "summary" => "auto"}
   end
 
   test "uses adaptive thinking and output effort for modern Claude models" do

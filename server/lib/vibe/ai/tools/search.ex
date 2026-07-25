@@ -8,7 +8,12 @@ defmodule Vibe.AI.Tools.Search do
 
   require Logger
 
-  @gemini_api "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent"
+  # `gemini-3.0-flash` was retired and every web lookup 404'd ("is not found for API version
+  # v1beta") — search_google was simply dead. 2.5-flash is the newest model this project's
+  # key can actually call: measured 2026-07-25, the 3.x flash models return
+  # 429 "free_tier_requests, limit: 0". Override with GEMINI_SEARCH_MODEL after upgrading the
+  # Gemini plan, so a retirement or a plan change is config, not a code edit.
+  @default_gemini_model "gemini-2.5-flash"
 
   @doc """
   Search the web using Gemini with Google Search grounding and return structured results.
@@ -25,13 +30,26 @@ defmodule Vibe.AI.Tools.Search do
   # Handle missing query parameter
   def google(_params), do: %{error: "Missing search query"}
 
+  defp gemini_endpoint do
+    model =
+      case System.get_env("GEMINI_SEARCH_MODEL") do
+        value when is_binary(value) ->
+          if String.trim(value) == "", do: @default_gemini_model, else: String.trim(value)
+
+        _ ->
+          @default_gemini_model
+      end
+
+    "https://generativelanguage.googleapis.com/v1beta/models/#{model}:generateContent"
+  end
+
   defp search_with_gemini(query) do
     api_key = System.get_env("GEMINI_API_KEY")
 
     if is_nil(api_key) do
       {:error, "No Gemini API key configured"}
     else
-      url = "#{@gemini_api}?key=#{api_key}"
+      url = "#{gemini_endpoint()}?key=#{api_key}"
 
       body = Jason.encode!(%{
         contents: [

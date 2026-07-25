@@ -26,6 +26,9 @@ defmodule Vibe.Accounts do
   # so an active session never lapses yet we touch the DB at most ~once/day/user.
   @token_slide_after_seconds 24 * 60 * 60
 
+  # Repo.get/2 raises on a nil id. Callers reach here from agent tool inputs, where a
+  # missing id must be an ordinary "no user" answer, not an exception that unwinds the turn.
+  def get_user(nil), do: nil
   def get_user(id), do: Repo.get(User, id)
 
   @privacy_fields %{

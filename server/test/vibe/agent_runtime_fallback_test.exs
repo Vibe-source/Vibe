@@ -139,7 +139,7 @@ defmodule Vibe.AI.AgentRuntimeFallbackTest do
 
     assert payload["model"] == "gpt-5.6-luna"
     assert payload["instructions"] == "You are Vibe."
-    assert payload["reasoning"] == %{"effort" => "medium"}
+    assert payload["reasoning"] == %{"effort" => "medium", "summary" => "auto"}
     assert payload["stream"]
     refute payload["store"]
 

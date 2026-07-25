@@ -56,15 +56,27 @@ defmodule Vibe.AI.AgentRuntime do
     end
   end
 
+  # Depth exhaustion must NOT throw the answer away. The old clause returned
+  # {:error, depth_error}, discarding every chunk already streamed to the client — the user
+  # watched text arrive and then got "Something went wrong". Hand back what we have and let
+  # the caller finalize it; the state carries the reason so the UI can note it.
   defp do_run(
          _messages,
          %Config{max_depth: max_depth} = config,
          _provider_state,
          depth,
-         _accumulated_text
+         accumulated_text
        )
        when depth > max_depth do
-    {:error, config.depth_error}
+    Logger.warning("[#{config.request_label}] Max tool depth #{max_depth} reached")
+
+    case String.trim(to_string(accumulated_text)) do
+      "" ->
+        {:error, config.depth_error}
+
+      _text ->
+        {:ok, accumulated_text, Map.put(config.state, :terminal_status, "depth_exhausted")}
+    end
   end
 
   defp do_run(messages, %Config{} = config, provider_state, depth, accumulated_text) do
@@ -72,7 +84,7 @@ defmodule Vibe.AI.AgentRuntime do
 
     case result do
       {:ok, reply} ->
-        {:ok, accumulated_text <> reply, config.state}
+        {:ok, join_beats(accumulated_text, reply), config.state}
 
       {:tool_use, tool_calls, partial_response, partial_text} ->
         callback = config.callback || fn _event -> :ok end
@@ -90,7 +102,7 @@ defmodule Vibe.AI.AgentRuntime do
             %{config | state: next_state},
             next_provider_state,
             depth + 1,
-            accumulated_text <> partial_text
+            join_beats(accumulated_text, partial_text)
           )
         end
 
@@ -177,7 +189,15 @@ defmodule Vibe.AI.AgentRuntime do
         Finch.stream(
           request,
           Vibe.Finch,
-          %{text: "", tool_calls: [], current_tool_index: -1, stop_reason: nil, buffer: ""},
+          %{
+            text: "",
+            tool_calls: [],
+            current_tool_index: -1,
+            stop_reason: nil,
+            buffer: "",
+            thinking_active: nil,
+            thinking_blocks: []
+          },
           fn
             {:status, status}, acc ->
               Map.put(acc, :status, status)
@@ -186,6 +206,10 @@ defmodule Vibe.AI.AgentRuntime do
               Map.put(acc, :headers, resp_headers)
 
             {:data, data}, acc ->
+              # Keep the raw body when the request failed — otherwise a provider message as
+              # actionable as "Your credit balance is too low" is thrown away and all anyone
+              # ever sees is "API error: 400".
+              acc = maybe_keep_error_body(acc, data)
               {events, buffer} = parse_sse_events((acc.buffer || "") <> data)
               acc = Map.put(acc, :buffer, buffer)
 
@@ -212,6 +236,66 @@ defmodule Vibe.AI.AgentRuntime do
                     inner_acc
                     |> Map.update(:tool_calls, [new_tool], &(&1 ++ [new_tool]))
                     |> Map.put(:current_tool_index, new_index)
+
+                  # ── extended thinking ─────────────────────────────────────────
+                  # The reducer used to drop every thinking event, so the native agent
+                  # could never show the "Thinking · N tokens" row the bridge agents show.
+                  %{
+                    "type" => "content_block_start",
+                    "index" => index,
+                    "content_block" => %{"type" => "thinking"}
+                  } ->
+                    callback.(%{type: :thinking, status: "running", content: "", tokens: 0})
+                    Map.put(inner_acc, :thinking_active, %{index: index, text: "", signature: nil})
+
+                  %{
+                    "type" => "content_block_delta",
+                    "delta" => %{"type" => "thinking_delta", "thinking" => chunk}
+                  }
+                  when is_binary(chunk) ->
+                    active = inner_acc.thinking_active || %{index: nil, text: "", signature: nil}
+                    text = active.text <> chunk
+
+                    callback.(%{
+                      type: :thinking,
+                      status: "running",
+                      content: chunk,
+                      text: text,
+                      tokens: estimated_tokens(text)
+                    })
+
+                    Map.put(inner_acc, :thinking_active, %{active | text: text})
+
+                  %{
+                    "type" => "content_block_delta",
+                    "delta" => %{"type" => "signature_delta", "signature" => signature}
+                  } ->
+                    case inner_acc.thinking_active do
+                      nil ->
+                        inner_acc
+
+                      active ->
+                        Map.put(inner_acc, :thinking_active, %{active | signature: signature})
+                    end
+
+                  %{"type" => "content_block_stop", "index" => index} ->
+                    case inner_acc.thinking_active do
+                      %{index: ^index} = active ->
+                        callback.(%{
+                          type: :thinking,
+                          status: "done",
+                          content: "",
+                          text: active.text,
+                          tokens: estimated_tokens(active.text)
+                        })
+
+                        inner_acc
+                        |> Map.put(:thinking_active, nil)
+                        |> Map.update(:thinking_blocks, [active], &(&1 ++ [active]))
+
+                      _ ->
+                        inner_acc
+                    end
 
                   %{
                     "type" => "content_block_delta",
@@ -251,7 +335,8 @@ defmodule Vibe.AI.AgentRuntime do
         case final_acc.status do
           status when is_integer(status) and status != 200 ->
             Logger.error(
-              "[#{config.request_label}] Claude streaming request failed with status #{status}"
+              "[#{config.request_label}] Claude streaming request failed with status #{status}" <>
+                error_body_suffix(final_acc)
             )
 
             {:error, "API error: #{status}", %{emitted_text?: emitted_text?}}
@@ -335,6 +420,7 @@ defmodule Vibe.AI.AgentRuntime do
               Map.put(acc, :headers, response_headers)
 
             {:data, data}, acc ->
+              acc = maybe_keep_error_body(acc, data)
               {events, buffer} = parse_sse_events((acc.buffer || "") <> data)
               acc = Map.put(acc, :buffer, buffer)
 
@@ -345,7 +431,9 @@ defmodule Vibe.AI.AgentRuntime do
                   callback.(%{type: :text, content: text_delta})
                 end
 
-                next_acc
+                # Reasoning deltas ride on the accumulator (rather than the return tuple) so
+                # the reducer keeps its {acc, text_delta} contract.
+                drain_thinking(next_acc, callback)
               end)
           end
         )
@@ -359,7 +447,7 @@ defmodule Vibe.AI.AgentRuntime do
           is_integer(final_acc.status) and final_acc.status != 200 ->
             Logger.error(
               "[#{config.request_label}] OpenAI Responses request failed with status " <>
-                "#{final_acc.status}"
+                "#{final_acc.status}" <> error_body_suffix(final_acc)
             )
 
             {:error, "OpenAI API error: #{final_acc.status}"}
@@ -402,7 +490,7 @@ defmodule Vibe.AI.AgentRuntime do
       "stream" => true
     }
 
-    if config.model in @adaptive_claude_models do
+    if adaptive_thinking_model?(config.model) do
       payload
       |> Map.put("thinking", %{"type" => "adaptive"})
       |> Map.put("output_config", %{"effort" => config.thinking_level})
@@ -410,6 +498,19 @@ defmodule Vibe.AI.AgentRuntime do
       payload
     end
   end
+
+  # Registry-driven: a model supports adaptive thinking when it offers more than the single
+  # "medium" effort level (Haiku 4.5 does not, and rejects the fields). The static list stays
+  # as the answer for models the registry has not heard of yet.
+  defp adaptive_thinking_model?(model) when is_binary(model) do
+    case Vibe.AI.ModelRegistry.thinking_levels("anthropic", model) do
+      levels when is_list(levels) and length(levels) > 1 -> true
+      levels when is_list(levels) -> false
+      _ -> model in @adaptive_claude_models
+    end
+  end
+
+  defp adaptive_thinking_model?(_model), do: false
 
   @doc false
   def openai_request_payload(messages, %Config{} = config) do
@@ -419,7 +520,9 @@ defmodule Vibe.AI.AgentRuntime do
       "input" => openai_input(messages),
       "tools" => openai_tools(config.tools),
       "max_output_tokens" => config.max_tokens,
-      "reasoning" => %{"effort" => openai_reasoning_effort(config)},
+      # summary: "auto" is what makes the model stream its reasoning summary; without it the
+      # response carries reasoning but emits no summary events, so there is nothing to show.
+      "reasoning" => %{"effort" => openai_reasoning_effort(config), "summary" => "auto"},
       "stream" => true,
       "store" => false
     }
@@ -449,6 +552,18 @@ defmodule Vibe.AI.AgentRuntime do
     case event do
       %{"type" => "response.output_text.delta", "delta" => delta} when is_binary(delta) ->
         {Map.update(acc, :text, delta, &(&1 <> delta)), delta}
+
+      # Reasoning summaries (verified live 2026-07-25: requires reasoning.summary = "auto";
+      # streams as response.reasoning_summary_text.delta, ~90 deltas for a medium-effort turn).
+      %{"type" => "response.reasoning_summary_part.added"} ->
+        {queue_thinking(acc, "", :running), nil}
+
+      %{"type" => "response.reasoning_summary_text.delta", "delta" => delta}
+      when is_binary(delta) ->
+        {queue_thinking(acc, delta, :running), nil}
+
+      %{"type" => "response.reasoning_summary_text.done", "text" => text} when is_binary(text) ->
+        {acc |> put_thinking_text(text) |> queue_thinking("", :done), nil}
 
       %{"type" => type, "item" => %{"type" => "function_call"} = item}
       when type in ["response.output_item.added", "response.output_item.done"] ->
@@ -725,6 +840,87 @@ defmodule Vibe.AI.AgentRuntime do
   defp resolve_system_prompt(system_prompt, _state) when is_binary(system_prompt),
     do: system_prompt
 
+  # ── thinking helpers ─────────────────────────────────────────────────────────────
+  # Map.get/Map.put throughout so an accumulator built before these fields existed (or in a
+  # test) still works.
+
+  defp queue_thinking(acc, chunk, status) do
+    text = Map.get(acc, :thinking_text, "") <> chunk
+
+    acc
+    |> Map.put(:thinking_text, text)
+    |> Map.put(:thinking_pending, %{
+      status: if(status == :done, do: "done", else: "running"),
+      content: chunk,
+      text: text,
+      tokens: estimated_tokens(text)
+    })
+  end
+
+  defp put_thinking_text(acc, text), do: Map.put(acc, :thinking_text, text)
+
+  defp drain_thinking(acc, callback) do
+    case Map.get(acc, :thinking_pending) do
+      nil ->
+        acc
+
+      pending ->
+        callback.(Map.put(pending, :type, :thinking))
+        Map.put(acc, :thinking_pending, nil)
+    end
+  end
+
+  # Providers do not report reasoning tokens per delta; ~4 chars/token is close enough for a
+  # live counter and never claims more precision than it has.
+  defp estimated_tokens(text) do
+    text |> to_string() |> String.length() |> div(4) |> max(0)
+  end
+
+  # Text emitted before a tool call and text emitted after it are separate beats of the same
+  # answer. Concatenating them raw glued sentences together ("…and send it.The first result
+  # was a mashup…"), so separate them with a paragraph break unless the model already did.
+  defp join_beats(accumulated, next) do
+    left = to_string(accumulated)
+    right = to_string(next)
+
+    cond do
+      String.trim(left) == "" -> right
+      String.trim(right) == "" -> left
+      String.ends_with?(left, ["\n", " "]) -> left <> right
+      String.starts_with?(right, ["\n", " "]) -> left <> right
+      true -> left <> "\n\n" <> right
+    end
+  end
+
+  @error_body_limit 600
+
+  defp maybe_keep_error_body(acc, data) do
+    case Map.get(acc, :status) do
+      status when is_integer(status) and status != 200 ->
+        kept = Map.get(acc, :error_body) || ""
+
+        if String.length(kept) >= @error_body_limit do
+          acc
+        else
+          Map.put(acc, :error_body, String.slice(kept <> to_string(data), 0, @error_body_limit))
+        end
+
+      _ ->
+        acc
+    end
+  end
+
+  defp error_body_suffix(acc) do
+    case Map.get(acc, :error_body) do
+      body when is_binary(body) ->
+        trimmed = body |> String.replace(~r/\s+/, " ") |> String.trim()
+        if trimmed == "", do: "", else: ": #{trimmed}"
+
+      _ ->
+        ""
+    end
+  end
+
   defp parse_sse_events(data) do
     data =
       data
@@ -779,11 +975,22 @@ defmodule Vibe.AI.AgentRuntime do
   end
 
   defp build_content_blocks(acc) do
+    # Thinking blocks must be handed back UNMODIFIED (with their signature) in the assistant
+    # turn that precedes the tool results, or the provider rejects the follow-up request when
+    # extended thinking is on.
+    thinking_blocks =
+      acc
+      |> Map.get(:thinking_blocks, [])
+      |> Enum.filter(&(is_binary(&1.signature) and &1.text != ""))
+      |> Enum.map(
+        &%{"type" => "thinking", "thinking" => &1.text, "signature" => &1.signature}
+      )
+
     blocks =
       if acc.text != "" do
-        [%{"type" => "text", "text" => acc.text}]
+        thinking_blocks ++ [%{"type" => "text", "text" => acc.text}]
       else
-        []
+        thinking_blocks
       end
 
     acc.tool_calls

@@ -297,7 +297,11 @@ defmodule Vibe.AgentTurnContractTest do
     end
   end
 
-  test "agentic progress labels are single-line and capped at 32 graphemes" do
+  # The 32-grapheme cap was the PRIMARY shortener and clipped almost every real label
+  # mid-word ("Found · Anathema - Flying [Live…"). Producers now emit short labels (≤30) and
+  # this is a 40-grapheme safety net that cuts on a word boundary when that keeps most of the
+  # label. See docs/agent-loop-payload-audit.md §3.
+  test "agentic progress labels are single-line and capped at 40 graphemes" do
     long_label = "  Inspecting\n" <> String.duplicate("é", 40) <> "\twith details  "
     detailed_result = %{"content" => String.duplicate("full result ", 20)}
 
@@ -311,20 +315,20 @@ defmodule Vibe.AgentTurnContractTest do
         activity: [%{title: long_label, detail: "keep activity detail"}]
       })
 
-    assert String.length(enriched.label) == 32
+    assert String.length(enriched.label) == 40
     assert String.ends_with?(enriched.label, "…")
     refute String.contains?(enriched.label, "\n")
 
     [first_node, second_node] = enriched.progressNodes
-    assert String.length(first_node.label) == 32
+    assert String.length(first_node.label) == 40
     assert String.ends_with?(first_node.label, "…")
     assert first_node.result == detailed_result
-    assert String.length(second_node["title"]) == 32
+    assert String.length(second_node["title"]) == 40
     assert String.ends_with?(second_node["title"], "…")
     assert second_node["detail"] == "keep\nthis detail intact"
 
     [activity] = enriched.activity
-    assert String.length(activity.title) == 32
+    assert String.length(activity.title) == 40
     assert String.ends_with?(activity.title, "…")
     assert activity.detail == "keep activity detail"
   end

@@ -61,15 +61,26 @@ defmodule VibeWeb.UserChannel do
         VibeWeb.Presence.list("user:#{fid}") |> map_size() > 0
       end)
 
+      # Compute the current bridge status ONCE here, off the channel process (this
+      # Task already does DB work). Presence only emits a diff — and thus a
+      # bridge-status push — when a computer is actually connected; a user with NO
+      # paired bridge would otherwise never get a push, so the phone's 20s fallback
+      # poll of /api/agent-bridge/status runs forever (a wall of cheap-but-needless
+      # calls, ~2/10s per surface). Pushing an initial snapshot on join stamps the
+      # client's freshness so the fallback stays quiet as long as the socket is up,
+      # paired or not. `status_for_push/1` rescues internally, so a failure here can
+      # never take down the join.
+      bridge_status = AgentBridge.status_for_push(user_id)
+
       # Send results back to the channel process (push must happen there)
-      send(channel_pid, {:after_join_complete, friend_ids, online_friend_ids})
+      send(channel_pid, {:after_join_complete, friend_ids, online_friend_ids, bridge_status})
     end)
 
     {:noreply, socket}
   end
 
   @impl true
-  def handle_info({:after_join_complete, friend_ids, online_friend_ids}, socket) do
+  def handle_info({:after_join_complete, friend_ids, online_friend_ids, bridge_status}, socket) do
     # Cache friend_ids so terminate/2 doesn't need to re-fetch
     socket = assign(socket, :friend_ids, friend_ids)
 
@@ -77,6 +88,9 @@ defmodule VibeWeb.UserChannel do
       onlineFriendIds: online_friend_ids,
       online_friend_ids: online_friend_ids
     })
+
+    # Initial bridge snapshot so the client stops polling while the socket is alive.
+    push(socket, "bridge-status", bridge_status)
 
     {:noreply, socket}
   end

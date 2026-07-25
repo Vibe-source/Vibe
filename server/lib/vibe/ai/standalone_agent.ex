@@ -140,6 +140,8 @@ defmodule Vibe.AI.StandaloneAgent do
     conversation_history =
       recent_chat_history(vibe_chat_id, requester_user_id, agent.agent_user_id)
 
+    turn_memory = turn_memory_from_chat(vibe_chat_id, requester_user_id, agent.agent_user_id)
+
     has_prior_messages = chat_has_prior_messages?(vibe_chat_id, requester_user_id)
     system_prompt = build_system_prompt(agent, has_prior_messages)
 
@@ -179,7 +181,8 @@ defmodule Vibe.AI.StandaloneAgent do
                agent.model_id,
                system_prompt,
                agent.enabled_tools || [],
-               conversation_history
+               conversation_history,
+               turn_memory
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
 
@@ -394,12 +397,14 @@ defmodule Vibe.AI.StandaloneAgent do
          model_id,
          system_prompt,
          enabled_tools,
-         conversation_history
+         conversation_history,
+         turn_memory
        ) do
     case ChatAgent.stream_response(
            message,
            callback,
            history: conversation_history,
+           turn_memory: turn_memory,
            images: image_urls,
            chat_id: vibe_chat_id,
            user_id: user_id,
@@ -610,11 +615,13 @@ defmodule Vibe.AI.StandaloneAgent do
     rich_outputs =
       tool_results
       |> List.wrap()
+      |> select_music_tool_results()
       |> Enum.flat_map(fn item ->
         tool = map_value(item, :tool)
         result = map_value(item, :result)
         tool_outputs_from_result(tool, result)
       end)
+      |> dedupe_media_outputs()
 
     if rich_outputs == [] do
       []
@@ -626,6 +633,81 @@ defmodule Vibe.AI.StandaloneAgent do
       |> Enum.reject(&(output_type(&1) == "text"))
     end
   end
+
+  # A turn can call search_music several times while it narrows down (resolve link → fails →
+  # search → refine). Shipping a card for EVERY call meant a turn whose answer named one
+  # track attached four, including the ones the agent had explicitly discarded. The agent's
+  # decision is its LAST successful music call, so that is the one that becomes cards;
+  # earlier attempts are dropped. Every non-music tool result passes through untouched.
+  @doc false
+  def select_music_tool_results(tool_results) do
+    music_indices =
+      tool_results
+      |> Enum.with_index()
+      |> Enum.filter(fn {item, _index} ->
+        map_value(item, :tool) == "search_music" and
+          not error_result?(map_value(item, :result)) and
+          music_tracks?(map_value(item, :result))
+      end)
+      |> Enum.map(fn {_item, index} -> index end)
+
+    case List.last(music_indices) do
+      nil ->
+        tool_results
+
+      keep_index ->
+        drop = MapSet.new(music_indices -- [keep_index])
+
+        tool_results
+        |> Enum.with_index()
+        |> Enum.reject(fn {_item, index} -> MapSet.member?(drop, index) end)
+        |> Enum.map(fn {item, _index} -> item end)
+    end
+  end
+
+  defp music_tracks?(result) when is_map(result) do
+    (map_value(result, :tracks) || []) |> List.wrap() |> Enum.any?()
+  end
+
+  defp music_tracks?(_result), do: false
+
+  defp error_result?(result) when is_map(result) do
+    case map_value(result, :error) do
+      value when is_binary(value) -> true
+      %{} -> true
+      _ -> map_value(result, :ok) == false
+    end
+  end
+
+  defp error_result?(_result), do: false
+
+  # The same track resolved twice in one turn is one card.
+  defp dedupe_media_outputs(outputs) do
+    {deduped, _seen} =
+      Enum.reduce(outputs, {[], MapSet.new()}, fn output, {kept, seen} ->
+        key = media_dedupe_key(output)
+
+        cond do
+          is_nil(key) -> {kept ++ [output], seen}
+          MapSet.member?(seen, key) -> {kept, seen}
+          true -> {kept ++ [output], MapSet.put(seen, key)}
+        end
+      end)
+
+    deduped
+  end
+
+  defp media_dedupe_key(output) when is_map(output) do
+    metadata = map_value(output, :metadata) || %{}
+
+    case map_value(metadata, :videoId) || map_value(metadata, :trackId) ||
+           map_value(output, :mediaUrl) do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp media_dedupe_key(_output), do: nil
 
   @doc false
   def final_text_with_tool_fallback(final_text, tool_results) do
@@ -827,6 +909,51 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp recent_chat_history(_, _, _), do: []
+
+  # Same memory the built-in DM gets (AgentChannel.turn_memory_from_messages), derived from
+  # what this agent already delivered into the chat — so "send it again" resends the same
+  # track here too, instead of starting a fresh blind search.
+  defp turn_memory_from_chat(chat_id, requester_user_id, agent_user_id)
+       when is_binary(chat_id) and is_binary(requester_user_id) and is_binary(agent_user_id) do
+    chat_id
+    |> Chat.get_messages_for_user(requester_user_id)
+    |> Enum.filter(fn message ->
+      (Map.get(message, :from_id) || Map.get(message, "from_id")) == agent_user_id
+    end)
+    |> Enum.map(&memory_entry_from_message/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.take(-6)
+  end
+
+  defp turn_memory_from_chat(_, _, _), do: []
+
+  defp memory_entry_from_message(message) when is_map(message) do
+    metadata =
+      case Map.get(message, :metadata) || Map.get(message, "metadata") do
+        value when is_map(value) -> value
+        _ -> %{}
+      end
+
+    type = normalize_string(Map.get(message, :type) || Map.get(message, "type"))
+    title = normalize_string(map_value(metadata, :title))
+    track_id = normalize_string(map_value(metadata, :videoId) || map_value(metadata, :trackId))
+    file_name = normalize_string(map_value(metadata, :fileName))
+
+    cond do
+      type == "music" and is_binary(title) ->
+        id_part = if is_binary(track_id), do: " [#{track_id}]", else: ""
+        ~s(search_music → sent "#{String.slice(title, 0, 70)}"#{id_part})
+
+      is_binary(file_name) ->
+        ~s(sent file "#{String.slice(file_name, 0, 70)}")
+
+      true ->
+        nil
+    end
+  end
+
+  defp memory_entry_from_message(_message), do: nil
 
   defp chat_has_prior_messages?(chat_id, requester_user_id)
        when is_binary(chat_id) and is_binary(requester_user_id) do
