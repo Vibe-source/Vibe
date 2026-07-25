@@ -23,6 +23,7 @@ defmodule Vibe.AI.Agent do
   @always_available_tool_names ~w[
     query_event_inbox
     configure_event_inbox
+    list_my_agents
     get_current_agent_config
     update_current_agent_config
     inspect_current_agent_tools
@@ -302,9 +303,15 @@ defmodule Vibe.AI.Agent do
       }
     },
     %{
+      name: "list_my_agents",
+      description:
+        "List the agents this user OWNS (display name, @username, status, model, whether it has a system prompt). Read-only and cheap. Use it to answer \"do I have any agents?\", \"how many agents do I have?\", \"what are my agents called?\", or to check before offering to build one. This works in any chat, including this built-in assistant DM where there is no attached custom agent.",
+      input_schema: %{type: "object", properties: %{}}
+    },
+    %{
       name: "get_current_agent_config",
       description:
-        "Read the current standalone agent's live config for the owner, including prompt, ids, status, tools, output modes, destination chats, and endpoints. Prefer this for simple questions about the agent you are already talking to.",
+        "Read the CURRENT chat's standalone agent config (prompt, ids, status, tools, output modes, destination chats, endpoints). Only works inside a chat that has one of the user's own agents attached — in the built-in Vibe AI assistant DM there is no such agent, so use list_my_agents instead. Prefer this for simple questions about the agent you are already talking to.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -592,7 +599,21 @@ defmodule Vibe.AI.Agent do
       - Never ask for or invent GitHub tokens; the server holds OAuth credentials.
       - Prefer call_platform over guessing PR state from chat history when GitHub is connected.
 
+  11c. list_my_agents: Use whenever the user asks about THEIR OWN agents.
+      - "do I have any agents?", "how many agents do I have?", "what are my agents called?",
+        "is my agent published?", "show me my agents" → CALL THIS. Do not guess, and do not
+        answer from the fact that you yourself are an assistant.
+      - It works everywhere, including this built-in assistant DM. It is the correct tool when
+        get_current_agent_config reports that no custom agent is attached to this chat.
+      - Report what it returns concretely: count first, then names/@usernames and status
+        ("2 agents: Leorre (@leorre, published) and Draft Bot (@draftbot, draft)").
+      - If the count is 0, say so plainly and offer to create one.
+
   12. get_current_agent_config: Use for simple live questions about the agent you are already talking to.
+      - ONLY meaningful inside a chat that has one of the user's agents attached. In this
+        built-in Vibe AI assistant DM it returns `no_current_agent` — that is expected, not a
+        malfunction: switch to list_my_agents, and never surface phrases like "owner lookup
+        failed" to the user.
       - Use this for requests like:
         * "what is my current prompt?"
         * "what tools do you have enabled?"
@@ -641,6 +662,8 @@ defmodule Vibe.AI.Agent do
     Never end a turn with empty text after a tool ran.
   - For music: you may name the track/version you sent; never paste URLs or links.
   - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
+  - "Do I have any agents?" is a LOOKUP (list_my_agents), never an answer from memory or from
+    the fact that you are an assistant.
   - For simple current-agent prompt or name changes, use `update_current_agent_config` instead of delegating.
   - Use `ask_user` for required structured choices; never simulate waiting inside a tool call.
   - For simple greetings, respond naturally WITHOUT tools.
@@ -1001,6 +1024,7 @@ defmodule Vibe.AI.Agent do
       "call_connected_app" -> "Calling your app…"
       "list_platform_connections" -> "Checking apps…"
       "call_platform" -> "Calling connector…"
+      "list_my_agents" -> "Checking your agents…"
       "get_current_agent_config" -> "Reading config…"
       "update_current_agent_config" -> "Updating agent…"
       "create_chat_space" -> "Creating space…"
@@ -1068,10 +1092,21 @@ defmodule Vibe.AI.Agent do
           Vibe.AI.Tools.ConnectedApp.invoke(tool_input, agent_id, requester_user_id)
 
         tool_name == "list_platform_connections" ->
-          Vibe.AI.Tools.Platform.list_connections(tool_input, agent_id, requester_user_id)
+          Vibe.AI.Tools.Platform.list_connections(
+            platform_input(tool_input, agent_id),
+            agent_id,
+            requester_user_id
+          )
 
         tool_name == "call_platform" ->
-          Vibe.AI.Tools.Platform.invoke(tool_input, agent_id, requester_user_id)
+          Vibe.AI.Tools.Platform.invoke(
+            platform_input(tool_input, agent_id),
+            agent_id,
+            requester_user_id
+          )
+
+        tool_name == "list_my_agents" ->
+          list_my_agents(tool_input, requester_user_id || user_id)
 
         tool_name == "get_current_agent_config" ->
           get_current_agent_config(tool_input, agent_id, requester_user_id)
@@ -1201,6 +1236,27 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # Current-agent tools in a chat with no attached agent: terminal. Retrying the same tool
+  # cannot make an agent appear, and the answer the user actually wants lives in
+  # list_my_agents.
+  defp classify_tool_error(tool_name, _tool_input, message)
+       when tool_name in [
+              "get_current_agent_config",
+              "update_current_agent_config",
+              "inspect_current_agent_tools",
+              "test_current_agent_tool"
+            ] do
+    if String.contains?(message, "No custom agent") do
+      {"no_current_agent", false,
+       "This chat has no custom agent of the user's attached. Do NOT retry this tool. " <>
+         "If the user asked about THEIR agents, call list_my_agents instead. Never mention " <>
+         "internal lookups — say plainly that this chat is the built-in assistant."}
+    else
+      {"agent_config_unavailable", false,
+       "Do not retry. State in one line what is not available in this chat."}
+    end
+  end
+
   defp classify_tool_error(_tool_name, _tool_input, message) do
     if String.contains?(message, "not available") or String.contains?(message, "not found") do
       {"unavailable", false, "This is not retryable. Tell the user what is missing."}
@@ -1255,6 +1311,24 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # The note itself carries the answer, exactly like "Found · <track>": the user sees the
+  # count in the feed before the summary sentence arrives.
+  defp tool_complete_label("list_my_agents", _input, result) when is_map(result) do
+    cond do
+      tool_result_error?(result) ->
+        tool_failed_label("list_my_agents")
+
+      (Map.get(result, "count") || 0) == 0 ->
+        "No agents yet"
+
+      (Map.get(result, "count") || 0) == 1 ->
+        "1 agent"
+
+      true ->
+        "#{Map.get(result, "count")} agents"
+    end
+  end
+
   defp tool_complete_label(tool_name, _input, result) do
     if is_map(result) and tool_result_error?(result) do
       tool_failed_label(tool_name)
@@ -1282,6 +1356,7 @@ defmodule Vibe.AI.Agent do
       "call_connected_app" -> "App replied"
       "list_platform_connections" -> "Apps listed"
       "call_platform" -> "Connector replied"
+      "list_my_agents" -> "Agents listed"
       "get_current_agent_config" -> "Config read"
       "update_current_agent_config" -> "Agent updated"
       "create_chat_space" -> "Space created"
@@ -1298,6 +1373,11 @@ defmodule Vibe.AI.Agent do
     case to_string(tool_name) do
       "search_music" -> "No track found"
       "search_google" -> "Search failed"
+      "list_my_agents" -> "Agents unavailable"
+      "get_current_agent_config" -> "No agent here"
+      "update_current_agent_config" -> "No agent here"
+      "inspect_current_agent_tools" -> "No agent here"
+      "test_current_agent_tool" -> "No agent here"
       "analyze_image" -> "Image failed"
       "analyze_document" -> "Document failed"
       "delegate_to_subagent" -> "Specialist failed"
@@ -1647,6 +1727,60 @@ defmodule Vibe.AI.Agent do
       {:error, reason} ->
         %{"ok" => false, "error" => inbox_error_message(reason)}
     end
+  end
+
+  # With no attached agent, Platform.resolve_grantee falls back to the "claude" bridge grantee —
+  # which would silently hand the built-in assistant the grants the user gave Claude Code. Name
+  # ourselves instead: platform access in this DM must be granted to "vibe" explicitly.
+  defp platform_input(input, agent_id) when is_map(input) do
+    if is_binary(agent_id) and agent_id != "" do
+      input
+    else
+      case input["grantee_id"] || input["granteeId"] do
+        value when is_binary(value) and value != "" -> input
+        _ -> Map.put(input, "grantee_id", "vibe")
+      end
+    end
+  end
+
+  defp platform_input(input, _agent_id), do: input
+
+  # Owner-scoped agent inventory. get_current_agent_config only ever sees the agent attached
+  # to THIS chat, so in the built-in assistant DM (no attached agent) the assistant had no way
+  # to answer "do I have any agents?" at all — it apologised about an internal owner lookup.
+  defp list_my_agents(_input, owner_user_id) when is_binary(owner_user_id) do
+    agents = Agents.list_agents(owner_user_id)
+
+    %{
+      "ok" => true,
+      "count" => length(agents),
+      "agents" => Enum.map(agents, &my_agent_summary/1)
+    }
+  end
+
+  defp list_my_agents(_input, _owner_user_id) do
+    tool_error_envelope("owner_unknown", "No signed-in owner for this chat.",
+      retryable: false,
+      hint: "Do not retry. Tell the user their agent list is not readable from this chat."
+    )
+  end
+
+  # Deliberately built from the struct (plus the preloaded shadow user) instead of
+  # Agents.agent_payload/2 — the payload runs extra per-agent queries for attached chats and
+  # integrations, which a "how many agents do I have" answer does not need.
+  defp my_agent_summary(%AgentSchema{} = agent) do
+    %{
+      "id" => agent.id,
+      "display_name" => agent.display_name,
+      "username" => agent.agent_user && agent.agent_user.username,
+      "status" => agent.status,
+      "model" => agent.model_id,
+      "model_provider" => agent.model_provider,
+      "has_prompt" => String.trim(to_string(agent.system_prompt || "")) != "",
+      "enabled_tool_count" => length(agent.enabled_tools || []),
+      "published_at" => agent.published_at && DateTime.to_iso8601(agent.published_at),
+      "last_invoked_at" => agent.last_invoked_at && DateTime.to_iso8601(agent.last_invoked_at)
+    }
   end
 
   defp get_current_agent_config(input, agent_id, requester_user_id) do
@@ -2229,6 +2363,17 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # Two very different failures. "No agent attached to this chat" is the normal state of the
+  # built-in assistant DM and is terminal (nothing to retry, use list_my_agents instead);
+  # "no owner" means the caller is unauthenticated.
+  defp resolve_owned_agent(agent_id, requester_user_id) when is_binary(requester_user_id) do
+    if is_binary(agent_id) and agent_id != "" do
+      {:error, :agent_not_available}
+    else
+      {:error, :no_current_agent}
+    end
+  end
+
   defp resolve_owned_agent(_agent_id, _requester_user_id), do: {:error, :owner_lookup_required}
 
   defp resolve_event_timeframe(raw) do
@@ -2448,7 +2593,10 @@ defmodule Vibe.AI.Agent do
   defp related_messages_title(count), do: "#{count} related messages"
 
   defp inbox_error_message(:owner_lookup_required),
-    do: "Owner lookup is required for inbox tools."
+    do: "No signed-in owner for this chat."
+
+  defp inbox_error_message(:no_current_agent),
+    do: "No custom agent is attached to this chat (this is the built-in Vibe AI assistant)."
 
   defp inbox_error_message(:agent_not_available),
     do: "This inbox is not available in the current chat."

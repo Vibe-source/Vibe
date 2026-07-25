@@ -413,6 +413,11 @@ defmodule VibeWeb.AgentChannel do
              turn_memory: turn_memory,
              images: images,
              user_id: user_id,
+             # The DM socket IS the authenticated owner. Without this every owner-scoped
+             # lookup (list_my_agents, agent config, connected apps) failed with
+             # "Owner lookup is required" — the user asked "do I have any agent?" and the
+             # assistant could only apologise.
+             requester_user_id: user_id,
              model_provider: model_selection.provider,
              model_id: model_selection.model_id,
              thinking_level: model_selection.thinking_level

@@ -154,6 +154,11 @@ defmodule Vibe.AI.AgenticEventShape do
 
   # Order matters: search_music is a MUSIC step, not a generic web search (the old
   # substring check on "search" gave every track lookup a globe icon).
+  #
+  # These kinds must NOT collide with the CLI/bridge vocabulary (read/edit/write/bash), which
+  # means "a file operation whose `target` is a path". The client renders those as verb +
+  # target and throws the label away — a native `get_current_agent_config` step tagged "write"
+  # rendered as a bare "Create" and was even counted as an edited file by the diff summary.
   defp tool_kind(tool) do
     tool = to_string(tool)
 
@@ -164,7 +169,8 @@ defmodule Vibe.AI.AgenticEventShape do
       String.contains?(tool, "document") -> "read"
       String.contains?(tool, "ask_user") -> "question"
       String.contains?(tool, "subagent") || String.contains?(tool, "delegate") -> "task"
-      String.contains?(tool, "config") || String.contains?(tool, "update") -> "write"
+      String.contains?(tool, "agent") -> "agent"
+      String.contains?(tool, "config") || String.contains?(tool, "update") -> "config"
       true -> "tool"
     end
   end
