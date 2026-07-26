@@ -39,9 +39,18 @@ defmodule VibeWeb.AgentsController do
     json(conn, %{items: items, quota: quota})
   end
 
-  @doc "Returns the catalog of tools an agent can be granted."
+  @doc """
+  Returns the catalog of tools an agent can be granted.
+
+  `toggleable_tools/0`, not `tools/0`: the full catalog also includes
+  always-on runtime/meta tools (agent_management, ask_user, the always-on
+  analytics pair) that the native Vibe AI assistant uses to manage agents —
+  they're never optional for a standalone agent, so showing them as
+  togglable items in its own Tools picker just clutters it with entries
+  that look like the built-in assistant's own capabilities leaking in.
+  """
   def tool_registry(conn, _params) do
-    json(conn, %{items: Vibe.AI.ToolRegistry.tools()})
+    json(conn, %{items: Vibe.AI.ToolRegistry.toggleable_tools()})
   end
 
   @doc "Returns the server-authoritative provider and model catalog."

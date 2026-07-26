@@ -317,6 +317,8 @@ class ChatAgentConfigViewModel: ObservableObject {
     var onLoadModelRegistry: ((@escaping (ChatAgentModelRegistry) -> Void) -> Void)?
     /// Persist one exact provider/model pair.
     var onSaveModelSelection: ((String, String, @escaping (Bool) -> Void) -> Void)?
+    /// Persist the agent's voice provider ("google" or "openai_realtime").
+    var onSaveVoiceProvider: ((String, @escaping (Bool) -> Void) -> Void)?
 
     /// Whether the current session's `card.latestSecret` (a just-minted invoke secret) is
     /// shown in the clear right now. Resets to false whenever the view is torn down —
@@ -1423,90 +1425,88 @@ struct ChatAgentOutputSettingsView: View {
     }
 }
 
+private struct ChatAgentVoiceProviderOption: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let icon: String
+    let tint: Color
+}
+
+private let chatAgentVoiceProviderOptions: [ChatAgentVoiceProviderOption] = [
+    ChatAgentVoiceProviderOption(
+        id: "google",
+        title: "Google",
+        subtitle: "Gemini TTS — natural, steerable voices in 70+ languages.",
+        icon: "waveform",
+        tint: .blue
+    ),
+    ChatAgentVoiceProviderOption(
+        id: "openai_realtime",
+        title: "OpenAI Realtime",
+        subtitle: "Low-latency, live spoken conversation — not the older OpenAI TTS API.",
+        icon: "waveform.badge.mic",
+        tint: .green
+    ),
+]
+
 struct ChatAgentVoiceSettingsView: View {
     @ObservedObject var viewModel: ChatAgentConfigViewModel
-    @State private var selectedVoice = "alloy"
-    @State private var voiceSpeed: Double = 1.0
-    
-    let voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    
+    @State private var isSaving = false
+
     var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color(white: 0.1), Color.blue.opacity(0.3)], startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
-            
-            VStack(spacing: 30) {
-                Spacer().frame(height: 20)
-                
-                // Animated shader mock
-                ZStack {
-                    Circle()
-                        .fill(RadialGradient(gradient: Gradient(colors: [.cyan.opacity(0.8), .blue.opacity(0.4), .clear]), center: .center, startRadius: 10, endRadius: 120))
-                        .frame(width: 240, height: 240)
-                        .blur(radius: 20)
-                    
-                    Circle()
-                        .stroke(Color.white.opacity(0.3), lineWidth: 1)
-                        .frame(width: 180, height: 180)
-                    
-                    Image(systemName: "waveform")
-                        .font(.system(size: 60))
-                        .foregroundColor(.white)
-                }
-                
-                Text("Voice Personality")
-                    .font(.system(size: 24, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white)
-                
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
-                        ForEach(voices, id: \.self) { voice in
-                            VStack(spacing: 8) {
-                                Circle()
-                                    .fill(selectedVoice == voice ? Color.white : Color.white.opacity(0.1))
-                                    .frame(width: 64, height: 64)
-                                    .overlay(
-                                        Image(systemName: selectedVoice == voice ? "play.fill" : "play")
-                                            .foregroundColor(selectedVoice == voice ? .black : .white)
-                                    )
-                                Text(voice.capitalized)
-                                    .font(.system(size: 14, weight: .medium, design: .rounded))
-                                    .foregroundColor(selectedVoice == voice ? .white : .gray)
-                            }
-                            .onTapGesture {
-                                withAnimation(.spring()) {
-                                    selectedVoice = voice
+        Form {
+            Section {
+                ForEach(chatAgentVoiceProviderOptions) { option in
+                    Button {
+                        select(option)
+                    } label: {
+                        HStack(spacing: 12) {
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(option.tint.gradient)
+                                .frame(width: 28, height: 28)
+                                .overlay {
+                                    Image(systemName: option.icon)
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundColor(.white)
                                 }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(option.title)
+                                    .foregroundColor(.primary)
+                                Text(option.subtitle)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if viewModel.card.voiceProvider == option.id {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.accentColor)
                             }
                         }
                     }
-                    .padding(.horizontal, 24)
+                    .disabled(isSaving)
                 }
-                .padding(.top, 20)
-                
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text("Speed")
-                            .font(.subheadline)
-                            .foregroundColor(.gray)
-                        Spacer()
-                        Text(String(format: "%.1fx", voiceSpeed))
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundColor(.white)
-                    }
-                    Slider(value: $voiceSpeed, in: 0.5...2.0, step: 0.1)
-                        .accentColor(.white)
-                }
-                .padding(.horizontal, 30)
-                .padding(.top, 20)
-                
-                Spacer()
+            } header: {
+                Text("Provider")
+            } footer: {
+                Text("Which speech engine this agent uses when it talks back with voice.")
             }
         }
         .navigationTitle("Voice Settings")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarColorScheme(.dark, for: .navigationBar)
-        .toolbarBackground(.hidden, for: .navigationBar)
+        .overlay {
+            if isSaving {
+                ProgressView().controlSize(.small)
+            }
+        }
+    }
+
+    private func select(_ option: ChatAgentVoiceProviderOption) {
+        guard viewModel.card.voiceProvider != option.id else { return }
+        isSaving = true
+        viewModel.onSaveVoiceProvider?(option.id) { _ in
+            isSaving = false
+        }
     }
 }
 

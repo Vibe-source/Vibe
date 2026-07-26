@@ -3177,21 +3177,9 @@ private struct ChatHomeScreen: View {
           if !isEditingHome {
             ToolbarItem(placement: .topBarTrailing) {
               HStack(spacing: 18) {
-                // The Search tab was repurposed into a real "Agents" tab, so chat search
-                // (previously reached by tapping that dummy tab, which called this same
-                // coordinator method) lives here instead.
-                Button {
-                  coordinator.openChatSearch()
-                } label: {
-                  Image(systemName: "magnifyingglass")
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(colorScheme == .dark ? .white : .black)
-                    .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-
+                // No separate search button here — the list already carries its
+                // own inline animated search capsule (tap it directly); a second
+                // magnifying-glass in the header was pure duplication.
                 Button {
                   openAgentChat()
                 } label: {
@@ -3297,6 +3285,7 @@ private struct ChatHomeScreen: View {
       // late-input + flicker). Throttled, background, non-throwing.
       if let config = AppSessionConfig.current {
         AgentPairingService.warmStatusIfStale(config: config)
+        chatNativeWarmOwnedAgentIds(config: config)
       }
       // We no longer present the modal on appear, as we now use search focus
     }
@@ -4813,7 +4802,10 @@ private final class SearchFlightContainerView: UIView {
 /// covers the real capsule at takeoff and rides the shared translate while
 /// the glass ghost crossfades in over it. The crossfade IS the handoff, so
 /// tiny inner-metric differences can never read as a jump.
-private final class HomeSearchCapsuleView: UIView {
+/// Not private: reused as-is (same pill, same blur fill, same icon/placeholder)
+/// wherever another list needs Home's exact search affordance — e.g. the
+/// Agents tab — without re-implementing or subtly diverging from it.
+final class HomeSearchCapsuleView: UIView {
   static let fieldHeight: CGFloat = 44
 
   let iconView = UIImageView()
@@ -11138,6 +11130,27 @@ final class ChatConversationController: UIViewController {
 
   private func pushProfileView(animated: Bool) {
     guard route.chatId != "saved_messages" else { return }
+    // Talking to one of MY OWN agents: the header opens that agent's settings
+    // instead of a normal contact profile (there's nothing to "friend" — it's
+    // my own configurable agent), matching how the Agents tab now opens the
+    // chat first and reaches settings from inside it.
+    if let peerAgentId = route.peerAgentId,
+      ChatOwnedAgentIdsCache.agentIds.contains(peerAgentId),
+      let config = AppSessionConfig.current,
+      let navigationController
+    {
+      let apiContext = ChatNativeAgentConfigAPIContext(
+        apiBaseURL: config.apiBaseURL, token: config.authToken
+      )
+      chatNativeAgentPushConfig(
+        agentId: peerAgentId,
+        apiContext: apiContext,
+        appearance: .fallback,
+        from: navigationController,
+        onToast: { AppToastController.shared.show($0) }
+      )
+      return
+    }
     let profileRoute = profileRouteSnapshot()
     let onClose: () -> Void = { [weak self] in
       guard let self, let navigationController = self.navigationController,

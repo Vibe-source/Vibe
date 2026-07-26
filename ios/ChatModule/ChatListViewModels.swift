@@ -323,6 +323,9 @@ struct ChatListRow {
     let enabledTools: [String]
     let outputModes: [String]
     let voiceProfile: String?
+    /// `"google"` or `"openai_realtime"` — which speech provider this agent's
+    /// voice output uses. Nil = not yet configured.
+    let voiceProvider: String?
     let callbackURL: String?
     let apiBaseURL: String?
     let invokeURL: String?
@@ -406,6 +409,7 @@ struct ChatListRow {
         enabledTools: parseStringArray(raw["enabled_tools"] ?? raw["enabledTools"]),
         outputModes: parseStringArray(raw["output_modes"] ?? raw["outputModes"]),
         voiceProfile: parseNonEmptyString(raw["voice_profile"] ?? raw["voiceProfile"]),
+        voiceProvider: parseNonEmptyString(raw["voice_provider"] ?? raw["voiceProvider"]),
         callbackURL: parseNonEmptyString(raw["callback_url"] ?? raw["callbackUrl"]),
         apiBaseURL: parseNonEmptyString(raw["api_base_url"] ?? raw["apiBaseUrl"]),
         invokeURL: parseNonEmptyString(raw["invoke_url"] ?? raw["invokeUrl"]),
@@ -455,6 +459,7 @@ struct ChatListRow {
       if let modelProvider { raw["model_provider"] = modelProvider }
       if let modelId { raw["model_id"] = modelId }
       if let voiceProfile { raw["voice_profile"] = voiceProfile }
+      if let voiceProvider { raw["voice_provider"] = voiceProvider }
       if let callbackURL { raw["callback_url"] = callbackURL }
       if let apiBaseURL { raw["api_base_url"] = apiBaseURL }
       if let invokeURL { raw["invoke_url"] = invokeURL }
