@@ -257,7 +257,8 @@ struct ChannelCreationSheet: View {
               .padding(.horizontal)
 
             HStack(spacing: 0) {
-              Text("vibegram.io/r/")
+              // Never hardcode the host: it follows the server's share base.
+              Text("\(VibeShareLinks.display(VibeShareLinks.baseURLString) ?? "vibegram.io")/r/")
                 .font(.body)
                 .foregroundStyle(palette.secondaryText)
               TextField("channel_name", text: $publicSlug)

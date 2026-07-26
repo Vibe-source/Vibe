@@ -24,6 +24,7 @@ defmodule Vibe.AI.Agent do
     query_event_inbox
     configure_event_inbox
     list_my_agents
+    check_agent_username
     get_current_agent_config
     update_current_agent_config
     inspect_current_agent_tools
@@ -309,6 +310,64 @@ defmodule Vibe.AI.Agent do
       input_schema: %{type: "object", properties: %{}}
     },
     %{
+      name: "check_agent_username",
+      description:
+        "Check whether a public @username is free for one of the user's agents, and get clean alternatives when it is taken. ALWAYS call this before create_agent so the agent gets the handle the user actually wants — the username becomes the agent's permanent public link (vibegram.io/<username>). Never invent a username with random numbers.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          username: %{
+            type: "string",
+            description: "Candidate username without @. Letters, numbers and _ only."
+          },
+          display_name: %{
+            type: "string",
+            description:
+              "Optional display name to derive suggestions from when the candidate is taken."
+          }
+        },
+        required: ["username"]
+      }
+    },
+    %{
+      name: "create_agent",
+      description:
+        "Create a new standalone agent the user owns, and return its public shareable link plus its one-time invoke_secret. Requires a display_name and a username the user chose (check it with check_agent_username first). Optionally attach the new agent to a group/channel the user owns. Use this when the user asks you to build or create an agent for them.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          display_name: %{type: "string", description: "Human-readable name for the agent."},
+          username: %{
+            type: "string",
+            description:
+              "Public username without @, confirmed free via check_agent_username. Becomes the agent's permanent public link."
+          },
+          description: %{
+            type: "string",
+            description:
+              "What the agent is for, in the user's words. Used as the system prompt when system_prompt is not given."
+          },
+          system_prompt: %{type: "string", description: "Explicit system prompt to save."},
+          avatar_url: %{type: "string", description: "Optional hosted avatar image URL."},
+          output_modes: %{
+            type: "array",
+            items: %{type: "string", enum: ["text", "media", "voice"]},
+            description: "How the agent may answer. Defaults to text."
+          },
+          enabled_tools: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Optional allowlisted tool ids for the new agent."
+          },
+          attach_to_chat_id: %{
+            type: "string",
+            description: "Optional chat id of an owned group/channel to attach the new agent to."
+          }
+        },
+        required: ["display_name", "username"]
+      }
+    },
+    %{
       name: "get_current_agent_config",
       description:
         "Read the CURRENT chat's standalone agent config (prompt, ids, status, tools, output modes, destination chats, endpoints). Only works inside a chat that has one of the user's own agents attached — in the built-in Vibe AI assistant DM there is no such agent, so use list_my_agents instead. Prefer this for simple questions about the agent you are already talking to.",
@@ -360,30 +419,83 @@ defmodule Vibe.AI.Agent do
     %{
       name: "create_chat_space",
       description:
-        "Create an owned group or channel and optionally attach the current agent. Channel creation supports private/public access, slug, approval, and saving restrictions.",
+        "Create a group or channel owned by this user, optionally with one of their agents attached, and return its shareable link. Works in this built-in assistant DM: with no agent attached here, pass attach_agent when the user wants an agent running the room. A public channel always gets a public link (the slug is derived from the name when not given). Use it for requests like \"make me a channel for X with an agent that handles media\".",
       input_schema: %{
         type: "object",
         properties: %{
           room_type: %{type: "string", enum: ["group", "channel"]},
           name: %{type: "string"},
           description: %{type: "string"},
+          topic: %{
+            type: "string",
+            description: "What the room is about. Same field as description."
+          },
           avatar_url: %{type: "string"},
           member_ids: %{type: "array", items: %{type: "string"}},
-          access_type: %{type: "string", enum: ["private", "public"]},
-          public_slug: %{type: "string"},
+          access_type: %{
+            type: "string",
+            enum: ["private", "public"],
+            description:
+              "Public channels are reachable by their link to anyone. Defaults to private."
+          },
+          public_slug: %{
+            type: "string",
+            description:
+              "Optional link handle for a public channel (letters, numbers, hyphens). Derived from the name when omitted."
+          },
           join_approval_required: %{type: "boolean"},
           restrict_saving: %{type: "boolean"},
+          attach_agent: %{
+            type: "string",
+            description:
+              "Agent id or @username (one the user owns) to attach and run this room. Required if the user wants an agent in the room and this chat has none attached."
+          },
+          agent_output_modes: %{
+            type: "array",
+            items: %{type: "string", enum: ["text", "media", "voice"]},
+            description:
+              "What the attached agent may post in this room — include \"media\" for image/audio/video handling."
+          },
+          agent_tools: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Tool ids the attached agent may use in this room."
+          },
           attach_current_agent: %{
             type: "boolean",
-            description: "Attach this agent to the new room. Defaults to true."
+            description:
+              "Attach the agent of the CURRENT chat, when there is one. Defaults to true; ignored in this built-in assistant DM."
           }
         },
         required: ["room_type", "name"]
       }
     },
     %{
+      name: "attach_agent_to_chat",
+      description:
+        "Attach an agent the user owns to an existing group or channel they own, with optional per-room tool and output-mode limits. Name the agent (id or @username) — in this built-in assistant DM there is no current agent to fall back on.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          chat_id: %{type: "string"},
+          agent: %{
+            type: "string",
+            description: "Agent id or @username to attach. Defaults to the current chat's agent."
+          },
+          allowed_tools: %{type: "array", items: %{type: "string"}},
+          allowed_output_modes: %{
+            type: "array",
+            items: %{type: "string", enum: ["text", "media", "voice"]}
+          },
+          permissions: %{type: "object", additionalProperties: true}
+        },
+        required: ["chat_id"]
+      }
+    },
+    %{
       name: "attach_current_agent_to_chat",
-      description: "Attach the current agent to a group or channel owned by the requester.",
+      description:
+        "Attach the CURRENT chat's agent to a group or channel owned by the requester. Prefer attach_agent_to_chat, which can also name a specific agent.",
       input_schema: %{
         type: "object",
         properties: %{
@@ -607,7 +719,24 @@ defmodule Vibe.AI.Agent do
         get_current_agent_config reports that no custom agent is attached to this chat.
       - Report what it returns concretely: count first, then names/@usernames and status
         ("2 agents: Leorre (@leorre, published) and Draft Bot (@draftbot, draft)").
+      - Each agent comes back with a `public_link`. When the user asks for an agent's link,
+        or you just created one, quote that link exactly as returned.
       - If the count is 0, say so plainly and offer to create one.
+
+  11d. check_agent_username / create_agent: Creating an agent the user owns.
+      - The @username IS the agent's permanent public link (`public_link`), so the user picks
+        it — you never invent one, and you NEVER append random numbers or letters to make one
+        free. There is no "newsroom_9f3a1c".
+      - Flow: ask what the agent should be called → check_agent_username → if taken, say so and
+        offer the returned `suggestions` (or ask for another name) → once free, create_agent
+        with display_name + that username.
+      - Do not call create_agent without a username the user chose and you checked.
+      - After creating, give the user the `public_link` in your reply — that link is how they
+        share the agent with anyone. Never invent, shorten, or reformat it.
+      - The result also carries `invoke_secret`: quote it verbatim, ONCE, in this same reply,
+        and say plainly that it will not be shown again (rotate_secret mints a new one if lost).
+        Never omit it, never paraphrase it, never say it is "available elsewhere" — this chat is
+        the only place it is ever surfaced in full.
 
   12. get_current_agent_config: Use for simple live questions about the agent you are already talking to.
       - ONLY meaningful inside a chat that has one of the user's agents attached. In this
@@ -629,9 +758,22 @@ defmodule Vibe.AI.Agent do
         * "switch your status to draft/published/disabled"
       - Prefer this over delegate_to_subagent when the request is a one-agent edit and you already have enough information.
 
-  14. create_chat_space / attach_current_agent_to_chat: Use these for explicit requests to create an owned group/channel or attach this agent to an existing owned room.
-      - Never claim that a subscriber owns a channel. The tools independently verify the current agent id and requester owner id.
-      - Public channels require a public_slug. attach_current_agent defaults to true on creation.
+  14. create_chat_space / attach_agent_to_chat: Creating rooms and putting an agent in them.
+      - Use create_chat_space for "make me a group/channel …". Pass the user's subject as
+        `topic`, and `access_type: "public"` when they want it shareable — a public channel
+        gets a link automatically (you do not have to invent the slug).
+      - To have an agent run the room, pass `attach_agent` with an id or @username the user
+        owns. In this built-in assistant DM there is no current agent to attach, so if the user
+        wants one and you don't know which, call list_my_agents (or offer to create one) — do
+        not silently create the room without the agent they asked for.
+      - "handle media / images / voice in that channel" → pass `agent_output_modes`
+        (e.g. ["text","media"]); specific capabilities → `agent_tools`.
+      - ALWAYS finish by giving the user the room's `share_url` from the result. That is the
+        link they asked for; quote it verbatim and never fabricate one.
+      - A private channel's link is an invite token, a public channel's link is its handle.
+        Groups have no public link — say so rather than inventing one.
+      - Never claim that a subscriber owns a channel. The tools independently verify the
+        requester's ownership.
 
   15. inspect_current_agent_tools / test_current_agent_tool: Use these to explain or validate this agent's tools.
       - Tool tests are bounded: only explicit web/music sample searches may execute live. Mutating/destructive tools only report a dry-run capability result.
@@ -661,6 +803,13 @@ defmodule Vibe.AI.Agent do
   - Agentic loop: short intent → tool → READ the tool result → short specific summary.
     Never end a turn with empty text after a tool ran.
   - For music: you may name the track/version you sent; never paste URLs or links.
+  - SHARE LINKS are the one exception to "never paste links": when a tool returns
+    `public_link` / `share_url` for an agent, channel, or profile, that link IS the answer the
+    user asked for — include it verbatim on its own line. Never invent, guess, shorten, or
+    retype a share link, and never claim something is shareable when the tool returned no link.
+  - `invoke_secret` from create_agent is the one thing you ARE allowed to paste verbatim as a
+    raw token: it is shown exactly once, in that reply, in full — never redact, truncate, or
+    defer it to "the config panel" from this chat.
   - If a user asks for live agent configuration, current inbox mode, or historical notification facts, use the live lookup/config tools first.
   - "Do I have any agents?" is a LOOKUP (list_my_agents), never an answer from memory or from
     the fact that you are an assistant.
@@ -686,6 +835,14 @@ defmodule Vibe.AI.Agent do
       |> with_turn_memory(Keyword.get(opts, :turn_memory, []))
 
     enabled_tools = Keyword.get(opts, :enabled_tools, available_tool_names())
+    # Owner-management tools (list_my_agents, get/update_current_agent_config, ...) are
+    # normally "always available" regardless of `enabled_tools` — correct for the built-in
+    # Vibe AI assistant, where the signed-in user IS the requester. A user-created agent's
+    # own runtime (Vibe.AI.StandaloneAgent) reuses this same loop for messages from ANYONE,
+    # so it explicitly passes admin_mode: false unless the requester is verified as the
+    # agent's owner chatting in their private DM (Chat.effective_agent_policy/3) — otherwise
+    # any stranger DMing someone else's agent would see owner-only tools.
+    admin_mode = Keyword.get(opts, :admin_mode, true)
     max_tokens = Keyword.get(opts, :max_tokens, 4096)
     # 3 was too tight for a real agentic loop: resolve → fails → retry → answer is already 4
     # rounds, and hitting the cap used to surface as a hard error with the streamed text
@@ -694,7 +851,7 @@ defmodule Vibe.AI.Agent do
     model_provider = Keyword.get(opts, :model_provider, "anthropic")
     model_id = Keyword.get(opts, :model_id, @claude_model)
     thinking_level = Keyword.get(opts, :thinking_level, "medium")
-    tools = filter_tools(enabled_tools)
+    tools = filter_tools(enabled_tools, admin_mode)
 
     messages = build_messages(conversation_history, user_message, image_urls)
 
@@ -1025,9 +1182,12 @@ defmodule Vibe.AI.Agent do
       "list_platform_connections" -> "Checking apps…"
       "call_platform" -> "Calling connector…"
       "list_my_agents" -> "Checking your agents…"
+      "check_agent_username" -> "Checking that name…"
+      "create_agent" -> "Creating your agent…"
       "get_current_agent_config" -> "Reading config…"
       "update_current_agent_config" -> "Updating agent…"
-      "create_chat_space" -> "Creating space…"
+      "create_chat_space" -> room_progress_label(tool_input)
+      "attach_agent_to_chat" -> "Attaching agent…"
       "attach_current_agent_to_chat" -> "Attaching agent…"
       "inspect_current_agent_tools" -> "Checking tools…"
       "test_current_agent_tool" -> "Testing tool…"
@@ -1108,6 +1268,12 @@ defmodule Vibe.AI.Agent do
         tool_name == "list_my_agents" ->
           list_my_agents(tool_input, requester_user_id || user_id)
 
+        tool_name == "check_agent_username" ->
+          check_agent_username(tool_input, requester_user_id || user_id)
+
+        tool_name == "create_agent" ->
+          create_agent(tool_input, requester_user_id || user_id)
+
         tool_name == "get_current_agent_config" ->
           get_current_agent_config(tool_input, agent_id, requester_user_id)
 
@@ -1117,8 +1283,8 @@ defmodule Vibe.AI.Agent do
         tool_name == "create_chat_space" ->
           Vibe.AI.Tools.Channel.create_chat_space(tool_input, agent_id, requester_user_id)
 
-        tool_name == "attach_current_agent_to_chat" ->
-          Vibe.AI.Tools.Channel.attach_current_agent_to_chat(
+        tool_name in ["attach_agent_to_chat", "attach_current_agent_to_chat"] ->
+          Vibe.AI.Tools.Channel.attach_agent_to_chat(
             tool_input,
             agent_id,
             requester_user_id
@@ -1329,6 +1495,42 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # Same idea for the identity/room steps: the note carries the outcome (the handle, the
+  # room name) so the feed reads as work done rather than as a generic "Step done".
+  defp tool_complete_label("check_agent_username", input, result) when is_map(result) do
+    handle = to_string(Map.get(result, "username") || input["username"] || "")
+
+    cond do
+      tool_result_error?(result) -> tool_failed_label("check_agent_username")
+      Map.get(result, "available") == true -> "@#{clip_words(handle, 20)} is free"
+      handle != "" -> "@#{clip_words(handle, 20)} is taken"
+      true -> "Name checked"
+    end
+  end
+
+  defp tool_complete_label("create_agent", input, result) when is_map(result) do
+    handle =
+      to_string(get_in(result, ["agent", "username"]) || input["username"] || "")
+      |> String.trim_leading("@")
+
+    cond do
+      tool_result_error?(result) -> tool_failed_label("create_agent")
+      handle != "" -> "@#{clip_words(handle, 20)} created"
+      true -> "Agent created"
+    end
+  end
+
+  defp tool_complete_label("create_chat_space", input, result) when is_map(result) do
+    name = to_string(get_in(result, ["room", "name"]) || input["name"] || "")
+    kind = if to_string(input["room_type"] || "") == "channel", do: "Channel", else: "Group"
+
+    cond do
+      tool_result_error?(result) -> tool_failed_label("create_chat_space")
+      name != "" -> "#{kind} · #{clip_words(name, @done_label_limit - 10)}"
+      true -> "#{kind} created"
+    end
+  end
+
   defp tool_complete_label(tool_name, _input, result) do
     if is_map(result) and tool_result_error?(result) do
       tool_failed_label(tool_name)
@@ -1336,6 +1538,16 @@ defmodule Vibe.AI.Agent do
       tool_done_label(tool_name)
     end
   end
+
+  defp room_progress_label(input) when is_map(input) do
+    if to_string(input["room_type"] || input["roomType"] || "") == "channel" do
+      "Creating channel…"
+    else
+      "Creating group…"
+    end
+  end
+
+  defp room_progress_label(_), do: "Creating space…"
 
   defp tool_done_label(tool_name) do
     case tool_name do
@@ -1357,9 +1569,12 @@ defmodule Vibe.AI.Agent do
       "list_platform_connections" -> "Apps listed"
       "call_platform" -> "Connector replied"
       "list_my_agents" -> "Agents listed"
+      "check_agent_username" -> "Name checked"
+      "create_agent" -> "Agent created"
       "get_current_agent_config" -> "Config read"
       "update_current_agent_config" -> "Agent updated"
       "create_chat_space" -> "Space created"
+      "attach_agent_to_chat" -> "Agent attached"
       "attach_current_agent_to_chat" -> "Agent attached"
       "inspect_current_agent_tools" -> "Tools checked"
       "test_current_agent_tool" -> "Tool tested"
@@ -1374,6 +1589,11 @@ defmodule Vibe.AI.Agent do
       "search_music" -> "No track found"
       "search_google" -> "Search failed"
       "list_my_agents" -> "Agents unavailable"
+      "check_agent_username" -> "Name check failed"
+      "create_agent" -> "Agent not created"
+      "create_chat_space" -> "Not created"
+      "attach_agent_to_chat" -> "Attach failed"
+      "attach_current_agent_to_chat" -> "Attach failed"
       "get_current_agent_config" -> "No agent here"
       "update_current_agent_config" -> "No agent here"
       "inspect_current_agent_tools" -> "No agent here"
@@ -1769,10 +1989,15 @@ defmodule Vibe.AI.Agent do
   # Agents.agent_payload/2 — the payload runs extra per-agent queries for attached chats and
   # integrations, which a "how many agents do I have" answer does not need.
   defp my_agent_summary(%AgentSchema{} = agent) do
+    username = agent.agent_user && agent.agent_user.username
+
     %{
       "id" => agent.id,
       "display_name" => agent.display_name,
-      "username" => agent.agent_user && agent.agent_user.username,
+      "username" => username,
+      # The shareable link is part of the answer, not an extra lookup: "do I have any
+      # agents?" should come back with something the user can actually send someone.
+      "public_link" => Vibe.Links.agent_url(username),
       "status" => agent.status,
       "model" => agent.model_id,
       "model_provider" => agent.model_provider,
@@ -1782,6 +2007,169 @@ defmodule Vibe.AI.Agent do
       "last_invoked_at" => agent.last_invoked_at && DateTime.to_iso8601(agent.last_invoked_at)
     }
   end
+
+  # A username is permanent public identity (it IS the link), so availability is a real
+  # lookup the user gets to react to — never something we paper over with a random suffix.
+  defp check_agent_username(input, owner_user_id) when is_binary(owner_user_id) do
+    candidate = to_string(input["username"] || input["handle"] || "") |> String.trim_leading("@")
+    display_name = input["display_name"] || input["displayName"] || candidate
+
+    case Agents.username_availability(candidate, nil) do
+      {:ok, normalized} ->
+        %{
+          "ok" => true,
+          "available" => true,
+          "username" => normalized,
+          "public_link" => Vibe.Links.agent_url(normalized)
+        }
+
+      {:error, reason} ->
+        %{
+          "ok" => true,
+          "available" => false,
+          "username" => candidate,
+          "reason" => to_string(reason),
+          "message" => username_reason_message(reason),
+          "suggestions" =>
+            Agents.suggest_usernames(display_name)
+            |> Enum.map(fn name ->
+              %{"username" => name, "public_link" => Vibe.Links.agent_url(name)}
+            end)
+        }
+    end
+  end
+
+  defp check_agent_username(_input, _owner_user_id) do
+    tool_error_envelope("owner_unknown", "No signed-in owner for this chat.",
+      retryable: false,
+      hint: "Do not retry. Tell the user usernames cannot be checked from this chat."
+    )
+  end
+
+  defp username_reason_message(:username_taken), do: "That username is already taken."
+
+  defp username_reason_message(:reserved_username),
+    do: "That username is reserved by Vibe."
+
+  defp username_reason_message(:username_locked_after_publish),
+    do: "This agent is published, so its username can no longer change."
+
+  defp username_reason_message(_),
+    do: "Usernames need 3–30 characters, using letters, numbers or _ only."
+
+  defp create_agent(input, owner_user_id) when is_binary(owner_user_id) do
+    display_name = present_string(input["display_name"] || input["displayName"])
+    username = present_string(input["username"]) |> then(&(&1 && String.trim_leading(&1, "@")))
+
+    cond do
+      is_nil(display_name) ->
+        tool_error_envelope("missing_display_name", "A display name is required.",
+          retryable: true,
+          hint: "Ask the user what the agent should be called, then call create_agent again."
+        )
+
+      is_nil(username) ->
+        tool_error_envelope("missing_username", "A username is required.",
+          retryable: true,
+          hint:
+            "Ask the user which @username they want, confirm it with check_agent_username, " <>
+              "then call create_agent again. Never invent one with random numbers."
+        )
+
+      true ->
+        do_create_agent(input, owner_user_id, display_name, username)
+    end
+  end
+
+  defp create_agent(_input, _owner_user_id) do
+    tool_error_envelope("owner_unknown", "No signed-in owner for this chat.",
+      retryable: false,
+      hint: "Do not retry. Tell the user agents cannot be created from this chat."
+    )
+  end
+
+  defp do_create_agent(input, owner_user_id, display_name, username) do
+    attrs =
+      %{
+        "display_name" => display_name,
+        "username" => username,
+        "system_prompt" =>
+          present_string(input["system_prompt"] || input["systemPrompt"]) ||
+            present_string(input["description"]),
+        "avatar_url" => present_string(input["avatar_url"] || input["avatarUrl"]),
+        "output_modes" => normalize_string_list(input["output_modes"] || input["outputModes"]),
+        "enabled_tools" => normalize_string_list(input["enabled_tools"] || input["enabledTools"])
+      }
+      |> Enum.reject(fn {_key, value} -> is_nil(value) or value == [] end)
+      |> Map.new()
+
+    case Agents.create_agent(owner_user_id, attrs) do
+      {:ok, agent, secret} ->
+        agent_username = agent.agent_user && agent.agent_user.username
+
+        %{
+          "ok" => true,
+          "agent" => my_agent_summary(agent),
+          "public_link" => Vibe.Links.agent_url(agent_username),
+          "public_link_display" => Vibe.Links.display(Vibe.Links.agent_url(agent_username)),
+          "invoke_secret" => secret,
+          "invoke_secret_notice" =>
+            "Shown once, right now. Not stored anywhere retrievable — rotate_secret mints a new one if lost.",
+          "attached" => maybe_attach_new_agent(input, agent, owner_user_id)
+        }
+
+      {:error, :quota_exceeded} ->
+        tool_error_envelope("quota_exceeded", "This account has reached its agent limit.",
+          retryable: false,
+          hint: "Do not retry. Tell the user they need to remove an agent or upgrade."
+        )
+
+      {:error, reason} when reason in [:username_taken, :reserved_username, :invalid_username] ->
+        tool_error_envelope(to_string(reason), username_reason_message(reason),
+          retryable: true,
+          hint:
+            "Ask the user for a different @username (offer check_agent_username suggestions), " <>
+              "then call create_agent again."
+        )
+
+      {:error, reason} ->
+        tool_error_envelope("create_failed", "The agent could not be created.",
+          retryable: false,
+          hint: "Do not retry. Say the agent could not be created. Detail: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp maybe_attach_new_agent(input, agent, owner_user_id) do
+    case present_string(input["attach_to_chat_id"] || input["attachToChatId"]) do
+      nil ->
+        nil
+
+      chat_id ->
+        Vibe.AI.Tools.Channel.attach_agent_to_chat(
+          %{"chat_id" => chat_id, "agent" => agent.id},
+          nil,
+          owner_user_id
+        )
+    end
+  end
+
+  defp normalize_string_list(value) when is_list(value) do
+    value
+    |> Enum.map(&present_string(to_string(&1)))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_string_list(_), do: nil
+
+  defp present_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp present_string(_), do: nil
 
   defp get_current_agent_config(input, agent_id, requester_user_id) do
     include_prompt =
@@ -2604,18 +2992,19 @@ defmodule Vibe.AI.Agent do
   defp inbox_error_message(:invalid_mode), do: "That inbox mode is not supported."
   defp inbox_error_message(reason), do: inspect(reason)
 
-  defp filter_tools(enabled_tools) do
+  defp filter_tools(enabled_tools, admin_mode) do
     allowed = MapSet.new(List.wrap(enabled_tools) |> Enum.map(&to_string/1))
 
     Enum.filter(available_tools(), fn tool ->
-      MapSet.member?(allowed, tool.name) or tool.name in @always_available_tool_names
+      MapSet.member?(allowed, tool.name) or
+        (admin_mode and tool.name in @always_available_tool_names)
     end)
   end
 
   @doc false
-  def effective_tool_names(enabled_tools) do
+  def effective_tool_names(enabled_tools, admin_mode \\ true) do
     enabled_tools
-    |> filter_tools()
+    |> filter_tools(admin_mode)
     |> Enum.map(& &1.name)
   end
 end

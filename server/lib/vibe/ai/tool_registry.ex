@@ -185,6 +185,22 @@ defmodule Vibe.AI.ToolRegistry do
       testability: "dry_run"
     },
     %{
+      id: "attach_agent_to_chat",
+      name: "Attach Agent",
+      description: "Attach a named owned agent to an owned group or channel.",
+      category: "chat_management",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "check_agent_username",
+      name: "Check Agent Username",
+      description: "Check whether a public @username is free, with clean alternatives.",
+      category: "agent_management",
+      always_on: true,
+      testability: "live_readonly"
+    },
+    %{
       id: "inspect_current_agent_tools",
       name: "Inspect Current Agent Tools",
       description: "Show registry, configured, effective, output-mode, and testability state.",

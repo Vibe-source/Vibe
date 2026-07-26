@@ -37,6 +37,10 @@ defmodule Vibe.Agent do
     field :secret_hint, :string
     field :published_at, :utc_datetime
     field :last_invoked_at, :utc_datetime
+    # Runtime-only: whether the CURRENT request is the owner talking to this agent in
+    # their private 1:1 DM (Chat.effective_agent_policy/3). Never persisted, never cast —
+    # StandaloneAgent stamps it per-invocation to gate owner-only tools/prompt data.
+    field :admin_mode, :boolean, default: false, virtual: true
 
     belongs_to :owner, Vibe.Accounts.User, foreign_key: :owner_user_id
     belongs_to :agent_user, Vibe.Accounts.User, foreign_key: :agent_user_id

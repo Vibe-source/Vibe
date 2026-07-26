@@ -358,8 +358,10 @@ enum VibeAgentKitTextRenderer {
       // file-path references like (/Users/…/File.swift:120) render as clean label
       // text instead of raw `[label](path)` markdown.
       if let url = URL(string: urlString), let scheme = url.scheme, !scheme.isEmpty {
+        // Match body text color (not system blue) — white/them text on bubble.
+        let linkColor = (baseAttributes[.foregroundColor] as? UIColor) ?? .label
         mutable.addAttribute(.link, value: url, range: replacedRange)
-        mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: replacedRange)
+        mutable.addAttribute(.foregroundColor, value: linkColor, range: replacedRange)
         mutable.addAttribute(
           .underlineStyle,
           value: NSUnderlineStyle.single.rawValue,
@@ -480,7 +482,9 @@ enum VibeAgentKitTextRenderer {
         let display = cleanURLDisplay(url)
         var linkAttributes = baseAttributes
         linkAttributes[.link] = url
-        linkAttributes[.foregroundColor] = UIColor.systemBlue
+        // Same color as bubble body text; underline marks tappable.
+        linkAttributes[.foregroundColor] =
+          (baseAttributes[.foregroundColor] as? UIColor) ?? .label
         linkAttributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
         mutable.replaceCharacters(
           in: match.range,
@@ -954,6 +958,11 @@ final class VibeAgentKitStreamingTextLabel: UITextView {
     self.textContainer.widthTracksTextView = true
     backgroundColor = .clear
     isUserInteractionEnabled = true
+    // Telegram-style white (body) links — not system blue.
+    linkTextAttributes = [
+      .foregroundColor: UIColor.label,
+      .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
 
     let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
     tapGesture.cancelsTouchesInView = false
@@ -986,13 +995,28 @@ final class VibeAgentKitStreamingTextLabel: UITextView {
     rawText: String,
     isStreaming: Bool
   ) {
+    let bodyColor =
+      (newAttributedText.length > 0
+        ? newAttributedText.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor
+        : nil) ?? textColor ?? .label
+    linkTextAttributes = [
+      .foregroundColor: bodyColor,
+      .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
     let previousTargetText = fullAttributedValue?.string ?? attributedText?.string ?? ""
     let previousTargetLength = fullAttributedValue?.length ?? attributedText?.length ?? 0
     let currentRenderedString = attributedText?.string ?? ""
     let targetString = newAttributedText.string
     let targetDeltaLength = max(0, newAttributedText.length - previousTargetLength)
 
-    if Self.streamingLoggingEnabled,
+    // Only a LIVE turn is worth narrating. A settled cell re-applies its full text
+    // on every reuse (`previous=0 rendered=0` — the reused view starts empty, so
+    // neither the dedup below nor the skip-work early-return can catch it), and it
+    // does so twice per configure: once at `window=nil`, once attached. On a
+    // transcript of settled agent turns that is 4 synchronous NSLogs per cell per
+    // configure while the finger is on the glass — measured as the scroll lag and
+    // flicker in the Vibe AI view.
+    if Self.streamingLoggingEnabled, isStreaming,
        targetString != previousTargetText || targetString != currentRenderedString {
       logStreaming(
         "apply streaming=%@ previous=%d rendered=%d target=%d delta=%d reveal=%d rawPreview=%@",
@@ -1102,7 +1126,12 @@ final class VibeAgentKitStreamingTextLabel: UITextView {
   override func layoutSubviews() {
     super.layoutSubviews()
 
-    guard Self.streamingLoggingEnabled, attributedText?.length ?? 0 > 0 else {
+    // Same rule as `apply`: narrate LIVE turns only, and never an offscreen
+    // (`window == nil`) measurement pass. Settled cells re-typeset on reuse and
+    // laid out twice per configure, so this fired 2×/cell on every scroll frame.
+    guard Self.streamingLoggingEnabled, window != nil, fullAttributedValue != nil,
+      attributedText?.length ?? 0 > 0
+    else {
       return
     }
     let layoutSignature =

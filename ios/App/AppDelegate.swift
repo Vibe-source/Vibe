@@ -76,11 +76,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     open url: URL,
     options: [UIApplication.OpenURLOptionsKey: Any] = [:]
   ) -> Bool {
-    guard url.scheme?.lowercased() == "vibe", url.host?.lowercased() == "room-link" else {
-      return false
-    }
+    // Every vibe:// link goes through one router: room-link (channel invites), u/handle
+    // (@username share links), and chat (chatId/friendId). It decides what it can open
+    // and ignores the rest, so new link shapes don't need a change here.
+    guard url.scheme?.lowercased() == "vibe" else { return false }
+    guard let target = VibeRoomLinkRouter.target(from: url) else { return false }
     Task { @MainActor in
-      VibeRoomLinkRouter.shared.handle(url: url)
+      VibeRoomLinkRouter.shared.handle(target: target)
     }
     return true
   }

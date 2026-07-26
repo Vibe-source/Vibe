@@ -1244,6 +1244,10 @@ defmodule Vibe.Chat do
       accessType: if(room.type == "channel", do: room.access_type || "private", else: nil),
       publicSlug: if(room.type == "channel", do: room.public_slug, else: nil),
       shareLink: Keyword.get(opts, :share_link),
+      # Absolute, pasteable form of the same link. A public channel always has one
+      # (its slug); a private one only once an invite token exists. `shareLink` stays
+      # the relative path that the join endpoint accepts.
+      shareUrl: room_share_url(room, Keyword.get(opts, :share_link)),
       joinApprovalRequired:
         if(room.type == "channel", do: room.join_approval_required || false, else: nil),
       restrictSavingContent:
@@ -1800,6 +1804,35 @@ defmodule Vibe.Chat do
 
   def channel_settings(_), do: channel_settings(%Room{channel_settings: %{}})
 
+  @doc """
+  Normalized public-slug form of any text (`"Daily News"` -> `"daily-news"`), or `nil`
+  when nothing slug-shaped survives. Exposed so callers can propose a link before
+  creating the channel.
+  """
+  def slugify_public_slug(value) do
+    # Sanitizing, not validating: this turns a human room name ("Daily News!") into a
+    # usable handle, where `normalize_public_slug/1` deliberately keeps invalid input
+    # invalid so an explicit user-supplied slug is still rejected.
+    value
+    |> to_string()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.replace(~r/-+/, "-")
+    |> String.trim("-")
+    |> String.slice(0, 48)
+    |> case do
+      slug -> if valid_public_slug?(slug), do: slug, else: nil
+    end
+  end
+
+  @doc "True when `slug` is valid and no channel has claimed it yet."
+  def public_slug_available?(slug) do
+    case slugify_public_slug(slug) do
+      nil -> false
+      normalized -> not Repo.exists?(from(room in Room, where: room.public_slug == ^normalized))
+    end
+  end
+
   def resolve_channel_link(input) when is_binary(input) do
     with {:ok, reference} <- parse_room_link(input),
          {:ok, room, _link} <- resolve_room_reference(reference) do
@@ -2052,6 +2085,44 @@ defmodule Vibe.Chat do
       _ ->
         {:error, :chat_not_attached}
     end
+  end
+
+  @doc """
+  Requester-aware agent policy: layers an `admin_mode` flag on top of
+  `channel_agent_policy/2` without ever widening what it returns.
+
+  `admin_mode` is true ONLY when the requester is the agent's owner AND this
+  chat is the private 1:1 DM between the owner and the agent itself — never by
+  requester identity alone, so an owner posting in a shared group/channel never
+  leaks admin capability to anyone else in it. Every other caller (including the
+  owner elsewhere) gets the plain room-scoped policy.
+  """
+  def effective_agent_policy(channel_id, %Agent{} = agent, requester_user_id) do
+    with {:ok, base} <- channel_agent_policy(channel_id, agent) do
+      {:ok, Map.put(base, :admin_mode, owner_admin_dm?(channel_id, agent, requester_user_id))}
+    end
+  end
+
+  defp owner_admin_dm?(channel_id, %Agent{} = agent, requester_user_id)
+       when is_binary(channel_id) and is_binary(requester_user_id) do
+    requester_user_id == agent.owner_user_id and
+      match?(%Room{type: "dm"}, Repo.get(Room, channel_id)) and
+      owner_and_agent_only_participants?(channel_id, agent)
+  end
+
+  defp owner_admin_dm?(_channel_id, _agent, _requester_user_id), do: false
+
+  defp owner_and_agent_only_participants?(channel_id, %Agent{} = agent) do
+    participant_ids =
+      Repo.all(
+        from(p in Participant,
+          where: p.chat_id == ^channel_id and (is_nil(p.deleted) or p.deleted == false),
+          select: p.user_id
+        )
+      )
+      |> MapSet.new()
+
+    participant_ids == MapSet.new([agent.owner_user_id, agent.agent_user_id])
   end
 
   def channel_agent_event_enabled?(channel_id, %Agent{} = agent) do
@@ -2347,8 +2418,17 @@ defmodule Vibe.Chat do
       maxUses: link.max_uses,
       useCount: link.use_count,
       revokedAt: link.revoked_at,
-      shareLink: share_link
+      shareLink: share_link,
+      shareUrl: Vibe.Links.room_url(share_link)
     }
+  end
+
+  defp room_share_url(room, share_link) do
+    cond do
+      is_binary(share_link) -> Vibe.Links.room_url(share_link)
+      room.type == "channel" and is_binary(room.public_slug) -> Vibe.Links.room_url("/r/#{room.public_slug}")
+      true -> nil
+    end
   end
 
   defp parse_room_link(input) do

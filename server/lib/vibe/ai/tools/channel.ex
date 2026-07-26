@@ -9,54 +9,50 @@ defmodule Vibe.AI.Tools.Channel do
   alias Vibe.Chat
   alias Vibe.Notifications
 
-  @doc "Creates a group or channel owned by the current agent owner."
+  @doc """
+  Creates a group or channel owned by the requester.
+
+  Works from the built-in assistant DM too, where there is no attached agent: the
+  room is simply created with nothing attached unless the caller names an agent to
+  attach (`attach_agent`, an id or @username the requester owns).
+  """
   def create_chat_space(input, agent_id, requester_user_id) when is_map(input) do
-    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
+    with {:ok, owner_id} <- require_owner(requester_user_id),
          {:ok, room_type} <- normalize_room_type(input),
          {:ok, name} <- required_string(input["name"], :invalid_name),
+         {:ok, agent} <- resolve_attach_target(input, agent_id, owner_id),
          member_ids <-
            input
            |> then(&(&1["member_ids"] || &1["memberIds"]))
            |> normalize_id_list()
-           |> Enum.reject(&(&1 in [requester_user_id, agent.agent_user_id])),
+           |> Enum.reject(&(&1 in [owner_id, agent && agent.agent_user_id])),
          :ok <- validate_member_ids(member_ids),
-         attach? <-
-           normalize_boolean(
-             input_value(input, "attach_current_agent", "attachCurrentAgent"),
-             true
-           ),
-         {:ok, room} <-
-           create_space(
-             room_type,
-             requester_user_id,
-             agent,
-             input,
-             name,
-             member_ids,
-             attach?
-           ) do
-      %{
-        "ok" => true,
-        "room" => canonical_tool_room(room),
-        "attached_current_agent" => attach?
-      }
+         {:ok, room} <- create_space(room_type, owner_id, agent, input, name, member_ids) do
+      room_result(room, agent, agent_id)
     else
-      {:error, reason} -> %{"ok" => false, "error" => error_message(reason)}
+      {:error, reason} -> tool_error(reason)
     end
   end
 
   def create_chat_space(_input, _agent_id, _requester_user_id),
     do: %{"ok" => false, "error" => "Invalid room input."}
 
-  @doc "Attaches the current owned agent to an owned group or channel."
-  def attach_current_agent_to_chat(input, agent_id, requester_user_id) when is_map(input) do
+  @doc """
+  Attaches an owned agent to an owned group or channel.
+
+  Defaults to the current agent (so `attach_current_agent_to_chat` behaviour is
+  unchanged) but accepts an explicit `agent` id/@username, which is the only way
+  this can work from the built-in assistant DM.
+  """
+  def attach_agent_to_chat(input, agent_id, requester_user_id) when is_map(input) do
     chat_id = normalize_string(input["chat_id"] || input["chatId"])
 
-    with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
+    with {:ok, owner_id} <- require_owner(requester_user_id),
+         {:ok, agent} <- require_agent(resolve_attach_target(input, agent_id, owner_id)),
          true <- is_binary(chat_id) || {:error, :invalid_chat_id},
-         "owner" <- Chat.get_user_role(chat_id, requester_user_id) || {:error, :not_owned},
+         "owner" <- Chat.get_user_role(chat_id, owner_id) || {:error, :not_owned},
          room when not is_nil(room) <- Chat.get_chat(chat_id) || {:error, :not_found},
-         {:ok, attachment} <- attach_agent(room.type, room.id, agent, requester_user_id, input) do
+         {:ok, attachment} <- attach_agent(room.type, room.id, agent, owner_id, input) do
       %{
         "ok" => true,
         "chat_id" => room.id,
@@ -64,16 +60,21 @@ defmodule Vibe.AI.Tools.Channel do
         "chat_link" => chat_link(room.id),
         "agent_id" => agent.id,
         "agent_user_id" => agent.agent_user_id,
+        "agent" => agent_summary(agent),
         "attachment" => attachment
       }
     else
-      {:error, reason} -> %{"ok" => false, "error" => error_message(reason)}
+      {:error, reason} -> tool_error(reason)
       _ -> %{"ok" => false, "error" => "Only an owned group or channel can be changed."}
     end
   end
 
-  def attach_current_agent_to_chat(_input, _agent_id, _requester_user_id),
+  def attach_agent_to_chat(_input, _agent_id, _requester_user_id),
     do: %{"ok" => false, "error" => "Invalid room input."}
+
+  @doc "Backwards-compatible alias: attaches the current agent unless one is named."
+  def attach_current_agent_to_chat(input, agent_id, requester_user_id),
+    do: attach_agent_to_chat(input, agent_id, requester_user_id)
 
   def post_to_channel(input, user_id) do
     channel_id = input["channel_id"]
@@ -339,54 +340,125 @@ defmodule Vibe.AI.Tools.Channel do
   def schedule_post(_input, _agent_id, _requester_user_id),
     do: %{"ok" => false, "error" => "Invalid scheduled post."}
 
-  defp create_space("group", requester_user_id, agent, input, name, member_ids, attach?) do
+  defp create_space("group", requester_user_id, agent, input, name, member_ids) do
     with {:ok, room} <-
            Chat.create_group(
              requester_user_id,
              name,
              member_ids,
              normalize_string(input["avatar_url"] || input["avatarUrl"]),
-             normalize_string(input["description"])
+             room_description(input)
            ),
-         {:ok, _attachment} <- maybe_attach_group(room.id, agent, requester_user_id, attach?) do
+         {:ok, _attachment} <- maybe_attach_group(room.id, agent, requester_user_id) do
       {:ok, Chat.canonical_room_summary(Chat.get_chat(room.id), role: "owner")}
     end
   end
 
-  defp create_space("channel", requester_user_id, agent, input, name, member_ids, attach?) do
-    attrs = %{
-      "name" => name,
-      "description" => normalize_string(input["description"]),
-      "avatarUrl" => normalize_string(input["avatar_url"] || input["avatarUrl"]),
-      "memberIds" => member_ids,
-      "accessType" => normalize_string(input["access_type"] || input["accessType"]) || "private",
-      "publicSlug" => normalize_string(input["public_slug"] || input["publicSlug"]),
-      "joinApprovalRequired" =>
-        normalize_boolean(
-          input_value(input, "join_approval_required", "joinApprovalRequired"),
-          false
-        ),
-      "restrictSavingContent" =>
-        normalize_boolean(
-          input_value(
-            input,
-            "restrict_saving",
-            "restrictSaving",
-            "restrict_saving_content",
-            "restrictSavingContent"
-          ),
-          false
-        ),
-      "agentAdminIds" => if(attach?, do: [agent.id], else: [])
-    }
+  defp create_space("channel", requester_user_id, agent, input, name, member_ids) do
+    access_type = normalize_string(input["access_type"] || input["accessType"]) || "private"
 
-    Chat.create_channel(requester_user_id, attrs)
+    with {:ok, slug} <- resolve_public_slug(input, name, access_type) do
+      attrs = %{
+        "name" => name,
+        "description" => room_description(input),
+        "avatarUrl" => normalize_string(input["avatar_url"] || input["avatarUrl"]),
+        "memberIds" => member_ids,
+        "accessType" => access_type,
+        "publicSlug" => slug,
+        "joinApprovalRequired" =>
+          normalize_boolean(
+            input_value(input, "join_approval_required", "joinApprovalRequired"),
+            false
+          ),
+        "restrictSavingContent" =>
+          normalize_boolean(
+            input_value(
+              input,
+              "restrict_saving",
+              "restrictSaving",
+              "restrict_saving_content",
+              "restrictSavingContent"
+            ),
+            false
+          ),
+        "agentAdminIds" => if(agent, do: [agent.id], else: [])
+      }
+
+      with {:ok, room} <- Chat.create_channel(requester_user_id, attrs) do
+        # `create_channel` attaches the agent with default policy. Only when the caller
+        # asked for specific tools/output modes (e.g. "handle media in this channel") do
+        # we re-attach to write that policy onto the assignment.
+        maybe_apply_agent_policy(room, agent, requester_user_id, input)
+        {:ok, room}
+      end
+    end
   end
 
-  defp maybe_attach_group(_chat_id, _agent, _requester_user_id, false), do: {:ok, nil}
+  defp maybe_attach_group(_chat_id, nil, _requester_user_id), do: {:ok, nil}
 
-  defp maybe_attach_group(chat_id, agent, requester_user_id, true) do
+  defp maybe_attach_group(chat_id, agent, requester_user_id) do
     Chat.add_member(chat_id, agent.agent_user_id, "member", actor_id: requester_user_id)
+  end
+
+  defp maybe_apply_agent_policy(_room, nil, _owner_id, _input), do: :ok
+
+  defp maybe_apply_agent_policy(room, agent, owner_id, input) do
+    attrs = agent_policy_attrs(input)
+    chat_id = room[:chatId] || room["chatId"]
+
+    if map_size(attrs) > 0 and is_binary(chat_id) do
+      _ = Chat.attach_channel_agent(chat_id, owner_id, agent.id, attrs)
+    end
+
+    :ok
+  end
+
+  defp agent_policy_attrs(input) do
+    %{}
+    |> maybe_put(
+      "allowedTools",
+      input["agent_tools"] || input["agentTools"] || input["allowed_tools"] ||
+        input["allowedTools"]
+    )
+    |> maybe_put(
+      "allowedOutputModes",
+      input["agent_output_modes"] || input["agentOutputModes"] ||
+        input["allowed_output_modes"] || input["allowedOutputModes"]
+    )
+    |> maybe_put("permissions", input["permissions"])
+  end
+
+  # "Topic" is how people describe a room's subject; it's the same field as description.
+  defp room_description(input) do
+    normalize_string(input["description"]) || normalize_string(input["topic"])
+  end
+
+  # A public channel is worthless without a link, so derive the slug from the name when
+  # the caller didn't pick one. Taken slugs walk a short list of readable suffixes —
+  # never a random number.
+  defp resolve_public_slug(input, name, access_type) do
+    case normalize_string(input["public_slug"] || input["publicSlug"]) do
+      explicit when is_binary(explicit) ->
+        {:ok, explicit}
+
+      _ ->
+        if access_type == "public", do: pick_available_slug(name), else: {:ok, nil}
+    end
+  end
+
+  defp pick_available_slug(name) do
+    base = Chat.slugify_public_slug(name)
+
+    candidates =
+      case base do
+        nil -> []
+        value -> [value | Enum.map(~w[channel official hq live], &"#{value}-#{&1}")]
+      end
+
+    case Enum.find(candidates, &Chat.public_slug_available?/1) do
+      nil -> {:error, :slug_unavailable}
+      slug -> {:ok, slug}
+    end
   end
 
   defp attach_agent("group", chat_id, agent, requester_user_id, _input) do
@@ -412,8 +484,27 @@ defmodule Vibe.AI.Tools.Channel do
   defp attach_agent(_type, _chat_id, _agent, _requester_user_id, _input),
     do: {:error, :invalid_room_type}
 
+  # The room result the model sees. `share_url` is the absolute link a person can
+  # actually paste anywhere — always quote that one, never the relative path.
+  defp room_result(room, agent, current_agent_id) do
+    share_path = room[:shareLink] || room["shareLink"]
+    share_url = (room[:shareUrl] || room["shareUrl"]) || Vibe.Links.room_url(share_path)
+
+    %{
+      "ok" => true,
+      "room" => canonical_tool_room(room),
+      "share_url" => share_url,
+      "share_link_display" => Vibe.Links.display(share_url),
+      "attached_agent" => agent_summary(agent),
+      "attached_current_agent" =>
+        not is_nil(agent) and is_binary(current_agent_id) and agent.id == current_agent_id
+    }
+  end
+
   defp canonical_tool_room(room) when is_map(room) do
     chat_id = room[:chatId] || room["chatId"]
+    share_path = room[:shareLink] || room["shareLink"]
+    share_url = (room[:shareUrl] || room["shareUrl"]) || Vibe.Links.room_url(share_path)
 
     %{
       "chat_id" => chat_id,
@@ -424,9 +515,72 @@ defmodule Vibe.AI.Tools.Channel do
       "member_count" => room[:memberCount] || room["memberCount"],
       "access_type" => room[:accessType] || room["accessType"],
       "public_slug" => room[:publicSlug] || room["publicSlug"],
-      "share_link" => room[:shareLink] || room["shareLink"],
+      "share_link" => share_path,
+      "share_url" => share_url,
       "chat_link" => chat_link(chat_id)
     }
+  end
+
+  defp agent_summary(nil), do: nil
+
+  defp agent_summary(agent) do
+    username = agent.agent_user && agent.agent_user.username
+
+    %{
+      "agent_id" => agent.id,
+      "agent_user_id" => agent.agent_user_id,
+      "display_name" => agent.display_name,
+      "username" => username,
+      "status" => agent.status,
+      "public_link" => Vibe.Links.agent_url(username)
+    }
+  end
+
+  defp require_owner(requester_user_id) when is_binary(requester_user_id),
+    do: {:ok, requester_user_id}
+
+  defp require_owner(_), do: {:error, :owner_lookup_required}
+
+  defp require_agent({:ok, nil}), do: {:error, :agent_required}
+  defp require_agent(other), do: other
+
+  # Which agent (if any) should end up in the room:
+  #   * an explicitly named one wins (the only option in the built-in assistant DM),
+  #   * otherwise the current agent, unless the caller opted out,
+  #   * otherwise nothing — creating a plain room is a perfectly good outcome.
+  defp resolve_attach_target(input, current_agent_id, owner_id) do
+    explicit =
+      normalize_string(
+        input["attach_agent"] || input["attachAgent"] || input["agent"] ||
+          input["agent_username"] || input["agentUsername"] || input["agent_id"] ||
+          input["agentId"]
+      )
+
+    attach_current? =
+      normalize_boolean(input_value(input, "attach_current_agent", "attachCurrentAgent"), true)
+
+    cond do
+      is_binary(explicit) -> resolve_owned_agent_identifier(explicit, owner_id)
+      not attach_current? -> {:ok, nil}
+      is_binary(current_agent_id) -> resolve_owned_agent(current_agent_id, owner_id)
+      true -> {:ok, nil}
+    end
+  end
+
+  defp resolve_owned_agent_identifier(identifier, owner_id) do
+    handle = String.trim_leading(identifier, "@")
+
+    agent =
+      Agents.get_agent(identifier, owner_id) ||
+        case Agents.get_agent_by_username(handle) do
+          %{owner_user_id: ^owner_id} = owned -> owned
+          _ -> nil
+        end
+
+    case agent do
+      nil -> {:error, {:agent_not_found, identifier}}
+      found -> {:ok, found}
+    end
   end
 
   defp resolve_owned_agent(agent_id, requester_user_id)
@@ -438,6 +592,8 @@ defmodule Vibe.AI.Tools.Channel do
   end
 
   defp resolve_owned_agent(_, _), do: {:error, :owner_lookup_required}
+
+  defp tool_error(reason), do: %{"ok" => false, "error" => error_message(reason)}
 
   defp normalize_room_type(input) do
     case normalize_string(input["room_type"] || input["roomType"]) do
@@ -509,6 +665,15 @@ defmodule Vibe.AI.Tools.Channel do
 
   defp error_message(:owner_lookup_required), do: "Owner identity is required."
   defp error_message(:not_owned), do: "Only the agent owner can change rooms."
+
+  defp error_message(:agent_required),
+    do: "Name the agent to attach (its id or @username) — this chat has none attached."
+
+  defp error_message({:agent_not_found, identifier}),
+    do: "You don't own an agent called #{identifier}. List your agents first."
+
+  defp error_message(:slug_unavailable),
+    do: "That public link is already taken. Ask the owner for a different channel link."
   defp error_message(:invalid_name), do: "Room name is required."
   defp error_message(:invalid_chat_id), do: "Chat id is required."
   defp error_message(:invalid_member_ids), do: "member_ids contains an unknown user."

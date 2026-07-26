@@ -55,6 +55,14 @@ targets:
         NSLocalNetworkUsageDescription: Vibe connects directly to the Vibe bridge on your Mac over your local network for faster, private agent updates when your phone and Mac share Wi‑Fi.
         NSBonjourServices:
           - _vibegram-bridge._tcp
+        # vibe:// deep links (share-link preview pages redirect here, and
+        # ASWebAuthenticationSession uses the same scheme for OAuth callbacks).
+        # Declared here so regenerating the project never drops it.
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Viewer
+            CFBundleURLName: com.vibegram.app.room-link
+            CFBundleURLSchemes:
+              - vibe
         UIBackgroundModes:
           - audio
           - voip

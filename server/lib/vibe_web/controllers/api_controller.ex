@@ -19,7 +19,10 @@ defmodule VibeWeb.ApiController do
       name: "Vibe Server (Elixir)",
       version: "1.0.0",
       features: ["e2ee", "p2p", "push", "media"],
-      limits: %{maxFileSize: 52428800}
+      limits: %{maxFileSize: 52428800},
+      # Host that public share links hang off, so clients render the same link the
+      # server hands out even after the domain changes.
+      shareBaseUrl: Vibe.Links.share_base_url()
     })
   end
 

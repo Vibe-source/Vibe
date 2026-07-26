@@ -337,6 +337,9 @@ defmodule VibeWeb.UserController do
     json(conn, %{
       userId: user.id,
       username: user.username,
+      # The user's one public link. Server-built so the app never has to guess the share
+      # host (it moves with VIBE_SHARE_BASE_URL — see Vibe.Links).
+      shareLink: Vibe.Links.profile_url(user.username),
       isAgent: user.is_agent || false,
       agentId: agent_id,
       acceptsIncomingChat:

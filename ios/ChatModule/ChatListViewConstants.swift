@@ -27,6 +27,34 @@ let agentTurnVerticalPadding: CGFloat = bubbleTopPadding
 // message. Rich content (diff cards / step lists) scrolls/wraps inside this width rather
 // than widening the whole bubble past its neighbours.
 let agentTurnMaxWidthFactor: CGFloat = bubbleMaxWidthFactor
+/// One rendered line of agent-turn body text, measured on device: the streaming label's
+/// bounds step 20 → 44 → 68 → 92 as it wraps.
+let agentTurnStreamingLineStep: CGFloat = 24.0
+/// Height granularity for a LIVE agent turn: two lines of headroom.
+///
+/// A streaming turn used to be sized to the exact measured height of the text it had SO
+/// FAR, so every wrapped line was a real height change — `requiresLayoutReload` saw the
+/// delta, reconfigured the cell, invalidated layout and re-pinned the bottom. Measured on
+/// one 5s answer: ten separate `[LayoutShift] path=heightReload` steps (Δ19, Δ24, Δ24,
+/// Δ24, …), each one a visible nudge of the whole transcript.
+///
+/// Quantising the live plate up to the next block instead means the text streams into
+/// space the cell ALREADY has: the plate grows once per two lines, and between those steps
+/// nothing in the list moves at all. The reserve is dropped the instant the turn settles
+/// (`isLiveStreaming == false`), so a finished bubble is still sized exactly to its
+/// content — the collapse at settle is bounded by one block, which is why this is two
+/// lines and not five.
+let agentTurnStreamingHeightBlock: CGFloat = agentTurnStreamingLineStep * 2.0
+
+/// Plate height for a live agent turn: `measured` rounded up to the next block, never
+/// below one block. Deterministic on purpose — the list's sizing pass and the cell's own
+/// `layoutSubviews` both call `measureMessageBubbleLayout`, and they must agree to the
+/// pixel or the plate and its slot disagree (empty air above a bottom-pinned bubble).
+func agentTurnStreamingReservedHeight(_ measured: CGFloat) -> CGFloat {
+  guard measured > 0.0 else { return measured }
+  let block = agentTurnStreamingHeightBlock
+  return max(block, (measured / block).rounded(.up) * block)
+}
 // Telegram-style date chip: a clean solid capsule — slightly wider and shorter than the
 // old bordered pill. Shared by the in-list day separators AND the sticky header pill so
 // the stick/hand-off between them reads as one element.

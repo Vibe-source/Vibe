@@ -10,6 +10,7 @@ import ProviderDocs from './pages/ProviderDocs';
 import ProviderQuickstartDocs from './pages/ProviderQuickstartDocs';
 import ProviderPayloadDocs from './pages/ProviderPayloadDocs';
 import ProviderSecurityDocs from './pages/ProviderSecurityDocs';
+import ConnectorsLanding from './pages/ConnectorsLanding';
 
 // App Wrapper to handle PWA vs Landing logic
 const App = () => {
@@ -37,6 +38,7 @@ const App = () => {
         <Route path="/docs/providers/quickstart" element={<ProviderQuickstartDocs />} />
         <Route path="/docs/providers/payloads" element={<ProviderPayloadDocs />} />
         <Route path="/docs/providers/security" element={<ProviderSecurityDocs />} />
+        <Route path="/settings/connectors" element={<ConnectorsLanding />} />
         <Route path="/app" element={<Chat />} />
         {/* Catch-all redirect to Home or App depending on preference, default to Home for now */}
         <Route path="*" element={<Navigate to="/" replace />} />

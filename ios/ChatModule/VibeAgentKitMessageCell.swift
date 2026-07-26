@@ -621,10 +621,27 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasDisplayText = !trimmedText.isEmpty
     let hasToolProgressItems = progressItems.contains { $0.itemType != "text" }
+    // A PLAIN-PROSE live turn (the built-in "Vibe AI" conversational agent) streams its
+    // answer AS THE MESSAGE BODY — no tool steps, no runtime card, no progress feed. The
+    // interleaved-feed machinery below assumes live prose rides as "text" progressItems
+    // (true for Claude/Codex) and SUPPRESSES the body while streaming; but this agent has
+    // no such nodes, so that path hides the whole answer behind a fixed-size "Thinking"
+    // shimmer until the turn settles — the "empty cell, no growth with the stream, then a
+    // height jump at settle" bug. Detect it and let the body stream + grow directly: the
+    // SAME renderer and SAME hug width are used live and settled, so nothing shifts when
+    // the turn finishes. CLI-agent rows (bridge-/stream-/lan- ids, or any turn that
+    // carries progress items / a runtime) never qualify — they keep the interleaved feed
+    // even on a momentarily-empty first frame. Because `measuredHeight` reuses this exact
+    // `configure`, the height measurement follows the body automatically (symmetry), so
+    // the per-chunk heightReload path fires and the row grows token-by-token.
+    let isPlainProseLiveTurn =
+      isStreaming && hasDisplayText && progressItems.isEmpty && runtime == nil
+      && !messageId.hasPrefix("bridge-") && !messageId.hasPrefix("stream-")
+      && !messageId.hasPrefix("lan-")
     // A live turn stays one interleaved feed even after its first prose arrives.
     // Using hasFinalResponseText here switched to the settled layout mid-stream,
     // rendering the same assistant text once as a progress node and again as body.
-    let showsLoader = isStreaming
+    let showsLoader = isStreaming && !isPlainProseLiveTurn
     let runningStatuses: Set<String> = [
       "active", "in-progress", "in_progress", "pending", "queued", "running", "streaming", "working",
     ]
@@ -651,11 +668,27 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     loaderView.applyAppearance(appearance)
     loaderView.onTap = onLoaderTap
 
-    let shouldShowLoader = showsLoaderView && (showsLoader || canShowCompletedWork)
-    // Only a finished turn can expand its step list inline; a live turn shows the
-    // shimmer, not a static list. Never expand steps while the bubble is tall-collapsed
-    // (the cap is too short for a multi-block feed — crushing it overlaps glass cards).
-    let stepsExpanded = isProgressExpanded && canShowCompletedWork && !isContentCollapsed
+    // GPT-style settled follow-up: answer body first, steps under it — no "Worked"
+    // header on top. Bridge CLI turns keep the Worked summary.
+    let isNativeToolFollowUp =
+      !isStreaming && hasDisplayText && hasToolProgressItems && runtime == nil
+      && !messageId.hasPrefix("bridge-") && !messageId.hasPrefix("stream-")
+      && !messageId.hasPrefix("lan-")
+
+    // Live tool turns always stream the interleaved feed under the shimmer. Settled
+    // native follow-ups keep steps expanded under the answer body. Never expand
+    // while tall-collapsed.
+    let stepsExpanded =
+      !isContentCollapsed
+      && (
+        (isStreaming && hasToolProgressItems)
+          || (isProgressExpanded && canShowCompletedWork)
+          || isNativeToolFollowUp
+      )
+
+    let shouldShowLoader =
+      showsLoaderView
+      && (showsLoader || (canShowCompletedWork && !isNativeToolFollowUp))
 
     if shouldShowLoader {
       let loaderText: String
@@ -787,7 +820,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
       // Keep the work feed visible so the row never looks frozen; it owns the live
       // narration + tool steps until the turn finishes.
-      positionSummaryViews(belowText: false)
+      positionSummaryViews()
       return
     }
 
@@ -840,7 +873,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
         blockHeightConstraints[0].constant = height
       }
       _ = previewBlocks
-      positionSummaryViews(belowText: false)
+      positionSummaryViews()
       return
     }
 
@@ -933,9 +966,12 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       }
     }
 
-    // The work wrapper stays at the top; when expanded, its own stack owns the
-    // progress/timeline. The answer body below is only for finished/non-live text.
-    positionSummaryViews(belowText: false)
+    // Chronological, always: the intent line and the steps the agent ran come FIRST, the
+    // answer settles underneath — the same order the user watched it stream, and the same
+    // order the bridge CLIs use. Putting the body on top (the old "GPT-style" native
+    // follow-up layout) read as scrambled: the summary appeared above the "I'll check…"
+    // intent that produced it, with the reasoning row trailing at the bottom.
+    positionSummaryViews()
   }
 
   /// Plain preview for tall-collapsed agent bubbles: drop fenced code (it needs a
@@ -965,27 +1001,25 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     return joined
   }
 
-  /// Place the loader/work log at the top. For live turns, `stepsStack` owns the
-  /// streamed answer text plus progress rows; for completed turns it owns the expanded
-  /// work details. The diff/runtime summary always stays last.
-  private func positionSummaryViews(belowText: Bool) {
+  /// Place the loader/work log above the answer body: header, work feed, then the response
+  /// blocks, with the runtime summary always last. One order for every provider and for both
+  /// the live and settled rendering of the same turn.
+  private func positionSummaryViews() {
     guard stackView.arrangedSubviews.contains(runtimeSummaryView) else { return }
-    if belowText {
-      for view in [loaderView, stepsStack] {
+    // Detach both so re-insert order is deterministic.
+    for view in [loaderView, stepsStack] {
+      if stackView.arrangedSubviews.contains(view) {
         stackView.removeArrangedSubview(view)
-        stackView.insertArrangedSubview(view, at: max(0, stackView.arrangedSubviews.count - 1))
+        view.removeFromSuperview()
       }
-    } else {
-      stackView.removeArrangedSubview(loaderView)
-      stackView.insertArrangedSubview(loaderView, at: 0)
-      stackView.removeArrangedSubview(stepsStack)
-      stackView.insertArrangedSubview(stepsStack, at: 1)
     }
+    stackView.insertArrangedSubview(loaderView, at: 0)
+    stackView.insertArrangedSubview(stepsStack, at: 1)
     // Spacing follows each view across reordering and is ignored while a view is
     // hidden. Keep gaps tight so the live text/progress timeline reads as one
     // continuous shape under the Working header.
-    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: loaderView)
-    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 8.0, after: stepsStack)
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 10.0, after: loaderView)
+    stackView.setCustomSpacing(isLiveTurn ? 6.0 : 10.0, after: stepsStack)
   }
 
   // Completed-turn summary line. Matches the Claude Code / Codex "Worked for Xs"
@@ -1626,7 +1660,7 @@ private final class VibeAgentKitStepRowView: UIView {
       para.lineBreakMode = .byTruncatingTail
       titleLabel.attributedText = VibeAgentKitAssistantMessageBodyView.styledStepLabel(
         labelText,
-        font: UIFont.systemFont(ofSize: streaming ? 13.4 : 14.75, weight: .regular),
+        font: UIFont.systemFont(ofSize: streaming ? 14.5 : 15.5, weight: .regular),
         baseColor: previewTextColor,
         paragraph: para
       )

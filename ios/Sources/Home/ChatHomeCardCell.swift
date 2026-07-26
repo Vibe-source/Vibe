@@ -67,7 +67,10 @@ final class ChatHomeCardCell: UITableViewCell {
   private let rightCheckmarkView = UIImageView()
 
   private var rowContentLeadingConstraint: NSLayoutConstraint?
+  private var avatarWidthConstraint: NSLayoutConstraint?
+  private var avatarHeightConstraint: NSLayoutConstraint?
   private var currentEditingLayout = false
+  private var compactForwardStyle = false
   private lazy var swipePanGestureRecognizer: UIPanGestureRecognizer = {
     let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleSwipePan(_:)))
     gesture.delegate = self
@@ -128,6 +131,12 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionBackgroundView.isHidden = true
     editSelectionCheckView.isHidden = true
     rowContentLeadingConstraint?.constant = 0
+    avatarWidthConstraint?.constant = 60
+    avatarHeightConstraint?.constant = 60
+    compactForwardStyle = false
+    previewLabel.isHidden = false
+    rightCheckmarkView.image = UIImage(systemName: "circle")
+    rightCheckmarkView.transform = .identity
     currentRow = nil
     lastBridgePreviewSignature = nil
     leadingDisplaySpecs = []
@@ -164,8 +173,10 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarGradientColors: (UIColor, UIColor)?,
     isEditing: Bool,
     isEditSelected: Bool,
-    showsRightCheckmark: Bool = false
+    showsRightCheckmark: Bool = false,
+    compactForwardStyle: Bool = false
   ) {
+    self.compactForwardStyle = compactForwardStyle
     let primary =
       isDark ? UIColor.white : UIColor(red: 22 / 255, green: 28 / 255, blue: 36 / 255, alpha: 1)
     let secondary =
@@ -205,10 +216,11 @@ final class ChatHomeCardCell: UITableViewCell {
 
     titleLabel.text = row.title
     titleLabel.textColor = primary
+    titleLabel.font = .systemFont(ofSize: compactForwardStyle ? 15.5 : 17, weight: .medium)
     rowContentContainer.isHidden = false
     rowContentContainer.alpha = 1.0
-    tierBadgeImageView.isHidden = !row.isGoldTier
-    if row.isGoldTier {
+    tierBadgeImageView.isHidden = compactForwardStyle || !row.isGoldTier
+    if row.isGoldTier && !compactForwardStyle {
       let goldColor = UIColor(red: 255 / 255, green: 205 / 255, blue: 84 / 255, alpha: 1)
       tierBadgeImageView.image = UIImage(systemName: "checkmark.seal.fill")
       tierBadgeImageView.tintColor = goldColor
@@ -219,16 +231,16 @@ final class ChatHomeCardCell: UITableViewCell {
       isAgent: row.isAgentFriend,
       agentId: row.peerAgentId
     )
-    // Bridge agent rows carry a static "Start session" preview. While a run is actually
-    // live, surface the current working state (thinking / tool step, e.g. "Reading …")
-    // instead so the home reflects active sessions rather than always reading "Start
-    // session". Once progress settles, the row returns to the explicit idle action,
-    // never a persisted message preview.
-    if row.isBridgeAgentSurface,
+    // Forward sheet: name-only rows (no preview / time / badges) — denser list.
+    if compactForwardStyle {
+      previewLabel.text = nil
+      previewLabel.isHidden = true
+    } else if row.isBridgeAgentSurface,
       let progress = ChatEngine.shared.agentProgress(chatId: row.chatId),
       let liveLabel = (progress["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
       !liveLabel.isEmpty
     {
+      previewLabel.isHidden = false
       previewLabel.text = liveLabel
       previewLabel.textColor = typingColor
       traceBridgePreview(row: row, provider: bridgeProvider, state: "progress:\(liveLabel)")
@@ -242,6 +254,7 @@ final class ChatHomeCardCell: UITableViewCell {
       // before this chat's channel is joined) — but the bridge status snapshot reports a
       // task running for this chat. Show the working state instead of the idle
       // "Start session" preview so home reflects the in-flight session.
+      previewLabel.isHidden = false
       previewLabel.text = "Working…"
       previewLabel.textColor = typingColor
       traceBridgePreview(row: row, provider: bridgeProvider, state: "working")
@@ -249,30 +262,43 @@ final class ChatHomeCardCell: UITableViewCell {
       // Agent DMs are launch surfaces, not ordinary chat previews. A persisted
       // message may still exist in the Home row/cache, but it must never replace
       // the explicit idle state after a live task settles or on cold launch.
+      previewLabel.isHidden = false
       previewLabel.text = "Start session"
       previewLabel.textColor = secondary
       traceBridgePreview(row: row, provider: bridgeProvider, state: "idle")
     } else {
+      previewLabel.isHidden = false
       previewLabel.text = row.isTyping ? "typing..." : row.preview
       previewLabel.textColor = row.isTyping ? typingColor : secondary
     }
 
-    timeLabel.isHidden = showsRightCheckmark
+    timeLabel.isHidden = showsRightCheckmark || compactForwardStyle
     timeLabel.text = row.timeLabel
     timeLabel.textColor = secondary
 
-    unreadBadge.isHidden = showsRightCheckmark || !(row.unreadCount > 0 || row.markedUnread)
+    unreadBadge.isHidden = showsRightCheckmark || compactForwardStyle || !(row.unreadCount > 0 || row.markedUnread)
     unreadLabel.text = row.unreadCount > 0 ? "\(row.unreadCount)" : ""
     unreadLabel.textColor = isDark ? UIColor.black : UIColor.white
     unreadBadge.backgroundColor = badgeBackground
 
-    muteIconView.isHidden = showsRightCheckmark || !row.muted
-    pinIconView.isHidden = showsRightCheckmark || !row.pinned
+    muteIconView.isHidden = showsRightCheckmark || compactForwardStyle || !row.muted
+    pinIconView.isHidden = showsRightCheckmark || compactForwardStyle || !row.pinned
     muteIconView.tintColor = secondary
     pinIconView.tintColor = secondary
-    onlineDot.isHidden = !row.isOnline
+    onlineDot.isHidden = compactForwardStyle || !row.isOnline
     selectionOverlayView.backgroundColor = selectedOverlayColor
-    selectionOverlayView.alpha = isEditSelected ? 1 : 0
+    // Soft fill morph for selection (forward sheet + edit mode).
+    let wantOverlay = isEditSelected && (isEditing || showsRightCheckmark)
+    if selectionOverlayView.alpha != (wantOverlay ? 1 : 0) {
+      UIView.animate(
+        withDuration: 0.26,
+        delay: 0,
+        options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+      ) {
+        self.selectionOverlayView.alpha = wantOverlay ? 1 : 0
+      }
+    }
+
     // Selection chrome visibility is driven by updateEditingLayout (animated).
     // Don't snap alpha/hidden here or the edit gutter "pops".
     editSelectionBackgroundView.backgroundColor = isEditSelected ? badgeBackground : selectionIdleBackgroundColor
@@ -281,7 +307,43 @@ final class ChatHomeCardCell: UITableViewCell {
     editSelectionCheckView.tintColor = isDark ? UIColor.black : UIColor.white
 
     rightCheckmarkView.isHidden = !showsRightCheckmark
-    rightCheckmarkView.tintColor = isEditSelected ? badgeBackground : secondary.withAlphaComponent(0.3)
+    // Morph empty circle → filled check (no pop).
+    let radioName = isEditSelected ? "checkmark.circle.fill" : "circle"
+    let nextRadio = UIImage(systemName: radioName)
+    if rightCheckmarkView.image !== nextRadio {
+      if showsRightCheckmark, window != nil {
+        UIView.transition(
+          with: rightCheckmarkView,
+          duration: 0.22,
+          options: [.transitionCrossDissolve, .beginFromCurrentState, .allowUserInteraction]
+        ) {
+          self.rightCheckmarkView.image = nextRadio
+          self.rightCheckmarkView.tintColor = isEditSelected
+            ? badgeBackground
+            : secondary.withAlphaComponent(0.45)
+          self.rightCheckmarkView.transform = isEditSelected
+            ? CGAffineTransform(scaleX: 1.06, y: 1.06)
+            : .identity
+        } completion: { _ in
+          UIView.animate(withDuration: 0.16) {
+            self.rightCheckmarkView.transform = .identity
+          }
+        }
+      } else {
+        rightCheckmarkView.image = nextRadio
+        rightCheckmarkView.tintColor = isEditSelected
+          ? badgeBackground
+          : secondary.withAlphaComponent(0.45)
+      }
+    } else {
+      rightCheckmarkView.tintColor = isEditSelected
+        ? badgeBackground
+        : secondary.withAlphaComponent(0.45)
+    }
+
+    let avatarSide: CGFloat = compactForwardStyle ? 36 : 60
+    avatarWidthConstraint?.constant = avatarSide
+    avatarHeightConstraint?.constant = avatarSide
 
     let avatarKind: ChatAvatarKind =
       row.isSavedMessages ? .savedMessages : (row.isArchiveEntry ? .archive : .standard)
@@ -298,7 +360,7 @@ final class ChatHomeCardCell: UITableViewCell {
         gradientColors: avatarGradientColors
       ),
       isDark: isDark,
-      renderingSide: 60
+      renderingSide: avatarSide
     )
     pressOverlayView.backgroundColor = pressedColor
     dividerView.backgroundColor = dividerColor
@@ -611,8 +673,16 @@ final class ChatHomeCardCell: UITableViewCell {
 
       avatarNode.leadingAnchor.constraint(equalTo: rowContentContainer.leadingAnchor, constant: 16),
       avatarNode.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
-      avatarNode.widthAnchor.constraint(equalToConstant: 60),
-      avatarNode.heightAnchor.constraint(equalToConstant: 60),
+      {
+        let w = avatarNode.widthAnchor.constraint(equalToConstant: 60)
+        self.avatarWidthConstraint = w
+        return w
+      }(),
+      {
+        let h = avatarNode.heightAnchor.constraint(equalToConstant: 60)
+        self.avatarHeightConstraint = h
+        return h
+      }(),
 
       // Align under the text stack (after avatar + gap). Tracks edit shift
       // because it is relative to the avatar, not fixed contentView leading.

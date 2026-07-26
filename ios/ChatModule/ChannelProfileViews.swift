@@ -7,10 +7,20 @@ struct ChannelMemberListPage: View {
   let title: String
   let members: [ChannelProfileService.Member]
   let emptyText: String
+  /// When true, split human admins vs agent admins into sections.
+  var groupAgentAdmins: Bool = false
 
   @Environment(\.colorScheme) private var colorScheme
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  private var humanMembers: [ChannelProfileService.Member] {
+    members.filter { !isAgentAdmin($0.role) }
+  }
+
+  private var agentMembers: [ChannelProfileService.Member] {
+    members.filter { isAgentAdmin($0.role) }
+  }
 
   var body: some View {
     List {
@@ -19,36 +29,101 @@ struct ChannelMemberListPage: View {
           .font(.system(size: 15))
           .foregroundStyle(palette.secondaryText)
           .listRowBackground(Color.clear)
+      } else if groupAgentAdmins, !agentMembers.isEmpty {
+        if !humanMembers.isEmpty {
+          Section(humanMembers.count == 1 ? "Administrator" : "Administrators") {
+            ForEach(humanMembers, id: \.userId) { member in
+              memberRow(member)
+            }
+          }
+        }
+        Section(agentMembers.count == 1 ? "Agent admin" : "Agent admins") {
+          ForEach(agentMembers, id: \.userId) { member in
+            memberRow(member)
+          }
+        }
       } else {
         ForEach(members, id: \.userId) { member in
-          HStack(spacing: 12) {
-            Circle()
-              .fill(palette.accent.opacity(0.18))
-              .frame(width: 40, height: 40)
-              .overlay {
-                Text(String(member.name.prefix(1)).uppercased())
-                  .font(.system(size: 16, weight: .semibold))
-                  .foregroundStyle(palette.accent)
-              }
-            VStack(alignment: .leading, spacing: 2) {
-              Text(member.name)
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(.primary)
-              Text(member.role.capitalized)
-                .font(.system(size: 13))
-                .foregroundStyle(palette.secondaryText)
-            }
-            Spacer()
-          }
-          .listRowBackground(palette.card)
+          memberRow(member)
         }
       }
     }
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
+    .background(Color.clear.ignoresSafeArea())
     .navigationTitle(title)
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+  }
+
+  @ViewBuilder
+  private func memberRow(_ member: ChannelProfileService.Member) -> some View {
+    HStack(spacing: 12) {
+      memberAvatar(member)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(member.name)
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(.primary)
+        Text(roleLabel(member.role))
+          .font(.system(size: 13))
+          .foregroundStyle(palette.secondaryText)
+      }
+      Spacer(minLength: 0)
+    }
+    .listRowBackground(palette.card)
+  }
+
+  @ViewBuilder
+  private func memberAvatar(_ member: ChannelProfileService.Member) -> some View {
+    let initial = String(member.name.prefix(1)).uppercased()
+    if let urlString = member.avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !urlString.isEmpty,
+      let url = URL(string: urlString)
+    {
+      AsyncImage(url: url) { phase in
+        switch phase {
+        case .success(let image):
+          image
+            .resizable()
+            .scaledToFill()
+        default:
+          Circle()
+            .fill(palette.accent.opacity(0.18))
+            .overlay {
+              Text(initial)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(palette.accent)
+            }
+        }
+      }
+      .frame(width: 40, height: 40)
+      .clipShape(Circle())
+    } else {
+      Circle()
+        .fill(palette.accent.opacity(0.18))
+        .frame(width: 40, height: 40)
+        .overlay {
+          Text(initial)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(palette.accent)
+        }
+    }
+  }
+
+  private func roleLabel(_ role: String) -> String {
+    let r = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch r {
+    case "owner": return "Owner"
+    case "admin": return "Admin"
+    case "agent_admin", "agent admin": return "Agent admin"
+    case "subscriber", "member", "": return "Subscriber"
+    default: return role
+    }
+  }
+
+  private func isAgentAdmin(_ role: String) -> Bool {
+    let r = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return r == "agent_admin" || r == "agent admin"
   }
 }
 
@@ -91,9 +166,10 @@ struct ChannelRecentActionsPage: View {
     }
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
+    .background(Color.clear.ignoresSafeArea())
     .navigationTitle("Recent actions")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
   }
 
   private static func timeLabel(_ ms: Int64) -> String {
@@ -107,90 +183,281 @@ struct ChannelRecentActionsPage: View {
   }
 }
 
-// MARK: - Channel settings (page, not sheet)
+// MARK: - Channel settings (page, not sheet) — Telegram-style icon list
 
 struct ChannelSettingsPage: View {
   let chatId: String
   let channelName: String
+  var channelDescription: String = ""
+  var avatarUri: String? = nil
   let canManage: Bool
   @Binding var settings: ChannelProfileService.Settings
+  var adminCount: Int = 0
+  var subscriberCount: Int = 0
   let onEditName: () -> Void
   let onOpenAppearance: () -> Void
   let onOpenRecentActions: () -> Void
+  var onOpenAdministrators: (() -> Void)? = nil
+  var onOpenSubscribers: (() -> Void)? = nil
+  var onDescriptionChanged: ((String) -> Void)? = nil
+  var onNameChanged: ((String) -> Void)? = nil
+  var onAvatarChanged: ((String) -> Void)? = nil
   let onSettingsChanged: (ChannelProfileService.Settings) -> Void
 
   @Environment(\.colorScheme) private var colorScheme
   @State private var isBusy = false
   @State private var errorMessage: String?
+  @State private var showTypePicker = false
+  @State private var nameLocal: String = ""
+  @State private var descriptionLocal: String = ""
+  @State private var identitySeeded = false
+  @State private var localAvatarUri: String?
+  @State private var photoPickerItem: PhotosPickerItem?
+  @State private var isUploadingPhoto = false
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
+  private var resolvedAvatarUri: String? {
+    let local = localAvatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !local.isEmpty { return local }
+    let host = avatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return host.isEmpty ? nil : host
+  }
+
+  private var typeLabel: String {
+    settings.channelType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "public"
+      ? "Public"
+      : "Private"
+  }
+
+  private var inviteTrailing: String {
+    if let link = settings.inviteLink, !link.isEmpty { return "1" }
+    if let slug = settings.publicSlug, !slug.isEmpty { return "1" }
+    return canManage ? "Add" : "—"
+  }
+
+  private var reactionsTrailing: String {
+    settings.reactionsEnabled ? "All Reactions" : "Off"
+  }
+
+  private var dmsTrailing: String {
+    settings.allowDirectMessages ? "On" : "Off"
+  }
+
   var body: some View {
     List {
+      // —— Identity: shared avatar node + compact native name/description rows ——
       Section {
-        Button(action: onEditName) {
-          settingsRow(
-            title: "Channel name",
-            subtitle: channelName,
-            showsChevron: canManage
+        VStack(spacing: 10) {
+          ChannelSettingsAvatarNode(
+            title: nameLocal.isEmpty ? channelName : nameLocal,
+            avatarUri: resolvedAvatarUri,
+            chatId: chatId,
+            isDark: colorScheme == .dark,
+            size: 96
           )
-        }
-        .disabled(!canManage)
-
-        if canManage {
-          Picker("Channel type", selection: channelTypeBinding) {
-            Text("Public").tag("public")
-            Text("Private").tag("private")
-          }
-
-          if settings.channelType == "public" {
-            TextField("Public link name", text: publicSlugBinding)
-              .textInputAutocapitalization(.never)
-              .autocorrectionDisabled()
-          }
-
-          Button("Apply channel type") {
-            Task { await persist(settings) }
-          }
-          .disabled(
-            settings.channelType == "public"
-              && (settings.publicSlug ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          )
-
-          if settings.channelType == "private" {
-            Button {
-              Task { await rotateInvite() }
-            } label: {
-              settingsRow(
-                title: "Invite link",
-                subtitle: settings.inviteLink?.isEmpty == false
-                  ? settings.inviteLink!
-                  : "Create invite link",
-                showsChevron: true
-              )
+          .frame(width: 96, height: 96)
+          .clipShape(Circle())
+          .overlay {
+            if isUploadingPhoto {
+              Circle().fill(Color.black.opacity(0.42))
+              ProgressView().tint(.white)
             }
           }
 
-          Toggle("Approve new subscribers", isOn: joinApprovalBinding)
-          Toggle("Restrict saving content", isOn: restrictSavingBinding)
-          Toggle("Discussions", isOn: discussionsBinding)
-          Toggle("Reactions", isOn: reactionsBinding)
-          Toggle("Direct messages", isOn: dmsBinding)
-          Toggle("Auto-translate", isOn: translateBinding)
+          if canManage {
+            PhotosPicker(selection: $photoPickerItem, matching: .images) {
+              Text(isUploadingPhoto ? "Uploading…" : "Set New Photo")
+                .font(.system(size: 17, weight: .regular))
+                .foregroundStyle(Color.accentColor)
+            }
+            .disabled(isUploadingPhoto)
+          }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+
+        // Two compact native rows (name + description), values pre-filled — no push.
+        if canManage {
+          // Empty title = no placeholder label; text is the live channel name.
+          TextField("", text: $nameLocal)
+            .font(.system(size: 17))
+            .textInputAutocapitalization(.words)
+            .submitLabel(.done)
+            .onSubmit { Task { await persistIdentity() } }
+            .listRowBackground(palette.card)
+
+          TextField("", text: $descriptionLocal, axis: .vertical)
+            .font(.system(size: 17))
+            .lineLimit(1...4)
+            .submitLabel(.done)
+            .onSubmit { Task { await persistIdentity() } }
+            .listRowBackground(palette.card)
         } else {
-          settingsRow(
-            title: "Channel type",
-            subtitle: settings.channelType.capitalized,
-            showsChevron: false
+          Text(channelName)
+            .font(.system(size: 17))
+            .listRowBackground(palette.card)
+          if !channelDescription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(channelDescription)
+              .font(.system(size: 17))
+              .foregroundStyle(.secondary)
+              .listRowBackground(palette.card)
+          }
+        }
+      }
+
+      // —— Channel policy / content ——
+      Section {
+        iconButtonRow(
+          title: "Channel Type",
+          systemImage: "megaphone.fill",
+          tint: Color(red: 0.20, green: 0.55, blue: 0.98),
+          trailing: typeLabel,
+          showsChevron: canManage
+        ) {
+          if canManage { showTypePicker = true }
+        }
+
+        if canManage, settings.channelType.lowercased() == "public" {
+          HStack(spacing: 12) {
+            leadingIcon("link", tint: Color(red: 0.98, green: 0.62, blue: 0.20))
+            VStack(alignment: .leading, spacing: 2) {
+              Text("Public link")
+                .font(.system(size: 17))
+              TextField("channel_name", text: publicSlugBinding)
+                .font(.system(size: 15))
+                .foregroundStyle(palette.secondaryText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            }
+          }
+          .listRowBackground(palette.card)
+
+          Button {
+            Task { await persist(settings) }
+          } label: {
+            Text("Apply public link")
+              .font(.system(size: 16, weight: .medium))
+              .foregroundStyle(palette.accent)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .listRowBackground(palette.card)
+        }
+
+        iconButtonRow(
+          title: "Invite Links",
+          systemImage: "link",
+          tint: Color(red: 0.98, green: 0.62, blue: 0.20),
+          trailing: inviteTrailing,
+          showsChevron: canManage
+        ) {
+          if canManage { Task { await rotateInvite() } }
+        }
+
+        iconButtonRow(
+          title: "Discussion",
+          systemImage: "bubble.left.and.bubble.right.fill",
+          tint: Color(red: 0.30, green: 0.78, blue: 0.42),
+          trailing: settings.discussionsEnabled ? "On" : "Add",
+          showsChevron: canManage
+        ) {
+          if canManage {
+            var s = settings
+            s.discussionsEnabled.toggle()
+            settings = s
+            Task { await persist(s) }
+          }
+        }
+
+        iconButtonRow(
+          title: "Reactions",
+          systemImage: "heart.fill",
+          tint: Color(red: 0.98, green: 0.35, blue: 0.45),
+          trailing: reactionsTrailing,
+          showsChevron: canManage
+        ) {
+          if canManage {
+            var s = settings
+            s.reactionsEnabled.toggle()
+            settings = s
+            Task { await persist(s) }
+          }
+        }
+
+        // Appearance / photo-poster intentionally omitted for channels.
+
+        if canManage {
+          iconToggleRow(
+            title: "Auto-Translate Messages",
+            systemImage: "character.bubble.fill",
+            tint: Color(red: 0.62, green: 0.40, blue: 0.95),
+            isOn: translateBinding
           )
         }
 
-        Button(action: onOpenAppearance) {
-          settingsRow(title: "Appearance", subtitle: "Photo & poster", showsChevron: true)
+        iconButtonRow(
+          title: "Direct Messages",
+          systemImage: "bubble.left.fill",
+          tint: Color(red: 0.35, green: 0.55, blue: 0.98),
+          trailing: dmsTrailing,
+          showsChevron: canManage
+        ) {
+          if canManage {
+            var s = settings
+            s.allowDirectMessages.toggle()
+            settings = s
+            Task { await persist(s) }
+          }
         }
 
-        Button(action: onOpenRecentActions) {
-          settingsRow(title: "Recent actions", subtitle: "Messages & events", showsChevron: true)
+        if canManage {
+          iconToggleRow(
+            title: "Approve new subscribers",
+            systemImage: "person.badge.clock.fill",
+            tint: Color(red: 0.20, green: 0.65, blue: 0.85),
+            isOn: joinApprovalBinding
+          )
+          iconToggleRow(
+            title: "Restrict saving content",
+            systemImage: "lock.rectangle.on.rectangle.fill",
+            tint: Color(red: 0.55, green: 0.55, blue: 0.60),
+            isOn: restrictSavingBinding
+          )
+        }
+      }
+
+      // —— People ——
+      Section {
+        iconButtonRow(
+          title: "Administrators",
+          systemImage: "checkmark.shield.fill",
+          tint: Color(red: 0.30, green: 0.78, blue: 0.42),
+          trailing: adminCount > 0 ? "\(adminCount)" : nil,
+          showsChevron: true
+        ) {
+          onOpenAdministrators?()
+        }
+
+        iconButtonRow(
+          title: "Subscribers",
+          systemImage: "person.3.fill",
+          tint: Color(red: 0.25, green: 0.55, blue: 0.95),
+          trailing: subscriberCount > 0 ? "\(subscriberCount)" : nil,
+          showsChevron: true
+        ) {
+          onOpenSubscribers?()
+        }
+
+        iconButtonRow(
+          title: "Recent Actions",
+          systemImage: "eye.fill",
+          tint: Color(red: 0.98, green: 0.62, blue: 0.20),
+          trailing: nil,
+          showsChevron: true
+        ) {
+          onOpenRecentActions()
         }
       }
 
@@ -204,9 +471,50 @@ struct ChannelSettingsPage: View {
     }
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
+    .background(Color.clear.ignoresSafeArea())
     .navigationTitle("Channel settings")
     .navigationBarTitleDisplayMode(.inline)
+    .toolbarBackground(.hidden, for: .navigationBar)
+    .onAppear {
+      if !identitySeeded {
+        nameLocal = channelName
+        descriptionLocal = channelDescription
+        localAvatarUri = avatarUri
+        identitySeeded = true
+      }
+    }
+    .onChange(of: channelName) { _, next in
+      if nameLocal == channelName || nameLocal.isEmpty { nameLocal = next }
+    }
+    .onChange(of: channelDescription) { _, next in
+      if descriptionLocal == channelDescription || descriptionLocal.isEmpty {
+        descriptionLocal = next
+      }
+    }
+    .onChange(of: avatarUri) { _, next in
+      if localAvatarUri == nil || localAvatarUri == avatarUri {
+        localAvatarUri = next
+      }
+    }
+    .onChange(of: photoPickerItem) { _, item in
+      guard let item else { return }
+      Task { await loadPickedPhoto(item) }
+    }
+    .confirmationDialog("Channel Type", isPresented: $showTypePicker, titleVisibility: .visible) {
+      Button("Private") {
+        var s = settings
+        s.channelType = "private"
+        settings = s
+        Task { await persist(s) }
+      }
+      Button("Public") {
+        var s = settings
+        s.channelType = "public"
+        settings = s
+        Task { await persist(s) }
+      }
+      Button("Cancel", role: .cancel) {}
+    }
     .overlay {
       if isBusy {
         ProgressView().padding().background(.ultraThinMaterial).cornerRadius(10)
@@ -214,15 +522,122 @@ struct ChannelSettingsPage: View {
     }
   }
 
-  private var channelTypeBinding: Binding<String> {
-    Binding(
-      get: { settings.channelType },
-      set: { next in
-        var s = settings
-        s.channelType = next
-        settings = s
+  // MARK: Persist identity / photo
+
+  @MainActor
+  private func persistIdentity() async {
+    guard canManage else { return }
+    guard let config = AppSessionConfig.current else { return }
+    let trimmedName = nameLocal.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedDesc = descriptionLocal.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedName.isEmpty else { return }
+    isBusy = true
+    errorMessage = nil
+    defer { isBusy = false }
+    do {
+      let profile = try await ChannelProfileService.update(
+        chatId: chatId,
+        name: trimmedName,
+        description: trimmedDesc,
+        config: config
+      )
+      if !profile.name.isEmpty {
+        nameLocal = profile.name
+        onNameChanged?(profile.name)
       }
-    )
+      descriptionLocal = profile.description ?? trimmedDesc
+      onDescriptionChanged?(descriptionLocal)
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  @MainActor
+  private func loadPickedPhoto(_ item: PhotosPickerItem) async {
+    guard canManage else { return }
+    guard let config = AppSessionConfig.current else { return }
+    isUploadingPhoto = true
+    errorMessage = nil
+    defer { isUploadingPhoto = false }
+    do {
+      guard let data = try await item.loadTransferable(type: Data.self) else { return }
+      let remoteURL = try await ChatRoomCreateService.uploadAvatar(
+        imageData: data, config: config)
+      let profile = try await ChannelProfileService.update(
+        chatId: chatId, avatarUrl: remoteURL, config: config)
+      let next = profile.avatarUrl ?? remoteURL
+      localAvatarUri = next
+      onAvatarChanged?(next)
+      onSettingsChanged(profile.settings)
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  // MARK: Row builders
+
+  private func leadingIcon(_ systemImage: String, tint: Color) -> some View {
+    Image(systemName: systemImage)
+      .font(.system(size: 14, weight: .semibold))
+      .foregroundStyle(.white)
+      .frame(width: 30, height: 30)
+      .background(
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+          .fill(tint)
+      )
+  }
+
+  private func iconButtonRow(
+    title: String,
+    systemImage: String,
+    tint: Color,
+    trailing: String?,
+    showsChevron: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      HStack(spacing: 14) {
+        leadingIcon(systemImage, tint: tint)
+        Text(title)
+          .font(.system(size: 17))
+          .foregroundStyle(.primary)
+          .lineLimit(1)
+        Spacer(minLength: 8)
+        if let trailing, !trailing.isEmpty {
+          Text(trailing)
+            .font(.system(size: 16))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+        if showsChevron {
+          Image(systemName: "chevron.right")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(palette.secondaryText.opacity(0.75))
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .listRowBackground(palette.card)
+  }
+
+  private func iconToggleRow(
+    title: String,
+    systemImage: String,
+    tint: Color,
+    isOn: Binding<Bool>
+  ) -> some View {
+    HStack(spacing: 14) {
+      leadingIcon(systemImage, tint: tint)
+      Text(title)
+        .font(.system(size: 17))
+        .foregroundStyle(.primary)
+        .lineLimit(1)
+      Spacer(minLength: 8)
+      Toggle("", isOn: isOn)
+        .labelsHidden()
+    }
+    .listRowBackground(palette.card)
   }
 
   private var publicSlugBinding: Binding<String> {
@@ -260,42 +675,6 @@ struct ChannelSettingsPage: View {
     )
   }
 
-  private var discussionsBinding: Binding<Bool> {
-    Binding(
-      get: { settings.discussionsEnabled },
-      set: { next in
-        var s = settings
-        s.discussionsEnabled = next
-        settings = s
-        Task { await persist(s) }
-      }
-    )
-  }
-
-  private var reactionsBinding: Binding<Bool> {
-    Binding(
-      get: { settings.reactionsEnabled },
-      set: { next in
-        var s = settings
-        s.reactionsEnabled = next
-        settings = s
-        Task { await persist(s) }
-      }
-    )
-  }
-
-  private var dmsBinding: Binding<Bool> {
-    Binding(
-      get: { settings.allowDirectMessages },
-      set: { next in
-        var s = settings
-        s.allowDirectMessages = next
-        settings = s
-        Task { await persist(s) }
-      }
-    )
-  }
-
   private var translateBinding: Binding<Bool> {
     Binding(
       get: { settings.autoTranslateEnabled },
@@ -306,26 +685,6 @@ struct ChannelSettingsPage: View {
         Task { await persist(s) }
       }
     )
-  }
-
-  @ViewBuilder
-  private func settingsRow(title: String, subtitle: String, showsChevron: Bool) -> some View {
-    HStack {
-      VStack(alignment: .leading, spacing: 2) {
-        Text(title)
-          .foregroundStyle(.primary)
-        Text(subtitle)
-          .font(.footnote)
-          .foregroundStyle(palette.secondaryText)
-          .lineLimit(2)
-      }
-      Spacer()
-      if showsChevron {
-        Image(systemName: "chevron.right")
-          .font(.system(size: 13, weight: .semibold))
-          .foregroundStyle(palette.secondaryText)
-      }
-    }
   }
 
   @MainActor
@@ -339,6 +698,31 @@ struct ChannelSettingsPage: View {
         chatId: chatId, settings: next, config: config)
       settings = profile.settings
       onSettingsChanged(profile.settings)
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  @MainActor
+  private func persistDescription() async {
+    guard canManage else { return }
+    guard let config = AppSessionConfig.current else { return }
+    let trimmed = descriptionLocal.trimmingCharacters(in: .whitespacesAndNewlines)
+    isBusy = true
+    errorMessage = nil
+    defer { isBusy = false }
+    do {
+      let profile = try await ChannelProfileService.update(
+        chatId: chatId,
+        description: trimmed,
+        config: config
+      )
+      if let desc = profile.description {
+        descriptionLocal = desc
+        onDescriptionChanged?(desc)
+      } else {
+        onDescriptionChanged?(trimmed)
+      }
     } catch {
       errorMessage = error.localizedDescription
     }
@@ -360,6 +744,37 @@ struct ChannelSettingsPage: View {
     } catch {
       errorMessage = error.localizedDescription
     }
+  }
+}
+
+// MARK: - Shared avatar node (same ChatAvatarNodeView as home/chat)
+
+private struct ChannelSettingsAvatarNode: UIViewRepresentable {
+  let title: String
+  let avatarUri: String?
+  let chatId: String
+  let isDark: Bool
+  var size: CGFloat = 96
+
+  func makeUIView(context: Context) -> ChatAvatarNodeView {
+    let view = ChatAvatarNodeView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }
+
+  func updateUIView(_ uiView: ChatAvatarNodeView, context: Context) {
+    let descriptor = ChatAvatarDescriptor(
+      title: title,
+      rawAvatarURI: avatarUri,
+      peerUserId: nil,
+      chatId: chatId,
+      kind: .standard,
+      isGroup: true,
+      members: [],
+      preferPushAvatar: false,
+      gradientColors: nil
+    )
+    uiView.configure(with: descriptor, isDark: isDark, renderingSide: size)
   }
 }
 

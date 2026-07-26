@@ -382,9 +382,22 @@ struct AppUserProfile: Equatable {
   let privacyGifts: AppPrivacyChoice
   let privacyBirthday: AppPrivacyChoice
   let privacySavedMusic: AppPrivacyChoice
+  /// Public share link as the SERVER built it (it owns the share host, which moves when
+  /// the domain changes). Nil on older servers; `shareLink` then falls back locally.
+  let serverShareLink: String?
 
   var displayName: String {
     name?.nilIfBlank ?? username
+  }
+
+  /// The one link this person can hand to anyone: `vibegram.io/<username>`.
+  var shareLink: String? {
+    serverShareLink?.nilIfBlank ?? VibeShareLinks.profileURL(username: username)
+  }
+
+  /// Same link without the scheme, for display.
+  var shareLinkDisplay: String? {
+    VibeShareLinks.display(shareLink)
   }
 
   var subtitle: String {
@@ -413,7 +426,8 @@ struct AppUserProfile: Equatable {
     privacyBio: AppPrivacyChoice = .everybody,
     privacyGifts: AppPrivacyChoice = .everybody,
     privacyBirthday: AppPrivacyChoice = .everybody,
-    privacySavedMusic: AppPrivacyChoice = .everybody
+    privacySavedMusic: AppPrivacyChoice = .everybody,
+    serverShareLink: String? = nil
   ) {
     let resolvedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
     let resolvedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -438,6 +452,7 @@ struct AppUserProfile: Equatable {
     self.privacyGifts = privacyGifts
     self.privacyBirthday = privacyBirthday
     self.privacySavedMusic = privacySavedMusic
+    self.serverShareLink = serverShareLink?.nilIfBlank
   }
 
   init?(payload: [String: Any], fallbackConfig: AppSessionConfig? = nil) {
@@ -482,7 +497,8 @@ struct AppUserProfile: Equatable {
       privacyBirthday: Self.normalizedPrivacyChoice(payload["privacyBirthday"])
         ?? Self.normalizedPrivacyChoice(fallbackConfig?.privacyBirthday) ?? .everybody,
       privacySavedMusic: Self.normalizedPrivacyChoice(payload["privacySavedMusic"])
-        ?? Self.normalizedPrivacyChoice(fallbackConfig?.privacySavedMusic) ?? .everybody
+        ?? Self.normalizedPrivacyChoice(fallbackConfig?.privacySavedMusic) ?? .everybody,
+      serverShareLink: Self.normalizedString(payload["shareLink"] ?? payload["share_link"])
     ) else {
       return nil
     }

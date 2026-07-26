@@ -282,6 +282,22 @@ defmodule Vibe.AI.AgentBuilder do
           }
         }
       }
+    },
+    %{
+      name: "check_agent_username",
+      description:
+        "Check whether a public @username is free, and get clean alternatives when it is taken. Call this before create_agent (and before renaming a draft's username): the username becomes the agent's permanent public link, and taken names are refused rather than auto-suffixed.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          username: %{type: "string", description: "Candidate username without @."},
+          display_name: %{
+            type: "string",
+            description: "Optional name to derive suggestions from when the candidate is taken."
+          }
+        },
+        required: ["username"]
+      }
     }
   ]
 
@@ -576,19 +592,70 @@ defmodule Vibe.AI.AgentBuilder do
 
     case Agents.create_agent(user_id, attrs) do
       {:ok, agent, secret} ->
+        username = agent.agent_user && agent.agent_user.username
+
         result = %{
           "ok" => true,
           "message" => "Agent draft created.",
           "agent" => builder_agent_context(agent, secret),
+          "public_link" => Vibe.Links.agent_url(username),
           "_ui_group_id" => "builder:agent:#{agent.id}",
           "_ui_cards" => [agent_card_payload(agent, secret, "config")]
         }
 
         {result, %{state | active_agent_id: agent.id, latest_secret: secret}}
 
+      {:error, reason} when reason in [:username_taken, :reserved_username, :invalid_username] ->
+        # Usernames are never auto-suffixed (the handle IS the agent's public link), so a
+        # clash comes back here for the owner to resolve — with real alternatives.
+        {%{
+           "ok" => false,
+           "error" => format_reason(reason),
+           "suggestions" =>
+             Agents.suggest_usernames(
+               Map.get(input, "display_name") || Map.get(input, "username") || "agent"
+             ),
+           "next_step" =>
+             "Ask the owner which @username they want, confirm it with check_agent_username, " <>
+               "then call create_agent again. Never add random characters to force it through."
+         }, state}
+
       {:error, reason} ->
         {%{"ok" => false, "error" => format_reason(reason)}, state}
     end
+  end
+
+  defp execute_builder_tool("check_agent_username", input, state) do
+    candidate =
+      (Map.get(input, "username") || "")
+      |> to_string()
+      |> String.trim()
+      |> String.trim_leading("@")
+
+    display_name = Map.get(input, "display_name") || candidate
+
+    result =
+      case Agents.username_availability(candidate, nil) do
+        {:ok, normalized} ->
+          %{
+            "ok" => true,
+            "available" => true,
+            "username" => normalized,
+            "public_link" => Vibe.Links.agent_url(normalized)
+          }
+
+        {:error, reason} ->
+          %{
+            "ok" => true,
+            "available" => false,
+            "username" => candidate,
+            "reason" => to_string(reason),
+            "error" => format_reason(reason),
+            "suggestions" => Agents.suggest_usernames(display_name)
+          }
+      end
+
+    {result, state}
   end
 
   defp execute_builder_tool("select_agent", input, state) do
@@ -931,9 +998,11 @@ defmodule Vibe.AI.AgentBuilder do
     - If the live lookup returns the same chat id again, say that explicitly and explain why: Vibe may reuse the same real DM or current default destination, so the correct current id can remain unchanged.
     - When you are not sure about current state, look it up and analyze tool results before you respond. Do not guess, recycle stale ids, or paraphrase uncertain setup details.
     - For setup and integration requests, ask only for true blockers. Treat these as blockers: whether to create a new agent or use an existing one when that is ambiguous, destination chat selection when the user wants delivery inside Vibe and there is no default attached chat, and secret rotation when the current full secret is unavailable.
-    - Do NOT ask for low-value polish when the workflow is already clear. Do not ask for channel name, display name, username, event labels, tone, welcome copy, or message formatting unless the user explicitly asked to customize them or that choice changes functionality.
+    - Do NOT ask for low-value polish when the workflow is already clear. Do not ask for channel name, display name, event labels, tone, welcome copy, or message formatting unless the user explicitly asked to customize them or that choice changes functionality. Username is the exception: ask for it whenever the derived handle is taken, or whenever the user cares which link they get.
     - If the user clearly asked to create a new agent and the workflow is already described, create the draft with sensible defaults immediately. Infer a practical display name from the workflow instead of blocking on naming questions.
     - When the user gives a preferred agent name, says the generated name is bad, or asks to rename the agent, always pass display_name explicitly to create_agent or update_agent instead of leaving the old default in place.
+    - USERNAMES ARE PUBLIC IDENTITY. The @username becomes the agent's permanent public link (public_link, e.g. vibegram.io/newsroom), so it is derived from the name the user chose — never suffixed with random characters to force it through. If create_agent comes back with username_taken/invalid, tell the user their handle is unavailable, offer the returned `suggestions`, and retry with the one they pick. Use check_agent_username when the user proposes a handle or asks whether one is free.
+    - After creating or renaming an agent, tell the user its @username AND its public_link, exactly as the tool returned them. That link is how they share the agent with anyone; never invent, shorten, or retype it.
     - If the user asks for env vars, integration details, or Python/backend setup, always produce a clean integration pack after using tools. Prefer integration_pack_text, env_export_lines, env_vars, and python_event_example from tool results instead of improvising your own shape.
     - When the user wants custom website/app/backend behavior, secure default is code-side customization. Offer the code/env setup path first so the user can control prompts, actions, and backend behavior in their own app instead of asking you to mutate tools or hidden server state.
     - For connected-app requests, ask one concise question only when needed: whether they want the code pack/custom endpoint route, or whether they want you to apply normal agent defaults immediately. If they already asked for code or customization, skip the question and provide the code-oriented setup directly.
@@ -958,6 +1027,9 @@ defmodule Vibe.AI.AgentBuilder do
 
   defp builder_tool_progress_label("create_agent", _input),
     do: "Creating draft…"
+
+  defp builder_tool_progress_label("check_agent_username", _input),
+    do: "Checking that name…"
 
   defp builder_tool_progress_label("select_agent", _input),
     do: "Opening agent…"
@@ -1203,6 +1275,9 @@ defmodule Vibe.AI.AgentBuilder do
       "prompt_status" => prompt_status_line(agent),
       "open_link" => default_chat && default_chat["open_link"],
       "agent_dm_link" => build_agent_dm_link(payload.userId),
+      # The public https link an owner can hand to anyone (agent_dm_link only opens the
+      # app for someone who already has it).
+      "public_link" => payload.publicLink,
       "builder_link" => @builder_deep_link,
       "integration" => integration_payload(agent, latest_secret)
     }

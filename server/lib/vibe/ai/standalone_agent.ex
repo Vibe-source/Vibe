@@ -42,7 +42,8 @@ defmodule Vibe.AI.StandaloneAgent do
           normalize_string(params["agentTurnId"] || params["agent_turn_id"]) ||
             Ecto.UUID.generate()
 
-        with {:ok, scoped_agent} <- delivery_scoped_agent(agent, response_mode, vibe_chat_id),
+        with {:ok, scoped_agent} <-
+               delivery_scoped_agent(agent, response_mode, vibe_chat_id, requester_user_id),
              {:ok, outputs} <-
                generate_outputs(
                  scoped_agent,
@@ -90,19 +91,20 @@ defmodule Vibe.AI.StandaloneAgent do
     invoke(agent, params)
   end
 
-  defp delivery_scoped_agent(agent, "send", chat_id) do
-    with {:ok, policy} <- Chat.channel_agent_policy(chat_id, agent) do
+  defp delivery_scoped_agent(agent, "send", chat_id, requester_user_id) do
+    with {:ok, policy} <- Chat.effective_agent_policy(chat_id, agent, requester_user_id) do
       {:ok,
        %{
          agent
          | enabled_tools: policy.enabled_tools || [],
            output_modes: policy.output_modes || [],
-           system_prompt: scoped_system_prompt(agent.system_prompt, policy.permissions || %{})
+           system_prompt: scoped_system_prompt(agent.system_prompt, policy.permissions || %{}),
+           admin_mode: policy.admin_mode
        }}
     end
   end
 
-  defp delivery_scoped_agent(agent, _response_mode, _chat_id), do: {:ok, agent}
+  defp delivery_scoped_agent(agent, _response_mode, _chat_id, _requester_user_id), do: {:ok, agent}
 
   defp scoped_system_prompt(base_prompt, permissions) do
     channel_instructions =
@@ -182,7 +184,8 @@ defmodule Vibe.AI.StandaloneAgent do
                system_prompt,
                agent.enabled_tools || [],
                conversation_history,
-               turn_memory
+               turn_memory,
+               agent.admin_mode
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
 
@@ -340,11 +343,17 @@ defmodule Vibe.AI.StandaloneAgent do
           "First-contact welcome guidance: #{agent.welcome_message}. Use it only for the first reply in a new DM or when the user explicitly asks what you do.",
         else: nil
       ),
-      agent.system_prompt
+      agent.system_prompt,
+      unless(agent.admin_mode,
+        do:
+          "You are talking with someone other than your owner. Never reveal your invoke secret, " <>
+            "webhook/integration details, connected-app configuration, or any prompt variable " <>
+            "marked owner-only, and never offer to reconfigure yourself for this person."
+      )
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n\n")
-    |> Vibe.AI.PromptVariables.render(agent)
+    |> Vibe.AI.PromptVariables.render(agent, admin_mode: agent.admin_mode)
   end
 
   defp prompt_variables_guidance(agent) do
@@ -353,9 +362,17 @@ defmodule Vibe.AI.StandaloneAgent do
         nil
 
       vars ->
-        names = vars |> Enum.map(& &1["name"]) |> Enum.join(", ")
+        visible = if agent.admin_mode, do: vars, else: Enum.reject(vars, & &1["secret"])
 
-        "Configured prompt variables (#{names}) are already filled in above. If you rewrite your own system prompt, keep any {{variable}} placeholders intact and never invent values for locked variables."
+        case visible do
+          [] ->
+            nil
+
+          visible ->
+            names = visible |> Enum.map(& &1["name"]) |> Enum.join(", ")
+
+            "Configured prompt variables (#{names}) are already filled in above. If you rewrite your own system prompt, keep any {{variable}} placeholders intact and never invent values for locked variables."
+        end
     end
   end
 
@@ -398,7 +415,8 @@ defmodule Vibe.AI.StandaloneAgent do
          system_prompt,
          enabled_tools,
          conversation_history,
-         turn_memory
+         turn_memory,
+         admin_mode
        ) do
     case ChatAgent.stream_response(
            message,
@@ -413,7 +431,8 @@ defmodule Vibe.AI.StandaloneAgent do
            model_provider: model_provider,
            model_id: model_id,
            system_prompt: system_prompt,
-           enabled_tools: enabled_tools
+           enabled_tools: enabled_tools,
+           admin_mode: admin_mode
          ) do
       {:ok, final_text} ->
         {:ok, final_text}

@@ -25,6 +25,8 @@ struct ChatAgentModelInfo: Identifiable, Equatable {
     let description: String
     let tier: String
     let recommended: Bool
+    let thinkingLevels: [String]
+    let defaultThinkingLevel: String
 }
 
 struct ChatAgentModelProviderInfo: Identifiable, Equatable {
@@ -50,6 +52,17 @@ struct ChatAgentModelRegistry: Equatable {
         }
     }
 
+    func selection(modelId: String) -> (provider: ChatAgentModelProviderInfo, model: ChatAgentModelInfo)? {
+        for provider in providers {
+            if let model = provider.models.first(where: {
+                $0.id.caseInsensitiveCompare(modelId) == .orderedSame
+            }) {
+                return (provider, model)
+            }
+        }
+        return nil
+    }
+
     static let fallback = ChatAgentModelRegistry(
         defaultProvider: "anthropic",
         defaultModelId: "claude-sonnet-5",
@@ -64,25 +77,33 @@ struct ChatAgentModelRegistry: Equatable {
                         name: "Fable 5",
                         description: "Deep reasoning for complex decisions.",
                         tier: "frontier",
-                        recommended: false),
+                        recommended: false,
+                        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+                        defaultThinkingLevel: "medium"),
                     ChatAgentModelInfo(
                         id: "claude-opus-4-8",
                         name: "Opus 4.8",
                         description: "Maximum capability for demanding work.",
                         tier: "frontier",
-                        recommended: false),
+                        recommended: false,
+                        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+                        defaultThinkingLevel: "medium"),
                     ChatAgentModelInfo(
                         id: "claude-sonnet-5",
                         name: "Sonnet 5",
                         description: "Fast, capable, and recommended for most agents.",
                         tier: "balanced",
-                        recommended: true),
+                        recommended: true,
+                        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+                        defaultThinkingLevel: "medium"),
                     ChatAgentModelInfo(
                         id: "claude-haiku-4-5-20251001",
                         name: "Haiku 4.5",
                         description: "Quick responses for lightweight tasks.",
                         tier: "fast",
-                        recommended: false),
+                        recommended: false,
+                        thinkingLevels: ["medium"],
+                        defaultThinkingLevel: "medium"),
                 ]),
             ChatAgentModelProviderInfo(
                 id: "openai",
@@ -94,19 +115,25 @@ struct ChatAgentModelRegistry: Equatable {
                         name: "GPT-5.6 Sol",
                         description: "Maximum capability for demanding work.",
                         tier: "frontier",
-                        recommended: false),
+                        recommended: false,
+                        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+                        defaultThinkingLevel: "medium"),
                     ChatAgentModelInfo(
                         id: "gpt-5.6-terra",
                         name: "GPT-5.6 Terra",
                         description: "A strong balance of speed and capability.",
                         tier: "balanced",
-                        recommended: true),
+                        recommended: true,
+                        thinkingLevels: ["low", "medium", "high", "xhigh"],
+                        defaultThinkingLevel: "medium"),
                     ChatAgentModelInfo(
                         id: "gpt-5.6-luna",
                         name: "GPT-5.6 Luna",
                         description: "Fast and efficient for everyday tasks.",
                         tier: "fast",
-                        recommended: false),
+                        recommended: false,
+                        thinkingLevels: ["low", "medium", "high"],
+                        defaultThinkingLevel: "medium"),
                 ]),
         ],
         isFallback: true
@@ -169,12 +196,34 @@ enum ChatAgentModelRegistryService {
             }
             let models: [ChatAgentModelInfo] = rawModels.compactMap { rawModel in
                 guard let modelId = normalizedString(rawModel["id"]) else { return nil }
+                let fallbackModel = ChatAgentModelRegistry.fallback.selection(modelId: modelId)?.model
+                let rawThinkingLevels =
+                    normalizedStringList(
+                        rawModel["thinkingLevels"] ?? rawModel["thinking_levels"])
+                    ?? fallbackModel?.thinkingLevels
+                    ?? ["medium"]
+                let thinkingLevels = normalizedThinkingLevels(rawThinkingLevels)
+                let requestedDefault =
+                    normalizedString(
+                        rawModel["defaultThinkingLevel"]
+                            ?? rawModel["default_thinking_level"])
+                    ?? fallbackModel?.defaultThinkingLevel
+                    ?? "medium"
+                let defaultThinkingLevel =
+                    thinkingLevels.first(where: {
+                        $0.caseInsensitiveCompare(requestedDefault) == .orderedSame
+                    })
+                    ?? thinkingLevels.first(where: { $0 == "medium" })
+                    ?? thinkingLevels.first
+                    ?? "medium"
                 return ChatAgentModelInfo(
                     id: modelId,
                     name: normalizedString(rawModel["name"]) ?? modelId,
                     description: normalizedString(rawModel["description"]) ?? "",
                     tier: normalizedString(rawModel["tier"]) ?? "",
-                    recommended: boolean(rawModel["recommended"]) ?? false
+                    recommended: boolean(rawModel["recommended"]) ?? false,
+                    thinkingLevels: thinkingLevels.isEmpty ? ["medium"] : thinkingLevels,
+                    defaultThinkingLevel: defaultThinkingLevel
                 )
             }
             let providerName: String
@@ -221,6 +270,21 @@ enum ChatAgentModelRegistryService {
         }
         return nil
     }
+
+    private static func normalizedStringList(_ raw: Any?) -> [String]? {
+        guard let values = raw as? [Any] else { return nil }
+        return values.compactMap { normalizedString($0) }
+    }
+
+    private static func normalizedThinkingLevels(_ values: [String]) -> [String] {
+        let accepted = Set(["low", "medium", "high", "xhigh", "max"])
+        var seen = Set<String>()
+        return values.compactMap { raw in
+            let level = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard accepted.contains(level), seen.insert(level).inserted else { return nil }
+            return level
+        }
+    }
 }
 
 class ChatAgentConfigViewModel: ObservableObject {
@@ -254,16 +318,59 @@ class ChatAgentConfigViewModel: ObservableObject {
     /// Persist one exact provider/model pair.
     var onSaveModelSelection: ((String, String, @escaping (Bool) -> Void) -> Void)?
 
+    /// Whether the current session's `card.latestSecret` (a just-minted invoke secret) is
+    /// shown in the clear right now. Resets to false whenever the view is torn down —
+    /// there is no way to re-reveal it after that, by design (hashed at rest server-side).
+    @Published var isInvokeSecretRevealed = false
+    @Published var isRotatingInvokeSecret = false
+    /// Mints a new invoke secret (`POST /agents/:id/rotate_secret`). Completion carries
+    /// (success, freshSecret, freshSecretHint).
+    var onRotateInvokeSecret: ((@escaping (Bool, String?, String?) -> Void) -> Void)?
+
+    /// Webhook signing secret state — a DIFFERENT, reversibly-stored secret (verifies
+    /// inbound webhook signatures) that can be fetched again anytime, unlike the
+    /// hashed-at-rest invoke secret above.
+    @Published var webhookSecret: String?
+    @Published var webhookSecretHint: String?
+    @Published var isWebhookSecretRevealed = false
+    @Published var isLoadingWebhookSecret = false
+    /// Fetches the webhook signing secret (`GET /agents/:id/secret`).
+    var onLoadWebhookSecret: ((@escaping (String?, String?) -> Void) -> Void)?
+
     init(card: ChatListRow.AgentCard) {
         self.card = card
     }
 }
 
+/// A Settings-app-style row label: a colored icon tile followed by a title. Gives the
+/// Configuration list instant visual scannability instead of a column of plain text rows.
+private struct ChatAgentSettingsRowLabel: View {
+    let icon: String
+    let tint: Color
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(tint.gradient)
+                .frame(width: 28, height: 28)
+                .overlay {
+                    Image(systemName: icon)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white)
+                }
+            Text(title)
+        }
+    }
+}
+
 struct ChatAgentSettingsView: View {
     @ObservedObject var viewModel: ChatAgentConfigViewModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var draftName: String = ""
     @State private var isSavingName = false
     @State private var didLoadModelRegistry = false
+    @State private var showRotateInvokeSecretConfirm = false
 
     private var promptSummary: String {
         let prompt = (viewModel.card.systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -295,16 +402,19 @@ struct ChatAgentSettingsView: View {
 
     var body: some View {
         Form {
-            // Profile / avatar — tappable to change the agent's photo.
+            // Profile / avatar — a single tappable affordance (the camera badge) instead
+            // of a duplicate "Change Photo" button doing the same thing underneath it.
             Section {
                 HStack {
                     Spacer()
                     Button(action: { viewModel.onPickAvatar?() }) {
-                        ChatAgentAvatarView(
+                        ChatAgentGlobalAvatarView(
                             avatarUrl: viewModel.card.avatarUrl,
                             displayName: viewModel.card.displayName,
+                            peerUserId: viewModel.card.agentUserId,
                             size: 88
                         )
+                        .frame(width: 88, height: 88)
                         .overlay(alignment: .bottomTrailing) {
                             Image(systemName: "camera.fill")
                                 .font(.system(size: 13, weight: .semibold))
@@ -320,9 +430,6 @@ struct ChatAgentSettingsView: View {
                 }
                 .padding(.vertical, 8)
                 .listRowBackground(Color.clear)
-
-                Button("Change Photo") { viewModel.onPickAvatar?() }
-                    .frame(maxWidth: .infinity, alignment: .center)
             } header: {
                 Text("Profile")
             }
@@ -361,9 +468,37 @@ struct ChatAgentSettingsView: View {
             }
 
             Section {
+                ChatNativeAgentSecretCardRepresentable(
+                    secret: viewModel.card.latestSecret,
+                    hint: viewModel.card.secretHint,
+                    isLoading: viewModel.isRotatingInvokeSecret,
+                    isRevealed: viewModel.isInvokeSecretRevealed,
+                    canReveal: viewModel.card.latestSecret != nil,
+                    isDark: colorScheme == .dark,
+                    onReveal: { viewModel.isInvokeSecretRevealed.toggle() },
+                    onCopy: {
+                        guard let secret = viewModel.card.latestSecret else { return }
+                        viewModel.onCopy?(secret)
+                    },
+                    onRotate: { showRotateInvokeSecretConfirm = true }
+                )
+                .frame(minHeight: 190)
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            } header: {
+                Text("Invoke Secret")
+            } footer: {
+                Text(
+                    viewModel.card.latestSecret != nil
+                        ? "Shown once — copy it now. It cannot be viewed again after you leave this screen."
+                        : "For security this can only be viewed right after it's created or rotated. Rotate to generate a new one."
+                )
+            }
+
+            Section {
                 NavigationLink(destination: ChatAgentModelPickerView(viewModel: viewModel)) {
                     HStack {
-                        Text("Model")
+                        ChatAgentSettingsRowLabel(icon: "cpu", tint: .purple, title: "Model")
                         Spacer()
                         Text(modelSummary)
                             .foregroundColor(.secondary)
@@ -373,7 +508,7 @@ struct ChatAgentSettingsView: View {
 
                 NavigationLink(destination: ChatAgentPromptView(viewModel: viewModel)) {
                     HStack {
-                        Text("System Prompt")
+                        ChatAgentSettingsRowLabel(icon: "text.alignleft", tint: .blue, title: "System Prompt")
                         Spacer()
                         Text(promptSummary)
                             .foregroundColor(.secondary)
@@ -384,7 +519,7 @@ struct ChatAgentSettingsView: View {
 
                 NavigationLink(destination: ChatAgentToolsView(viewModel: viewModel)) {
                     HStack {
-                        Text("Tools")
+                        ChatAgentSettingsRowLabel(icon: "wrench.and.screwdriver.fill", tint: .orange, title: "Tools")
                         Spacer()
                         Text(toolsSummary)
                             .foregroundColor(.secondary)
@@ -392,12 +527,18 @@ struct ChatAgentSettingsView: View {
                 }
 
                 NavigationLink(destination: ChatAgentPromptVariablesView(viewModel: viewModel)) {
-                    Text("Prompt Variables")
+                    ChatAgentSettingsRowLabel(icon: "curlybraces", tint: .teal, title: "Prompt Variables")
                 }
 
-                NavigationLink("Integration & Delivery", destination: ChatAgentIntegrationView(viewModel: viewModel))
-                NavigationLink("Output Controls", destination: ChatAgentOutputSettingsView(viewModel: viewModel))
-                NavigationLink("Voice Settings", destination: ChatAgentVoiceSettingsView(viewModel: viewModel))
+                NavigationLink(destination: ChatAgentIntegrationView(viewModel: viewModel)) {
+                    ChatAgentSettingsRowLabel(icon: "bolt.horizontal.circle.fill", tint: .indigo, title: "Integration & Delivery")
+                }
+                NavigationLink(destination: ChatAgentOutputSettingsView(viewModel: viewModel)) {
+                    ChatAgentSettingsRowLabel(icon: "slider.horizontal.3", tint: .pink, title: "Output Controls")
+                }
+                NavigationLink(destination: ChatAgentVoiceSettingsView(viewModel: viewModel)) {
+                    ChatAgentSettingsRowLabel(icon: "waveform", tint: .green, title: "Voice Settings")
+                }
             } header: {
                 Text("Configuration")
             }
@@ -414,6 +555,20 @@ struct ChatAgentSettingsView: View {
             if !isSavingName {
                 draftName = newCard.displayName
             }
+        }
+        .alert("Rotate invoke secret?", isPresented: $showRotateInvokeSecretConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Rotate", role: .destructive) {
+                viewModel.isRotatingInvokeSecret = true
+                viewModel.onRotateInvokeSecret? { success, _, _ in
+                    viewModel.isRotatingInvokeSecret = false
+                    if success {
+                        viewModel.isInvokeSecretRevealed = true
+                    }
+                }
+            }
+        } message: {
+            Text("The current secret stops working immediately. Anything invoking this agent with it will need the new one.")
         }
     }
 
@@ -437,79 +592,82 @@ struct ChatAgentModelPickerView: View {
         ChatProviderModelPickerView(
             registry: viewModel.modelRegistry,
             currentProviderId: viewModel.card.modelProvider ?? "anthropic",
-            currentModelId: viewModel.card.modelId ?? "claude-haiku-4-5-20251001"
-        ) { providerId, modelId, completion in
+            currentModelId: viewModel.card.modelId ?? "claude-haiku-4-5-20251001",
+            currentThinkingLevel: nil
+        ) { providerId, modelId, _, completion in
+            // Standalone-agent persistence currently stores the provider/model pair.
+            // The reusable picker still resolves thinking locally without inventing
+            // a separate backend update contract here.
             viewModel.onSaveModelSelection?(providerId, modelId, completion)
         }
     }
 }
 
-/// Reusable server-registry-backed provider/model picker. Standalone agent
-/// settings supply a server save closure; built-in VibeAgent supplies a local
-/// selection closure while using the exact same catalog and validation UI.
+/// Reusable server-registry-backed model/thinking picker. Provider is inferred
+/// from the selected model and returned only as persistence/runtime metadata.
 struct ChatProviderModelPickerView: View {
     let registry: ChatAgentModelRegistry
     let currentProviderId: String
     let currentModelId: String
-    let onSave: (String, String, @escaping (Bool) -> Void) -> Void
+    let currentThinkingLevel: String?
+    let onSave: (String, String, String, @escaping (Bool) -> Void) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var selectedProviderId = ""
     @State private var selectedModelId = ""
+    @State private var selectedThinkingLevel = ""
     @State private var isSaving = false
 
     private var selectedProvider: ChatAgentModelProviderInfo? {
         registry.provider(id: selectedProviderId)
     }
 
-    private var selectedPairIsValid: Bool {
-        guard let provider = selectedProvider, provider.available else { return false }
-        return provider.models.contains { $0.id == selectedModelId }
+    private var selectedModel: ChatAgentModelInfo? {
+        registry.model(providerId: selectedProviderId, modelId: selectedModelId)
+    }
+
+    private var selectedCombinationIsValid: Bool {
+        guard
+            let provider = selectedProvider,
+            provider.available,
+            let model = selectedModel
+        else {
+            return false
+        }
+        return model.thinkingLevels.contains(selectedThinkingLevel)
     }
 
     private var isDirty: Bool {
-        selectedProviderId != currentProviderId || selectedModelId != currentModelId
+        selectedProviderId.caseInsensitiveCompare(currentProviderId) != .orderedSame
+            || selectedModelId.caseInsensitiveCompare(currentModelId) != .orderedSame
+            || selectedThinkingLevel.caseInsensitiveCompare(resolvedCurrentThinkingLevel)
+                != .orderedSame
+    }
+
+    private var resolvedCurrentThinkingLevel: String {
+        let model =
+            registry.model(providerId: currentProviderId, modelId: currentModelId)
+            ?? ChatAgentModelRegistry.fallback.model(
+                providerId: currentProviderId,
+                modelId: currentModelId)
+        guard let model else { return currentThinkingLevel ?? "medium" }
+        if let currentThinkingLevel,
+            let supported = model.thinkingLevels.first(where: {
+                $0.caseInsensitiveCompare(currentThinkingLevel) == .orderedSame
+            })
+        {
+            return supported
+        }
+        return model.defaultThinkingLevel
     }
 
     var body: some View {
         Form {
             Section {
                 ForEach(registry.providers) { provider in
-                    Button {
-                        selectProvider(provider)
-                    } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 12) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(provider.name)
-                                    .foregroundColor(provider.available ? .primary : .secondary)
-                                if !provider.available {
-                                    Text("Unavailable — this provider is not configured.")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                            Spacer()
-                            if selectedProviderId == provider.id {
-                                Image(systemName: "checkmark")
-                                    .font(.body.weight(.semibold))
-                            }
-                        }
-                    }
-                    .disabled(!provider.available)
-                }
-            } header: {
-                Text("Provider")
-            } footer: {
-                if registry.isFallback {
-                    Text("Showing the built-in catalog while the live registry is unavailable. The server validates every selection.")
-                }
-            }
-
-            Section {
-                if let provider = selectedProvider {
                     ForEach(provider.models) { model in
                         Button {
-                            selectedModelId = model.id
+                            selectModel(model, from: provider)
                         } label: {
                             HStack(alignment: .center, spacing: 12) {
                                 VStack(alignment: .leading, spacing: 3) {
@@ -522,13 +680,18 @@ struct ChatProviderModelPickerView: View {
                                                 .foregroundColor(.accentColor)
                                         }
                                     }
-                                    Text(model.description)
+                                    Text(
+                                        provider.available
+                                            ? model.description
+                                            : "Unavailable")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                         .multilineTextAlignment(.leading)
                                 }
                                 Spacer()
-                                if selectedModelId == model.id {
+                                if selectedProviderId == provider.id
+                                    && selectedModelId == model.id
+                                {
                                     Image(systemName: "checkmark")
                                         .font(.body.weight(.semibold))
                                 }
@@ -536,23 +699,54 @@ struct ChatProviderModelPickerView: View {
                         }
                         .disabled(!provider.available)
                     }
-                } else {
-                    Text("Select an available provider first.")
-                        .foregroundColor(.secondary)
                 }
             } header: {
                 Text("Model")
+            } footer: {
+                if registry.isFallback {
+                    Text("Showing the built-in catalog while the live registry is unavailable. The server validates every selection.")
+                }
+            }
+
+            Section {
+                if let model = selectedModel {
+                    ForEach(model.thinkingLevels, id: \.self) { level in
+                        Button {
+                            selectedThinkingLevel = level
+                        } label: {
+                            HStack {
+                                Text(thinkingLevelTitle(level))
+                                    .foregroundColor(.primary)
+                                Spacer()
+                                if selectedThinkingLevel == level {
+                                    Image(systemName: "checkmark")
+                                        .font(.body.weight(.semibold))
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text("Select an available model first.")
+                        .foregroundColor(.secondary)
+                }
+            } header: {
+                Text("Thinking")
+            } footer: {
+                Text("Higher levels spend more time reasoning before answering.")
             }
         }
         .navigationTitle("Model")
         .navigationBarTitleDisplayMode(.inline)
+        .scrollContentBackground(.hidden)
+        .background(Color.clear)
+        .presentationBackground(.ultraThinMaterial)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 if isSaving {
                     ProgressView().controlSize(.small)
                 } else {
                     Button("Save") { saveSelection() }
-                        .disabled(!isDirty || !selectedPairIsValid)
+                        .disabled(!isDirty || !selectedCombinationIsValid)
                 }
             }
         }
@@ -565,16 +759,19 @@ struct ChatProviderModelPickerView: View {
     }
 
     private func resolveSelection() {
-        if let currentProvider = registry.provider(id: currentProviderId) {
+        if let currentProvider = registry.provider(id: currentProviderId),
+            let currentModel = registry.model(
+                providerId: currentProvider.id,
+                modelId: currentModelId)
+        {
             selectedProviderId = currentProvider.id
-            if currentProvider.models.contains(where: { $0.id == currentModelId }) {
-                selectedModelId = currentModelId
-            } else {
-                selectedModelId =
-                    currentProvider.models.first(where: \.recommended)?.id
-                    ?? currentProvider.models.first?.id
-                    ?? ""
-            }
+            selectedModelId = currentModel.id
+            selectedThinkingLevel =
+                currentModel.thinkingLevels.first(where: {
+                    guard let currentThinkingLevel else { return false }
+                    return $0.caseInsensitiveCompare(currentThinkingLevel) == .orderedSame
+                })
+                ?? currentModel.defaultThinkingLevel
             return
         }
 
@@ -586,105 +783,99 @@ struct ChatProviderModelPickerView: View {
         else {
             selectedProviderId = ""
             selectedModelId = ""
+            selectedThinkingLevel = ""
             return
         }
-        selectProvider(fallbackProvider)
+        guard
+            let fallbackModel =
+                registry.model(
+                    providerId: fallbackProvider.id,
+                    modelId: registry.defaultModelId)
+                ?? fallbackProvider.models.first(where: \.recommended)
+                ?? fallbackProvider.models.first
+        else {
+            selectedProviderId = fallbackProvider.id
+            selectedModelId = ""
+            selectedThinkingLevel = ""
+            return
+        }
+        selectModel(fallbackModel, from: fallbackProvider)
     }
 
-    private func selectProvider(_ provider: ChatAgentModelProviderInfo) {
+    private func selectModel(
+        _ model: ChatAgentModelInfo,
+        from provider: ChatAgentModelProviderInfo
+    ) {
         guard provider.available else { return }
+        let previousThinkingLevel = selectedThinkingLevel
         selectedProviderId = provider.id
-        if provider.id == currentProviderId,
-            provider.models.contains(where: { $0.id == currentModelId })
-        {
-            selectedModelId = currentModelId
-        } else {
-            selectedModelId =
-                provider.models.first(where: \.recommended)?.id
-                ?? provider.models.first?.id
-                ?? ""
-        }
+        selectedModelId = model.id
+        selectedThinkingLevel =
+            model.thinkingLevels.first(where: {
+                $0.caseInsensitiveCompare(previousThinkingLevel) == .orderedSame
+            })
+            ?? model.defaultThinkingLevel
     }
 
     private func saveSelection() {
-        guard selectedPairIsValid, !isSaving else { return }
+        guard selectedCombinationIsValid, !isSaving else { return }
         isSaving = true
-        onSave(selectedProviderId, selectedModelId) { success in
+        onSave(selectedProviderId, selectedModelId, selectedThinkingLevel) { success in
             isSaving = false
             if success {
                 dismiss()
             }
         }
     }
+
+    private func thinkingLevelTitle(_ level: String) -> String {
+        switch level.lowercased() {
+        case "low": return "Low"
+        case "medium": return "Medium"
+        case "high": return "High"
+        case "xhigh": return "Extra High"
+        case "max": return "Max"
+        default: return level.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
 }
 
 /// Circular agent avatar: remote image when available, gradient initial otherwise.
-struct ChatAgentAvatarView: View {
+/// Bridges the SAME global avatar component the Chats home list and the Agents list use
+/// (`ChatAvatarNodeView` — real photo, real per-identity gradient fallback, real image
+/// cache) into SwiftUI, so an agent's avatar looks identical everywhere it appears instead
+/// of this screen inventing its own one-off placeholder style.
+struct ChatAgentGlobalAvatarView: UIViewRepresentable {
     let avatarUrl: String?
     let displayName: String
+    let peerUserId: String?
     var size: CGFloat = 44
+    @Environment(\.colorScheme) private var colorScheme
 
-    private var initial: String {
-        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "?" : String(trimmed.prefix(1)).uppercased()
+    func makeUIView(context: Context) -> ChatAvatarNodeView {
+        ChatAvatarNodeView()
     }
 
-    @State private var image: UIImage?
-    @State private var loadedUrl: String?
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                placeholder
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-        .onAppear { loadInitial() }
-        .onChange(of: avatarUrl) { _ in
-            Task { await loadImage() }
-        }
+    func updateUIView(_ uiView: ChatAvatarNodeView, context: Context) {
+        uiView.configure(
+            with: ChatAvatarDescriptor(
+                title: displayName,
+                rawAvatarURI: avatarUrl,
+                peerUserId: peerUserId,
+                chatId: nil,
+                kind: .standard,
+                isGroup: false,
+                members: [],
+                preferPushAvatar: false,
+                gradientColors: nil
+            ),
+            isDark: colorScheme == .dark,
+            renderingSide: size
+        )
     }
 
-    private func loadInitial() {
-        if let avatarUrl, let cached = ChatAvatarImageStore.cached(for: avatarUrl) {
-            image = cached
-            loadedUrl = avatarUrl
-        } else {
-            Task { await loadImage() }
-        }
-    }
-
-    @MainActor
-    private func loadImage() async {
-        guard let url = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else {
-            image = nil
-            loadedUrl = nil
-            return
-        }
-        if let fetched = await ChatAvatarImageStore.load(from: url) {
-            if loadedUrl != url {
-                image = fetched
-                loadedUrl = url
-            }
-        }
-    }
-
-    private var placeholder: some View {
-        ZStack {
-            LinearGradient(
-                colors: [Color.accentColor.opacity(0.85), Color.accentColor.opacity(0.45)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            Text(initial)
-                .font(.system(size: size * 0.42, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
-        }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: ChatAvatarNodeView, context: Context) -> CGSize? {
+        CGSize(width: size, height: size)
     }
 }
 
@@ -1095,10 +1286,51 @@ struct ChatAgentIntegrationView: View {
                     // Call backend later
                     viewModel.onToast?("Inbox mode set to \(newValue == "batched_summary" ? "Batched" : "Per Event")")
                 }
-                
+
                 Toggle("Accept Incoming Chat", isOn: $incomingChatEnabled)
             } header: {
                 Text("Settings")
+            }
+
+            Section {
+                HStack {
+                    Text("Webhook Signing Secret")
+                    Spacer()
+                    if viewModel.isLoadingWebhookSecret {
+                        ProgressView().controlSize(.small)
+                    } else if viewModel.isWebhookSecretRevealed, let secret = viewModel.webhookSecret {
+                        Text(secret)
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } else {
+                        Text(maskedWebhookSecret)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Button(action: toggleWebhookSecretRevealed) {
+                        Image(systemName: viewModel.isWebhookSecretRevealed ? "eye.slash.fill" : "eye.fill")
+                            .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.isLoadingWebhookSecret)
+
+                    if viewModel.isWebhookSecretRevealed, let secret = viewModel.webhookSecret {
+                        Button(action: {
+                            viewModel.onCopy?(secret)
+                            viewModel.onToast?("Copied webhook signing secret")
+                        }) {
+                            Image(systemName: "square.on.square")
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } header: {
+                Text("Webhook Signing Secret")
+            } footer: {
+                Text("Verifies inbound webhook signatures. This is separate from the invoke secret used to call your agent, and can be viewed anytime.")
             }
         }
         .navigationTitle("Integration & Delivery")
@@ -1108,7 +1340,35 @@ struct ChatAgentIntegrationView: View {
             incomingChatEnabled = viewModel.card.incomingChatEnabled
         }
     }
-    
+
+    private var maskedWebhookSecret: String {
+        let hint = viewModel.webhookSecretHint?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (hint?.isEmpty == false) ? "•••• \(hint!)" : "Tap to reveal"
+    }
+
+    private func toggleWebhookSecretRevealed() {
+        if viewModel.isWebhookSecretRevealed {
+            viewModel.isWebhookSecretRevealed = false
+            return
+        }
+        if viewModel.webhookSecret != nil {
+            viewModel.isWebhookSecretRevealed = true
+            return
+        }
+        viewModel.isLoadingWebhookSecret = true
+        viewModel.onLoadWebhookSecret? { secret, hint in
+            viewModel.isLoadingWebhookSecret = false
+            viewModel.webhookSecret = secret
+            if let hint {
+                viewModel.webhookSecretHint = hint
+            }
+            viewModel.isWebhookSecretRevealed = secret != nil
+            if secret == nil {
+                viewModel.onToast?("Could not load webhook secret")
+            }
+        }
+    }
+
     private func copyableRow(title: String, value: String?) -> some View {
         HStack {
             Text(title)

@@ -68,11 +68,62 @@ func chatStableCacheHash(_ value: String) -> String {
   return String(format: "%016llx", hash)
 }
 
+/// Durable on-disk root for chat media (NOT Caches — iOS purges Caches under pressure,
+/// which forced re-download after reopen for voice/music/images the user already had).
+func vibeDurableMediaCacheRoot() -> URL {
+  let fm = FileManager.default
+  let base =
+    fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    ?? fm.urls(for: .documentDirectory, in: .userDomainMask).first
+    ?? fm.temporaryDirectory
+  let root = base.appendingPathComponent("VibeMediaCache", isDirectory: true)
+  try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+  return root
+}
+
+/// Stable identity for remote media cache slots. Strips volatile query/fragment and
+/// collapses `/api/music/stream/<id>` to `musicstream:<id>` so reopen never MISS-es
+/// a file that was seeded/downloaded under a slightly different URL.
+func chatStableRemoteMediaIdentity(_ url: URL) -> String {
+  if let videoId = ChatMusicStreamResolver.videoId(fromBackendStreamURL: url) {
+    return "musicstream:\(videoId)"
+  }
+  var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+  comps?.query = nil
+  comps?.fragment = nil
+  let host = (comps?.host ?? "").lowercased()
+  let path = comps?.path ?? url.path
+  if !host.isEmpty {
+    return host + path
+  }
+  return comps?.string ?? url.absoluteString
+}
+
 private func chatMediaDiskCacheDir() -> URL {
-  let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-  let dir = caches.appendingPathComponent("chat-media-images", isDirectory: true)
+  let dir = vibeDurableMediaCacheRoot().appendingPathComponent("chat-media-images", isDirectory: true)
   try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+  // One-time migration from the purgeable Caches location (pre-fix installs).
+  migrateLegacyMediaCacheFolder(
+    named: "chat-media-images",
+    into: dir
+  )
   return dir
+}
+
+private func migrateLegacyMediaCacheFolder(named name: String, into destination: URL) {
+  let fm = FileManager.default
+  guard
+    let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first
+  else { return }
+  let legacy = caches.appendingPathComponent(name, isDirectory: true)
+  guard fm.fileExists(atPath: legacy.path) else { return }
+  guard let items = try? fm.contentsOfDirectory(atPath: legacy.path) else { return }
+  for item in items {
+    let src = legacy.appendingPathComponent(item)
+    let dst = destination.appendingPathComponent(item)
+    if fm.fileExists(atPath: dst.path) { continue }
+    try? fm.copyItem(at: src, to: dst)
+  }
 }
 
 /// Strips tracking query params from Giphy (and similar CDN) URLs so the same
@@ -199,6 +250,77 @@ func chatMediaImageFromBase64Public(_ value: String?) -> UIImage? {
     return nil
   }
   return UIImage(data: data)
+}
+
+/// Pixel quality ladder for media bubbles. Thumbs never overwrite full media.
+enum ChatMediaPreviewQuality: Int {
+  case none = 0
+  case microThumb = 1
+  case full = 2
+}
+
+/// Telegram-style durable micro-thumb: ~64px longest side, JPEG ~0.5, typically ≤4KB.
+/// Sender generates; server keeps `thumbnailBase64` in metadata (sealed blobs stay stripped).
+private let chatMicroThumbMaxDimension: CGFloat = 64.0
+private let chatMicroThumbJPEGQuality: CGFloat = 0.52
+private let chatMicroThumbDecodedCache = NSCache<NSString, UIImage>()
+
+/// Encode a tiny durable preview for wire + optimistic paint.
+func chatMicroThumbnailJPEGBase64(
+  from image: UIImage,
+  maxDimension: CGFloat = chatMicroThumbMaxDimension
+) -> String? {
+  let size = image.size
+  guard size.width > 0.5, size.height > 0.5 else { return nil }
+  let longest = max(size.width, size.height)
+  let scale = min(1.0, maxDimension / longest)
+  let target = CGSize(
+    width: max(1.0, floor(size.width * scale)),
+    height: max(1.0, floor(size.height * scale))
+  )
+  let format = UIGraphicsImageRendererFormat.default()
+  format.scale = 1.0
+  format.opaque = true
+  let rendered = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+    image.draw(in: CGRect(origin: .zero, size: target))
+  }
+  guard let jpeg = rendered.jpegData(compressionQuality: chatMicroThumbJPEGQuality) else {
+    return nil
+  }
+  return jpeg.base64EncodedString()
+}
+
+/// Sync decode of micro-thumb for first paint. Clamps oversized legacy thumbs so
+/// main-thread configure never stalls on a full-res base64 blob.
+func chatDecodedMicroThumbnail(fromBase64 value: String?, cacheKey: String?) -> UIImage? {
+  if let cacheKey,
+    let hit = chatMicroThumbDecodedCache.object(forKey: cacheKey as NSString)
+  {
+    return hit
+  }
+  guard let image = chatMediaImageFromBase64Public(value) else { return nil }
+  let size = image.size
+  let clampDim: CGFloat = 128.0
+  let out: UIImage
+  if max(size.width, size.height) > clampDim + 0.5 {
+    let scale = clampDim / max(size.width, size.height)
+    let target = CGSize(
+      width: max(1.0, floor(size.width * scale)),
+      height: max(1.0, floor(size.height * scale))
+    )
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1.0
+    format.opaque = true
+    out = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+      image.draw(in: CGRect(origin: .zero, size: target))
+    }
+  } else {
+    out = image
+  }
+  if let cacheKey {
+    chatMicroThumbDecodedCache.setObject(out, forKey: cacheKey as NSString)
+  }
+  return out
 }
 
 private func chatMediaPreviewVideoCacheDir() -> URL {
@@ -391,6 +513,64 @@ func chatMediaDiskCacheLoad(_ urlString: String) -> Data? {
   let fileURL = dir.appendingPathComponent(filename)
   guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
   return try? Data(contentsOf: fileURL, options: [.mappedIfSafe])
+}
+
+// MARK: - Music album cover cache
+
+/// Shared mem+disk cache key for a music album cover URL. Music rows carry the
+/// cover as a remote URL (`ChatListRow.musicCoverURL`); we decode it once and reuse
+/// the image across the chat bubble plate, the mini player banner, and the full player.
+func chatMusicCoverCacheKey(_ url: String) -> String { "musiccover|\(url)" }
+
+/// A music album cover already decoded IN MEMORY, if any. Mem-only, so it is safe to
+/// call on layout / hot paths; disk and network warming happen in `chatLoadMusicCover`.
+func chatCachedMusicCoverImage(for row: ChatListRow) -> UIImage? {
+  guard let raw = row.musicCoverURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !raw.isEmpty
+  else { return nil }
+  return chatMediaImageCache.object(forKey: chatMusicCoverCacheKey(raw) as NSString)
+}
+
+/// Best static artwork for an audio/music row: a warm album cover beats an inline
+/// base64 thumbnail (voice notes), which beats nothing. Synchronous / mem-only.
+func chatMusicArtworkImage(for row: ChatListRow) -> UIImage? {
+  chatCachedMusicCoverImage(for: row) ?? chatMediaImage(fromBase64: row.thumbnailBase64)
+}
+
+/// Resolves a music album cover (mem → disk → network), populating both caches, and
+/// calls `completion` on the main thread with the decoded image. Returns the network
+/// task, if one was started, so the caller can cancel it on cell reuse.
+@discardableResult
+func chatLoadMusicCover(urlString: String?, completion: @escaping (UIImage) -> Void)
+  -> URLSessionDataTask?
+{
+  guard var trimmed = urlString?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !trimmed.isEmpty
+  else { return nil }
+  // Protocol-relative og:image values show up from SoundCloud/YouTube scrapes.
+  if trimmed.hasPrefix("//") { trimmed = "https:" + trimmed }
+  let key = chatMusicCoverCacheKey(trimmed)
+  if let cached = chatMediaImageCache.object(forKey: key as NSString) {
+    DispatchQueue.main.async { completion(cached) }
+    return nil
+  }
+  guard let url = URL(string: trimmed) else { return nil }
+  let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+    guard let data, !data.isEmpty, let image = UIImage(data: data) else { return }
+    chatMediaImageCache.setObject(image, forKey: key as NSString)
+    chatMediaDiskCacheSave(data, forKey: key)
+    DispatchQueue.main.async { completion(image) }
+  }
+  // Check disk off-main first; only hit the network on a miss.
+  chatMediaDiskCacheQueue.async {
+    if let diskData = chatMediaDiskCacheLoad(key), let image = UIImage(data: diskData) {
+      chatMediaImageCache.setObject(image, forKey: key as NSString)
+      DispatchQueue.main.async { completion(image) }
+    } else {
+      task.resume()
+    }
+  }
+  return task
 }
 
 /// Pre-fetches a media URL into the in-memory + disk cache so the cell can
@@ -1679,6 +1859,30 @@ private func formatMediaByteSize(_ bytes: Int64) -> String {
   return String(format: "%.2f GB", gb)
 }
 
+/// Byte captions for live download/upload chrome (`ByteCountFormatter`, `.file`).
+private let chatDownloadByteCountFormatter: ByteCountFormatter = {
+  let formatter = ByteCountFormatter()
+  formatter.countStyle = .file
+  formatter.allowsNonnumericFormatting = false
+  return formatter
+}()
+
+private func formatDownloadByteCount(_ bytes: Int64) -> String {
+  chatDownloadByteCountFormatter.string(fromByteCount: bytes)
+}
+
+/// `"2.3 MB / 7.8 MB"` when total is known; just total until first bytes arrive; nil until known.
+private func formatDownloadSizeCaption(downloadedBytes: Int64?, totalBytes: Int64?) -> String? {
+  if let totalBytes, totalBytes > 0 {
+    let totalText = formatDownloadByteCount(totalBytes)
+    if let downloadedBytes, downloadedBytes > 0 {
+      return "\(formatDownloadByteCount(downloadedBytes)) / \(totalText)"
+    }
+    return totalText
+  }
+  return nil
+}
+
 private let chatTransferProgressQuantizationStep: CGFloat = 0.01
 private let chatTransferProgressAnimationThreshold: CGFloat = 0.006
 
@@ -1690,6 +1894,9 @@ private func quantizedTransferProgress(_ progress: CGFloat?, minimum: CGFloat) -
   return max(minimum, min(1.0, quantized))
 }
 
+/// Agent `type: music` (and other non-voice audio) rows: compact playable music cell
+/// (cover on the play plate + title/artist), NOT the tall Telegram link-preview card.
+/// SoundCloud/YouTube *text* URLs still use `BubbleLinkPreviewView` music-card mode.
 private func usesAudioMetadataVoiceLayout(_ row: ChatListRow) -> Bool {
   row.visualKind == .voice && row.messageType.lowercased() != "voice"
 }
@@ -1718,6 +1925,18 @@ private func resolvedAudioVoiceTitle(_ row: ChatListRow) -> String {
 }
 
 private func resolvedAudioVoiceStaticDetail(_ row: ChatListRow) -> String {
+  if usesAudioMetadataVoiceLayout(row) {
+    // Telegram-style third line: artist, else duration.
+    if let artist = row.musicArtist?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !artist.isEmpty
+    {
+      return artist
+    }
+    if let duration = row.duration, duration.isFinite, duration > 0 {
+      return formatBubbleDuration(seconds: duration)
+    }
+    return row.musicSource ?? "Music"
+  }
   var components: [String] = []
   if let duration = row.duration, duration.isFinite, duration > 0 {
     components.append(formatBubbleDuration(seconds: duration))
@@ -1729,6 +1948,25 @@ private func resolvedAudioVoiceStaticDetail(_ row: ChatListRow) -> String {
     return "Audio"
   }
   return components.joined(separator: " • ")
+}
+
+private func resolvedMusicSourceLabel(_ row: ChatListRow) -> String {
+  if let source = row.musicSource?.trimmingCharacters(in: .whitespacesAndNewlines), !source.isEmpty {
+    return source
+  }
+  let lowerType = row.messageType.lowercased()
+  if lowerType == "music" || lowerType == "mp3" || lowerType == "audio" { return "Music" }
+  return "Audio"
+}
+
+/// Telegram music card text stack under the artwork: Source / Title / Artist.
+/// Prefer the cover-card labels over the compact voice "duration •" chrome.
+private func musicCardTextStack(for row: ChatListRow) -> (source: String, title: String, artist: String?) {
+  let source = resolvedMusicSourceLabel(row)
+  let title = resolvedAudioVoiceTitle(row)
+  let artist = row.musicArtist?.trimmingCharacters(in: .whitespacesAndNewlines)
+  let resolvedArtist = (artist?.isEmpty == false) ? artist : nil
+  return (source, title, resolvedArtist)
 }
 
 private func trimmedBubbleText(_ row: ChatListRow) -> String {
@@ -1790,12 +2028,37 @@ func bubbleRendersTeamRun(_ row: ChatListRow) -> Bool {
 // Internal (not private) so ChatListView's setRows can route streaming agent-turn reloads
 // through `reconfigureItems` (persist the cell + its reusable live feed) instead of
 // `reloadItems` (recreate → re-fade the whole narration every chunk).
+/// A native (built-in "Vibe AI") PLAIN conversational agent turn: no tool feed, no runtime
+/// card, no actions, and not a bridge/stream/lan session row. Its SETTLED form renders as an
+/// ordinary text bubble (hugs its text, ~34pt); keeping only its STREAMING form on the
+/// agent-turn path (via `isStreamingText`) — which floors the bubble at 44pt to reserve the
+/// loader/meta strip — made the turn visibly shrink + shift the instant it settled (the
+/// ~working-cell-height empty gap the user reported: [LayoutShift] Δ (44→34) + [CellFit]
+/// OVERFLOW at `finishStreaming`). Routing BOTH phases through the same plain bubble makes
+/// streaming==settled by construction. Bridge (Claude/Codex) turns never match (they carry a
+/// runtime/progress feed or a "bridge-" id) so they stay on the agent-turn path, and a native
+/// turn WITH tools keeps it too (its progress nodes are non-empty).
+func agentTurnRowIsNativePlainProse(_ row: ChatListRow) -> Bool {
+  guard row.isAgentMessage,
+    row.agentRuntime == nil,
+    row.agentProgressNodes.isEmpty,
+    (row.agentActionsEnc?.isEmpty ?? true),
+    row.messageType != "agent_progress_tree"
+  else { return false }
+  let id = row.messageId ?? ""
+  return !id.hasPrefix("bridge-") && !id.hasPrefix("stream-") && !id.hasPrefix("lan-")
+}
+
 func bubbleUsesAgentTurnContent(_ row: ChatListRow) -> Bool {
-  (!row.isGroupOrChannel || bubbleRendersTeamRun(row))
+  // Native plain conversational turns render as an ordinary text bubble, live AND settled,
+  // so nothing re-measures at settle. (See `agentTurnRowIsNativePlainProse`.)
+  if agentTurnRowIsNativePlainProse(row) { return false }
+  return (!row.isGroupOrChannel || bubbleRendersTeamRun(row))
     && row.kind == .message
     && row.visualKind == .text
     && row.isAgentMessage
     && agentSystemDividerText(for: row) == nil
+    && agentErrorNoticeText(for: row) == nil
     && (row.isStreamingText
       || row.messageType == "agent_progress_tree"
       || !row.agentProgressNodes.isEmpty
@@ -1847,6 +2110,48 @@ func agentSystemDividerText(for row: ChatListRow) -> String? {
     return "Interrupted"
   }
   return nil
+}
+
+/// A friendly, human-readable notice for an agent turn the server marked as an error
+/// (`isError`). Production apps never surface a raw "API error: 400" / "AI request
+/// failed." string as an ordinary assistant bubble — it reads like the agent *said*
+/// the error, and the in-cell retry chrome makes the transcript feel broken. Instead
+/// an errored turn renders as a centered, muted mid-chat notice (styled like the
+/// day/interrupt divider, but with a warning glyph and a tappable "Try again") so the
+/// list stays clean and the failure is legible at the point it happened. Returns the
+/// short human message, or nil for any non-error row.
+func agentErrorNoticeText(for row: ChatListRow) -> String? {
+  guard row.kind == .message,
+    row.isAgentMessage,
+    row.isAgentError,
+    !row.isStreamingText
+  else { return nil }
+  let raw = (row.plainContent ?? row.text).trimmingCharacters(in: .whitespacesAndNewlines)
+  return humanizedAgentErrorMessage(raw)
+}
+
+/// Maps a raw provider/transport error string to calm, human copy. Never leaks status
+/// codes or internal phrasing — the raw text is only inspected to pick the closest
+/// friendly sentence.
+func humanizedAgentErrorMessage(_ raw: String) -> String {
+  let lower = raw.lowercased()
+  if lower.contains("429") || lower.contains("rate limit") || lower.contains("overloaded")
+    || lower.contains("capacity") || lower.contains("quota")
+    || lower.contains("usage limit") || lower.contains("too many requests")
+  {
+    return "The assistant is busy right now"
+  }
+  if lower.contains("timeout") || lower.contains("timed out") {
+    return "That took too long to answer"
+  }
+  if lower.contains("network") || lower.contains("connection")
+    || lower.contains("offline") || lower.contains("unreachable")
+  {
+    return "Couldn't reach the assistant"
+  }
+  // API error: 4xx/5xx, "AI request failed.", parse failures, and anything unknown all
+  // collapse to one calm default — the raw detail lives in logs, not the transcript.
+  return "Something went wrong"
 }
 
 /// Formats "Alice added Bob", "Carol left the group", "Dave joined the group".
@@ -2261,6 +2566,38 @@ private func effectiveMetaTopSpacing(for row: ChatListRow) -> CGFloat {
 private let bubbleLinkPreviewHeight: CGFloat = 78.0
 private let bubbleLinkPreviewSpacing: CGFloat = 8.0
 private let bubbleLinkPreviewMinWidth: CGFloat = 220.0
+// Telegram-style rich music card (SoundCloud/YouTube links): fixed geometry so the
+// bubble height is deterministic (estimate/exact drift is paid as a visible warmup
+// correction — never size this card off async metadata).
+//
+// Reference (Telegram SoundCloud bubble):
+//   [ ~10pt pad ]
+//   [ nearly-square artwork, ~12pt corner, centered dark play ]
+//   [ ~10pt ]
+//   [ Source  (SoundCloud) ]
+//   [ Title ]
+//   [ Artist ]
+//   [ time ✓ bottom-trailing ]
+private let bubbleMusicLinkArtTop: CGFloat = 10.0
+private let bubbleMusicLinkArtBottomGap: CGFloat = 10.0
+private let bubbleMusicLinkTextBlockHeight: CGFloat = 62.0  // site + title + artist
+private let bubbleMusicLinkBottomPad: CGFloat = 10.0
+private let bubbleMusicLinkArtworkHeight: CGFloat = 236.0
+private let bubbleMusicLinkPreviewHeight: CGFloat =
+  bubbleMusicLinkArtTop + bubbleMusicLinkArtworkHeight + bubbleMusicLinkArtBottomGap
+  + bubbleMusicLinkTextBlockHeight + bubbleMusicLinkBottomPad
+private let bubbleMusicLinkPreviewMinWidth: CGFloat = 480.0
+// Agent `type: music` rows use the same Telegram card proportions inside the bubble.
+// Media container is already inset by `bubbleHorizontalPadding` (12pt) — do NOT add a
+// second large horizontal pad around the art or the cover looks stubby vs Telegram.
+private let musicMessageCardArtTop: CGFloat = 10.0
+private let musicMessageCardArtMaxSide: CGFloat = 248.0
+private let musicMessageCardArtBottomGap: CGFloat = 10.0
+private let musicMessageCardTextBlockHeight: CGFloat = 62.0
+private let musicMessageCardBottomPad: CGFloat = 8.0
+private let musicMessageCardHeight: CGFloat =
+  musicMessageCardArtTop + musicMessageCardArtMaxSide + musicMessageCardArtBottomGap
+  + musicMessageCardTextBlockHeight + musicMessageCardBottomPad
 private let bubbleRichTextBlockSpacing: CGFloat = 6.0
 private let bubbleURLDetector = try! NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 private let bubbleInternalChatIdRegex = try! NSRegularExpression(
@@ -2353,6 +2690,16 @@ func chatAgentNodeCompactLabel(_ node: ChatListRow.AgentProgressNode) -> String 
     }
     if isRunning { return "\(base)…" }
     return base
+  }
+  // "Read"/"Edit"/"Create"/"Run" are the CLI vocabulary: a file/command operation whose
+  // `target` is the path or command, where the raw label ("Claude Read: /long/path") is worse
+  // than the derived text. The native server agent uses the same coarse kinds for SEMANTIC
+  // steps and ships a written label instead ("Checking your agents…", "No agent here") with no
+  // target — deriving a verb there produced a bare, meaningless "Create"/"Fetch"/"Step".
+  // Target present → CLI shape → verb + target. No target → trust the server's label.
+  let hasTarget = (node.target?.isEmpty == false)
+  if !hasTarget, !node.label.isEmpty, kind != "todo" {
+    return node.label
   }
   let verb: String
   switch kind {
@@ -2461,9 +2808,11 @@ private func bubbleParsedBlocks(for row: ChatListRow) -> [AgentParsedBlock] {
     // is no longer live.
     guard !row.isStreamingText else { return }
     guard let runtime = row.agentRuntime else {
-      if row.isAgentMessage {
-        NSLog("[AgentView] chatCell blocks: msg=\(row.messageId ?? row.key) runtime=nil -> NO card block (plain text only)")
-      }
+      // No log here: runtime=nil is the NORMAL case for every plain-prose agent
+      // turn, so this fired once per agent row per configure (2–5× per cell as the
+      // list reconfigures) — a synchronous NSLog on the scroll hot path that said
+      // nothing actionable. The "appended card block" line below is the rare,
+      // informative one and stays.
       return
     }
     // A turn that changed nothing has nothing to review — an empty "0 files changed
@@ -2597,7 +2946,42 @@ private func bubblePreviewURL(for row: ChatListRow) -> URL? {
   return nil
 }
 
-private func bubblePreviewSiteLabel(for url: URL) -> String {
+/// Music page hosts get the tall Telegram-style artwork card instead of the
+/// compact strip. Mirrors the server's `YtDlp.music_page_url?` host list.
+/// Shared with the composer draft-preview banner (`ChatInputBar`).
+func bubbleIsMusicPreviewURL(_ url: URL) -> Bool {
+  guard let host = url.host?.lowercased() else { return false }
+  let musicHosts = [
+    "soundcloud.com", "on.soundcloud.com", "snd.sc",
+    "youtube.com", "youtu.be", "music.youtube.com",
+  ]
+  return musicHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+}
+
+private func bubbleMusicPreviewURL(for row: ChatListRow) -> URL? {
+  guard let url = bubblePreviewURL(for: row), bubbleIsMusicPreviewURL(url) else { return nil }
+  return url
+}
+
+private func bubbleRowPreviewHeight(for row: ChatListRow) -> CGFloat {
+  guard let url = bubblePreviewURL(for: row) else { return 0.0 }
+  return bubbleIsMusicPreviewURL(url) ? bubbleMusicLinkPreviewHeight : bubbleLinkPreviewHeight
+}
+
+private func bubbleRowPreviewMinWidth(for row: ChatListRow) -> CGFloat {
+  guard let url = bubblePreviewURL(for: row) else { return 0.0 }
+  // Music cards want the full bubble width (clamped by the caller's max).
+  return bubbleIsMusicPreviewURL(url) ? bubbleMusicLinkPreviewMinWidth : bubbleLinkPreviewMinWidth
+}
+
+func bubbleMusicPreviewFallbackSite(for url: URL) -> String {
+  guard let host = url.host?.lowercased() else { return bubblePreviewSiteLabel(for: url) }
+  if host.contains("soundcloud") || host == "snd.sc" { return "SoundCloud" }
+  if host.contains("youtu") { return "YouTube" }
+  return bubblePreviewSiteLabel(for: url)
+}
+
+func bubblePreviewSiteLabel(for url: URL) -> String {
   guard let host = url.host?.lowercased(), !host.isEmpty else {
     return url.absoluteString
   }
@@ -2902,6 +3286,12 @@ private final class BubbleLinkPreviewStore {
 
   private init() {}
 
+  /// Disk keys for one preview URL. The image rides the shared chat-media disk cache
+  /// (same eviction//clear plumbing as every other cached image); the text fields ride
+  /// UserDefaults because they are two short strings.
+  private static func imageDiskKey(_ url: String) -> String { "linkpreview|\(url)" }
+  private static func textDefaultsKey(_ url: String) -> String { "linkpreview.meta|\(url)" }
+
   func fetch(url: URL, completion: @escaping (BubbleLinkPreviewData) -> Void) {
     let key = url.absoluteString
     if let cachedData = cached[key] {
@@ -2914,6 +3304,35 @@ private final class BubbleLinkPreviewStore {
     inFlight[key, default: []].append(completion)
     guard inFlight[key]?.count == 1 else { return }
 
+    // Disk before network. `cached` is per-process, so without this every relaunch
+    // re-ran the full LPMetadataProvider scrape AND re-downloaded the og:image for
+    // every link bubble on screen — the reported "any link with an image isn't cached,
+    // it refetches the image each time we reopen". A preview is immutable enough to
+    // serve from disk indefinitely; a miss still falls through to the live fetch below.
+    let imageKey = Self.imageDiskKey(key)
+    chatMediaDiskCacheQueue.async { [weak self] in
+      guard let self else { return }
+      let meta = UserDefaults.standard.stringArray(forKey: Self.textDefaultsKey(key))
+      guard let meta, meta.count == 2 else {
+        DispatchQueue.main.async { self.startRemoteFetch(url: url, key: key) }
+        return
+      }
+      var image: UIImage?
+      if let cachedImage = chatMediaImageCache.object(forKey: imageKey as NSString) {
+        image = cachedImage
+      } else if let data = chatMediaDiskCacheLoad(imageKey), let decoded = UIImage(data: data) {
+        chatMediaImageCache.setObject(decoded, forKey: imageKey as NSString)
+        image = decoded
+      }
+      self.finish(
+        key: key,
+        data: BubbleLinkPreviewData(url: url, title: meta[0], site: meta[1], icon: image),
+        persist: false
+      )
+    }
+  }
+
+  private func startRemoteFetch(url: URL, key: String) {
     let provider = LPMetadataProvider()
   activeProviders[key] = provider
     provider.startFetchingMetadata(for: url) { [weak self] metadata, _ in
@@ -2960,13 +3379,160 @@ private final class BubbleLinkPreviewStore {
     }
   }
 
-  private func finish(key: String, data: BubbleLinkPreviewData) {
+  private func finish(key: String, data: BubbleLinkPreviewData, persist: Bool = true) {
     DispatchQueue.main.async {
       self.cached[key] = data
       self.activeProviders.removeValue(forKey: key)
       let callbacks = self.inFlight.removeValue(forKey: key) ?? []
       callbacks.forEach { $0(data) }
     }
+    // Write-through so the NEXT launch reads disk instead of re-scraping. Only for
+    // results that came off the network — a disk hit re-persisting itself is pure churn.
+    guard persist else { return }
+    let imageKey = Self.imageDiskKey(key)
+    if let icon = data.icon {
+      chatMediaImageCache.setObject(icon, forKey: imageKey as NSString)
+    }
+    chatMediaDiskCacheQueue.async {
+      UserDefaults.standard.set([data.title, data.site], forKey: Self.textDefaultsKey(key))
+      // JPEG keeps og:image thumbnails small; they are photographic and never need alpha.
+      if let icon = data.icon, let encoded = icon.jpegData(compressionQuality: 0.9) {
+        chatMediaDiskCacheSave(encoded, forKey: imageKey)
+      }
+    }
+  }
+}
+
+private struct BubbleMusicPreviewData {
+  let url: URL
+  let site: String
+  let title: String
+  let desc: String?
+  let imageURLString: String?
+}
+
+/// Prefetch OpenGraph metadata + album art for a music page URL (composer draft
+/// preview + send-morph). Warms the same caches the bubble card reads so the
+/// outgoing cell paints cover immediately at fixed height (no mid-stream resize).
+@discardableResult
+func chatPrefetchMusicURLPreview(
+  url: URL,
+  completion: ((String, String, String?, String?) -> Void)? = nil
+) -> Void {
+  guard bubbleIsMusicPreviewURL(url) else {
+    completion?(bubblePreviewSiteLabel(for: url), bubblePreviewTitleFallback(for: url), nil, nil)
+    return
+  }
+  BubbleMusicPreviewStore.shared.fetch(url: url) { data in
+    completion?(data.site, data.title, data.desc, data.imageURLString)
+    if let imageURL = data.imageURLString, !imageURL.isEmpty {
+      _ = chatLoadMusicCover(urlString: imageURL) { _ in }
+    }
+  }
+}
+
+/// OpenGraph metadata for the Telegram-style music card. `LPMetadataProvider`
+/// drops `og:description`, so fetch the page head and parse the tags directly
+/// (SoundCloud/YouTube serve them to plain GETs). Main-thread API, memoized per URL.
+private final class BubbleMusicPreviewStore {
+  static let shared = BubbleMusicPreviewStore()
+
+  private var cached: [String: BubbleMusicPreviewData] = [:]
+  private var inFlight: [String: [(BubbleMusicPreviewData) -> Void]] = [:]
+
+  private init() {}
+
+  func fetch(url: URL, completion: @escaping (BubbleMusicPreviewData) -> Void) {
+    let key = url.absoluteString
+    if let cachedData = cached[key] {
+      DispatchQueue.main.async { completion(cachedData) }
+      return
+    }
+    inFlight[key, default: []].append(completion)
+    guard inFlight[key]?.count == 1 else { return }
+
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 15
+    request.setValue(
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      forHTTPHeaderField: "User-Agent"
+    )
+    request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+      let resolvedURL = (response?.url) ?? url
+      // og tags live in <head>; cap the parse window so huge pages stay cheap.
+      let html = data.flatMap { String(data: $0.prefix(400_000), encoding: .utf8) } ?? ""
+      let title = Self.ogContent("og:title", in: html)
+        ?? Self.ogContent("twitter:title", in: html)
+      let desc = Self.ogContent("og:description", in: html)
+        ?? Self.ogContent("twitter:description", in: html)
+      let rawImage = Self.ogContent("og:image", in: html)
+        ?? Self.ogContent("twitter:image", in: html)
+        ?? Self.ogContent("twitter:image:src", in: html)
+      let image = Self.absolutizeURLString(rawImage, base: resolvedURL)
+      let site = Self.ogContent("og:site_name", in: html)
+      let result = BubbleMusicPreviewData(
+        url: resolvedURL,
+        site: site ?? bubbleMusicPreviewFallbackSite(for: resolvedURL),
+        title: title ?? bubblePreviewTitleFallback(for: resolvedURL),
+        desc: desc,
+        imageURLString: image
+      )
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.cached[key] = result
+        let callbacks = self.inFlight.removeValue(forKey: key) ?? []
+        callbacks.forEach { $0(result) }
+      }
+    }.resume()
+  }
+
+  /// Turns protocol-relative (`//cdn…`) and root-relative (`/img…`) og:image values
+  /// into absolute https URLs so cover loads don't silently fail.
+  private static func absolutizeURLString(_ raw: String?, base: URL) -> String? {
+    guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty
+    else { return nil }
+    if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") { return trimmed }
+    if trimmed.hasPrefix("//") { return "https:" + trimmed }
+    if let absolute = URL(string: trimmed, relativeTo: base)?.absoluteString, !absolute.isEmpty {
+      return absolute
+    }
+    return trimmed
+  }
+
+  /// `<meta property="og:x" content="...">` in either attribute order.
+  private static func ogContent(_ property: String, in html: String) -> String? {
+    guard !html.isEmpty else { return nil }
+    let escaped = NSRegularExpression.escapedPattern(for: property)
+    let patterns = [
+      "<meta[^>]*(?:property|name)=[\"']\(escaped)[\"'][^>]*content=[\"']([^\"']*)[\"']",
+      "<meta[^>]*content=[\"']([^\"']*)[\"'][^>]*(?:property|name)=[\"']\(escaped)[\"']",
+    ]
+    for pattern in patterns {
+      guard
+        let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+        let match = regex.firstMatch(
+          in: html, options: [], range: NSRange(html.startIndex..., in: html)),
+        match.numberOfRanges > 1,
+        let range = Range(match.range(at: 1), in: html)
+      else { continue }
+      let value = Self.decodeHTMLEntities(String(html[range]))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !value.isEmpty { return value }
+    }
+    return nil
+  }
+
+  private static func decodeHTMLEntities(_ value: String) -> String {
+    var result = value
+    let entities: [(String, String)] = [
+      ("&amp;", "&"), ("&quot;", "\""), ("&#34;", "\""), ("&#39;", "'"),
+      ("&#x27;", "'"), ("&apos;", "'"), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "),
+    ]
+    for (entity, replacement) in entities {
+      result = result.replacingOccurrences(of: entity, with: replacement)
+    }
+    return result
   }
 }
 
@@ -3163,6 +3729,13 @@ private final class BubbleLinkPreviewView: UIView {
   private let iconView = UIImageView()
   private let siteLabel = UILabel()
   private let titleLabel = UILabel()
+  // Music-card mode (Telegram-style rich preview for SoundCloud/YouTube links).
+  private let artworkView = UIImageView()
+  private let playBadgeView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+  private let playGlyphView = UIImageView()
+  private let descLabel = UILabel()
+  private var isMusicCard = false
+  private var currentArtworkURLString: String?
   private var currentURL: URL?
   private var currentAppearance = ChatListAppearance.fallback
   private var currentIsMe = false
@@ -3191,6 +3764,31 @@ private final class BubbleLinkPreviewView: UIView {
     titleLabel.numberOfLines = 2
     addSubview(titleLabel)
 
+    artworkView.contentMode = .scaleAspectFill
+    artworkView.clipsToBounds = true
+    artworkView.layer.cornerRadius = 10.0
+    artworkView.layer.cornerCurve = .continuous
+    artworkView.isHidden = true
+    addSubview(artworkView)
+
+    playBadgeView.clipsToBounds = true
+    playBadgeView.isUserInteractionEnabled = false
+    playBadgeView.isHidden = true
+    playGlyphView.image = UIImage(
+      systemName: "play.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 22.0, weight: .bold)
+    )
+    playGlyphView.tintColor = .white
+    playGlyphView.contentMode = .center
+    playBadgeView.contentView.addSubview(playGlyphView)
+    addSubview(playBadgeView)
+
+    descLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    descLabel.numberOfLines = 1
+    descLabel.lineBreakMode = .byTruncatingTail
+    descLabel.isHidden = true
+    addSubview(descLabel)
+
     let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
     addGestureRecognizer(tap)
   }
@@ -3201,8 +3799,17 @@ private final class BubbleLinkPreviewView: UIView {
 
   func reset() {
     currentURL = nil
+    currentArtworkURLString = nil
     siteLabel.text = nil
     titleLabel.text = nil
+    descLabel.text = nil
+    artworkView.image = nil
+    isMusicCard = false
+    artworkView.isHidden = true
+    playBadgeView.isHidden = true
+    descLabel.isHidden = true
+    iconView.isHidden = false
+    titleLabel.numberOfLines = 2
     iconView.image = UIImage(systemName: "globe")
     iconView.contentMode = .scaleAspectFit
   }
@@ -3221,6 +3828,9 @@ private final class BubbleLinkPreviewView: UIView {
       : UIColor(white: appearance.isDark ? 1.0 : 0.0, alpha: appearance.isDark ? 0.08 : 0.05)
     siteLabel.textColor = accentColor.withAlphaComponent(0.96)
     titleLabel.textColor = isMe ? appearance.textColorMe : appearance.textColorThem
+    descLabel.textColor = (isMe ? appearance.textColorMe : appearance.textColorThem)
+      .withAlphaComponent(0.72)
+    artworkView.backgroundColor = accentColor.withAlphaComponent(appearance.isDark ? 0.16 : 0.10)
     if iconView.image == nil || iconView.contentMode != .scaleAspectFill {
       iconView.image = UIImage(systemName: "globe")
       iconView.tintColor = accentColor.withAlphaComponent(0.96)
@@ -3231,8 +3841,19 @@ private final class BubbleLinkPreviewView: UIView {
 
   func configure(url: URL, appearance: ChatListAppearance, isMe: Bool) {
     currentURL = url
+    isMusicCard = bubbleIsMusicPreviewURL(url)
     applyAppearance(appearance, isMe: isMe)
 
+    if isMusicCard {
+      configureMusicCard(url: url, appearance: appearance, isMe: isMe)
+      return
+    }
+
+    iconView.isHidden = false
+    artworkView.isHidden = true
+    playBadgeView.isHidden = true
+    descLabel.isHidden = true
+    titleLabel.numberOfLines = 2
     siteLabel.text = bubblePreviewSiteLabel(for: url)
     titleLabel.text = bubblePreviewTitleFallback(for: url)
     iconView.image = UIImage(systemName: "globe")
@@ -3254,11 +3875,90 @@ private final class BubbleLinkPreviewView: UIView {
     }
   }
 
+  private func configureMusicCard(url: URL, appearance: ChatListAppearance, isMe: Bool) {
+    iconView.isHidden = true
+    artworkView.isHidden = false
+    playBadgeView.isHidden = false
+    descLabel.isHidden = false
+    titleLabel.numberOfLines = 1
+    // Keep existing artwork when re-configuring the same link (avoids empty-then-pop
+    // on every cell rebind / setRows while OG metadata is still warm).
+    let sameURL = currentURL?.absoluteString == url.absoluteString
+    if !sameURL {
+      artworkView.image = nil
+      currentArtworkURLString = nil
+      siteLabel.text = bubbleMusicPreviewFallbackSite(for: url)
+      titleLabel.text = bubblePreviewTitleFallback(for: url)
+      descLabel.text = nil
+    }
+
+    BubbleMusicPreviewStore.shared.fetch(url: url) { [weak self] data in
+      guard let self, self.currentURL?.absoluteString == url.absoluteString else { return }
+      // Telegram order: site, title, description (artist).
+      self.siteLabel.text = data.site
+      self.titleLabel.text = data.title
+      self.descLabel.text = data.desc
+      guard let imageURLString = data.imageURLString else { return }
+      if self.currentArtworkURLString == imageURLString, self.artworkView.image != nil {
+        return
+      }
+      self.currentArtworkURLString = imageURLString
+      // Prefer in-memory cover immediately (no empty flash).
+      let warmKey = chatMusicCoverCacheKey(imageURLString)
+      if let warm = chatMediaImageCache.object(forKey: warmKey as NSString) {
+        self.artworkView.image = warm
+        return
+      }
+      _ = chatLoadMusicCover(urlString: imageURLString) { [weak self] image in
+        guard let self, self.currentArtworkURLString == imageURLString else { return }
+        self.artworkView.image = image
+        self.setNeedsLayout()
+      }
+    }
+  }
+
   override func layoutSubviews() {
     super.layoutSubviews()
 
+    // Telegram card uses a thin left accent bar.
     accentView.frame = CGRect(x: 0.0, y: 0.0, width: 3.0, height: bounds.height)
 
+    if isMusicCard {
+      // Match Telegram reference: art inset ~10–12pt from card edge (accent bar is 3pt),
+      // nearly-square cover, 56pt centered play, Source/Title/Artist tight under art.
+      let artX: CGFloat = 10.0
+      let artWidth = max(1.0, bounds.width - artX - 10.0)
+      let artSide = min(bubbleMusicLinkArtworkHeight, artWidth)
+      artworkView.frame = CGRect(
+        x: artX, y: bubbleMusicLinkArtTop, width: artWidth, height: artSide
+      )
+      artworkView.layer.cornerRadius = 12.0
+      artworkView.layer.cornerCurve = .continuous
+      let badgeSize: CGFloat = 56.0
+      playBadgeView.frame = CGRect(
+        x: artworkView.frame.midX - badgeSize * 0.5,
+        y: artworkView.frame.midY - badgeSize * 0.5,
+        width: badgeSize,
+        height: badgeSize
+      )
+      playBadgeView.layer.cornerRadius = badgeSize * 0.5
+      // Nudge the play triangle slightly right so it looks optically centered.
+      playGlyphView.frame = CGRect(x: 2.0, y: 0.0, width: badgeSize, height: badgeSize)
+      siteLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+      titleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+      descLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
+      let textY = artworkView.frame.maxY + bubbleMusicLinkArtBottomGap
+      siteLabel.frame = CGRect(x: artX, y: textY, width: artWidth, height: 18.0)
+      titleLabel.frame = CGRect(
+        x: artX, y: siteLabel.frame.maxY + 2.0, width: artWidth, height: 20.0
+      )
+      descLabel.frame = CGRect(
+        x: artX, y: titleLabel.frame.maxY + 1.0, width: artWidth, height: 18.0
+      )
+      return
+    }
+
+    siteLabel.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
     let leadingInset: CGFloat = 14.0
     let iconSize: CGFloat = 24.0
     iconView.frame = CGRect(
@@ -3295,7 +3995,10 @@ private final class BubbleLinkPreviewView: UIView {
 /// use it to skip building the whole AgentKit message — which E2E-decrypts action
 /// details — for the settled rows that dominate a transcript. Keep in sync with
 /// `isLiveTurn`; a false positive here only costs the full (correct) check.
-private func agentTurnRowCouldBeLive(_ row: ChatListRow) -> Bool {
+// Internal, not fileprivate: `presentationSeedMessageHeight` decides measure-vs-estimate
+// with the SAME liveness test the plate reserve uses, so the two can't disagree about
+// which rows are mid-stream.
+func agentTurnRowCouldBeLive(_ row: ChatListRow) -> Bool {
   row.isStreamingText
     || row.agentProgressNodes.contains { $0.status.lowercased() == "running" }
 }
@@ -3404,6 +4107,168 @@ func agentTurnSettledTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) 
   return min(maxContentWidth, max(196.0, measuredWidth + 10.0))
 }
 
+/// Width a PLAIN conversational agent answer should hug — live OR settled — so its bubble
+/// tracks the text instead of snapping to the full agent workspace width (the "big empty
+/// shell around a one-line reply"). Qualifies only when there is NO tool/progress feed, NO
+/// runtime card, and NO action bar — i.e. the row renders "plain text only" (Vibe AI's
+/// conversational turns, a no-tool bridge answer). Uses ROW-NATIVE fields, not the
+/// VibeAgentKit mapping, because the built-in agent's rows don't set isStreaming /
+/// hasFinalResponseText consistently (that's why the earlier streaming-only hug never
+/// fired). Handles live + settled identically so the width doesn't jump at settle. The hug
+/// tracks the WIDEST wrapped line, so it grows monotonically as text streams (a later short
+/// line never shrinks it) and caps at maxContentWidth. Height is always measured at this
+/// same width, so an imperfect estimate costs at most a hair of extra wrap — never a clip.
+func agentTurnPlainTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -> CGFloat? {
+  guard row.isAgentMessage,
+    row.agentRuntime == nil,
+    row.agentProgressNodes.isEmpty,
+    (row.agentActionsEnc?.isEmpty ?? true)
+  else { return nil }
+  let text = trimmedBubbleText(row)
+  // Code blocks / tables need the full reading width to stay legible.
+  guard !text.isEmpty, !text.contains("```") else { return nil }
+  let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+  let widestLine = text.split(whereSeparator: { $0.isNewline }).reduce(CGFloat(0)) {
+    acc, line in
+    max(acc, ceil((String(line) as NSString).size(withAttributes: [.font: font]).width))
+  }
+  guard widestLine > 0 else { return nil }
+  // +16 slack so a slightly-wider glyph (bold, emoji) never forces an extra wrap.
+  return min(maxContentWidth, max(bubbleMinWidth, widestLine + 16.0))
+}
+
+/// Width a NATIVE ("Vibe AI") turn should hug while it is showing ONLY a single running
+/// progress-narration step (e.g. "Resolving SoundCloud…" → "Found · …"). Without this the
+/// turn snaps to the full agent workspace width (~336pt) around one short line — the big
+/// fixed-width empty box the user reported. We hug the narration like the thinking pill
+/// (`agentTurnCompactHugWidth`) so it grows width→height instead. Returns nil (→ full width)
+/// for anything ambiguous, so every risky case defaults safe.
+///
+/// HARD native-only gate: the id must be a built-in agent turn ("<uuid>-turn") and NOT a
+/// bridge/stream/lan session row — the Claude/Codex rich multi-step / diff / card feeds share
+/// this renderer and MUST keep full width. Also bails on any real tool step (file/diff/read
+/// range, subagent, detail body), any runtime/actions/music-card, more than one node, or a
+/// non-running / multi-line label. Intro prose arrives as extra `.text` nodes (see the
+/// interleaved-prose builder), so a prose+step turn has >1 node and correctly falls through.
+func agentTurnSingleStepHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -> CGFloat? {
+  let id = row.messageId ?? ""
+  guard id.hasSuffix("-turn"),
+    !id.hasPrefix("bridge-"), !id.hasPrefix("stream-"), !id.hasPrefix("lan-")
+  else { return nil }
+  // Only the LIVE narration phase; a settled turn renders the "Worked · N steps" summary.
+  guard row.isStreamingText,
+    row.agentRuntime == nil,
+    (row.agentActionsEnc?.isEmpty ?? true),
+    (row.musicCoverURL?.isEmpty ?? true),
+    row.agentProgressNodes.count == 1,
+    let node = row.agentProgressNodes.first,
+    // Hug across the whole live narration: the step flips running→done ("Resolving…"→
+    // "Found · …") WHILE the turn is still streaming, so accepting only "running" would
+    // snap it to full width mid-stream. Any non-error live status hugs; a failed step
+    // falls through to the full width (it renders its own error affordance).
+    ["running", "done", "complete", "completed", "success"].contains(node.status.lowercased())
+  else { return nil }
+  // Must be a plain spinner+label step — reject anything that needs the full workspace:
+  // file/diff/read-range tool steps, subagent grouping, or a detail body.
+  guard (node.kind ?? "").lowercased() != "task",
+    node.parentId == nil, node.subagentType == nil,
+    node.target == nil, node.added == nil, node.removed == nil,
+    node.start == nil, node.end == nil,
+    (node.detail?.isEmpty ?? true)
+  else { return nil }
+  let label = node.label.trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !label.isEmpty, !label.contains(where: { $0.isNewline }) else { return nil }
+  // Reuse the thinking-pill measurement (label + icon affordance). Height is measured at this
+  // same width downstream, so a hair-off estimate costs at most a tiny wrap, never a clip.
+  let hug = agentTurnCompactHugWidth(row)
+  // A label that already needs the full reading width should just use it (never wrap a
+  // single line inside a pill).
+  guard hug > 0, hug < maxContentWidth else { return nil }
+  return min(maxContentWidth, max(bubbleMinWidth, hug))
+}
+
+/// Single width decision for agent-turn bubbles (measure == render).
+///
+/// - Full `maxContentWidth` when the row genuinely needs the workspace (bridge/stream/lan
+///   id, runtime card, actions, >1 real non-text progress node, or a diff/file/subagent/
+///   detail node).
+/// - Otherwise hug natural content width (widest body line + narration / thinking pill),
+///   floored at `bubbleMinWidth` and capped at `maxContentWidth`.
+func agentTurnContentWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -> CGFloat {
+  // Compact "thinking" shell: always hug the shimmer, even on bridge rows.
+  if agentTurnBubbleIsCompactThinking(row) {
+    return min(maxContentWidth, max(bubbleMinWidth, agentTurnCompactHugWidth(row)))
+  }
+
+  let id = row.messageId ?? ""
+  let isBridgeFamily =
+    id.hasPrefix("bridge-") || id.hasPrefix("stream-") || id.hasPrefix("lan-")
+  let realNonTextNodes = row.agentProgressNodes.filter {
+    ($0.kind ?? "").lowercased() != "text"
+  }
+  let hasWorkspaceShape = row.agentProgressNodes.contains { node in
+    let kind = (node.kind ?? "").lowercased()
+    if kind == "task" || kind == "diff" || kind == "file" { return true }
+    if node.subagentType != nil || node.parentId != nil { return true }
+    if node.target != nil || node.added != nil || node.removed != nil { return true }
+    if node.start != nil || node.end != nil { return true }
+    if !(node.detail?.isEmpty ?? true) { return true }
+    return false
+  }
+  let needsWorkspace =
+    isBridgeFamily
+    || row.agentRuntime != nil
+    || !(row.agentActionsEnc?.isEmpty ?? true)
+    || realNonTextNodes.count > 1
+    || hasWorkspaceShape
+  if needsWorkspace {
+    return maxContentWidth
+  }
+
+  // Natural hug: reuse the old specialized hug helpers as building blocks, then fall
+  // back to measuring the body + any single narration/thinking label.
+  if let plainHug = agentTurnPlainTextHugWidth(row, maxContentWidth: maxContentWidth) {
+    return plainHug
+  }
+  if let settledHug = agentTurnSettledTextHugWidth(row, maxContentWidth: maxContentWidth) {
+    return settledHug
+  }
+  if let stepHug = agentTurnSingleStepHugWidth(row, maxContentWidth: maxContentWidth) {
+    return stepHug
+  }
+
+  let bodyFont = UIFont.systemFont(ofSize: 16.0, weight: .regular)
+  let pillFont = UIFont.systemFont(ofSize: 14.5, weight: .medium)
+  var natural: CGFloat = 0
+  let bodyText = trimmedBubbleText(row)
+  if !bodyText.isEmpty, !bodyText.contains("```") {
+    let widest = bodyText.split(whereSeparator: { $0.isNewline }).reduce(CGFloat(0)) {
+      max($0, ceil((String($1) as NSString).size(withAttributes: [.font: bodyFont]).width))
+    }
+    natural = max(natural, widest + 16.0)
+  }
+  for node in row.agentProgressNodes {
+    let label = node.label.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !label.isEmpty else { continue }
+    if (node.kind ?? "").lowercased() == "text" {
+      let widest = label.split(whereSeparator: { $0.isNewline }).reduce(CGFloat(0)) {
+        max($0, ceil((String($1) as NSString).size(withAttributes: [.font: bodyFont]).width))
+      }
+      natural = max(natural, widest + 16.0)
+    } else {
+      // activity icon (15) + stack spacing (6) + slack — same affordance as compact hug.
+      let pill =
+        ceil((label as NSString).size(withAttributes: [.font: pillFont]).width) + 15.0 + 6.0
+        + 14.0
+      natural = max(natural, pill)
+    }
+  }
+  if natural > 0 {
+    return min(maxContentWidth, max(bubbleMinWidth, natural))
+  }
+  return maxContentWidth
+}
+
 func measureMessageBubbleLayout(
   row: ChatListRow, rowWidth: CGFloat, agentTurnState: AgentTurnBubbleState = AgentTurnBubbleState()
 )
@@ -3441,21 +4306,9 @@ func measureMessageBubbleLayout(
     // agentTurn* constants) so the dense step/narration/diff feed has room to breathe.
     let agentMaxBubbleWidth = floor(rowWidth * agentTurnMaxWidthFactor)
     let maxContentWidth = max(1.0, agentMaxBubbleWidth - (agentTurnHorizontalPadding * 2.0))
-    // A live turn that is only "thinking" (no tool steps, no narration, no answer body
-    // yet) shouldn't inflate to the full agent width — hug the shimmer line and center the
-    // bubble in the row so the tiny loader isn't marooned in a huge empty shell. As soon
-    // as real content streams in it stops being compact and expands to maxContentWidth.
+    // ONE width rule for measure + render (see agentTurnContentWidth).
     let compact = agentTurnBubbleIsCompactThinking(row)
-    let contentWidth: CGFloat
-    if compact {
-      contentWidth = min(maxContentWidth, agentTurnCompactHugWidth(row))
-    } else if let huggedWidth = agentTurnSettledTextHugWidth(
-      row, maxContentWidth: maxContentWidth)
-    {
-      contentWidth = huggedWidth
-    } else {
-      contentWidth = maxContentWidth
-    }
+    let contentWidth = agentTurnContentWidth(row, maxContentWidth: maxContentWidth)
     // Colors don't affect layout metrics, so a fixed appearance is fine for measurement
     // even though the live render uses the trait-matched one. Measure at the SAME width we
     // set below so the height matches what actually renders.
@@ -3482,11 +4335,30 @@ func measureMessageBubbleLayout(
     let bubbleContentHeight =
       tallCollapsed ? min(previewHeight, tallBubbleCollapsedContentHeight) : previewHeight
     // Glass expand/collapse chip lives OUTSIDE the plate (list overlay).
-    let bubbleHeight = max(
-      44.0,
+    // Floor at 44 only when a live loader/placeholder is actually visible (compact
+    // thinking shell, or a live streaming placeholder with no body yet). Settled bodies
+    // self-size so we never keep a 44→34 settle shift or an artificial user↔agent gap.
+    // Mid-stream tool gaps keep the session-grace isStreaming latch: an empty live turn
+    // still floors so the cell does not collapse between steps.
+    let bodyPlusPadding =
       bubbleContentHeight
-        + agentTurnVerticalPadding + agentTurnVerticalPadding + reactionHeightOffset
-    )
+      + agentTurnVerticalPadding + agentTurnVerticalPadding + reactionHeightOffset
+    let isLiveStreaming =
+      row.isStreamingText || agentTurnRowCouldBeLive(row)
+    let needsHeightFloor =
+      compact
+      || (isLiveStreaming && bubbleContentHeight < 1.0)
+      || (isLiveStreaming && !agentTurnBubbleShowsWorkedSummary(row) && bubbleContentHeight < 44.0)
+    let settledBubbleHeight = needsHeightFloor ? max(44.0, bodyPlusPadding) : bodyPlusPadding
+    // A live turn is sized with headroom, a settled one exactly (see
+    // agentTurnStreamingHeightBlock). The slack lands BELOW the body: the content view is
+    // top-aligned at `bubbleFrame.minY + agentTurnVerticalPadding` and keeps its own
+    // measured `textHeight`, so pre-expanding the plate never moves text that is already
+    // on screen — the next tokens simply fill space that is already there.
+    let bubbleHeight =
+      isLiveStreaming
+      ? agentTurnStreamingReservedHeight(settledBubbleHeight)
+      : settledBubbleHeight
     // DIAGNOSTIC (live-turn empty-bubble): compare what the sizing pass measured against
     // what the render pass draws. An empty on-screen bubble with items>0 here means the
     // content exists but is clipped/misplaced; h≈44 with items>0 means the measurement
@@ -3529,7 +4401,7 @@ func measureMessageBubbleLayout(
     let bubbleWidth = max(1.0, rowWidth - (bubbleSideMargin * 2.0))
     let messageWidth = max(1.0, bubbleWidth - (bubbleHorizontalPadding * 2.0))
     let usesRichTextLayout = bubbleUsesBlockLayout(row)
-    let previewHeight = bubblePreviewURL(for: row) == nil ? 0.0 : bubbleLinkPreviewHeight
+    let previewHeight = bubbleRowPreviewHeight(for: row)
     let textHeight: CGFloat
     if usesRichTextLayout {
       textHeight = measureBubbleRichText(for: row, availableWidth: messageWidth).height
@@ -3572,29 +4444,28 @@ func measureMessageBubbleLayout(
     switch row.visualKind {
     case .voice:
       if usesAudioMetadataVoiceLayout(row) {
-        let titleWidth = ceil(
-          (resolvedAudioVoiceTitle(row) as NSString).size(
-            withAttributes: [.font: UIFont.systemFont(ofSize: 13, weight: .semibold)]
-          ).width
-        )
-        let detailWidth = ceil(
-          (resolvedAudioVoiceStaticDetail(row) as NSString).size(
-            withAttributes: [.font: UIFont.systemFont(ofSize: 11, weight: .regular)]
-          ).width
-        )
-        let textWidth = max(titleWidth, detailWidth)
-        let minW = 176.0 + meta.total
-        targetWidth = min(
-          maxContentWidth,
-          max(minW, textWidth + 86.0)
-        )
+        // Compact music cell: play plate + title/artist (not the tall link-preview card).
+        let title = resolvedAudioVoiceTitle(row)
+        let detail = resolvedAudioVoiceStaticDetail(row)
+        let titleFont = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        let detailFont = UIFont.systemFont(ofSize: 13, weight: .regular)
+        let titleW = ceil(
+          (title as NSString).size(withAttributes: [.font: titleFont]).width)
+        let detailW = ceil(
+          (detail as NSString).size(withAttributes: [.font: detailFont]).width)
+        let textW = max(titleW, detailW)
+        // 52 play + 8 gap + text + trailing meta room
+        let contentW = 52.0 + 8.0 + textW + 8.0
+        targetWidth = min(maxContentWidth, max(160.0 + meta.total, contentW + meta.total))
+        // Extra height so the VAD halo around the play plate is not vertically clipped.
+        mediaHeight = 68.0
       } else {
         let dur = max(1.0, min(30.0, row.duration ?? 1.0))
         let frac = CGFloat((Double(dur) - log(Double(max(2.0, dur)))) / 15.0)
         let minW = 100.0 + meta.total
         targetWidth = minW + max(0.0, min(1.0, frac)) * (maxContentWidth - minW)
+        mediaHeight = 60.0
       }
-      mediaHeight = 60.0
     case .videoNote:
       targetWidth = 200.0
       mediaHeight = 200.0
@@ -3692,8 +4563,10 @@ func measureMessageBubbleLayout(
           ? max(bubbleMinWidth, contentWidth)
           : max(bubbleMinWidth, max(contentWidth, messageWidth) + (bubbleHorizontalPadding * 2.0))
       }
-      let topPad = isVoice ? 2.0 : (isEdgeCaption ? mediaCaptionEdgeInset : bubbleTopPadding)
-      let bottomPad =
+      // Compact voice/music: tight pads so the play-row stays short.
+      let topPad: CGFloat =
+        isVoice ? 2.0 : (isEdgeCaption ? mediaCaptionEdgeInset : bubbleTopPadding)
+      let bottomPad: CGFloat =
         isVoice ? 7.0 : (isEdgeCaption ? mediaCaptionBottomPadding : bubbleBottomPadding)
       bubbleHeight =
         isFullBleed
@@ -3727,7 +4600,8 @@ func measureMessageBubbleLayout(
   let showsReplyPreview = hasReplyPreview(row)
   let showsInlineAttachment = hasInlineAttachment(row)
   let usesRichTextLayout = bubbleUsesBlockLayout(row)
-  let previewHeight = bubblePreviewURL(for: row) == nil ? 0.0 : bubbleLinkPreviewHeight
+  let previewHeight = bubbleRowPreviewHeight(for: row)
+  let previewMinWidth = bubbleRowPreviewMinWidth(for: row)
   let usesRTLColumn = usesRTLColumnLayout(row) && !showsInlineAttachment && !usesRichTextLayout && previewHeight <= 0.0
   let replyPreviewHeight = showsReplyPreview ? bubbleReplyPreviewHeight : 0.0
   let replyPreviewBlockHeight =
@@ -3740,7 +4614,7 @@ func measureMessageBubbleLayout(
     if usesRichTextLayout {
       let measured = measureBubbleRichText(for: row, availableWidth: availableWidth)
       return (
-        min(availableWidth, max(measured.maxWidth, previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0)),
+        min(availableWidth, max(measured.maxWidth, previewHeight > 0.0 ? previewMinWidth : 0.0)),
         measured.height
       )
     }
@@ -3814,7 +4688,7 @@ func measureMessageBubbleLayout(
     let coreContentWidth = max(
       textWidth,
       usesRTLColumn ? meta.total : 0.0,
-      previewHeight > 0.0 ? bubbleLinkPreviewMinWidth : 0.0,
+      previewHeight > 0.0 ? previewMinWidth : 0.0,
       replyPreviewWidth
     )
     desiredContentWidth = max(
@@ -3845,7 +4719,13 @@ func measureMessageBubbleLayout(
     : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
   let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
   let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
-  let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0) - 4.0)
+  // No fudge: the plate is exactly the content box plus its two paddings. Shaving 4pt here
+  // made the bubble narrower than the content it advertises, so the body label (laid out at
+  // contentX + contentWidth) ended 4pt to the right of the meta (right-aligned to
+  // maxX - padding). Invisible for LTR — left-aligned body, right-aligned meta, both inside
+  // — but a right-aligned RTL body hugs that edge, so its text and its ✓ sat on two
+  // different right edges.
+  let bubbleWidth = max(bubbleMinWidth, contentWidth + (bubbleHorizontalPadding * 2.0))
   let bubbleHeight = max(
     34.0, bodyHeight + bubbleTopPadding + bubbleBottomPadding + reactionHeightOffset)
   var metrics = ChatMessageBubbleLayoutMetrics(
@@ -4060,17 +4940,31 @@ final class BubbleUploadProgressView: UIView {
     if isDownloading {
       if let raw = progress.map({ CGFloat($0) }), raw.isFinite, raw >= realProgressThreshold {
         let clamped = max(0.0, min(1.0, raw))
-        lastResolvedDownloadProgress = clamped
-        resolvedProgress = clamped
+        // Monotonic progress so reconfigure never snaps the ring back to empty.
+        if let last = lastResolvedDownloadProgress, clamped + 0.002 < last {
+          resolvedProgress = last
+        } else {
+          lastResolvedDownloadProgress = clamped
+          resolvedProgress = clamped
+        }
       } else if let lastResolvedDownloadProgress, lastResolvedDownloadProgress >= realProgressThreshold
       {
         resolvedProgress = lastResolvedDownloadProgress
       } else {
         resolvedProgress = nil
       }
+    } else if !needsDownload {
+      resolvedProgress = nil
+      lastResolvedDownloadProgress = nil
     } else {
       resolvedProgress = nil
       lastResolvedDownloadProgress = nil
+    }
+
+    // Ignore idle flicker while still "needs download" during an active transfer.
+    if self.isDownloading && !isDownloading && needsDownload {
+      ensureSpinning()
+      return
     }
 
     let progressChanged =
@@ -4177,6 +5071,26 @@ final class BubbleUploadProgressView: UIView {
   }
 }
 
+/// HTTP headers some media CDNs require. SoundCloud's HLS CDN hotlink-protects with a
+/// Referer/User-Agent gate — the server's yt-dlp sends these, so the client must match or
+/// the CDN returns 403 "Forbidden".
+enum VoicePlayProgressViewSourceHeaders {
+  static let browserUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+
+  static func headers(for url: URL) -> [String: String]? {
+    guard let host = url.host?.lowercased() else { return nil }
+    if host.contains("soundcloud") {
+      return [
+        "User-Agent": browserUserAgent,
+        "Referer": "https://soundcloud.com/",
+        "Origin": "https://soundcloud.com",
+      ]
+    }
+    return nil
+  }
+}
+
 final class VoicePlayProgressView: UIView {
   private let fluidVisualizer = FluidVADVisualizer()
   private let fillView = UIView()
@@ -4184,29 +5098,52 @@ final class VoicePlayProgressView: UIView {
   private let artworkOverlayView = UIView()
   private let iconView = UIImageView()
   private let ringProgressLayer = CAShapeLayer()
+  // Download state lives on a small corner badge over the artwork (bottom-right),
+  // never on the center glyph — the center is always the play/pause control.
+  private let downloadBadgeView = UIView()
+  private let downloadBadgeIconView = UIImageView()
+  private let downloadBadgeRingLayer = CAShapeLayer()
   private let uploadProgressAnimationKey = "voice.upload.progress"
+  private let uploadSpinAnimationKey = "voice.upload.spin"
+  private let badgeSpinAnimationKey = "voice.badge.spin"
+  private let badgeProgressAnimationKey = "voice.badge.progress"
   private var iconTintColor = ChatListAppearance.fallback.accent
+  private var ringTintColor = ChatListAppearance.fallback.accent
+  /// Fill color of the corner download badge — the appearance accent (falls back to ringTint).
+  private var badgeTintColor = ChatListAppearance.fallback.accent
+  /// Dominant color pulled from the artwork; tints the fluid halo so it reads as the cover.
+  private var artworkAccentColor: UIColor?
+  /// When true the glyph is punched OUT of the filled circle instead of drawn on top,
+  /// so the bubble itself shows through it. Used on my own bubbles, where the plate is
+  /// the text color and the icon must read as the bubble color.
+  private var knockoutIcon = false
+  private var currentIconName: String?
+  private var lastKnockoutMaskKey: String?
   private var isUploading = false
   private var needsDownload = false
   private var isDownloading = false
+  private var downloadFailed = false
   private var uploadProgress: CGFloat?
   private var lastResolvedUploadProgress: CGFloat?
   private var downloadProgress: CGFloat?
-  private var lastResolvedDownloadProgress: CGFloat?
-  private let uploadSpinAnimationKey = "voice.upload.spin"
   private let minimumUploadProgress: CGFloat = 0.027
 
   override init(frame: CGRect) {
     super.init(frame: frame)
     isUserInteractionEnabled = true
     backgroundColor = .clear
+    // Fluid paints behind the plate and slightly outside it — never clip.
+    clipsToBounds = false
 
     fluidVisualizer.isUserInteractionEnabled = false
-    addSubview(fluidVisualizer)
+    fluidVisualizer.alpha = 0
+    // BEHIND fill/artwork so VAD is never on top of the cover.
+    insertSubview(fluidVisualizer, at: 0)
 
     fillView.isUserInteractionEnabled = false
     fillView.backgroundColor = UIColor(white: 1.0, alpha: 0.96)
     fillView.layer.cornerCurve = .continuous
+    fillView.clipsToBounds = true
     addSubview(fillView)
 
     artworkImageView.isHidden = true
@@ -4220,8 +5157,9 @@ final class VoicePlayProgressView: UIView {
     fillView.addSubview(artworkOverlayView)
 
     ringProgressLayer.fillColor = UIColor.clear.cgColor
-    ringProgressLayer.strokeColor = ChatListAppearance.fallback.accent.cgColor
-    ringProgressLayer.lineWidth = 2.4
+    // Center ring is upload-only now (download moved to the corner badge).
+    ringProgressLayer.strokeColor = UIColor(white: 0.55, alpha: 0.85).cgColor
+    ringProgressLayer.lineWidth = 2.6
     ringProgressLayer.lineCap = .round
     ringProgressLayer.strokeStart = 0.0
     ringProgressLayer.strokeEnd = 0.0
@@ -4229,6 +5167,26 @@ final class VoicePlayProgressView: UIView {
 
     iconView.contentMode = .scaleAspectFit
     addSubview(iconView)
+
+    // Corner download badge — a hit-through overlay above the plate.
+    downloadBadgeView.isUserInteractionEnabled = false
+    downloadBadgeView.isHidden = true
+    downloadBadgeView.layer.cornerCurve = .continuous
+    addSubview(downloadBadgeView)
+
+    downloadBadgeIconView.contentMode = .center
+    downloadBadgeIconView.tintColor = .white
+    downloadBadgeIconView.isUserInteractionEnabled = false
+    downloadBadgeView.addSubview(downloadBadgeIconView)
+
+    downloadBadgeRingLayer.fillColor = UIColor.clear.cgColor
+    downloadBadgeRingLayer.strokeColor = UIColor.white.cgColor
+    downloadBadgeRingLayer.lineWidth = 2.0
+    downloadBadgeRingLayer.lineCap = .round
+    downloadBadgeRingLayer.strokeStart = 0.0
+    downloadBadgeRingLayer.strokeEnd = 0.0
+    downloadBadgeView.layer.addSublayer(downloadBadgeRingLayer)
+
     setPlaybackState(isPlaying: false, progress: 0.0)
   }
 
@@ -4238,6 +5196,8 @@ final class VoicePlayProgressView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
+    clipsToBounds = false
+    // Plate inset so VAD can pulse outside without being edge-clipped.
     let diameter = max(1.0, min(bounds.width, bounds.height) - 6.0)
     let fillFrame = CGRect(
       x: floor((bounds.width - diameter) * 0.5),
@@ -4252,6 +5212,7 @@ final class VoicePlayProgressView: UIView {
     artworkOverlayView.frame = fillView.bounds
     artworkOverlayView.layer.cornerRadius = fillView.layer.cornerRadius
 
+    // Match the plate; scale animation expands outside (parent clipsToBounds = false).
     fluidVisualizer.activePushMultiplier = 0.15
     fluidVisualizer.frame = fillView.frame
 
@@ -4272,14 +5233,57 @@ final class VoicePlayProgressView: UIView {
       width: 20.0,
       height: 20.0
     )
+
+    // Corner badge: bottom-right, tucked just inside the plate edge.
+    let badgeSize: CGFloat = 19.0
+    downloadBadgeView.frame = CGRect(
+      x: fillFrame.maxX - badgeSize - 0.5,
+      y: fillFrame.maxY - badgeSize - 0.5,
+      width: badgeSize,
+      height: badgeSize
+    )
+    downloadBadgeView.layer.cornerRadius = badgeSize * 0.5
+    downloadBadgeIconView.frame = downloadBadgeView.bounds
+    let badgeRingPath = UIBezierPath(
+      arcCenter: CGPoint(x: badgeSize * 0.5, y: badgeSize * 0.5),
+      radius: (badgeSize * 0.5) - 2.0,
+      startAngle: -.pi / 2,
+      endAngle: (.pi * 3.0) / 2.0,
+      clockwise: true)
+    // Set bounds + position (NOT frame) so a live rotation transform on the spinner is never
+    // disturbed — setting `.frame` under a transform recomputes it and made the arc flicker
+    // every layout pass. Disable implicit actions so geometry changes never animate.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    downloadBadgeRingLayer.bounds = downloadBadgeView.bounds
+    downloadBadgeRingLayer.position = CGPoint(
+      x: downloadBadgeView.bounds.midX,
+      y: downloadBadgeView.bounds.midY
+    )
+    downloadBadgeRingLayer.path = badgeRingPath.cgPath
+    CATransaction.commit()
+
+    refreshIconKnockout()
   }
 
-  func applyStyle(fillColor: UIColor, iconTint: UIColor, ringTint: UIColor) {
+  func applyStyle(
+    fillColor: UIColor,
+    iconTint: UIColor,
+    ringTint: UIColor,
+    badgeTint: UIColor? = nil,
+    knockoutIcon: Bool = false
+  ) {
     fillView.backgroundColor = fillColor
     iconTintColor = iconTint
+    ringTintColor = ringTint
+    badgeTintColor = badgeTint ?? ringTint
+    self.knockoutIcon = knockoutIcon
     iconView.tintColor = resolvedIconTintColor()
-    fluidVisualizer.applyColor(ringTint.withAlphaComponent(0.35))
     ringProgressLayer.strokeColor = ringTint.cgColor
+    refreshFluidColor()
+    refreshIconKnockout()
+    // Badge fill tracks the appearance accent; refresh it whenever the style changes.
+    updateDownloadBadge()
     if isUploading {
       updateUploadRingVisual()
     }
@@ -4290,20 +5294,96 @@ final class VoicePlayProgressView: UIView {
     let hasArtwork = image != nil
     artworkImageView.isHidden = !hasArtwork
     artworkOverlayView.isHidden = !hasArtwork
+    artworkAccentColor = image.flatMap { VoicePlayProgressView.dominantColor(of: $0) }
+    refreshFluidColor()
     iconView.tintColor = resolvedIconTintColor()
+    // Artwork fills the plate, so there is no plate color left to punch through to —
+    // the glyph goes back to being drawn on top (white, per `resolvedIconTintColor`).
+    refreshIconKnockout()
+  }
+
+  /// Dynamic fluid tint: cover dominant color when present, else ring/accent tint.
+  private func refreshFluidColor() {
+    if let accent = artworkAccentColor {
+      fluidVisualizer.applyColor(accent.withAlphaComponent(0.40))
+    } else {
+      fluidVisualizer.applyColor(ringTintColor.withAlphaComponent(0.35))
+    }
+  }
+
+  private var knockoutActive: Bool {
+    knockoutIcon && artworkImageView.image == nil
+  }
+
+  /// Rebuild the punched-out plate. The mask is the filled circle with the glyph
+  /// erased out of it, so whatever is behind the button (the bubble) reads as the icon.
+  private func refreshIconKnockout() {
+    guard knockoutActive, let glyph = iconView.image, fillView.bounds.width > 1 else {
+      if fillView.layer.mask != nil {
+        fillView.layer.mask = nil
+      }
+      lastKnockoutMaskKey = nil
+      iconView.isHidden = false
+      return
+    }
+
+    iconView.isHidden = true
+    let size = fillView.bounds.size
+    let key = "\(currentIconName ?? "-")|\(Int(size.width))x\(Int(size.height))"
+    guard key != lastKnockoutMaskKey else { return }
+    lastKnockoutMaskKey = key
+
+    let glyphSize = glyph.size
+    let glyphRect = CGRect(
+      x: (size.width - glyphSize.width) * 0.5,
+      y: (size.height - glyphSize.height) * 0.5,
+      width: glyphSize.width,
+      height: glyphSize.height
+    )
+    let maskImage = UIGraphicsImageRenderer(size: size).image { _ in
+      UIColor.black.setFill()
+      UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).fill()
+      glyph.draw(in: glyphRect, blendMode: .destinationOut, alpha: 1.0)
+    }
+
+    let maskLayer = CALayer()
+    maskLayer.frame = fillView.bounds
+    maskLayer.contents = maskImage.cgImage
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    fillView.layer.mask = maskLayer
+    CATransaction.commit()
+  }
+
+  private func setIcon(_ image: UIImage?, name: String) {
+    iconView.image = image
+    currentIconName = name
+    iconView.tintColor = resolvedIconTintColor()
+    refreshIconKnockout()
   }
 
   func setPlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat = 0.0) {
-    guard !isUploading, !isDownloading, !needsDownload else { return }
+    // The center glyph is always the play/pause control; download chrome now lives on
+    // the corner badge, so playback state applies unconditionally — except while an
+    // upload owns the center ring + cancel glyph.
+    guard !isUploading else { return }
+    applyPlaybackChrome(isPlaying: isPlaying, progress: progress, level: level)
+  }
+
+  private func applyPlaybackChrome(isPlaying: Bool, progress: CGFloat, level: CGFloat) {
     ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
     ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    ringProgressLayer.transform = CATransform3DIdentity
     ringProgressLayer.strokeStart = 0.0
-    ringProgressLayer.strokeEnd = 0.0 // Never show ring for playback
+    ringProgressLayer.strokeEnd = 0.0 // Never show center ring for playback
+    CATransaction.commit()
     let symbol = isPlaying ? "pause.fill" : "play.fill"
-    let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
-    iconView.image = UIImage(systemName: symbol, withConfiguration: config)
-    iconView.tintColor = resolvedIconTintColor()
+    let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)
+    setIcon(UIImage(systemName: symbol, withConfiguration: config), name: symbol)
 
+    // Classic fluid behind the plate — level from metering; color from applyStyle / cover.
     fluidVisualizer.level = level
     if isPlaying {
       if fluidVisualizer.alpha < 0.05 { fluidVisualizer.start() }
@@ -4317,7 +5397,8 @@ final class VoicePlayProgressView: UIView {
       needsDownload = false
       isDownloading = false
       downloadProgress = nil
-      lastResolvedDownloadProgress = nil
+      downloadFailed = false
+      updateDownloadBadge()
     }
     let resolvedProgress: CGFloat?
     if isUploading {
@@ -4346,56 +5427,126 @@ final class VoicePlayProgressView: UIView {
 
   func setDownloadState(needsDownload: Bool, isDownloading: Bool, progress: CGFloat?) {
     guard !isUploading else { return }
+    // Any live download push supersedes a latched failure badge.
+    downloadFailed = false
 
-    let resolvedProgress: CGFloat?
+    // Keep the badge/spinner latched for the whole transfer. Transient reconfigure
+    // passes with isDownloading=false would blank the circle mid-download.
+    let clampedProgress: CGFloat?
     if isDownloading {
-      if let normalizedProgress = quantizedTransferProgress(
-        progress, minimum: minimumUploadProgress)
-      {
-        lastResolvedDownloadProgress = normalizedProgress
-        resolvedProgress = normalizedProgress
-      } else if let lastResolvedDownloadProgress {
-        resolvedProgress = lastResolvedDownloadProgress
+      if let progress, progress.isFinite {
+        let next = max(0.0, min(1.0, progress))
+        // Monotonic — never snap the ring backward.
+        if let prev = downloadProgress, next + 0.001 < prev {
+          clampedProgress = prev
+        } else {
+          clampedProgress = next
+        }
       } else {
-        lastResolvedDownloadProgress = minimumUploadProgress
-        resolvedProgress = minimumUploadProgress
+        clampedProgress = downloadProgress  // keep last known
       }
+    } else if !needsDownload {
+      clampedProgress = nil
     } else {
-      resolvedProgress = nil
-      lastResolvedDownloadProgress = nil
+      // Idle downloadable state (not transferring) — clear progress.
+      clampedProgress = nil
     }
 
-    if self.needsDownload == needsDownload, self.isDownloading == isDownloading,
-      self.downloadProgress == resolvedProgress
-    {
+    // If we were downloading and a reconfigure claims "not downloading" while still
+    // needing a download, ignore the false idle flicker (race with snapshot publish).
+    if self.isDownloading && !isDownloading && needsDownload {
+      updateDownloadBadge()
       return
     }
 
     self.needsDownload = needsDownload
     self.isDownloading = isDownloading
-    self.downloadProgress = resolvedProgress
+    self.downloadProgress = clampedProgress
+    updateDownloadBadge()
+  }
 
-    guard needsDownload else {
-      ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      ringProgressLayer.strokeStart = 0.0
-      ringProgressLayer.strokeEnd = 0.0
+  /// Terminal failure: a broken source that can't be downloaded. The badge turns red —
+  /// the spinner never lingers, and the center stays a plain play glyph.
+  func setDownloadFailed() {
+    guard !isUploading else { return }
+    downloadFailed = true
+    needsDownload = true
+    isDownloading = false
+    downloadProgress = nil
+    updateDownloadBadge()
+    applyPlaybackChrome(isPlaying: false, progress: 0.0, level: 0.0)
+  }
+
+  /// Drive the bottom-right corner badge: down-arrow (idle), a continuously spinning arc
+  /// (downloading/buffering — a plain SPINNER, never a jumpy determinate ring that can reset
+  /// to zero), or a red error mark (failed). Hidden when there is nothing to download.
+  ///
+  /// Colors: the badge fill is the appearance accent (passed via `applyStyle` → ringTintColor),
+  /// the spinner arc is white, and failure turns the fill red. No border.
+  private func updateDownloadBadge() {
+    let show = downloadFailed || needsDownload || isDownloading
+    downloadBadgeView.isHidden = !show
+    guard show else {
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeSpinAnimationKey)
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeProgressAnimationKey)
+      downloadBadgeRingLayer.strokeEnd = 0.0
       return
     }
+
+    if downloadFailed {
+      downloadBadgeView.backgroundColor = UIColor(red: 0.90, green: 0.23, blue: 0.20, alpha: 0.95)
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeSpinAnimationKey)
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeProgressAnimationKey)
+      downloadBadgeRingLayer.strokeEnd = 0.0
+      let config = UIImage.SymbolConfiguration(pointSize: 11, weight: .heavy)
+      downloadBadgeIconView.image = UIImage(systemName: "exclamationmark", withConfiguration: config)
+      return
+    }
+
+    // Accent fill (from appearance), white spinner arc.
+    downloadBadgeView.backgroundColor = badgeTintColor
+    downloadBadgeRingLayer.strokeColor = UIColor.white.cgColor
 
     guard isDownloading else {
-      ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      ringProgressLayer.strokeStart = 0.0
-      ringProgressLayer.strokeEnd = 0.0
-      let config = UIImage.SymbolConfiguration(pointSize: 17, weight: .bold)
-      iconView.image = UIImage(systemName: "arrow.down", withConfiguration: config)
-      iconView.tintColor = resolvedIconTintColor()
-      fluidVisualizer.stop()
+      // Needs download, idle: a plain down-arrow, no ring.
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeSpinAnimationKey)
+      downloadBadgeRingLayer.removeAnimation(forKey: badgeProgressAnimationKey)
+      downloadBadgeRingLayer.strokeStart = 0.0
+      downloadBadgeRingLayer.strokeEnd = 0.0
+      let config = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+      downloadBadgeIconView.image = UIImage(systemName: "arrow.down", withConfiguration: config)
       return
     }
 
-    updateDownloadRingVisual()
+    // Downloading / buffering: a continuously spinning quarter-arc — a plain SPINNER, no
+    // byte progress (which jumped 5% then snapped back to zero on the old broken loop).
+    downloadBadgeIconView.image = nil
+    downloadBadgeRingLayer.removeAnimation(forKey: badgeProgressAnimationKey)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    downloadBadgeRingLayer.strokeStart = 0.0
+    downloadBadgeRingLayer.strokeEnd = 0.28
+    CATransaction.commit()
+    if downloadBadgeRingLayer.animation(forKey: badgeSpinAnimationKey) == nil {
+      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+      spin.fromValue = 0.0
+      spin.toValue = 2.0 * CGFloat.pi
+      spin.duration = 1.0
+      spin.repeatCount = .infinity
+      spin.timingFunction = CAMediaTimingFunction(name: .linear)
+      spin.isRemovedOnCompletion = false
+      downloadBadgeRingLayer.add(spin, forKey: badgeSpinAnimationKey)
+    }
+  }
+
+  /// Hard reset for cell reuse.
+  func resetDownloadChromeForReuse() {
+    downloadFailed = false
+    needsDownload = false
+    isDownloading = false
+    downloadProgress = nil
+    updateDownloadBadge()
+    applyPlaybackChrome(isPlaying: false, progress: 0.0, level: 0.0)
   }
 
   private func updateUploadRingVisual() {
@@ -4407,8 +5558,7 @@ final class VoicePlayProgressView: UIView {
       return
     }
     let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)
-    iconView.image = UIImage(systemName: "xmark", withConfiguration: config)
-    iconView.tintColor = resolvedIconTintColor()
+    setIcon(UIImage(systemName: "xmark", withConfiguration: config), name: "xmark")
 
     let targetProgress = max(minimumUploadProgress, min(1.0, uploadProgress ?? minimumUploadProgress))
     let currentProgress = ringProgressLayer.presentation()?.strokeEnd ?? ringProgressLayer.strokeEnd
@@ -4445,55 +5595,39 @@ final class VoicePlayProgressView: UIView {
     }
   }
 
-  private func updateDownloadRingVisual() {
-    guard needsDownload, isDownloading else {
-      ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-      ringProgressLayer.removeAnimation(forKey: uploadSpinAnimationKey)
-      ringProgressLayer.strokeStart = 0.0
-      ringProgressLayer.strokeEnd = 0.0
-      return
-    }
-    let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)
-    iconView.image = UIImage(systemName: "xmark", withConfiguration: config)
-    iconView.tintColor = resolvedIconTintColor()
-
-    let targetProgress = max(minimumUploadProgress, min(1.0, downloadProgress ?? minimumUploadProgress))
-    let currentProgress = ringProgressLayer.presentation()?.strokeEnd ?? ringProgressLayer.strokeEnd
-    let shouldAnimate =
-      abs(currentProgress - targetProgress) >= chatTransferProgressAnimationThreshold
-      || targetProgress >= 0.999
-
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    ringProgressLayer.strokeStart = 0.0
-    ringProgressLayer.strokeEnd = targetProgress
-    CATransaction.commit()
-
-    if shouldAnimate {
-      let progressAnimation = CABasicAnimation(keyPath: "strokeEnd")
-      progressAnimation.fromValue = currentProgress
-      progressAnimation.toValue = targetProgress
-      progressAnimation.duration = 0.16
-      progressAnimation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-      ringProgressLayer.add(progressAnimation, forKey: uploadProgressAnimationKey)
-    } else {
-      ringProgressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-    }
-
-    if ringProgressLayer.animation(forKey: uploadSpinAnimationKey) == nil {
-      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-      spin.fromValue = 0.0
-      spin.toValue = (2.0 * CGFloat.pi)
-      spin.duration = 1.57
-      spin.repeatCount = .infinity
-      spin.timingFunction = CAMediaTimingFunction(name: .linear)
-      spin.isRemovedOnCompletion = true
-      ringProgressLayer.add(spin, forKey: uploadSpinAnimationKey)
-    }
-  }
-
   private func resolvedIconTintColor() -> UIColor {
     artworkImageView.image == nil ? iconTintColor : .white
+  }
+
+  /// Cheap dominant-color probe: average the image down to 1×1 and lift saturation so a
+  /// muted mean still reads as a tint. Runs once per artwork set, off the hot path.
+  static func dominantColor(of image: UIImage) -> UIColor? {
+    guard let cg = image.cgImage else { return nil }
+    var pixel = [UInt8](repeating: 0, count: 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard
+      let ctx = CGContext(
+        data: &pixel,
+        width: 1,
+        height: 1,
+        bitsPerComponent: 8,
+        bytesPerRow: 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+    ctx.interpolationQuality = .medium
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+    let r = CGFloat(pixel[0]) / 255.0
+    let g = CGFloat(pixel[1]) / 255.0
+    let b = CGFloat(pixel[2]) / 255.0
+    var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+    UIColor(red: r, green: g, blue: b, alpha: 1.0).getHue(
+      &h, saturation: &s, brightness: &v, alpha: &a)
+    return UIColor(
+      hue: h,
+      saturation: min(1.0, s * 1.4 + 0.08),
+      brightness: max(0.55, min(1.0, v + 0.12)),
+      alpha: 1.0)
   }
 }
 
@@ -4665,6 +5799,8 @@ final class VoiceWaveformView: UIView {
 protocol VoicePlayableCell: AnyObject {
   func applyVoicePlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat)
   func applyVoiceDownloadState(needsDownload: Bool, isDownloading: Bool, progress: CGFloat?)
+  /// Terminal download failure — render inline "Couldn't load · Tap to retry" chrome.
+  func applyVoiceDownloadFailedState()
 }
 
 fileprivate struct ChatAudioQueueItem {
@@ -4693,9 +5829,11 @@ final class ChatAudioQueueRegistry {
 
     var nextItems: [ChatAudioQueueItem] = []
     var seenMessageIds = Set<String>()
+    var musicCandidates = 0
     nextItems.reserveCapacity(rows.count)
 
     for row in rows {
+      if usesAudioMetadataVoiceLayout(row) { musicCandidates += 1 }
       guard let item = makeItem(from: row, fallbackChatId: trimmedChatId) else { continue }
       if seenMessageIds.insert(item.messageId).inserted {
         nextItems.append(item)
@@ -4704,10 +5842,47 @@ final class ChatAudioQueueRegistry {
     }
 
     itemsByChatId[trimmedChatId] = nextItems
+    // The store is persistent + accumulates across windows, so the sheet list can exceed
+    // what this window registered. If musicCandidates > registered, per-row [MusicList]
+    // skip logs above say why (no id / no media URL).
+    let persistedTotal = NativeMusicPlayerStore.shared.tracks(forChatId: trimmedChatId).count
+    NSLog(
+      "[MusicList] setRows chat=%@ rows=%d musicCandidates=%d registered=%d persistedTotal=%d",
+      trimmedChatId,
+      rows.count,
+      musicCandidates,
+      nextItems.count,
+      persistedTotal
+    )
   }
 
   func tracks(for chatId: String?) -> [NativeMusicPlayerTrack] {
     items(for: chatId).map(\.track)
+  }
+
+  /// Register ONE music row into the persistent store + per-chat queue immediately, keyed on
+  /// `chatId`. Independent of the batch `setRows` path — that runs off the row-diff/apply pass,
+  /// which the cold-open cache/snapshot paint can skip (and per-message payloads often omit
+  /// `chat_id`, so `row.chatId` is nil). Called at music-cell configure so EVERY rendered track
+  /// lands in the chat's player-sheet list, not just the tapped one.
+  func registerMusicRow(_ row: ChatListRow, chatId: String) {
+    let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    guard let item = makeItem(from: row, fallbackChatId: trimmed) else { return }
+    let key = item.chatId
+    var chatItems = itemsByChatId[key] ?? []
+    // Only touch the store on a genuinely new track — cacheTrack is a JSON encode +
+    // UserDefaults write, and this runs on every music-cell configure.
+    guard !chatItems.contains(where: { $0.messageId == item.messageId }) else { return }
+    chatItems.append(item)
+    itemsByChatId[key] = chatItems
+    _ = NativeMusicPlayerStore.shared.cacheTrack(payload: item.track.toPayload())
+    NSLog(
+      "[MusicList] registerMusicRow chat=%@ msg=%@ chatTotal=%d",
+      key,
+      item.messageId,
+      chatItems.count
+    )
   }
 
   func tracks(for chatId: String?, fallbackTrackId: String?) -> [NativeMusicPlayerTrack] {
@@ -4770,7 +5945,15 @@ final class ChatAudioQueueRegistry {
 
   private func makeItem(from row: ChatListRow, fallbackChatId: String) -> ChatAudioQueueItem? {
     guard usesAudioMetadataVoiceLayout(row) else { return nil }
-    guard let messageId = normalizedChatAudioId(row.messageId) else { return nil }
+    guard let messageId = normalizedChatAudioId(row.messageId) else {
+      NSLog(
+        "[MusicList] skip music row — no messageId · type=%@ hasCover=%@ file=%@",
+        row.messageType,
+        (row.musicCoverURL?.isEmpty == false) ? "Y" : "N",
+        row.fileName ?? "-"
+      )
+      return nil
+    }
 
     let localMedia = row.localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
     let remoteMedia = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4782,11 +5965,23 @@ final class ChatAudioQueueRegistry {
     } else {
       resolvedMediaURL = nil
     }
-    guard let mediaURL = resolvedMediaURL else { return nil }
+    guard let mediaURL = resolvedMediaURL else {
+      // Real music (has cover/artist/source) but no playable URL on the row → can't be
+      // added to the queue/list. Logged so we can see exactly which tracks fall out and why.
+      NSLog(
+        "[MusicList] skip music msgId=%@ — no media URL · type=%@ hasCover=%@ source=%@ title=%@",
+        messageId,
+        row.messageType,
+        (row.musicCoverURL?.isEmpty == false) ? "Y" : "N",
+        row.musicSource ?? "-",
+        resolvedAudioVoiceTitle(row)
+      )
+      return nil
+    }
 
     let title = resolvedAudioVoiceTitle(row)
     let subtitle = resolvedAudioVoiceStaticDetail(row)
-    let artwork = chatMediaImage(fromBase64: row.thumbnailBase64)
+    let artwork = chatMusicArtworkImage(for: row)
     let duration = max(0.0, row.duration ?? 0.0)
     let localURI = localMedia?.isEmpty == false ? localMedia : nil
     let remoteURI: String? = {
@@ -4805,7 +6000,7 @@ final class ChatAudioQueueRegistry {
       album: nil,
       duration: formatBubbleDuration(seconds: duration),
       durationSeconds: duration > 0.0 ? duration : nil,
-      cover: nil,
+      cover: row.musicCoverURL?.trimmingCharacters(in: .whitespacesAndNewlines),
       previewURL: remoteURI,
       streamURL: remoteURI,
       localURI: localURI,
@@ -4840,6 +6035,12 @@ struct VoiceBubblePlaybackSnapshot {
   let isRepeatEnabled: Bool
   let isDownloading: Bool
   let downloadProgress: CGFloat?
+  /// 0.0…1.0 while downloading with a known total; nil when indeterminate or not downloading.
+  let downloadFraction: CGFloat?
+  /// Bytes written so far; nil when not downloading.
+  let downloadedBytes: Int64?
+  /// Expected total bytes; nil when the server sent no Content-Length.
+  let totalBytes: Int64?
   let title: String?
   let subtitle: String?
   let artwork: UIImage?
@@ -4856,6 +6057,9 @@ struct VoiceBubblePlaybackSnapshot {
     isRepeatEnabled: false,
     isDownloading: false,
     downloadProgress: nil,
+    downloadFraction: nil,
+    downloadedBytes: nil,
+    totalBytes: nil,
     title: nil,
     subtitle: nil,
     artwork: nil,
@@ -4890,18 +6094,49 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   private var activeDownloadTask: URLSessionDownloadTask?
   private var activeDownloadProgressObservation: NSKeyValueObservation?
   private var activeDownloadProgress: CGFloat?
+  private var activeDownloadedBytes: Int64?
+  private var activeTotalBytes: Int64?
+  private var lastDownloadProgressPublishTime: CFTimeInterval = 0
   private var activeMediaKey: String?
   private var activeFileName: String?
+  /// Messages we've already re-fetched once after evicting a poisoned voice cache
+  /// (a non-audio body written as ".m4a"). Bounds the self-heal retry to one round so
+  /// a genuinely broken source can't loop.
+  private var poisonedCacheRetriedMessageIds: Set<String> = []
   private var activeTitle: String?
   private var activeSubtitle: String?
   private var activeArtwork: UIImage?
   private var activeDuration: Double = 0.0
   private var presentsGlobalPlayer = false
+  /// The global mini-player banner stays suppressed until audio actually starts
+  /// (first successful play / stream ready). A tap that is still downloading — or a
+  /// broken source that never plays — therefore never flashes the banner. Latches on
+  /// the first `isPlaying`; reset when playback is torn down or a new item begins.
+  private var bannerPlaybackStarted = false
   private var shouldResumeAfterInterruption = false
   private var didConfigureRemoteCommands = false
   private var lastNowPlayingSignature: String?
   private var randomizedQueueMessageIds: [String] = []
+  /// Manual drag-to-reorder override per chat (ordered trackIds == messageIds). When set
+  /// for the active chat, it defines the base play order the player sheet's "Next Up" list
+  /// was dragged into; forward mode honors it, reverse/random still transform on top.
+  private var manualQueueOrderByChatId: [String: [String]] = [:]
   private(set) var currentSnapshot = VoiceBubblePlaybackSnapshot.empty
+
+  /// Set an explicit queue order for the active chat (drag-to-reorder from the player
+  /// sheet). `orderedTrackIds` are trackIds (== messageIds) in the desired play order.
+  func setManualQueueOrder(_ orderedTrackIds: [String]) {
+    guard let chatId = activeChatId else { return }
+    manualQueueOrderByChatId[chatId] = orderedTrackIds
+    syncRandomizedQueueMessageIds(anchorMessageId: activeMessageId, regenerate: true)
+    publishSnapshot()
+  }
+
+  /// Live download byte counts for the active bubble (nil when no download is in flight).
+  var activeDownloadByteCounts: (downloaded: Int64?, total: Int64?) {
+    guard activeDownloadTask != nil else { return (nil, nil) }
+    return (activeDownloadedBytes, activeTotalBytes)
+  }
 
   private override init() {
     super.init()
@@ -5228,11 +6463,11 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     isPlaying = accepted
     ensureDisplayLink()
     if updateCell {
-      let isDownloading = self.activeDownloadTask != nil
-      activeCell?.applyVoiceDownloadState(
-        needsDownload: isDownloading,
-        isDownloading: isDownloading,
-        progress: activeDownloadProgress
+      let isLoading = isMediaTransferActive(for: activeMessageId)
+      pushDownloadState(
+        to: activeCell,
+        needsDownload: isLoading,
+        isDownloading: isLoading
       )
       activeCell?.applyVoicePlaybackState(
         isPlaying: accepted,
@@ -5251,11 +6486,11 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     isPlaying = false
     level = 0.0
     if updateCell {
-      let isDownloading = self.activeDownloadTask != nil
-      activeCell?.applyVoiceDownloadState(
-        needsDownload: isDownloading,
-        isDownloading: isDownloading,
-        progress: activeDownloadProgress
+      let isLoading = isMediaTransferActive(for: activeMessageId)
+      pushDownloadState(
+        to: activeCell,
+        needsDownload: isLoading,
+        isDownloading: isLoading
       )
       activeCell?.applyVoicePlaybackState(
         isPlaying: false,
@@ -5379,23 +6614,35 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     fileName: String? = nil
   ) {
     guard let messageId, !messageId.isEmpty else {
-      cell.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+      pushDownloadState(to: cell, needsDownload: false, isDownloading: false)
       cell.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
       return
     }
     if activeMessageId == messageId {
       activeCell = cell
-      let isDownloading = activeDownloadTask != nil
-      cell.applyVoiceDownloadState(
-        needsDownload: isDownloading,
-        isDownloading: isDownloading,
-        progress: activeDownloadProgress
+      // Resolving / downloading must keep the badge spinning across cell rebinds.
+      let isLoading = isMediaTransferActive(for: messageId)
+      pushDownloadState(
+        to: cell,
+        needsDownload: isLoading || mediaURLRequiresDownload(mediaURL, mediaKey: mediaKey, fileName: fileName),
+        isDownloading: isLoading
       )
       cell.applyVoicePlaybackState(
         isPlaying: isPlaying,
         progress: playbackProgress,
         level: level
       )
+      return
+    }
+    if failedMessageIds.contains(messageId) {
+      applyIdleState(
+        cell: cell,
+        messageId: messageId,
+        mediaURL: mediaURL,
+        mediaKey: mediaKey,
+        fileName: fileName
+      )
+      cell.applyVoiceDownloadFailedState()
       return
     }
     applyIdleState(
@@ -5417,18 +6664,118 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     let needsDownload =
       (messageId?.isEmpty == false)
       && mediaURLRequiresDownload(mediaURL, mediaKey: mediaKey, fileName: fileName)
-    cell.applyVoiceDownloadState(
-      needsDownload: needsDownload,
-      isDownloading: false,
-      progress: nil
-    )
+    pushDownloadState(to: cell, needsDownload: needsDownload, isDownloading: false)
     cell.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+  }
+
+  /// Push ring state. Live byte counts live on `currentSnapshot` for size captions + the sheet.
+  private func pushDownloadState(
+    to cell: VoicePlayableCell?,
+    needsDownload: Bool,
+    isDownloading: Bool
+  ) {
+    cell?.applyVoiceDownloadState(
+      needsDownload: needsDownload,
+      isDownloading: isDownloading,
+      progress: isDownloading ? activeDownloadProgress : nil
+    )
+  }
+
+  /// Read real byte counts from `URLSessionTask.progress` for the ring + snapshot.
+  private func ingestDownloadProgress(from progress: Progress) {
+    let completed = progress.completedUnitCount
+    let total = progress.totalUnitCount
+    if total > 0 {
+      activeDownloadProgress = max(0.0, min(1.0, CGFloat(Double(completed) / Double(total))))
+      activeDownloadedBytes = completed
+      activeTotalBytes = total
+    } else {
+      // No Content-Length → indeterminate ring; still track completed when the task reports it.
+      activeDownloadProgress = nil
+      activeDownloadedBytes = completed > 0 ? completed : nil
+      activeTotalBytes = nil
+    }
+  }
+
+  private func clearActiveDownloadByteState() {
+    activeDownloadProgress = nil
+    activeDownloadedBytes = nil
+    activeTotalBytes = nil
+    lastDownloadProgressPublishTime = 0
+  }
+
+  /// Throttle UI/snapshot publishes to ~60 fps or ≥1% fraction change.
+  private func shouldPublishDownloadProgressUpdate(previousFraction: CGFloat?) -> Bool {
+    let now = CACurrentMediaTime()
+    let elapsed = now - lastDownloadProgressPublishTime
+    let fraction = activeDownloadProgress
+    let previous = previousFraction
+    let fractionDelta: CGFloat = {
+      switch (previous, fraction) {
+      case let (p?, f?):
+        return abs(p - f)
+      case (nil, .some), (.some, nil):
+        return 1.0
+      default:
+        return 0.0
+      }
+    }()
+    if fractionDelta >= 0.01 || fraction == 1.0 || elapsed >= (1.0 / 60.0) || lastDownloadProgressPublishTime == 0 {
+      lastDownloadProgressPublishTime = now
+      return true
+    }
+    return false
   }
 
   func unbind(cell: VoicePlayableCell) {
     if activeCell === cell {
       activeCell = nil
     }
+  }
+
+  // Terminal download failures latched per message so cells render an inline
+  // "Couldn't load · Tap to retry" state instead of silently resetting to idle.
+  private var failedMessageIds: Set<String> = []
+  /// How many terminal failures we have seen for a message (reset on successful play).
+  private var failedAttemptCounts: [String: Int] = [:]
+  // Message currently resolving its backend stream URL (pre-download window) so
+  // taps cancel instead of restarting and cell rebinds keep the loading chrome.
+  private var resolvingMessageId: String?
+  /// When the current resolve started. First play of a SoundCloud track makes the server
+  /// download + re-host the audio (~5–10s), so taps in that window must NOT cancel the
+  /// resolve (the user re-tapping impatiently used to kill it every time); only allow a
+  /// cancel once it's clearly stuck.
+  private var resolvingStartedAt: CFTimeInterval = 0
+  private let resolveCancelGraceSeconds: CFTimeInterval = 15.0
+
+  func isDownloadFailed(messageId: String?) -> Bool {
+    guard let messageId, !messageId.isEmpty else { return false }
+    return failedMessageIds.contains(messageId)
+  }
+
+  /// A broken source no longer retries on tap (that just looped a doomed download),
+  /// so the copy points at re-sending instead of "Tap to retry". Repeated terminal
+  /// failures escalate to a plainly-unavailable line.
+  func voiceFailureCaption(for messageId: String?) -> String {
+    let attempts = messageId.flatMap { failedAttemptCounts[$0] } ?? 1
+    if attempts >= 2 {
+      return "Track unavailable · Ask to resend"
+    }
+    return "Couldn't download · Ask to resend"
+  }
+
+  private func markDownloadFailed(messageId: String) {
+    let next = (failedAttemptCounts[messageId] ?? 0) + 1
+    failedAttemptCounts[messageId] = next
+    NSLog(
+      "[ChatListView] voice download terminal-failure messageId=%@ attempt=%d",
+      messageId,
+      next
+    )
+    failedMessageIds.insert(messageId)
+    let cell = activeCell
+    stopActivePlayback(resetProgress: true)
+    cell?.applyVoiceDownloadFailedState()
   }
 
   func toggle(
@@ -5447,8 +6794,9 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     let loggedMessageId = messageId ?? "-"
     let loggedMedia = shortMediaURL(mediaURL)
     NSLog(
-      "[ChatListView] voice tap messageId=%@ mediaUrl=%@",
+      "[ChatListView] voice tap messageId=%@ chatId=%@ mediaUrl=%@",
       loggedMessageId,
+      chatId?.isEmpty == false ? chatId! : "-",
       loggedMedia
     )
     guard let messageId, !messageId.isEmpty, let mediaURL, !mediaURL.isEmpty else {
@@ -5472,7 +6820,39 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         NSLog("[ChatListView] voice cancel download messageId=%@", messageId)
         stopActivePlayback(resetProgress: true)
         return
+      } else if resolvingMessageId == messageId {
+        // First play of a SoundCloud track blocks ~5–10s while the server downloads +
+        // re-hosts it. Ignore taps during the grace window so an impatient re-tap does NOT
+        // cancel the in-flight resolve (that used to kill it every time and it never played).
+        // Only once it's clearly stuck does a tap cancel.
+        let elapsed = CACurrentMediaTime() - resolvingStartedAt
+        if elapsed < resolveCancelGraceSeconds {
+          NSLog(
+            "[ChatListView] voice tap during resolve — keeping it alive (%.1fs) messageId=%@",
+            elapsed,
+            messageId
+          )
+          return
+        }
+        NSLog("[ChatListView] voice cancel resolve (stuck %.1fs) messageId=%@", elapsed, messageId)
+        stopActivePlayback(resetProgress: true)
+        return
       }
+    }
+
+    // A known-broken source must NOT re-run the download on tap. The user already
+    // saw the spinner→error once; tapping again only looped a doomed retry (and the
+    // stream resolve can hang for seconds first). Surface the error immediately —
+    // no spinner, no banner — and point them at re-sending. The latch is in-memory,
+    // so relaunching clears it and a fresh tap retries (e.g. after a server-side fix).
+    if failedMessageIds.contains(messageId) {
+      NSLog(
+        "[ChatListView] voice tap on broken source — error only, no retry messageId=%@",
+        messageId
+      )
+      UINotificationFeedbackGenerator().notificationOccurred(.warning)
+      cell?.applyVoiceDownloadFailedState()
+      return
     }
 
     beginPlayback(
@@ -5626,7 +7006,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func orderedQueueItems() -> [ChatAudioQueueItem] {
-    let baseItems = resolvedQueueItems()
+    let baseItems = applyManualQueueOrder(to: resolvedQueueItems())
     switch queueOrderMode {
     case .forward:
       return baseItems
@@ -5637,6 +7017,19 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       let itemsByMessageId = Dictionary(uniqueKeysWithValues: baseItems.map { ($0.messageId, $0) })
       return randomizedQueueMessageIds.compactMap { itemsByMessageId[$0] }
     }
+  }
+
+  /// Reorders items to the manual drag order for the active chat; any items not named in
+  /// the manual order keep their base position at the end (newly-arrived tracks).
+  private func applyManualQueueOrder(to items: [ChatAudioQueueItem]) -> [ChatAudioQueueItem] {
+    guard let chatId = activeChatId, let order = manualQueueOrderByChatId[chatId], !order.isEmpty
+    else { return items }
+    let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+    return items.enumerated().sorted { lhs, rhs in
+      let lr = rank[lhs.element.messageId] ?? (order.count + lhs.offset)
+      let rr = rank[rhs.element.messageId] ?? (order.count + rhs.offset)
+      return lr < rr
+    }.map(\.element)
   }
 
   private func resolvedQueueItems() -> [ChatAudioQueueItem] {
@@ -5813,6 +7206,79 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     //     remote URL actually serves plaintext audio the stream plays fine, otherwise
     //     streaming fails gracefully and finishDownload auto-plays the decrypted file.
     let trimmedMediaKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    // Backend /api/music/stream sits behind API auth — AVPlayer cannot attach a bearer
+    // (401 / -1013). Resolve the PUBLIC URL first via /api/music/info (handles cache-fill
+    // + direct yt-dlp fallback), THEN download that public URL. Downloading the backend
+    // URL while resolve is still in flight used to race a 500 JSON body into the
+    // terminal-failure latch (retry just re-hit the same race).
+    if let videoId = ChatMusicStreamResolver.videoId(fromBackendStreamURL: url) {
+      activeMessageId = messageId
+      activeCell = cell
+      activeMediaURL = url.absoluteString
+      resolvingMessageId = messageId
+      resolvingStartedAt = CACurrentMediaTime()
+      pushDownloadState(to: cell, needsDownload: true, isDownloading: true)
+      publishSnapshot(forceNowPlaying: true)
+
+      var headers: [String: String] = [:]
+      if let authHeader = ChatEngine.shared.authorizationHeaderForAPI() {
+        headers["Authorization"] = authHeader
+      }
+      ChatMusicStreamResolver.shared.resolve(videoId: videoId, headers: headers) {
+        [weak self] publicURL in
+        guard let self else { return }
+        guard self.activeMessageId == messageId else { return }
+        // Keep resolvingMessageId set until stream + download are both kicked off so
+        // reconfigure/bind cannot blank the spinner between resolve and transfer start.
+
+        if let publicURL {
+          // AVPlayer streams both direct audio AND HLS manifests. Stream public for
+          // instant playback. ALWAYS cache via the STABLE backend /api/music/stream URL
+          // (auth + re-hosted file) — downloading the public CDN URL often hits HLS
+          // `.m3u8` which is abandoned, so reopen always MISSed the cache and re-asked
+          // the user to "download" media they already played.
+          self.startStreamingRemotePlayback(publicURL, messageId: messageId, cell: cell)
+          self.beginRemoteDownloadTask(
+            url,
+            messageId: messageId,
+            mediaKey: nil,
+            fileName: fileName,
+            autoPlayWhenFinished: false,
+            cacheDestinationURL: localURL
+          )
+          self.resolvingMessageId = nil
+          self.pushDownloadState(
+            to: cell,
+            needsDownload: self.activeDownloadTask != nil,
+            isDownloading: self.activeDownloadTask != nil || self.streamingPlayer != nil
+          )
+        } else {
+          // No public URL — download the authed backend stream (bearer attached for our host).
+          NSLog(
+            "[ChatListView] music resolve miss messageId=%@ videoId=%@ — trying backend stream",
+            messageId,
+            videoId
+          )
+          self.beginRemoteDownloadTask(
+            url,
+            messageId: messageId,
+            mediaKey: nil,
+            fileName: fileName,
+            autoPlayWhenFinished: true,
+            cacheDestinationURL: localURL
+          )
+          self.resolvingMessageId = nil
+          self.pushDownloadState(
+            to: cell,
+            needsDownload: self.activeDownloadTask != nil,
+            isDownloading: self.activeDownloadTask != nil
+          )
+        }
+      }
+      return
+    }
+
     startStreamingRemotePlayback(url, messageId: messageId, cell: cell)
     beginRemoteDownloadTask(
       url,
@@ -5821,6 +7287,12 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       fileName: fileName,
       autoPlayWhenFinished: !trimmedMediaKey.isEmpty
     )
+  }
+
+  /// True while resolve/download is still active for the playing message (badge must stay on).
+  private func isMediaTransferActive(for messageId: String?) -> Bool {
+    guard let messageId, !messageId.isEmpty, activeMessageId == messageId else { return false }
+    return activeDownloadTask != nil || resolvingMessageId == messageId
   }
 
   private func startStreamingRemotePlayback(
@@ -5832,7 +7304,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     activeMessageId = messageId
     activeMediaURL = url.absoluteString
     activeCell = cell
-    activeDownloadProgress = nil
+    clearActiveDownloadByteState()
     playbackProgress = 0.0
     level = 0.0
     isPlaying = false
@@ -5847,7 +7319,16 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       )
     }
 
-    let item = AVPlayerItem(url: url)
+    // SoundCloud's CDN hotlink-protects its HLS with a Referer/User-Agent gate (a bare
+    // request 403s "Forbidden"). Match what the server's yt-dlp sends so AVPlayer can fetch
+    // the manifest + segments.
+    let item: AVPlayerItem
+    if let headers = VoicePlayProgressViewSourceHeaders.headers(for: url) {
+      let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+      item = AVPlayerItem(asset: asset)
+    } else {
+      item = AVPlayerItem(url: url)
+    }
     let nextPlayer = AVPlayer(playerItem: item)
     // Play as soon as the first chunk is buffered rather than waiting to minimise stalling.
     // Gives near-instant audio start on reliable connections; may stall briefly on slow links
@@ -5882,16 +7363,17 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             self.cleanupStreamingPlayer()
             self.isPlaying = false
             self.level = 0.0
-            self.activeCell?.applyVoiceDownloadState(
-              needsDownload: true, isDownloading: true,
-              progress: self.activeDownloadProgress
+            self.pushDownloadState(
+              to: self.activeCell,
+              needsDownload: true,
+              isDownloading: true
             )
             self.activeCell?.applyVoicePlaybackState(
               isPlaying: false, progress: 0.0, level: 0.0
             )
             self.publishSnapshot(forceNowPlaying: true)
           } else {
-            self.stopActivePlayback(resetProgress: true)
+            self.markDownloadFailed(messageId: messageId)
           }
         default:
           break
@@ -5909,11 +7391,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       self.playbackProgress = duration > 0.0 ? CGFloat(currentTime / duration) : 0.0
       self.level = self.isPlaybackCurrentlyPlaying() ? 0.18 : 0.0
       self.isPlaying = self.isPlaybackCurrentlyPlaying()
-      let isDownloading = self.activeDownloadTask != nil
-      self.activeCell?.applyVoiceDownloadState(
-        needsDownload: isDownloading,
-        isDownloading: isDownloading,
-        progress: self.activeDownloadProgress
+      let isLoading = self.isMediaTransferActive(for: self.activeMessageId)
+      // Spinner stays up for the whole transfer (resolve + download), even while
+      // audio is already streaming. Only drop it when transfer is fully idle.
+      self.pushDownloadState(
+        to: self.activeCell,
+        needsDownload: isLoading,
+        isDownloading: isLoading
       )
       self.activeCell?.applyVoicePlaybackState(
         isPlaying: self.isPlaying,
@@ -5936,7 +7420,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
     // Show a buffering/loading indicator while AVPlayer is connecting.
     // The time observer will clear this once the first chunk starts playing.
-    cell?.applyVoiceDownloadState(needsDownload: true, isDownloading: true, progress: nil)
+    pushDownloadState(to: cell, needsDownload: true, isDownloading: true)
     cell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
     ensureDisplayLink()
     publishSnapshot(forceNowPlaying: true)
@@ -5947,10 +7431,30 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     messageId: String,
     mediaKey: String?,
     fileName: String?,
-    autoPlayWhenFinished: Bool
+    autoPlayWhenFinished: Bool,
+    cacheDestinationURL: URL? = nil
   ) {
-    let localURL = cachedRemoteVoiceURL(for: url, fileName: fileName)
-    let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
+    // cacheDestinationURL keeps the cache keyed on the STABLE backend URL when we
+    // download a resolved (ephemeral) public URL instead.
+    let localURL = cacheDestinationURL ?? cachedRemoteVoiceURL(for: url, fileName: fileName)
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 60
+    // Our media endpoints (e.g. /api/music/stream/:id) sit behind api auth and 401
+    // without a bearer. Attach the token only for our own host so it never leaks to
+    // the Supabase CDN we redirect to (or any third-party media host).
+    if let host = url.host?.lowercased(),
+      host == "vibegram.io" || host.hasSuffix(".vibegram.io"),
+      let authHeader = ChatEngine.shared.authorizationHeaderForAPI()
+    {
+      request.setValue(authHeader, forHTTPHeaderField: "Authorization")
+    }
+    // SoundCloud CDN hotlink-protects with a Referer/UA gate (bare request → 403 "Forbidden").
+    if let sourceHeaders = VoicePlayProgressViewSourceHeaders.headers(for: url) {
+      for (field, value) in sourceHeaders {
+        request.setValue(value, forHTTPHeaderField: field)
+      }
+    }
+    let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
     // Note: progress observation is set up below after task is assigned to activeDownloadTask.
       guard let self, let tempURL = tempURL, error == nil else {
         NSLog(
@@ -5960,10 +7464,10 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
           guard self?.activeMessageId == messageId else { return }
           if self?.hasActivePlaybackEngine == true {
             self?.activeDownloadTask = nil
-            self?.activeDownloadProgress = nil
+            self?.clearActiveDownloadByteState()
             self?.publishSnapshot(forceNowPlaying: true)
           } else {
-            self?.stopActivePlayback(resetProgress: true)
+            self?.markDownloadFailed(messageId: messageId)
           }
         }
         return
@@ -5989,15 +7493,34 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             guard self.activeMessageId == messageId else { return }
             if self.hasActivePlaybackEngine {
               self.activeDownloadTask = nil
-              self.activeDownloadProgress = nil
+              self.clearActiveDownloadByteState()
               self.publishSnapshot(forceNowPlaying: true)
             } else {
-              self.stopActivePlayback(resetProgress: true)
+              self.markDownloadFailed(messageId: messageId)
             }
           }
           return
         }
         let lowerCT = contentType.lowercased()
+        // HLS manifest (SoundCloud): NOT a downloadable audio file — it must be streamed by
+        // AVPlayer (which we already started in parallel). Abandon the cache download quietly;
+        // never mark it failed or evict, or we'd loop download→fail→retry on a healthy stream.
+        let isHLSManifest =
+          lowerCT.contains("mpegurl") || url.pathExtension.lowercased() == "m3u8"
+        if isHLSManifest {
+          NSLog(
+            "[ChatListView] voice download is HLS manifest — streaming instead messageId=%@ contentType=%@",
+            messageId,
+            contentType
+          )
+          DispatchQueue.main.async {
+            guard self.activeMessageId == messageId else { return }
+            self.activeDownloadTask = nil
+            self.clearActiveDownloadByteState()
+            self.publishSnapshot(forceNowPlaying: true)
+          }
+          return
+        }
         if lowerCT.contains("text/html") || lowerCT.contains("application/json") {
           NSLog(
             "[ChatListView] voice download got non-audio content messageId=%@ contentType=%@",
@@ -6008,10 +7531,10 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
             guard self.activeMessageId == messageId else { return }
             if self.hasActivePlaybackEngine {
               self.activeDownloadTask = nil
-              self.activeDownloadProgress = nil
+              self.clearActiveDownloadByteState()
               self.publishSnapshot(forceNowPlaying: true)
             } else {
-              self.stopActivePlayback(resetProgress: true)
+              self.markDownloadFailed(messageId: messageId)
             }
           }
           return
@@ -6030,10 +7553,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
           guard self.activeMessageId == messageId else { return }
           if self.hasActivePlaybackEngine {
             self.activeDownloadTask = nil
-            self.activeDownloadProgress = nil
+            self.clearActiveDownloadByteState()
             self.publishSnapshot(forceNowPlaying: true)
           } else {
-            self.stopActivePlayback(resetProgress: true)
+            // A ~100-byte body is a broken source (e.g. an error JSON), not a real file —
+            // latch it as failed so the badge shows the error immediately and the next tap
+            // surfaces the error instead of re-running the doomed spinner→resolve→download.
+            self.markDownloadFailed(messageId: messageId)
           }
         }
         return
@@ -6074,7 +7600,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
           guard self.activeMessageId == messageId else { return }
           if self.hasActivePlaybackEngine {
             self.activeDownloadTask = nil
-            self.activeDownloadProgress = nil
+            self.clearActiveDownloadByteState()
             self.publishSnapshot(forceNowPlaying: true)
           } else {
             self.stopActivePlayback(resetProgress: true)
@@ -6083,22 +7609,25 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       }
     }
     activeDownloadTask = task
-    // Track download progress so the cell and Now Playing show a percentage while waiting.
-    // Track download progress and always push it to the cell while a download is active.
+    clearActiveDownloadByteState()
+    // Drive the ring from real byte counts on task.progress (not coarse fractionCompleted alone).
     activeDownloadProgressObservation = task.progress.observe(
       \.fractionCompleted,
       options: [.initial, .new]
     ) { [weak self] progress, _ in
       guard let self else { return }
-      let value = max(0.03, min(1.0, progress.fractionCompleted))
       DispatchQueue.main.async {
-        guard self.activeMessageId == messageId else { return }
-        let previous = self.activeDownloadProgress ?? 0.0
-        guard abs(Double(previous) - value) >= 0.01 else { return }
-        self.activeDownloadProgress = CGFloat(value)
-        // Always push download progress to the cell while a download task is active.
-        self.activeCell?.applyVoiceDownloadState(
-          needsDownload: true, isDownloading: true, progress: CGFloat(value))
+        guard self.activeMessageId == messageId, self.activeDownloadTask != nil else { return }
+        let previousFraction = self.activeDownloadProgress
+        self.ingestDownloadProgress(from: progress)
+        guard self.shouldPublishDownloadProgressUpdate(previousFraction: previousFraction) else {
+          return
+        }
+        self.pushDownloadState(
+          to: self.activeCell,
+          needsDownload: true,
+          isDownloading: true
+        )
         self.publishSnapshot()
       }
     }
@@ -6118,8 +7647,12 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       activeMessageId = messageId
       activeMediaURL = url.absoluteString
       activeCell = cell
-      activeDownloadProgress = nil
+      clearActiveDownloadByteState()
       activeDownloadTask = nil
+      // Successful play clears the broken-file latch / attempt counter.
+      failedMessageIds.remove(messageId)
+      failedAttemptCounts.removeValue(forKey: messageId)
+      poisonedCacheRetriedMessageIds.remove(messageId)
       playbackProgress = 0.0
       level = 0.0
       activeDuration = max(activeDuration, nextPlayer.duration)
@@ -6132,7 +7665,8 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         nextPlayer.duration
       )
       ensureDisplayLink()
-      cell?.applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+      // needsDownload false + isDownloading false → ring fills to 100% then morphs to play.
+      pushDownloadState(to: cell, needsDownload: false, isDownloading: false)
       cell?.applyVoicePlaybackState(isPlaying: isPlaying, progress: 0.0, level: 0.0)
       publishSnapshot(forceNowPlaying: true)
     } catch {
@@ -6141,6 +7675,35 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         messageId,
         String(describing: error)
       )
+      // A cached voice/music file that won't decode is a poisoned cache: an earlier
+      // failed fetch (e.g. an 84-byte JSON 500 body from /api/music/stream) got written
+      // as ".m4a" and now replays forever (kAudioFileUnsupportedFileTypeError 'typ?').
+      // Evict it so a clean copy is re-fetched — the download path validates status /
+      // content-type / size, so it can't re-poison — then self-heal by retrying the
+      // remote source ONCE per message, no second tap or reinstall needed.
+      if isCachedVoiceFile(url) {
+        try? FileManager.default.removeItem(at: url)
+        NSLog(
+          "[ChatListView] voice evicted poisoned cache messageId=%@ path=%@",
+          messageId,
+          url.path
+        )
+        if !poisonedCacheRetriedMessageIds.contains(messageId),
+          let remoteString = activeMediaURL,
+          let remoteURL = URL(string: remoteString),
+          !remoteURL.isFileURL
+        {
+          poisonedCacheRetriedMessageIds.insert(messageId)
+          playRemoteURL(
+            remoteURL,
+            messageId: messageId,
+            cell: cell,
+            mediaKey: activeMediaKey,
+            fileName: activeFileName
+          )
+          return
+        }
+      }
       stopActivePlayback(resetProgress: true)
     }
   }
@@ -6168,19 +7731,17 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
   @objc private func handleDisplayTick() {
     if let activeDownloadTask, player == nil, streamingPlayer == nil {
-      let progress = activeDownloadTask.progress
-      if progress.totalUnitCount > 0 {
-        activeDownloadProgress = max(0.0, min(1.0, CGFloat(progress.fractionCompleted)))
-      } else {
-        activeDownloadProgress = nil
+      let previousFraction = activeDownloadProgress
+      ingestDownloadProgress(from: activeDownloadTask.progress)
+      if shouldPublishDownloadProgressUpdate(previousFraction: previousFraction) {
+        pushDownloadState(
+          to: activeCell,
+          needsDownload: true,
+          isDownloading: true
+        )
+        activeCell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
+        publishSnapshot()
       }
-      activeCell?.applyVoiceDownloadState(
-        needsDownload: true,
-        isDownloading: true,
-        progress: activeDownloadProgress
-      )
-      activeCell?.applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
-      publishSnapshot()
       return
     }
     if let streamingPlayer {
@@ -6191,10 +7752,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       level = streamingPlayer.timeControlStatus == .playing ? 0.18 : 0.0
       isPlaying = streamingPlayer.timeControlStatus == .playing
       let isDownloading = activeDownloadTask != nil
-      activeCell?.applyVoiceDownloadState(
+      if isDownloading, let activeDownloadTask {
+        ingestDownloadProgress(from: activeDownloadTask.progress)
+      }
+      pushDownloadState(
+        to: activeCell,
         needsDownload: isDownloading,
-        isDownloading: isDownloading,
-        progress: activeDownloadProgress
+        isDownloading: isDownloading
       )
       activeCell?.applyVoicePlaybackState(
         isPlaying: isPlaying,
@@ -6250,7 +7814,8 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     activeDownloadTask = nil
     activeDownloadProgressObservation?.invalidate()
     activeDownloadProgressObservation = nil
-    activeDownloadProgress = nil
+    // Snapshot byte fields go nil the moment download ends / playback begins.
+    clearActiveDownloadByteState()
     _ = NativeMusicPlayerStore.shared.updateLocalURI(trackId: messageId, localURI: localMediaURL)
     guard activeMessageId == messageId else { return }
     // If a streaming player is alive and playing (or buffering), the user already
@@ -6258,6 +7823,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     if let sp = streamingPlayer,
       sp.timeControlStatus == .playing || sp.timeControlStatus == .waitingToPlayAtSpecifiedRate
     {
+      // Morph the ring to play without a 0-reset, then leave streaming audio alone.
+      pushDownloadState(to: activeCell, needsDownload: false, isDownloading: false)
+      activeCell?.applyVoicePlaybackState(
+        isPlaying: sp.timeControlStatus == .playing,
+        progress: playbackProgress,
+        level: sp.timeControlStatus == .playing ? max(level, 0.18) : 0.0
+      )
       publishSnapshot(forceNowPlaying: true)
       return
     }
@@ -6279,11 +7851,12 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     let previousMessageId = activeMessageId
     let previousMediaURL = activeMediaURL
     shouldResumeAfterInterruption = false
+    resolvingMessageId = nil
     activeDownloadTask?.cancel()
     activeDownloadTask = nil
     activeDownloadProgressObservation?.invalidate()
     activeDownloadProgressObservation = nil
-    activeDownloadProgress = nil
+    clearActiveDownloadByteState()
     player?.stop()
     player = nil
     cleanupStreamingPlayer()
@@ -6316,6 +7889,10 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     presentsGlobalPlayer = false
     activeCell = nil
     if !suppressSnapshot {
+      // A genuine stop resets the play-gate so the next fresh start waits for real
+      // playback again. Queue transitions (suppressSnapshot) keep it latched so the
+      // banner doesn't blink out between gapless tracks.
+      bannerPlaybackStarted = false
       publishSnapshot(forceNowPlaying: true)
     }
   }
@@ -6349,8 +7926,37 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     guard !resolvedURL.isFileURL else {
       return false
     }
-    return !FileManager.default.fileExists(
-      atPath: cachedRemoteVoiceURL(for: resolvedURL, fileName: fileName).path)
+    // The pair to [VoiceCache] SEED: same key function, so a MISS here after a SEED for
+    // the same remote URL means the key drifted (signed params, host rewrite, extension
+    // mismatch) rather than the file being absent.
+    let slot = cachedRemoteVoiceURL(for: resolvedURL, fileName: fileName)
+    let needsDownload = !FileManager.default.fileExists(atPath: slot.path)
+    // Log only when THIS url's cached-state actually flips. A single shared
+    // last-signature slot thrashed when several music cells were probed in a loop
+    // (each snapshot publish re-checks every audio cell): consecutive probes were
+    // for different urls, so the slot never matched and every probe re-logged.
+    // Keyed-by-url state logs each url once (MISS), then again only on miss→hit.
+    let key = resolvedURL.absoluteString
+    if Self.lastVoiceCacheProbeState[key] != needsDownload {
+      Self.lastVoiceCacheProbeState[key] = needsDownload
+      NSLog(
+        "[VoiceCache] %@ key=%@ remote=%@",
+        needsDownload ? "MISS — will download" : "HIT — no download",
+        chatStableCacheHash(key), key)
+    }
+    return needsDownload
+  }
+
+  /// De-dupes the cache probe log per remote url (the check runs on every cell
+  /// configure and on every playback snapshot publish, for every audio cell).
+  private static var lastVoiceCacheProbeState: [String: Bool] = [:]
+  /// De-dupes the sandbox path-remap log, for the same reason.
+  private static var lastVoicePathRemapLogged: String?
+
+  /// Public lookup for share/forward: durable voice/music cache slot if present.
+  func resolvedCachedLocalURL(forRemote remoteURL: URL, fileName: String?) -> URL? {
+    let slot = cachedRemoteVoiceURL(for: remoteURL, fileName: fileName)
+    return FileManager.default.fileExists(atPath: slot.path) ? slot : nil
   }
 
   /// Seed the remote-keyed voice cache from the sender's original local file.
@@ -6385,29 +7991,88 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     DispatchQueue.global(qos: .utility).async {
       let fm = FileManager.default
       guard fm.fileExists(atPath: srcPath), !fm.fileExists(atPath: dstPath) else { return }
-      try? fm.copyItem(atPath: srcPath, toPath: dstPath)
+      do {
+        try fm.copyItem(atPath: srcPath, toPath: dstPath)
+        // The seed key must be byte-identical to the one the cold-launch resolve
+        // computes, or this "fix" silently changes nothing. Log the hash at BOTH ends
+        // so a device log answers that directly instead of by inference.
+        let bytes = (try? fm.attributesOfItem(atPath: dstPath)[.size] as? Int64) ?? 0
+        NSLog(
+          "[VoiceCache] SEED key=%@ bytes=%lld remote=%@",
+          chatStableCacheHash(remoteURL.absoluteString), bytes, remoteURL.absoluteString)
+      } catch {
+        NSLog(
+          "[VoiceCache] SEED FAILED remote=%@ error=%@",
+          remoteURL.absoluteString, error.localizedDescription)
+      }
     }
   }
 
   private func cachedRemoteVoiceURL(for remoteURL: URL, fileName: String?) -> URL {
-    let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-    let cacheDir = caches.appendingPathComponent("voice-cache", isDirectory: true)
+    let cacheDir = vibeDurableMediaCacheRoot().appendingPathComponent(
+      "voice-cache", isDirectory: true)
     try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+    migrateLegacyMediaCacheFolder(named: "voice-cache", into: cacheDir)
     let preferredExt = (fileName as NSString?)?.pathExtension.lowercased()
     let remoteExt = remoteURL.pathExtension.lowercased()
     let ext =
       !(preferredExt?.isEmpty ?? true) ? preferredExt!
       : remoteExt == "enc" || remoteExt.isEmpty ? "m4a" : remoteExt
-    let filename = chatStableCacheHash(remoteURL.absoluteString) + "." + ext
+    // Stable identity (music stream id / path without query) — not full absoluteString.
+    let identity = chatStableRemoteMediaIdentity(remoteURL)
+    let filename = chatStableCacheHash(identity) + "." + ext
     let preferred = cacheDir.appendingPathComponent(filename)
     if FileManager.default.fileExists(atPath: preferred.path) {
       return preferred
     }
-    let legacyStable = cacheDir.appendingPathComponent(chatStableCacheHash(remoteURL.absoluteString) + ".m4a")
-    if FileManager.default.fileExists(atPath: legacyStable.path) {
-      return legacyStable
+    // Legacy slots (old hash of full absoluteString, and old Caches path).
+    let legacyHashes = [
+      chatStableCacheHash(remoteURL.absoluteString),
+      chatStableCacheHash(identity),
+    ]
+    for hash in legacyHashes {
+      for e in [ext, "m4a", "mp3", "aac"] {
+        let candidate = cacheDir.appendingPathComponent(hash + "." + e)
+        if FileManager.default.fileExists(atPath: candidate.path) {
+          return candidate
+        }
+      }
+    }
+    if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+      let oldDir = caches.appendingPathComponent("voice-cache", isDirectory: true)
+      for hash in legacyHashes {
+        for e in [ext, "m4a", "mp3", "aac"] {
+          let candidate = oldDir.appendingPathComponent(hash + "." + e)
+          if FileManager.default.fileExists(atPath: candidate.path) {
+            // Promote into durable cache.
+            try? FileManager.default.copyItem(at: candidate, to: preferred)
+            if FileManager.default.fileExists(atPath: preferred.path) {
+              return preferred
+            }
+            return candidate
+          }
+        }
+      }
     }
     return preferred
+  }
+
+  /// True when `url` points inside our remote voice/music download cache. Used to
+  /// distinguish a poisoned cached file (safe to evict + re-fetch) from a user's own
+  /// local recording or an imported file we must never delete.
+  private func isCachedVoiceFile(_ url: URL) -> Bool {
+    guard url.isFileURL else { return false }
+    let durable = vibeDurableMediaCacheRoot()
+      .appendingPathComponent("voice-cache", isDirectory: true)
+      .standardizedFileURL.path
+    if url.standardizedFileURL.path.hasPrefix(durable) { return true }
+    let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    if let cacheDir = caches?.appendingPathComponent("voice-cache", isDirectory: true) {
+      if url.standardizedFileURL.path.hasPrefix(cacheDir.standardizedFileURL.path) {
+        return true
+      }
+    }
+    return url.deletingLastPathComponent().lastPathComponent == "voice-cache"
   }
 
   private func importedLocalAudioURL(for sourceURL: URL) -> URL? {
@@ -6485,6 +8150,16 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
 
+    // Relative API media paths (e.g. `/api/music/stream/sc_…`) must NOT be treated as
+    // local filesystem paths — that produced "Couldn't load" for server-sent music.
+    if let absoluteAPI = Self.absoluteAPIURL(fromRelativeOrAbsolute: trimmed) {
+      let cachedURL = cachedRemoteVoiceURL(for: absoluteAPI, fileName: activeFileName)
+      if FileManager.default.fileExists(atPath: cachedURL.path) {
+        return cachedURL
+      }
+      return absoluteAPI
+    }
+
     // Sandbox path remapping: App UUIDs change on update/build, breaking absolute paths.
     var pathString = trimmed
     if trimmed.hasPrefix("file://") {
@@ -6504,11 +8179,18 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         if let range = pathString.range(of: target, options: .backwards) {
           let suffix = pathString[range.lowerBound...]
           let patchedPath = NSHomeDirectory() + suffix
-          NSLog(
-            "[ChatListView] voice path remap original=%@ patched=%@",
-            shortMediaURL(raw),
-            patchedPath
-          )
+          // Once per distinct path. This resolves on every cell configure, so a voice
+          // send was dumping four identical NSLog lines per settle — into the exact
+          // main-thread beat the send already stalls on (measured setRows 54ms,
+          // applyMs=47), which is part of why adding a voice note doesn't feel smooth.
+          if patchedPath != Self.lastVoicePathRemapLogged {
+            Self.lastVoicePathRemapLogged = patchedPath
+            NSLog(
+              "[ChatListView] voice path remap original=%@ patched=%@",
+              shortMediaURL(raw),
+              patchedPath
+            )
+          }
           return importedLocalAudioURL(for: URL(fileURLWithPath: patchedPath))
         }
       }
@@ -6517,10 +8199,14 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     if let url = URL(string: trimmed), url.isFileURL {
       return importedLocalAudioURL(for: url)
     }
-    if trimmed.hasPrefix("/") {
+    // Only treat leading "/" as a local file when it is NOT an API path.
+    if trimmed.hasPrefix("/"), !trimmed.hasPrefix("/api/") {
       return importedLocalAudioURL(for: URL(fileURLWithPath: trimmed))
     }
-    if let decoded = trimmed.removingPercentEncoding, decoded.hasPrefix("/") {
+    if let decoded = trimmed.removingPercentEncoding,
+      decoded.hasPrefix("/"),
+      !decoded.hasPrefix("/api/")
+    {
       return importedLocalAudioURL(for: URL(fileURLWithPath: decoded))
     }
     if let url = URL(string: trimmed), let scheme = url.scheme,
@@ -6532,10 +8218,52 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       }
       return url
     }
-    if let url = URL(string: trimmed), url.scheme == nil {
+    if let url = URL(string: trimmed), url.scheme == nil, !trimmed.hasPrefix("/api/") {
       return URL(fileURLWithPath: trimmed)
     }
     return nil
+  }
+
+  /// Join relative `/api/...` media paths onto the session API base (or production host).
+  private static func absoluteAPIURL(fromRelativeOrAbsolute raw: String) -> URL? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    {
+      return url
+    }
+
+    // Relative API path from server when PUBLIC_BASE_URL was unset.
+    let path: String
+    if trimmed.hasPrefix("/api/") {
+      path = trimmed
+    } else if trimmed.hasPrefix("api/") {
+      path = "/" + trimmed
+    } else if trimmed.contains("/api/music/stream/") {
+      // Path-only or host-less fragments
+      if let range = trimmed.range(of: "/api/") {
+        path = String(trimmed[range.lowerBound...])
+      } else {
+        return nil
+      }
+    } else {
+      return nil
+    }
+
+    var base =
+      AppSessionConfig.current?.apiBaseURLString
+      ?? (ChatEngineStore.shared.getConfig()["apiBaseUrl"] as? String)
+      ?? (ChatEngineStore.shared.getConfig()["baseUrl"] as? String)
+      ?? "https://api.vibegram.io"
+    base = base.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    // path already includes `/api/...`
+    if base.lowercased().hasSuffix("/api"), path.hasPrefix("/api/") {
+      base = String(base.dropLast(4))
+    }
+    return URL(string: base + path)
   }
 
   private func shortMediaURL(_ raw: String?) -> String {
@@ -6545,9 +8273,13 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   }
 
   private func publishSnapshot(forceNowPlaying: Bool = false) {
+    // The banner is gated on real playback: latch the first time audio is actually
+    // playing so downloading / resolving / broken taps never surface the pill.
+    if isPlaying { bannerPlaybackStarted = true }
     let snapshot: VoiceBubblePlaybackSnapshot
     if let activeMessageId {
       let duration = currentPlaybackDuration()
+      let downloading = activeDownloadTask != nil
       snapshot = VoiceBubblePlaybackSnapshot(
         messageId: activeMessageId,
         chatId: activeChatId,
@@ -6557,12 +8289,15 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         playbackRate: playbackRate,
         queueOrderMode: queueOrderMode,
         isRepeatEnabled: isRepeatEnabled,
-        isDownloading: activeDownloadTask != nil,
-        downloadProgress: activeDownloadProgress,
+        isDownloading: downloading,
+        downloadProgress: downloading ? activeDownloadProgress : nil,
+        downloadFraction: downloading ? activeDownloadProgress : nil,
+        downloadedBytes: downloading ? activeDownloadedBytes : nil,
+        totalBytes: downloading ? activeTotalBytes : nil,
         title: activeTitle,
         subtitle: activeSubtitle,
         artwork: activeArtwork,
-        presentsGlobalPlayer: presentsGlobalPlayer
+        presentsGlobalPlayer: presentsGlobalPlayer && bannerPlaybackStarted
       )
     } else {
       snapshot = .empty
@@ -6576,6 +8311,9 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 private final class MessageSelectionCircleView: UIControl {
   private var checked = false
   private var accentColor = ChatListAppearance.fallback.accent
+  private let ringLayer = CAShapeLayer()
+  private let fillLayer = CAShapeLayer()
+  private let checkLayer = CAShapeLayer()
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -6583,44 +8321,256 @@ private final class MessageSelectionCircleView: UIControl {
     isHidden = true
     isAccessibilityElement = true
     accessibilityLabel = "Select message"
+    isOpaque = false
+
+    ringLayer.fillColor = UIColor.clear.cgColor
+    ringLayer.strokeColor = UIColor.secondaryLabel.withAlphaComponent(0.56).cgColor
+    ringLayer.lineWidth = 2.0
+    layer.addSublayer(ringLayer)
+
+    fillLayer.fillColor = accentColor.cgColor
+    fillLayer.opacity = 0
+    fillLayer.transform = CATransform3DMakeScale(0.55, 0.55, 1)
+    layer.addSublayer(fillLayer)
+
+    checkLayer.fillColor = UIColor.clear.cgColor
+    checkLayer.strokeColor = UIColor.white.cgColor
+    checkLayer.lineWidth = 2.0
+    checkLayer.lineCap = .round
+    checkLayer.lineJoin = .round
+    checkLayer.opacity = 0
+    checkLayer.strokeEnd = 0
+    layer.addSublayer(checkLayer)
   }
 
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-  func configure(selected: Bool, appearance: ChatListAppearance) {
-    checked = selected
+  func configure(selected: Bool, appearance: ChatListAppearance, animated: Bool = true) {
     accentColor = appearance.accent
+    fillLayer.fillColor = accentColor.cgColor
     accessibilityValue = selected ? "Selected" : "Not selected"
-    setNeedsDisplay()
+    let changed = checked != selected
+    checked = selected
+    applyCheckedState(animated: animated && changed && window != nil)
   }
 
-  override func draw(_ rect: CGRect) {
-    let diameter = min(rect.width, rect.height) - 4.0
+  /// Fade/scale the circle in when selection mode begins (or out when it ends).
+  func setSelectionChromeVisible(_ visible: Bool, animated: Bool) {
+    let target: CGFloat = visible ? 1 : 0
+    let scale: CGFloat = visible ? 1 : 0.72
+    if animated && window != nil {
+      UIView.animate(
+        withDuration: 0.28,
+        delay: 0,
+        usingSpringWithDamping: 0.84,
+        initialSpringVelocity: 0.2,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.alpha = target
+        self.transform = visible ? .identity : CGAffineTransform(scaleX: scale, y: scale)
+      } completion: { _ in
+        self.isHidden = !visible
+        if visible {
+          self.transform = .identity
+        }
+      }
+    } else {
+      layer.removeAllAnimations()
+      alpha = target
+      transform = .identity
+      isHidden = !visible
+    }
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let diameter = min(bounds.width, bounds.height) - 4.0
     guard diameter > 1.0 else { return }
     let circleRect = CGRect(
-      x: (rect.width - diameter) * 0.5,
-      y: (rect.height - diameter) * 0.5,
+      x: (bounds.width - diameter) * 0.5,
+      y: (bounds.height - diameter) * 0.5,
       width: diameter,
       height: diameter
     )
-    let circlePath = UIBezierPath(ovalIn: circleRect)
-    if checked {
-      accentColor.setFill()
-      circlePath.fill()
-      let check = UIBezierPath()
-      check.move(to: CGPoint(x: circleRect.minX + diameter * 0.28, y: circleRect.midY + diameter * 0.03))
-      check.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.43, y: circleRect.midY + diameter * 0.22))
-      check.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.72, y: circleRect.midY - diameter * 0.24))
-      UIColor.white.setStroke()
-      check.lineWidth = 2.0
-      check.lineCapStyle = .round
-      check.lineJoinStyle = .round
-      check.stroke()
+    let circlePath = UIBezierPath(ovalIn: circleRect).cgPath
+    ringLayer.frame = bounds
+    fillLayer.frame = bounds
+    checkLayer.frame = bounds
+    ringLayer.path = circlePath
+    fillLayer.path = circlePath
+
+    let check = UIBezierPath()
+    check.move(to: CGPoint(x: circleRect.minX + diameter * 0.28, y: circleRect.midY + diameter * 0.03))
+    check.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.43, y: circleRect.midY + diameter * 0.22))
+    check.addLine(to: CGPoint(x: circleRect.minX + diameter * 0.72, y: circleRect.midY - diameter * 0.24))
+    checkLayer.path = check.cgPath
+  }
+
+  private func applyCheckedState(animated: Bool) {
+    let fillOpacity: Float = checked ? 1 : 0
+    let checkOpacity: Float = checked ? 1 : 0
+    let checkEnd: CGFloat = checked ? 1 : 0
+    let fillScale: CGFloat = checked ? 1 : 0.55
+    let ringOpacity: Float = checked ? 0 : 1
+
+    if animated {
+      CATransaction.begin()
+      CATransaction.setAnimationDuration(0.28)
+      CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+
+      fillLayer.opacity = fillOpacity
+      fillLayer.transform = CATransform3DMakeScale(fillScale, fillScale, 1)
+      checkLayer.opacity = checkOpacity
+      checkLayer.strokeEnd = checkEnd
+      ringLayer.opacity = ringOpacity
+      CATransaction.commit()
     } else {
-      UIColor.secondaryLabel.withAlphaComponent(0.56).setStroke()
-      circlePath.lineWidth = 2.0
-      circlePath.stroke()
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      fillLayer.opacity = fillOpacity
+      fillLayer.transform = CATransform3DMakeScale(fillScale, fillScale, 1)
+      checkLayer.opacity = checkOpacity
+      checkLayer.strokeEnd = checkEnd
+      ringLayer.opacity = ringOpacity
+      CATransaction.commit()
     }
+  }
+}
+
+/// Telegram-style forward attribution inside the bubble plate:
+/// ```
+/// Forwarded from
+/// [avatar] Name
+/// ```
+/// Fixed height so list measurement and cell layout stay aligned (no content overlap).
+private final class ForwardedFromHeaderView: UIView {
+  /// Total strip height inside the bubble plate. Must match
+  /// `ChatListView.forwardedHeaderHeight` exactly so size ↔ layout never drift.
+  /// Telegram-tight: caption + avatar row with minimal padding.
+  static let preferredHeight: CGFloat = 36.0
+  private static let avatarSize: CGFloat = 18.0
+
+  private let captionLabel = UILabel()
+  /// Same global avatar renderer as Home / chat headers / group sender runs.
+  private let avatarNode = ChatAvatarNodeView()
+  private let nameLabel = UILabel()
+  private var configuredName = ""
+  private var configuredAvatarURL: String?
+  private var configuredPeerUserId: String?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isUserInteractionEnabled = false
+    clipsToBounds = true
+
+    captionLabel.numberOfLines = 1
+    captionLabel.font = .systemFont(ofSize: 12.0, weight: .regular)
+    captionLabel.lineBreakMode = .byTruncatingTail
+    addSubview(captionLabel)
+
+    avatarNode.isUserInteractionEnabled = false
+    addSubview(avatarNode)
+
+    nameLabel.numberOfLines = 1
+    nameLabel.font = .systemFont(ofSize: 13.5, weight: .semibold)
+    nameLabel.lineBreakMode = .byTruncatingTail
+    addSubview(nameLabel)
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  /// Text uses the same me/them body color as the bubble (white or dark), not accent green.
+  func configure(
+    name: String,
+    avatarURL: String?,
+    peerUserId: String?,
+    textColor: UIColor,
+    isDark: Bool
+  ) {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let displayName = trimmed.isEmpty ? "Unknown" : trimmed
+    captionLabel.text = "Forwarded from"
+    captionLabel.textColor = textColor.withAlphaComponent(0.72)
+    nameLabel.text = displayName
+    nameLabel.textColor = textColor
+
+    let url: String? = {
+      guard let raw = avatarURL?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+      else { return nil }
+      return raw
+    }()
+    let peer: String? = {
+      guard let raw = peerUserId?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+      else { return nil }
+      return raw
+    }()
+    let unchanged =
+      configuredName == displayName
+      && configuredAvatarURL == url
+      && configuredPeerUserId == peer
+    if !unchanged {
+      configuredName = displayName
+      configuredAvatarURL = url
+      configuredPeerUserId = peer
+      avatarNode.configure(
+        with: ChatAvatarDescriptor(
+          title: displayName,
+          rawAvatarURI: url,
+          peerUserId: peer,
+          chatId: nil,
+          kind: .standard,
+          isGroup: false,
+          members: [],
+          preferPushAvatar: false,
+          gradientColors: nil
+        ),
+        isDark: isDark,
+        renderingSide: Self.avatarSize
+      )
+    }
+    setNeedsLayout()
+  }
+
+  func prepareForReuse() {
+    configuredName = ""
+    configuredAvatarURL = nil
+    configuredPeerUserId = nil
+    captionLabel.text = nil
+    nameLabel.text = nil
+    // Reconfigure with empty descriptor so a recycled cell never keeps a prior face.
+    avatarNode.configure(
+      with: ChatAvatarDescriptor(
+        title: "",
+        rawAvatarURI: nil,
+        peerUserId: nil,
+        chatId: nil,
+        kind: .standard,
+        isGroup: false,
+        members: [],
+        preferPushAvatar: false,
+        gradientColors: nil
+      ),
+      isDark: traitCollection.userInterfaceStyle == .dark,
+      renderingSide: Self.avatarSize
+    )
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let w = bounds.width
+    guard w > 1 else { return }
+    // Telegram-tight stack: caption then avatar+name with minimal gap to body.
+    captionLabel.frame = CGRect(x: 0, y: 0, width: w, height: 14)
+    let rowY: CGFloat = 15
+    avatarNode.frame = CGRect(
+      x: 0, y: rowY, width: Self.avatarSize, height: Self.avatarSize)
+    let nameX = Self.avatarSize + 6
+    nameLabel.frame = CGRect(
+      x: nameX,
+      y: rowY,
+      width: max(0, w - nameX),
+      height: Self.avatarSize
+    )
   }
 }
 
@@ -6630,12 +8580,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private static let reactionBadgeInsetLeft: CGFloat = 8.0
   private static let reactionBadgeInsetBottom: CGFloat = 6.0
 
+  /// Authoritative chat id stamped by the list at configure time. Per-message payloads often
+  /// omit `chat_id` (so `row.chatId` is nil for music), so this is the fallback used to key
+  /// music playback + the player-sheet list on the chat that actually owns the message.
+  var hostChatId: String = ""
+
   let bubbleView = BubbleBackgroundView()
   let tailView = BubbleTailView()
 
   /// Group/channel sender name, shown above the FIRST bubble of an incoming sender-run
   /// (Telegram-style), tinted with the sender's colour (Claude ≈ orange, Codex ≈ white).
   private let groupSenderNameLabel = UILabel()
+  /// Telegram-style forward strip (caption + avatar + name) inside the plate top.
+  private let forwardedFromHeader = ForwardedFromHeaderView()
   /// Leading avatar-gutter width the view asked us to reserve for incoming group bubbles
   /// (0 for DMs and outgoing). Narrows the bubble + shifts it right so the floating avatar
   /// overlay has a column; kept in sync with the height measurement in `sizeForItemAt`.
@@ -6670,6 +8627,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let mediaPlaceholderBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
   private let mediaPlaceholderTintView = UIView()
   private let mediaImageView = UIImageView()
+  /// Quality of pixels currently in `mediaImageView` — enforces promote-only replaces.
+  private var mediaPixelQuality: ChatMediaPreviewQuality = .none
   private let mediaVideoPlayerHostView = UIView()
   private let mediaStickerAnimationView = LottieAnimationView()
   private let mediaPrimaryIconView = UIImageView()
@@ -6737,6 +8696,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// (interrupt / compaction) reusing `dayLabel` — lets `layoutSubviews` position it with
   /// the day-pill centering path instead of the bubble path.
   private var isConfiguredAgentDivider = false
+  /// Whether the last configure() rendered this row as a centered agent *error* notice
+  /// (a failed turn) reusing the `dayLabel` pill. Drives the warning tint + makes the
+  /// pill tappable to retry.
+  private var isConfiguredAgentErrorNotice = false
   /// Whether the last configure() hid this cell as the send-morph ghost — lets the
   /// host verify/repair the reveal after the transition without reconfiguring blindly.
   var isConfiguredGhostHidden: Bool { isGhostHidden }
@@ -6762,6 +8725,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var cachedLayoutMetrics: ChatMessageBubbleLayoutMetrics?
   private var cachedLayoutWidth: CGFloat = 0
   private var mediaImageTask: URLSessionDataTask?
+  private var musicCoverTask: URLSessionDataTask?
   private let mediaVideoPlayerLayer = AVPlayerLayer()
   private var mediaVideoPlayer: AVPlayer?
   private var mediaVideoLoopObserver: NSObjectProtocol?
@@ -6776,7 +8740,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var mediaVideoTotalDuration: Double?
   private var mediaNeedsDownload = false
   private var mediaIsDownloading = false
+  private var mediaDownloadFailed = false
   private var mediaDownloadProgress: Double?
+  private var mediaDownloadedBytes: Int64?
+  private var mediaTotalDownloadBytes: Int64?
   private var skipRemoteMediaLoad = false
   private var preferredLocalMediaURLOverride: String?
   private weak var wallpaperCoordinateView: UIView?
@@ -6796,6 +8763,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   var onMediaGridTileTap: ((ChatListRow, Int, UIImageView) -> Void)?
   var onRetryMessageTap: ((ChatListRow) -> Void)?
   var onNotSentTap: ((ChatListRow) -> Void)?
+  /// Tapped the centered "Something went wrong · Try again" agent-error notice pill.
+  var onAgentErrorRetryTap: ((ChatListRow) -> Void)?
   var onAgentAction: (([String: Any]) -> Void)?
   var onSelectionToggle: ((ChatListRow) -> Void)?
 
@@ -6809,16 +8778,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(tailView)
 
     contentView.addSubview(groupSenderNameLabel)
+    contentView.addSubview(forwardedFromHeader)
+    forwardedFromHeader.isHidden = true
     contentView.addSubview(messageLabel)
     contentView.addSubview(agentTurnContentView)
     contentView.addSubview(richTextView)
     contentView.addSubview(replyPreviewView)
     contentView.addSubview(linkPreviewView)
     contentView.addSubview(mediaContainerView)
-    mediaContainerView.addSubview(mediaPlaceholderBlurView)
-    mediaPlaceholderBlurView.contentView.addSubview(mediaPlaceholderTintView)
+    // Image/video host first; soft material blur sits ABOVE still pixels (Telegram
+    // transfer look) but below progress ring / play chrome.
     mediaContainerView.addSubview(mediaImageView)
     mediaContainerView.addSubview(mediaVideoPlayerHostView)
+    mediaContainerView.addSubview(mediaPlaceholderBlurView)
+    mediaPlaceholderBlurView.contentView.addSubview(mediaPlaceholderTintView)
     mediaContainerView.addSubview(mediaStickerAnimationView)
     mediaContainerView.addSubview(mediaPrimaryIconView)
     mediaContainerView.addSubview(mediaVoiceButtonView)
@@ -7073,6 +9046,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     dayLabel.textAlignment = .center
     dayLabel.textColor = UIColor(white: 0.95, alpha: 0.9)
+    // The day pill is normally inert; it becomes tappable only while it is rendering an
+    // agent-error notice (guarded in the handler by `isConfiguredAgentErrorNotice`).
+    dayLabel.isUserInteractionEnabled = true
+    dayLabel.addGestureRecognizer(
+      UITapGestureRecognizer(target: self, action: #selector(handleAgentErrorNoticeTap)))
 
     reactionPillView.backgroundColor = UIColor(white: 0.0, alpha: 0.25)
     reactionPillView.layer.cornerRadius = 12
@@ -7141,6 +9119,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaImageView.image
   }
 
+  /// The URL the cell's own inline AVPlayer actually resolved and is playing —
+  /// local-cache-preferring, unlike the row's raw (often remote) mediaUrl. The
+  /// floating mini-player must reuse this exact URL, not re-derive its own, or it
+  /// silently fails to produce frames and only the seed image ever shows.
+  func currentInlineVideoPlaybackURL() -> URL? {
+    guard let key = mediaVideoPlayerURLKey else { return nil }
+    return URL(string: key)
+  }
+
   func currentMediaImageView() -> UIImageView? {
     mediaImageView
   }
@@ -7160,11 +9147,135 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return mediaImageView
   }
 
+  var isInlineVideoPlaybackActive: Bool { mediaVideoPlaybackActive }
+
   func setInlineVideoPlaybackActive(_ active: Bool) {
     guard mediaVideoPlaybackActive != active else { return }
     mediaVideoPlaybackActive = active
     inlineVideoLog("setActive active=\(active ? "Y" : "N")")
     refreshInlineVideoPlaybackIfNeeded()
+  }
+
+  /// Telegram-style video-note expand: the circle itself scales up; ring spins on
+  /// the rim. `mediaContainerView` is the actually-visible circle for a full-bleed
+  /// video note (bubbleView underneath is chrome-hidden) — the meta pill and the
+  /// progress ring are real children of it, so they scale for free with zero
+  /// manual offset math and can never drift out of sync.
+  func setVideoNoteExpandedPlayback(_ expanded: Bool) {
+    guard row?.visualKind == .videoNote else { return }
+    // Scale must not be clipped by the cell or neighbours.
+    clipsToBounds = false
+    contentView.clipsToBounds = false
+    superview?.bringSubviewToFront(self)
+    let scale: CGFloat = expanded ? 1.24 : 1.0
+    let target = CGAffineTransform(scaleX: scale, y: scale)
+    UIView.animate(
+      withDuration: 0.32,
+      delay: 0,
+      usingSpringWithDamping: 0.84,
+      initialSpringVelocity: 0.22,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.bubbleView.transform = target
+      self.tailView.transform = target
+      self.mediaContainerView.transform = target
+      self.mediaPrimaryIconView.alpha = expanded ? 0 : 1
+    } completion: { _ in
+      if !expanded {
+        self.setNeedsLayout()
+      }
+    }
+    if expanded {
+      ensureVideoNoteProgressRing()
+      startVideoNoteProgressRing()
+    } else {
+      stopVideoNoteProgressRing()
+    }
+  }
+
+  private var videoNoteProgressRing: CAShapeLayer?
+  private var videoNoteProgressLink: CADisplayLink?
+
+  private func ensureVideoNoteProgressRing() {
+    if videoNoteProgressRing != nil { return }
+    let ring = CAShapeLayer()
+    ring.fillColor = UIColor.clear.cgColor
+    ring.strokeColor = UIColor.white.withAlphaComponent(0.95).cgColor
+    ring.lineWidth = 3.5
+    ring.lineCap = .round
+    ring.strokeEnd = 0
+    // On the visible media circle (not bubbleView, which is chrome-hidden and
+    // fully covered for full-bleed video notes) so the ring is actually seen.
+    mediaContainerView.layer.addSublayer(ring)
+    videoNoteProgressRing = ring
+  }
+
+  private func layoutVideoNoteProgressRingIfNeeded() {
+    guard let ring = videoNoteProgressRing else { return }
+    let bounds = mediaContainerView.bounds
+    let inset: CGFloat = 2.0
+    let path = UIBezierPath(
+      arcCenter: CGPoint(x: bounds.midX, y: bounds.midY),
+      radius: max(1, min(bounds.width, bounds.height) * 0.5 - inset),
+      startAngle: -.pi / 2,
+      endAngle: -.pi / 2 + .pi * 2,
+      clockwise: true
+    )
+    ring.frame = bounds
+    ring.path = path.cgPath
+  }
+
+  private func startVideoNoteProgressRing() {
+    layoutVideoNoteProgressRingIfNeeded()
+    videoNoteProgressLink?.invalidate()
+    let link = CADisplayLink(target: self, selector: #selector(tickVideoNoteProgressRing))
+    link.add(to: .main, forMode: .common)
+    videoNoteProgressLink = link
+  }
+
+  private func stopVideoNoteProgressRing() {
+    videoNoteProgressLink?.invalidate()
+    videoNoteProgressLink = nil
+    videoNoteProgressRing?.strokeEnd = 0
+    videoNoteProgressRing?.removeFromSuperlayer()
+    videoNoteProgressRing = nil
+  }
+
+  @objc private func tickVideoNoteProgressRing() {
+    layoutVideoNoteProgressRingIfNeeded()
+    let duration = max(0.01, mediaVideoTotalDuration ?? row?.duration ?? 1)
+    let current = max(0, mediaVideoCurrentTime)
+    videoNoteProgressRing?.strokeEnd = CGFloat(min(1, current / duration))
+  }
+
+  /// Lightweight selection chrome update — no full reconfigure (avoids media pop / flicker).
+  /// Parent drives `layoutIfNeeded` inside a spring animation for smooth X inset.
+  func applyMessageSelectionState(
+    mode: Bool,
+    selected: Bool,
+    appearance: ChatListAppearance,
+    animated: Bool
+  ) {
+    let modeChanged = selectionMode != mode
+    selectionMode = mode
+    self.appearance = appearance
+    let showSelectionChrome = mode && !isGhostHidden
+    if showSelectionChrome {
+      selectionCircleView.isHidden = false
+      selectionCircleView.setSelectionChromeVisible(true, animated: animated && modeChanged)
+    } else if !selectionCircleView.isHidden {
+      selectionCircleView.setSelectionChromeVisible(false, animated: animated && modeChanged)
+    } else {
+      selectionCircleView.isHidden = true
+    }
+    selectionCircleView.configure(
+      selected: selected, appearance: appearance, animated: animated)
+    // Hide side agent actions while selecting (same as full configure).
+    if mode {
+      agentRegenerateButton.isHidden = true
+      agentViewButton.isHidden = true
+    }
+    setNeedsLayout()
   }
 
   func applyAppearance(_ appearance: ChatListAppearance) {
@@ -7177,15 +9288,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.layer.cornerCurve = .circular
     dayLabel.clipsToBounds = true
     let isCurrentRowMe = row?.isMe == true
-    mediaWaveformView.applyColors(
-      active: appearance.accent.withAlphaComponent(0.98),
-      inactive: appearance.accent.withAlphaComponent(0.34)
-    )
-    mediaVoiceButtonView.applyStyle(
-      fillColor: appearance.accent,
-      iconTint: contrastingMediaForeground(for: appearance.accent),
-      ringTint: appearance.accent.withAlphaComponent(0.82)
-    )
+    applyVoiceChromeColors(isMe: isCurrentRowMe)
     mediaPlaceholderBlurView.effect = UIBlurEffect(
       style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
     )
@@ -7241,12 +9344,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         && $0.mediaKey == row.mediaKey
     } ?? false
     let preservedMediaImage = isSameMediaIdentity ? mediaImageView.image : nil
+    if !isSameMediaIdentity {
+      mediaPixelQuality = .none
+    } else if preservedMediaImage != nil, mediaPixelQuality == .none {
+      // Reused cell with pixels but no quality stamp (old path) — treat as full so
+      // a late micro-thumb cannot downgrade a sharp image.
+      mediaPixelQuality = .full
+    }
     // [MediaPop] reference point: image applies within ~1 frame of this stamp are the
     // synchronous configure pass (invisible); later applies on a window-attached cell
     // are the visible pop the flicker reports describe.
     lastConfigureStartedAt = ProcessInfo.processInfo.systemUptime
     self.agentTurnState = agentTurnState
     isConfiguredAgentDivider = false
+    isConfiguredAgentErrorNotice = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
     self.row = row
     self.selectionMode = selectionMode
@@ -7266,16 +9377,42 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     groupTopReservedSpacing = max(0.0, groupTopSpacing)
     // Palette belongs only to the quoted reply preview, not the sender name strip.
     self.replyAccentColors = replyAccentColors
-    if let groupSenderName, !groupSenderName.isEmpty {
+
+    // Top-of-plate chrome: optional group sender name + optional forward header.
+    // Heights must match `ChatListView.groupMeasurementExtras` so content never overlaps.
+    // Selection mode hides the sender name (and Ready/typing-style chrome) so the
+    // lift feels clean — reserve height stays 0 so rows don't keep empty name air.
+    var topChromeHeight: CGFloat = 0.0
+    if !selectionMode, let groupSenderName, !groupSenderName.isEmpty {
+      groupSenderNameLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
       groupSenderNameLabel.text = groupSenderName
       groupSenderNameLabel.textColor = groupSenderColor ?? .secondaryLabel
       groupSenderNameLabel.isHidden = false
-      groupNameReservedHeight = groupSenderNameHeight
+      topChromeHeight += max(groupSenderNameHeight, 0.0)
     } else {
+      groupSenderNameLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
       groupSenderNameLabel.text = nil
       groupSenderNameLabel.isHidden = true
-      groupNameReservedHeight = 0.0
     }
+
+    if row.isForwarded {
+      let name = row.forwardedFromName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      // Match bubble body text (white on me / dark-or-light on them) — not accent green.
+      let bodyTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
+      forwardedFromHeader.configure(
+        name: name.isEmpty ? "Unknown" : name,
+        avatarURL: row.forwardedFromAvatar,
+        peerUserId: row.forwardedFromUserId,
+        textColor: bodyTextColor,
+        isDark: appearance.isDark
+      )
+      forwardedFromHeader.isHidden = false
+      topChromeHeight += ForwardedFromHeaderView.preferredHeight
+    } else {
+      forwardedFromHeader.prepareForReuse()
+      forwardedFromHeader.isHidden = true
+    }
+    groupNameReservedHeight = topChromeHeight
     // Group list color flicker: log gutter/name/sender-color transitions + style path.
     if chatCellBubbleFlickerDebugLogs,
       groupExtraLeading > 0.1 || prevGroupLeading > 0.1 || row.isGroupOrChannel
@@ -7332,11 +9469,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if row.visualKind == .voice, activeVoiceSnapshot.messageId == row.messageId {
       mediaNeedsDownload = activeVoiceSnapshot.isDownloading
       mediaIsDownloading = activeVoiceSnapshot.isDownloading
-      mediaDownloadProgress = activeVoiceSnapshot.downloadProgress.map(Double.init)
+      mediaDownloadProgress = activeVoiceSnapshot.downloadFraction.map(Double.init)
+        ?? activeVoiceSnapshot.downloadProgress.map(Double.init)
+      mediaDownloadedBytes = activeVoiceSnapshot.downloadedBytes
+      mediaTotalDownloadBytes = activeVoiceSnapshot.totalBytes
     } else {
       mediaNeedsDownload = false
       mediaIsDownloading = false
       mediaDownloadProgress = nil
+      mediaDownloadedBytes = nil
+      mediaTotalDownloadBytes = nil
     }
     self.skipRemoteMediaLoad = skipRemoteMediaLoad
     self.preferredLocalMediaURLOverride = preferredLocalMediaURLOverride
@@ -7444,6 +9586,47 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         setNeedsLayout()
         return
       }
+
+      // A failed agent turn renders as a centered, tappable "Something went wrong ·
+      // Try again" pill — same centered day-pill machinery as the divider above, but
+      // warning-tinted and interactive — instead of leaking the raw provider error into
+      // the transcript as an assistant bubble with in-cell retry chrome.
+      if let errorText = agentErrorNoticeText(for: row) {
+        isConfiguredAgentDivider = true
+        isConfiguredAgentErrorNotice = true
+        self.isGhostHidden = false
+        VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
+        resetStickerAnimation()
+        stopTypingShimmer()
+        richTextView.reset()
+        resetAgentTurnContent()
+        replyPreviewView.reset()
+        linkPreviewView.reset()
+        dayLabel.attributedText = agentErrorNoticeAttributedText(message: errorText)
+        dayLabel.isHidden = false
+        bubbleView.isHidden = true
+        tailView.isHidden = true
+        messageLabel.isHidden = true
+        agentTurnContentView.isHidden = true
+        richTextView.isHidden = true
+        replyPreviewView.isHidden = true
+        linkPreviewView.isHidden = true
+        mediaContainerView.isHidden = true
+        inlineAttachmentView.isHidden = true
+        metaContainerView.isHidden = true
+        reactionPillView.isHidden = true
+        retryButton.isHidden = true
+        agentRegenerateButton.isHidden = true
+        agentViewButton.isHidden = true
+        notSentIndicator.isHidden = true
+        agentActionBarView.isHidden = true
+        mediaProgressSpinner.stopAnimating()
+        mediaProgressOverlayView.isHidden = true
+        mediaProgressSizeLabel.isHidden = true
+        selectionCircleView.isHidden = true
+        setNeedsLayout()
+        return
+      }
       let isGhostHidden = hiddenMessageId == row.messageId
       let usesTransparentAgentStreaming = usesTransparentAgentStreamingLayout(row)
       let usesAgentTurnContent = bubbleUsesAgentTurnContent(row)
@@ -7487,8 +9670,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       metaContainerView.isHidden =
         isGhostHidden || usesTransparentAgentStreaming || agentResponsePlaceholder(row)
         || usesAgentTurnContent
-      selectionCircleView.isHidden = !selectionMode || isGhostHidden
-      selectionCircleView.configure(selected: selected, appearance: appearance)
+      let showSelectionChrome = selectionMode && !isGhostHidden
+      if showSelectionChrome {
+        selectionCircleView.isHidden = false
+        selectionCircleView.setSelectionChromeVisible(true, animated: true)
+      } else if !selectionCircleView.isHidden {
+        selectionCircleView.setSelectionChromeVisible(false, animated: true)
+      } else {
+        selectionCircleView.isHidden = true
+      }
+      selectionCircleView.configure(selected: selected, appearance: appearance, animated: true)
 
       // Side regenerate button on completed agent bubbles (replaces the old
       // bottom action bar). Hidden while streaming / in selection mode.
@@ -7537,7 +9728,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Absolute .left, not .natural: the label below is forced RTL, and .natural under
       // forceRightToLeft resolves back to the right — the change would be a no-op.
       let rtlBody = isRTL(displayText.string)
-      messageLabel.textAlignment = rtlBody ? .left : .natural
+      messageLabel.textAlignment = rtlBody ? .right : .natural
       messageLabel.semanticContentAttribute = rtlBody ? .forceRightToLeft : .unspecified
       if messageLabel.isHidden {
         messageLabel.resetStreamingState()
@@ -7659,11 +9850,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         row.isMe
         ? appearance.textColorMe
         : (row.isAgentMessage ? appearance.textColorThem : appearance.textColorThem)
-      let metaColor = resolvedMetaColor(for: textColor)
+      // Video-note meta now overlays the video itself (Telegram-style pill), so it
+      // must stay legible against arbitrary footage — always light, on a dark
+      // translucent capsule — rather than the bubble-adaptive color used elsewhere.
+      let metaColor =
+        row.visualKind == .videoNote
+        ? UIColor(white: 1.0, alpha: 0.92)
+        : resolvedMetaColor(for: textColor)
       messageLabel.textColor = textColor
       editedLabel.textColor = metaColor
       pinnedLabel.textColor = metaColor
       timestampLabel.textColor = metaColor
+      if row.visualKind == .videoNote {
+        metaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.38)
+      } else {
+        metaContainerView.backgroundColor = .clear
+      }
       configureMediaPresentation(
         for: row,
         textColor: textColor,
@@ -7738,6 +9940,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onMediaGridTileTap = nil
     onRetryMessageTap = nil
     onNotSentTap = nil
+    onAgentErrorRetryTap = nil
     onAgentAction = nil
     onSelectionToggle = nil
     row = nil
@@ -7757,6 +9960,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     groupSenderNameLabel.text = nil
     groupSenderNameLabel.isHidden = true
     groupSenderNameLabel.frame = .zero
+    forwardedFromHeader.prepareForReuse()
+    forwardedFromHeader.isHidden = true
+    forwardedFromHeader.frame = .zero
     isGhostHidden = false
     mediaProgressSpinner.stopAnimating()
     mediaProgressOverlayView.isHidden = true
@@ -7779,6 +9985,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaNeedsDownload = false
     mediaIsDownloading = false
     mediaDownloadProgress = nil
+    mediaDownloadedBytes = nil
+    mediaTotalDownloadBytes = nil
     mediaVideoCurrentTime = 0.0
     mediaVideoTotalDuration = nil
     skipRemoteMediaLoad = false
@@ -7795,7 +10003,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     externalVoiceProgress = 0.0
     lastReportedMediaSizeKey = nil
     resolveDisplayStatus = nil
-    applyVoiceDownloadState(needsDownload: false, isDownloading: false, progress: nil)
+    mediaVoiceButtonView.resetDownloadChromeForReuse()
+    mediaNeedsDownload = false
+    mediaIsDownloading = false
+    mediaDownloadProgress = nil
+    mediaDownloadedBytes = nil
+    mediaTotalDownloadBytes = nil
     applyVoicePlaybackState(isPlaying: false, progress: 0.0, level: 0.0)
     mediaWaveformView.setWaveform(nil)
     statusImageView.isHidden = true
@@ -7818,8 +10031,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     hasSavedExtractionState = false
     mediaImageTask?.cancel()
     mediaImageTask = nil
+    musicCoverTask?.cancel()
+    musicCoverTask = nil
     mediaImageView.image = nil
+    mediaPixelQuality = .none
     stopInlineVideoPlayback(resetMutedState: true)
+    stopVideoNoteProgressRing()
+    mediaContainerView.transform = .identity
+    bubbleView.transform = .identity
+    tailView.transform = .identity
+    metaContainerView.transform = .identity
     mediaPlaceholderBlurView.isHidden = true
     resetStickerAnimation()
     lastReactionDebugSignature = nil
@@ -7909,13 +10130,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     if row.messageType == "agent_actions" {
       agentTurnContentView.frame = .zero
-      let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
+      // Selection chrome only opens space on the leading edge for *them* rows.
+      // "Me" bubbles stay trailing-pinned — no whole-list shift.
+      let selectionInset =
+        (selectionMode && !row.isMe) ? messageSelectionLeadingInset : 0.0
       let layoutWidth = max(1.0, bounds.width)
       agentActionBarView.frame = pixelAlignedRect(
         CGRect(
           x: bubbleSideMargin + selectionInset,
           y: max(0.0, bounds.height - 36.0),
-          width: max(1.0, layoutWidth - (bubbleSideMargin * 2.0)),
+          width: max(1.0, layoutWidth - (bubbleSideMargin * 2.0) - selectionInset),
           height: 36.0
         )
       )
@@ -7923,7 +10147,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
-    let selectionInset = selectionMode ? messageSelectionLeadingInset : 0.0
+    // Only incoming ("them") bubbles slide right for the check circle.
+    // Outgoing ("me") stay fixed on the trailing edge — no list-wide push.
+    let selectionInset =
+      (selectionMode && !row.isMe) ? messageSelectionLeadingInset : 0.0
     // Incoming group messages reserve a leading avatar gutter: measure the bubble against
     // the narrowed width and shift it right by the same amount, so it never sits under the
     // floating avatar. Outgoing / DM rows keep groupExtraLeading == 0 (no change).
@@ -7944,26 +10171,46 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // morphs instead of snapping to the target metrics size (empty gap / overflow jump).
     // Top-corner glass chip is overlay-only and does not reserve cell height.
     let outerReserve = metrics.tallOuterToggleReserve
+    // Top chrome (group name / forward header). When present, TOP-ALIGN the stack so
+    // reopen / seed-height corrections cannot bottom-pin content under empty air and
+    // then paint the header over it (the reported shift + overlap).
+    let inBubbleNameReserve = groupNameReservedHeight > 0.5 ? groupNameReservedHeight : 0.0
+    let topAir = groupTopReservedSpacing
     let availableBubbleHeight = max(
-      1.0, bounds.height - groupNameReservedHeight - groupTopReservedSpacing - outerReserve)
+      1.0, bounds.height - inBubbleNameReserve - topAir - outerReserve)
     let isTallHeightMorphing =
       metrics.tallToggleVisible && abs(availableBubbleHeight - metrics.bubbleHeight) > 1.0
-    let bubbleHeight =
-      isTallHeightMorphing ? availableBubbleHeight : metrics.bubbleHeight
+    // Always clamp to the slot under chrome so a short cell never lets body text
+    // run into the forward header or the next row.
+    let bubbleHeight: CGFloat = {
+      let raw = isTallHeightMorphing ? availableBubbleHeight : metrics.bubbleHeight
+      return min(raw, availableBubbleHeight)
+    }()
     let bubbleX: CGFloat
     if metrics.agentTurnCentered {
       // Compact "thinking" pill: center it in the row instead of pinning to the leading
       // edge, so the tiny loader reads as a centered indicator rather than a marooned
-      // scrap in a full-width shell.
-      bubbleX = max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0) + selectionInset + groupExtraLeading
-    } else {
+      // scrap in a full-width shell. Selection inset only shifts non-me rows.
       bubbleX =
-        (row.isMe
-          ? layoutWidth - bubbleWidth - bubbleSideMargin
-          : bubbleSideMargin + groupExtraLeading) + selectionInset
+        max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0)
+        + selectionInset + groupExtraLeading
+    } else if row.isMe {
+      // Trailing-pinned: never apply selection leading inset (no push-to-right).
+      // Video notes: meta (time + ticks) now sits INSIDE the circle bottom-right
+      // (Telegram-authentic overlay pill), so no trailing reserve is needed here.
+      bubbleX =
+        layoutWidth - bubbleWidth - bubbleSideMargin
+    } else {
+      bubbleX = bubbleSideMargin + groupExtraLeading + selectionInset
     }
-    // Plate sits above the outer glass reserve (when present).
-    let bubbleY = max(0.0, bounds.height - bubbleHeight - outerReserve)
+    // With chrome: content starts right under the reserved strip (stable top stack).
+    // Without chrome: keep classic bottom-pin so tails align with neighbouring cells.
+    let bubbleY: CGFloat
+    if inBubbleNameReserve > 0.5 {
+      bubbleY = topAir + inBubbleNameReserve
+    } else {
+      bubbleY = max(0.0, bounds.height - bubbleHeight - outerReserve)
+    }
     let bubbleFrame = pixelAlignedRect(
       CGRect(
         x: floor(bubbleX),
@@ -7971,23 +10218,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         width: ceil(bubbleWidth),
         height: ceil(bubbleHeight)
       ))
-    // The group sender name reads as part of the message, so the PLATE grows up over the
-    // reserved strip and the name sits inside it (Telegram-style) instead of floating on
-    // the wallpaper above a detached bubble. Only the plate moves: `bubbleFrame` stays the
-    // content anchor every element below is positioned against, so no measurement, height
-    // cache or cell height changes — the same total row height is just enclosed now.
-    let inBubbleNameReserve =
-      (!groupSenderNameLabel.isHidden && groupNameReservedHeight > 0) ? groupNameReservedHeight : 0.0
-    let bubblePlateFrame =
-      inBubbleNameReserve > 0
-      ? pixelAlignedRect(
+    // Plate wraps chrome + body. Chrome lives in [plate.minY, bubbleFrame.minY).
+    let bubblePlateFrame: CGRect
+    if inBubbleNameReserve > 0.5 {
+      bubblePlateFrame = pixelAlignedRect(
         CGRect(
           x: bubbleFrame.minX,
-          y: max(0.0, bubbleFrame.minY - inBubbleNameReserve),
+          y: topAir,
           width: bubbleFrame.width,
-          height: bubbleFrame.height + min(bubbleFrame.minY, inBubbleNameReserve)
+          height: bubbleFrame.height + inBubbleNameReserve
         ))
-      : bubbleFrame
+    } else {
+      bubblePlateFrame = bubbleFrame
+    }
     lastBubbleFrame = bubblePlateFrame
     lastTallToggleVisible = metrics.tallToggleVisible
     lastTallCollapsed = metrics.tallCollapsed
@@ -8004,7 +10247,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     // Tall rows clip overflow so full content under a short plate doesn't paint the next
     // cell. Soft fade mask on the body communicates "more below" (not a hard cut).
-    if metrics.tallToggleVisible {
+    // Forwarded / named rows also clip so chrome↔body seams never bleed into neighbours
+    // when a reopen uses a slightly-short seed height for one frame.
+    if metrics.tallToggleVisible || inBubbleNameReserve > 0.5 {
       clipsToBounds = true
       contentView.clipsToBounds = true
     } else {
@@ -8017,24 +10262,52 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     bubbleView.frame = bubblePlateFrame
 
-    // Group sender name: first line INSIDE the plate, aligned with the bubble's own text
-    // padding (it used to sit on the wallpaper above the bubble, which read as a caption
-    // belonging to nothing). The strip it occupies is the same one the layout already
-    // reserved, so nothing below shifts. No palette tint on the name strip — banner
-    // colors belong only to the quoted reply preview.
-    if inBubbleNameReserve > 0 {
-      let nameX = bubblePlateFrame.minX + bubbleHorizontalPadding
-      let nameMaxX = min(bubblePlateFrame.maxX - bubbleHorizontalPadding, bounds.width - bubbleSideMargin)
+    // Top-of-plate chrome stack — fills EXACTLY the reserved strip so body at
+    // bubbleFrame.minY cannot overlap it:
+    //   [optional group sender name]
+    //   [optional Forwarded from / avatar / name]
+    // Telegram keeps ~2–4pt between name and body (not a large empty band).
+    let chromeX = bubblePlateFrame.minX + bubbleHorizontalPadding
+    let chromeMaxX = min(
+      bubblePlateFrame.maxX - bubbleHorizontalPadding, bounds.width - bubbleSideMargin)
+    let chromeWidth = max(0.0, chromeMaxX - chromeX)
+    let chromeTop = bubblePlateFrame.minY
+    let chromeBottom = bubbleFrame.minY
+    if !groupSenderNameLabel.isHidden {
+      let nameH: CGFloat = 15.0
+      let nameY = chromeTop + 2.0
+      let maxNameH = max(0.0, chromeBottom - nameY - 1.0)
       groupSenderNameLabel.frame = pixelAlignedRect(
         CGRect(
-          x: nameX,
-          y: bubblePlateFrame.minY + 6.0,
-          width: max(0.0, nameMaxX - nameX),
-          height: max(0.0, inBubbleNameReserve - 8.0)
-        ))
+          x: chromeX, y: nameY, width: chromeWidth,
+          height: min(nameH, maxNameH)))
     } else {
       groupSenderNameLabel.frame = .zero
     }
+    if !forwardedFromHeader.isHidden {
+      // Forward-only: fill the whole reserved strip. With a group name above, take
+      // whatever is left under the name so body at chromeBottom never overlaps.
+      let forwardY: CGFloat
+      if !groupSenderNameLabel.isHidden {
+        forwardY = groupSenderNameLabel.frame.maxY + 3.0
+      } else {
+        forwardY = chromeTop
+      }
+      let forwardH = max(0.0, chromeBottom - forwardY)
+      forwardedFromHeader.frame = pixelAlignedRect(
+        CGRect(
+          x: chromeX,
+          y: forwardY,
+          width: chromeWidth,
+          height: forwardH
+        ))
+      // Keep chrome above the plate fill / body subviews so text never paints over it.
+      contentView.bringSubviewToFront(groupSenderNameLabel)
+      contentView.bringSubviewToFront(forwardedFromHeader)
+    } else {
+      forwardedFromHeader.frame = .zero
+    }
+    // Telegram-tight: body starts almost immediately under the forward header.
     let selectionSize: CGFloat = 26.0
     selectionCircleView.frame = pixelAlignedRect(
       CGRect(
@@ -8053,7 +10326,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // from the hidden bubble's path made the send-morph reveal a structural
     // path swap (tail-less silhouette → tailed) at the exact landing frame,
     // seen as "the tail appears after the bubble is in the list".
+    // Video notes are pure circles — never show a bubble tail (Telegram).
     let showTail = row.shape.showTail && !metrics.agentTurnCentered
+      && row.visualKind != .videoNote
       && !(row.messageType == "typing" || isTransparentStickerMessage(row) || usesTransparentAgentStreaming)
     // Normal bubbles draw the tail INSIDE BubbleBackgroundView's own path (one shape, one
     // fill — no color seam, no sliver outside the corner curve). The separate rotated
@@ -8106,9 +10381,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             height: metrics.mediaHeight
           ))
       } else {
-        let mediaTopInset: CGFloat = row.visualKind == .voice ? 2.0 : bubbleTopPadding
+        let mediaTopInset: CGFloat =
+          row.visualKind == .voice ? 2.0 : bubbleTopPadding
         let mediaLeftInset: CGFloat =
-          row.visualKind == .voice ? max(6.0, bubbleHorizontalPadding - 2.0) : bubbleHorizontalPadding
+          row.visualKind == .voice
+          ? max(6.0, bubbleHorizontalPadding - 2.0) : bubbleHorizontalPadding
         mediaFrame = pixelAlignedRect(
           CGRect(
             x: bubbleFrame.minX + mediaLeftInset,
@@ -8143,21 +10420,46 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       } else {
         messageLabel.frame = .zero
       }
-      let metaX =
-        isFullBleed
-        ? (bubbleFrame.maxX - metrics.metaWidth - 10)
-        : isTransparentSticker
-        ? (bubbleFrame.maxX - metrics.metaWidth)
-        : (bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth)
+      let metaX: CGFloat
       let metaY: CGFloat
-      if isFullBleed {
-        metaY = bubbleFrame.maxY - bubbleMetaHeight - 8
-      } else if row.visualKind == .voice {
-        metaY = bubbleFrame.maxY - bubbleMetaHeight - 3.0
-      } else if hasMediaCaption {
-        metaY = messageLabel.frame.maxY + bubbleMetaTopSpacing
+      if row.visualKind == .videoNote {
+        // Telegram-authentic: time + ✓ sit as a translucent pill INSIDE the circle,
+        // bottom-right, overlapping the video. metaContainerView is a real child of
+        // mediaContainerView (the actually-visible circle) so it inherits its scale
+        // transform for free during expand-on-play — no manual offset math, so it
+        // physically cannot drift out of sync with the circle.
+        if metaContainerView.superview !== mediaContainerView {
+          mediaContainerView.addSubview(metaContainerView)
+        } else {
+          mediaContainerView.bringSubviewToFront(metaContainerView)
+        }
+        // Inset along the diagonal (not the bounding-box corner) so the pill stays
+        // fully inside the circular mask instead of being clipped by it.
+        let diameter = min(mediaContainerView.bounds.width, mediaContainerView.bounds.height)
+        let cornerInset = diameter * 0.5 * (1.0 - 0.7071) + 3.0
+        metaY = mediaContainerView.bounds.height - bubbleMetaHeight - cornerInset
+        metaX = mediaContainerView.bounds.width - metrics.metaWidth - cornerInset
       } else {
-        metaY = mediaFrame.maxY + metaTopSpacing
+        if metaContainerView.superview !== contentView {
+          contentView.addSubview(metaContainerView)
+        }
+        metaContainerView.layer.cornerRadius = 0
+        if isFullBleed {
+          metaX = bubbleFrame.maxX - metrics.metaWidth - 10
+          metaY = bubbleFrame.maxY - bubbleMetaHeight - 8
+        } else if isTransparentSticker {
+          metaX = bubbleFrame.maxX - metrics.metaWidth
+          metaY = mediaFrame.maxY + metaTopSpacing
+        } else if row.visualKind == .voice {
+          metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+          metaY = bubbleFrame.maxY - bubbleMetaHeight - 3.0
+        } else if hasMediaCaption {
+          metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+          metaY = messageLabel.frame.maxY + bubbleMetaTopSpacing
+        } else {
+          metaX = bubbleFrame.maxX - bubbleHorizontalPadding - metrics.metaWidth
+          metaY = mediaFrame.maxY + metaTopSpacing
+        }
       }
 
       metaContainerView.frame = pixelAlignedRect(
@@ -8167,11 +10469,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           width: metrics.metaWidth,
           height: bubbleMetaHeight
         ))
-
-      // The background for meta inside full bleed needs to be darker so it's illegible
-      // over image
-      if isFullBleed {
-        // Typically we add a shadow or dark background pill for meta over media.
+      if row.visualKind == .videoNote {
+        metaContainerView.layer.cornerRadius = metaContainerView.bounds.height * 0.5
       }
 
       mediaProgressOverlayView.frame = mediaContainerView.bounds
@@ -8867,7 +11166,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
 
-    let badgeSymbolConfig = UIImage.SymbolConfiguration(pointSize: 10.5, weight: .semibold)
+    // Video notes: larger top-left mute control (Telegram diagram).
+    let pointSize: CGFloat = row.visualKind == .videoNote ? 13.0 : 10.5
+    let badgeSymbolConfig = UIImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
     let hasKnownAudio =
       mediaVideoHasAudio
       || resolvedVideoAudioState(
@@ -8880,7 +11181,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       systemName: showsMutedIcon ? "speaker.slash.fill" : "speaker.wave.2.fill",
       withConfiguration: badgeSymbolConfig
     )
-    mediaVideoAudioIconView.alpha = hasKnownAudio ? 1.0 : 0.72
+    mediaVideoAudioIconView.alpha = hasKnownAudio ? 1.0 : 0.85
+    if row.visualKind == .videoNote {
+      mediaVideoAudioIconView.tintColor = .white
+    }
   }
 
   private func updateInlineVideoTimeBadge() {
@@ -8922,11 +11226,42 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       row.visualKind == .video
       || row.visualKind == .videoNote
       || (row.visualKind == .media && row.messageType != "file")
+    guard supportsPlaceholder else {
+      mediaPlaceholderBlurView.isHidden = true
+      return
+    }
     let hasInlineVideo =
       !mediaVideoPlayerHostView.isHidden && mediaVideoReady && mediaVideoPlayerLayer.player != nil
-    let hasVisualPreview =
-      mediaImageView.image != nil || hasInlineVideo || !mediaStickerAnimationView.isHidden
-    mediaPlaceholderBlurView.isHidden = !supportsPlaceholder || hasVisualPreview
+    if hasInlineVideo {
+      // Live video frames replace any still preview.
+      mediaPlaceholderBlurView.isHidden = true
+      return
+    }
+    if !mediaStickerAnimationView.isHidden {
+      mediaPlaceholderBlurView.isHidden = true
+      return
+    }
+    let hasPixels = mediaImageView.image != nil
+    let transferPending =
+      mediaIsDownloading || mediaNeedsDownload || row.shouldShowUploadOverlay
+    if hasPixels {
+      // Telegram-style: soft material over the micro-thumb while full media is still
+      // transferring. Full-quality pixels hide the overlay.
+      let softContentBlur =
+        transferPending && mediaPixelQuality == .microThumb
+      mediaPlaceholderBlurView.isHidden = !softContentBlur
+      mediaPlaceholderTintView.backgroundColor = UIColor(
+        white: appearance.isDark ? 0.0 : 1.0,
+        alpha: softContentBlur ? (appearance.isDark ? 0.28 : 0.14) : 0.0
+      )
+    } else {
+      // Last resort only — no durable thumb on the wire. Prefer never reaching here.
+      mediaPlaceholderBlurView.isHidden = false
+      mediaPlaceholderTintView.backgroundColor = UIColor(
+        white: appearance.isDark ? 0.02 : 0.98,
+        alpha: appearance.isDark ? 0.18 : 0.10
+      )
+    }
   }
 
   private func refreshInlineVideoPlaybackIfNeeded(
@@ -9326,6 +11661,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     } else {
       mediaVideoInfoBadgeView.isHidden = true
     }
+    // Soft content blur rides transfer state — refresh whenever chrome flips.
+    updateMediaPlaceholderVisibility()
   }
 
   private func resolvedVoicePlaybackURL(for row: ChatListRow) -> String? {
@@ -9340,30 +11677,108 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return nil
   }
 
-  private func refreshVoiceMetadataText() {
-    guard let row, row.visualKind == .voice, usesAudioMetadataVoiceLayout(row) else { return }
+  /// Voice chrome (waveform bars + play plate) is colored by WHO sent the row, not by
+  /// the accent alone:
+  ///
+  ///   * My bubbles — the plate and bars take the bubble's own text color, and the
+  ///     glyph is punched out of the plate so it reads as the bubble color. Appearance
+  ///     never tints them; against my accent-filled bubble a second accent went muddy.
+  ///   * Their bubbles — the plate and bars take the appearance accent (their plate is
+  ///     near-black, so the accent is what carries), while the glyph stays white no
+  ///     matter which appearance is selected.
+  private func applyVoiceChromeColors(isMe: Bool) {
+    let tint = isMe ? appearance.textColorMe : appearance.accent
+    mediaWaveformView.applyColors(
+      active: tint.withAlphaComponent(0.98),
+      inactive: tint.withAlphaComponent(0.34)
+    )
+    mediaVoiceButtonView.applyStyle(
+      fillColor: tint,
+      // Knocked out on my side, so this tint only applies to the artwork variant,
+      // where `resolvedIconTintColor` forces white anyway.
+      iconTint: isMe ? .clear : .white,
+      ringTint: tint.withAlphaComponent(0.82),
+      knockoutIcon: isMe
+    )
+  }
 
-    mediaTitleLabel.text = resolvedAudioVoiceTitle(row)
+  /// Compact music cell labels: title = track name, detail = artist (or source).
+  private func applyCompactMusicTextLabels(for row: ChatListRow) {
+    let stack = musicCardTextStack(for: row)
+    let textColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
+    mediaTitleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+    mediaTitleLabel.textColor = textColor
+    mediaTitleLabel.text = stack.title
+    mediaTitleLabel.numberOfLines = 1
+
+    mediaDetailLabel.attributedText = nil
+    mediaDetailLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    mediaDetailLabel.textColor = textColor.withAlphaComponent(0.72)
+    mediaDetailLabel.numberOfLines = 1
+    if let artist = stack.artist, !artist.isEmpty {
+      mediaDetailLabel.text = artist
+    } else {
+      mediaDetailLabel.text = stack.source
+    }
+  }
+
+  private func refreshVoiceMetadataText() {
+    guard let row, row.visualKind == .voice else { return }
+    let usesMetadata = usesAudioMetadataVoiceLayout(row)
+
     if row.shouldShowUploadOverlay {
-      if let totalBytes = row.fileSize, totalBytes > 0, let progress = row.uploadProgress {
-        let sentBytes = Int64(Double(totalBytes) * max(0.0, min(1.0, progress)))
-        mediaDetailLabel.text = "\(formatMediaByteSize(sentBytes)) / \(formatMediaByteSize(totalBytes))"
+      // Sending a voice note: show its DURATION (the timer) alongside the spinner on the
+      // play plate — never the byte size. A short voice note is not heavy media, and a
+      // size/progress readout is exactly the noise the user asked to remove. Music keeps
+      // its title/artist (same as the download branch); the spinner carries the state.
+      if usesMetadata {
+        applyCompactMusicTextLabels(for: row)
       } else {
-        mediaDetailLabel.text = "Uploading"
+        mediaDetailLabel.attributedText = nil
+        mediaDetailLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
+        mediaDetailLabel.numberOfLines = 1
+        mediaDetailLabel.text = "\(formatBubbleDuration(seconds: row.duration)) \u{2022}"
       }
       return
     }
+
+    if mediaDownloadFailed {
+      if usesMetadata {
+        mediaTitleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        mediaTitleLabel.text = resolvedAudioVoiceTitle(row)
+        mediaTitleLabel.textColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
+      }
+      mediaDetailLabel.attributedText = nil
+      mediaDetailLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
+      mediaDetailLabel.numberOfLines = 1
+      mediaDetailLabel.text = VoiceBubblePlaybackCoordinator.shared.voiceFailureCaption(
+        for: row.messageId
+      )
+      return
+    }
+
     if mediaIsDownloading {
-      if let totalBytes = row.fileSize, totalBytes > 0, let progress = mediaDownloadProgress {
-        let receivedBytes = Int64(Double(totalBytes) * max(0.0, min(1.0, progress)))
-        mediaDetailLabel.text =
-          "\(formatMediaByteSize(receivedBytes)) / \(formatMediaByteSize(totalBytes))"
+      // Both music and plain voice keep their normal caption during download — music its
+      // title/artist, a voice note its DURATION timer. The spinner badge carries the loading
+      // state, so the cell never shows a byte-size caption (that read as noise and churned
+      // 5%→0 on the old broken loop). Voice is not heavy media; timer + spinner is all.
+      if usesMetadata {
+        applyCompactMusicTextLabels(for: row)
       } else {
-        mediaDetailLabel.text = "Downloading"
+        mediaDetailLabel.attributedText = nil
+        mediaDetailLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
+        mediaDetailLabel.numberOfLines = 1
+        mediaDetailLabel.text = "\(formatBubbleDuration(seconds: row.duration)) \u{2022}"
       }
       return
     }
-    mediaDetailLabel.text = resolvedAudioVoiceStaticDetail(row)
+
+    if usesMetadata {
+      applyCompactMusicTextLabels(for: row)
+    } else {
+      mediaDetailLabel.attributedText = nil
+      mediaDetailLabel.text = "\(formatBubbleDuration(seconds: row.duration)) \u{2022}"
+    }
   }
 
   private func configureMediaPresentation(
@@ -9390,6 +11805,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaImageView.image = preservedMediaImage
     mediaImageTask?.cancel()
     mediaImageTask = nil
+    musicCoverTask?.cancel()
+    musicCoverTask = nil
     mediaPrimaryIconView.image = nil
     mediaTitleLabel.text = nil
     mediaDetailLabel.text = nil
@@ -9463,36 +11880,69 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     switch row.visualKind {
     case .voice:
-      mediaContainerView.clipsToBounds = false
-      mediaVoiceButtonView.isHidden = false
       let usesMetadataLayout = usesAudioMetadataVoiceLayout(row)
-      mediaTitleLabel.isHidden = !usesMetadataLayout
-      mediaDetailLabel.isHidden = false
+      // Must NOT clip — VoicePlayProgressView's FluidVAD halo paints outside the plate.
+      mediaContainerView.clipsToBounds = false
       mediaWaveformView.isHidden = usesMetadataLayout
+      mediaDetailLabel.isHidden = false
       mediaDetailLabel.textAlignment = .left
-      mediaDetailLabel.font = UIFont.systemFont(
-        ofSize: 11,
-        weight: usesMetadataLayout ? .regular : .semibold
-      )
       mediaContainerView.backgroundColor = .clear
+      // Always hide the large media image for voice/music cells — cover sits on the play plate.
+      mediaImageView.isHidden = true
+      mediaImageView.image = nil
+      mediaVoiceButtonView.clipsToBounds = false
       if usesMetadataLayout {
-        mediaTitleLabel.text = resolvedAudioVoiceTitle(row)
+        // Register this track into the shared store/queue so the player sheet lists ALL of the
+        // chat's music, not just the tapped one. Runs per rendered cell — independent of the
+        // batch setRows path, which the cold-open cache paint skips (and which needs a chat id
+        // the per-message payload often omits). Keyed on the list-stamped hostChatId fallback.
+        if let musicChatId = effectiveHostChatId(for: row) {
+          ChatAudioQueueRegistry.shared.registerMusicRow(row, chatId: musicChatId)
+        } else {
+          NSLog(
+            "[MusicList] configure music msg=%@ NO chatId (row.chatId=%@ hostChatId=%@) — not registered",
+            row.messageId ?? "-",
+            row.chatId ?? "nil",
+            hostChatId.isEmpty ? "empty" : hostChatId
+          )
+        }
+        // Compact music cell: circular cover on play button + title/artist to the right.
+        mediaPrimaryIconView.isHidden = true
+        mediaVoiceButtonView.isHidden = false
+        mediaTitleLabel.isHidden = false
+        mediaTitleLabel.numberOfLines = 1
         mediaTitleLabel.textAlignment = .left
-        mediaTitleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
-        mediaVoiceButtonView.setArtworkImage(chatMediaImage(fromBase64: row.thumbnailBase64))
+        mediaTitleLabel.lineBreakMode = .byTruncatingTail
+        mediaDetailLabel.isHidden = false
+        mediaDetailLabel.numberOfLines = 1
+        mediaDetailLabel.textAlignment = .left
+        mediaDetailLabel.lineBreakMode = .byTruncatingTail
+        applyCompactMusicTextLabels(for: row)
+        // Cover on the play plate (not a tall art card).
+        let warm = chatMusicArtworkImage(for: row)
+        mediaVoiceButtonView.setArtworkImage(warm)
+        loadMusicCoverArtwork(for: row)
+        // Plate background follows the theme (deep in dark, soft light in light) so it reads
+        // behind the cover + VAD halo; white glyph/ring on play; accent-tinted download badge.
+        let plateColor =
+          appearance.isDark
+          ? UIColor(white: 0.12, alpha: 1.0)
+          : UIColor(white: 0.82, alpha: 1.0)
+        mediaVoiceButtonView.applyStyle(
+          fillColor: plateColor,
+          iconTint: .white,
+          ringTint: .white,
+          badgeTint: appearance.accent
+        )
       } else {
+        mediaVoiceButtonView.isHidden = false
+        mediaTitleLabel.isHidden = true
+        mediaDetailLabel.font = UIFont.systemFont(ofSize: 11, weight: .semibold)
+        mediaDetailLabel.numberOfLines = 1
         mediaDetailLabel.text = "\(formatBubbleDuration(seconds: row.duration)) \u{2022}"
         mediaWaveformView.setWaveform(row.waveform)
-        mediaWaveformView.applyColors(
-          active: appearance.accent.withAlphaComponent(0.98),
-          inactive: appearance.accent.withAlphaComponent(0.34)
-        )
+        applyVoiceChromeColors(isMe: row.isMe)
       }
-      mediaVoiceButtonView.applyStyle(
-        fillColor: appearance.accent,
-        iconTint: contrastingMediaForeground(for: appearance.accent),
-        ringTint: appearance.accent.withAlphaComponent(0.82)
-      )
       let uploadProgress: CGFloat?
       if let value = row.uploadProgress, value.isFinite {
         uploadProgress = CGFloat(max(0.0, min(1.0, value)))
@@ -9521,16 +11971,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     case .videoNote:
       mediaImageView.isHidden = false
-      mediaPrimaryIconView.isHidden = false
+      // Soft center play only when not already playing inline (Telegram circle).
+      let playingInline =
+        !mediaVideoPlayerHostView.isHidden && mediaVideoReady
+        && mediaVideoPlayerLayer.player != nil
+      mediaPrimaryIconView.isHidden = playingInline
       mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 26, weight: .bold))
-      mediaPrimaryIconView.tintColor = contrastingMediaForeground(for: appearance.accent)
-      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.90)
+        UIImage.SymbolConfiguration(pointSize: 22, weight: .bold))
+      mediaPrimaryIconView.tintColor = .white
+      mediaPrimaryIconView.backgroundColor = UIColor.black.withAlphaComponent(0.42)
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.4)
-      mediaBorderLayer.lineWidth = 1.0
-      mediaBorderLayer.strokeColor =
-        appearance.accent.withAlphaComponent(appearance.isDark ? 0.52 : 0.40).cgColor
-      mediaBorderLayer.isHidden = false
+      mediaBorderLayer.lineWidth = 0.0
+      mediaBorderLayer.strokeColor = nil
+      mediaBorderLayer.isHidden = true
 
     case .media, .sticker:
       mediaImageView.isHidden = false
@@ -9585,7 +12038,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // list never shows an empty media shell (even when a remote mediaUrl is present but
     // network hasn't finished; thumb paints first).
     if row.visualKind == .media, chatMediaGridImageCount(row) <= 1,
-      mediaImageView.image == nil,
+      mediaPixelQuality.rawValue < ChatMediaPreviewQuality.full.rawValue,
       !row.agentBridgeAttachmentsEnc.isEmpty
         || !row.attachmentThumbnailsB64.isEmpty
         || (row.thumbnailBase64?.isEmpty == false)
@@ -9594,38 +12047,43 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaPrimaryIconView.isHidden = true
       let rowKey = row.messageId ?? row.key
       let cacheKey = "\(rowKey)#hero-blob" as NSString
+      // Prefer durable thumb SYNC so the first paint is never a solid plate; full sealed
+      // blobs (larger) still decode async and promote.
+      let thumbB64 = row.attachmentThumbnailsB64.first ?? row.thumbnailBase64
+      if mediaPixelQuality.rawValue < ChatMediaPreviewQuality.microThumb.rawValue,
+        let thumbImage = chatDecodedMicroThumbnail(
+          fromBase64: thumbB64,
+          cacheKey: "thumb-\(row.key)"
+        )
+      {
+        applyResolvedMediaPreviewImage(
+          thumbImage,
+          for: row,
+          mediaURL: row.mediaUrl ?? row.key,
+          quality: .microThumb
+        )
+      }
       if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
-        mediaImageView.image = cached
-      } else {
-        let firstBlob = row.agentBridgeAttachmentsEnc.first
-        let thumbB64 = row.attachmentThumbnailsB64.first ?? row.thumbnailBase64
+        applyResolvedMediaPreviewImage(
+          cached,
+          for: row,
+          mediaURL: row.mediaUrl ?? row.key,
+          quality: .full
+        )
+      } else if let firstBlob = row.agentBridgeAttachmentsEnc.first {
         ChatListCell.bridgeGridDecodeQueue.async { [weak self] in
-          var image: UIImage?
-          if let firstBlob {
-            image = ChatListCell.decodeBridgeGridImage(blob: firstBlob)
-          }
-          if image == nil, let thumbB64 {
-            image = chatMediaImage(fromBase64: thumbB64)
-          }
-          guard let image else {
+          guard let image = ChatListCell.decodeBridgeGridImage(blob: firstBlob) else {
             return
           }
           ChatListCell.bridgeGridImageCache.setObject(image, forKey: cacheKey)
           DispatchQueue.main.async {
             guard let self, (self.row?.messageId ?? self.row?.key) == rowKey else { return }
-            if self.mediaImageView.image == nil {
-              if self.window != nil {
-                NSLog(
-                  "[MediaPop] late-image msgId=%@ type=blob sinceCfgMs=%d hadImage=N",
-                  rowKey,
-                  Int(
-                    (ProcessInfo.processInfo.systemUptime - self.lastConfigureStartedAt)
-                      * 1000))
-              }
-              self.mediaImageView.image = image
-            }
-            self.mediaImageView.isHidden = false
-            self.mediaPrimaryIconView.isHidden = true
+            self.applyResolvedMediaPreviewImage(
+              image,
+              for: row,
+              mediaURL: row.mediaUrl ?? row.key,
+              quality: .full
+            )
           }
         }
       }
@@ -9666,10 +12124,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     if !mediaImageView.isHidden || forceImageLoad {
       let prefersVideoPreview = row.visualKind == .video || row.visualKind == .videoNote
-      if mediaImageView.image == nil {
-        let thumbCacheKey = "thumb-\(row.key)" as NSString
-        if let cachedThumb = chatMediaImageCache.object(forKey: thumbCacheKey) {
-          applyResolvedMediaPreviewImage(cachedThumb, for: row, mediaURL: row.mediaUrl ?? row.key)
+      // Sync micro-thumb first paint (Telegram): never leave a solid empty plate while
+      // full media is still on disk/network. Decode is capped + cached (≤4KB wire thumbs).
+      if mediaPixelQuality.rawValue < ChatMediaPreviewQuality.microThumb.rawValue
+        || mediaImageView.image == nil
+      {
+        let thumbCacheKey = "thumb-\(row.key)"
+        if let cachedThumb = chatMediaImageCache.object(forKey: thumbCacheKey as NSString) {
+          applyResolvedMediaPreviewImage(
+            cachedThumb,
+            for: row,
+            mediaURL: row.mediaUrl ?? row.key,
+            quality: .microThumb
+          )
           mediaPrimaryIconView.isHidden = true
           chatCellDebugLog(
             chatCellMediaDebugLogs,
@@ -9682,10 +12149,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           let thumbSource =
             row.thumbnailBase64
             ?? row.attachmentThumbnailsB64.first
-          if let thumbnailImage = chatMediaImage(fromBase64: thumbSource) {
-            chatMediaImageCache.setObject(thumbnailImage, forKey: thumbCacheKey)
+          if let thumbnailImage = chatDecodedMicroThumbnail(
+            fromBase64: thumbSource,
+            cacheKey: thumbCacheKey
+          ) {
+            chatMediaImageCache.setObject(thumbnailImage, forKey: thumbCacheKey as NSString)
             applyResolvedMediaPreviewImage(
-              thumbnailImage, for: row, mediaURL: row.mediaUrl ?? row.key)
+              thumbnailImage,
+              for: row,
+              mediaURL: row.mediaUrl ?? row.key,
+              quality: .microThumb
+            )
             mediaPrimaryIconView.isHidden = true
             chatCellDebugLog(
               chatCellMediaDebugLogs,
@@ -9998,27 +12472,39 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private func applyResolvedMediaPreviewImage(
     _ image: UIImage,
     for row: ChatListRow,
-    mediaURL: String
+    mediaURL: String,
+    quality: ChatMediaPreviewQuality = .full
   ) {
+    // Promote-only: a micro-thumb must never clobber full media, and a stale late
+    // thumb after full download is a no-op.
+    if quality.rawValue < mediaPixelQuality.rawValue {
+      return
+    }
     // Every resolved preview lands here. An apply well after the synchronous configure
     // pass, on a cell the user can see, IS the visible image pop — name it.
     let sinceConfigureMs = Int(
       (ProcessInfo.processInfo.systemUptime - lastConfigureStartedAt) * 1000)
-    if window != nil, sinceConfigureMs > 50 {
+    if window != nil, sinceConfigureMs > 50, quality == .full {
       NSLog(
-        "[MediaPop] late-image msgId=%@ type=%@ sinceCfgMs=%d hadImage=%@",
+        "[MediaPop] late-image msgId=%@ type=%@ sinceCfgMs=%d hadImage=%@ quality=%d",
         row.messageId ?? row.key, row.messageType, sinceConfigureMs,
-        mediaImageView.image != nil ? "Y" : "N")
+        mediaImageView.image != nil ? "Y" : "N", quality.rawValue)
     }
     mediaImageView.image = image
     mediaImageView.isHidden = false
+    mediaPixelQuality = quality
     // Drop the SF Symbol "photo" placeholder the moment real pixels land.
     if row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote {
       mediaPrimaryIconView.isHidden = true
     }
-    reportNaturalMediaSizeIfNeeded(for: row, mediaURL: mediaURL, image: image)
+    // Natural size reporting only from full media — micro-thumbs are ~64px and would
+    // collapse the bubble aspect if used as layout truth.
+    if quality == .full {
+      reportNaturalMediaSizeIfNeeded(for: row, mediaURL: mediaURL, image: image)
+    }
     updateMediaPlaceholderVisibility()
-    if let metrics = cachedLayoutMetrics,
+    if quality == .full,
+      let metrics = cachedLayoutMetrics,
       metrics.isMediaLayout, usesFullBleedMediaLayout(row)
     {
       tailView.setImage(image)
@@ -10126,37 +12612,43 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     switch row.visualKind {
     case .voice:
-      let insetX: CGFloat = 2.0
-      let buttonSize: CGFloat = 52.0  // Button view size, inner rendered symbol will be smaller
+      // Inset the play plate so the FluidVAD halo (which paints outside the plate)
+      // is not clipped by the bubble edge or a hard left bound.
+      let edgePad: CGFloat = 5.0
+      let buttonSize: CGFloat = min(52.0, max(40.0, height - edgePad * 2.0))
       mediaVoiceButtonView.frame = CGRect(
-        x: insetX,
+        x: edgePad,
         y: floor((height - buttonSize) * 0.5),
         width: buttonSize,
         height: buttonSize
       )
-      let textStartX = mediaVoiceButtonView.frame.maxX + (usesAudioMetadataVoiceLayout(row) ? 10.0 : 4.0)
+      let textStartX = mediaVoiceButtonView.frame.maxX + 8.0
       let rightInset: CGFloat = 8.0
+      let textW = max(1.0, width - textStartX - rightInset)
       if usesAudioMetadataVoiceLayout(row) {
-        let textWidth = max(1.0, width - textStartX - rightInset)
-        mediaTitleLabel.frame = CGRect(
-          x: textStartX,
-          y: 11.0,
-          width: textWidth,
-          height: 18.0
-        )
+        // Compact music cell: play (with cover + VAD) | title / artist
+        mediaImageView.frame = .zero
+        mediaImageView.isHidden = true
+        mediaTitleLabel.frame = CGRect(x: textStartX, y: 12.0, width: textW, height: 18.0)
         mediaDetailLabel.frame = CGRect(
           x: textStartX,
-          y: 30.0,
-          width: textWidth,
-          height: 14.0
+          y: mediaTitleLabel.frame.maxY + 2.0,
+          width: textW,
+          height: 16.0
         )
+        mediaWaveformView.frame = .zero
       } else {
         let waveY: CGFloat = 10.0
         let waveHeight: CGFloat = 20.0
+        // Wider while downloading so "2.3 MB / 7.8 MB" captions are not clipped.
+        let detailWidth: CGFloat =
+          mediaIsDownloading
+          ? max(50.0, min(160.0, width - textStartX - rightInset))
+          : 50.0
         mediaDetailLabel.frame = CGRect(
           x: textStartX,
           y: waveY + waveHeight + 4.0,
-          width: 50.0,
+          width: detailWidth,
           height: 14.0
         )
         mediaWaveformView.frame = CGRect(
@@ -10177,11 +12669,67 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
       mediaPrimaryIconView.layer.cornerRadius = btnSize * 0.5
 
-      if !mediaVideoInfoBadgeView.isHidden && !mediaDurationBadge.isHidden {
+      if row.visualKind == .videoNote {
+        // Match Telegram reference:
+        //  - duration bottom-left under/inside the circle rim
+        //  - mute centered on the bottom of the circle
+        //  - time + ✓ outside to the RIGHT (meta frame)
+        let badgeHeight: CGFloat = 18.0
+        let badgeInset: CGFloat = 14.0
+        let muteSize: CGFloat = 18.0
+        let badgeText = mediaDurationBadge.text ?? ""
+        let textWidth = measuredTextWidth(badgeText, font: mediaDurationBadge.font)
+
+        // Duration alone bottom-left (white, soft shadow — no clipped pill).
+        mediaVideoInfoBadgeView.backgroundColor = .clear
+        mediaVideoInfoBadgeView.layer.cornerRadius = 0
+        mediaVideoInfoBadgeView.clipsToBounds = false
+        mediaVideoInfoBadgeView.isHidden = false
+        mediaVideoInfoBadgeView.frame = CGRect(
+          x: badgeInset,
+          y: height - badgeHeight - badgeInset,
+          width: max(28.0, textWidth + 4.0),
+          height: badgeHeight
+        )
+        mediaVideoTimeIconView.frame = .zero
+        mediaDurationBadge.textColor = .white
+        mediaDurationBadge.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        mediaDurationBadge.layer.shadowColor = UIColor.black.cgColor
+        mediaDurationBadge.layer.shadowOpacity = 0.65
+        mediaDurationBadge.layer.shadowRadius = 2.0
+        mediaDurationBadge.layer.shadowOffset = .zero
+        mediaDurationBadge.frame = mediaVideoInfoBadgeView.bounds
+        mediaDurationBadge.textAlignment = .left
+
+        // Mute disc bottom-center of the circle.
+        if mediaVideoAudioIconView.superview !== mediaContainerView {
+          mediaContainerView.addSubview(mediaVideoAudioIconView)
+        }
+        mediaVideoAudioIconView.isHidden = false
+        mediaVideoAudioIconView.backgroundColor = UIColor.black.withAlphaComponent(0.40)
+        mediaVideoAudioIconView.layer.cornerRadius = muteSize * 0.5
+        mediaVideoAudioIconView.clipsToBounds = true
+        mediaVideoAudioIconView.tintColor = .white
+        mediaVideoAudioIconView.contentMode = .scaleAspectFit
+        mediaVideoAudioIconView.frame = CGRect(
+          x: floor((width - muteSize) * 0.5),
+          y: height - muteSize - badgeInset,
+          width: muteSize,
+          height: muteSize
+        )
+        mediaContainerView.bringSubviewToFront(mediaVideoInfoBadgeView)
+        mediaContainerView.bringSubviewToFront(mediaVideoAudioIconView)
+      } else if !mediaVideoInfoBadgeView.isHidden && !mediaDurationBadge.isHidden {
+        // Regular video: duration + mute share a top-leading pill.
+        if mediaVideoAudioIconView.superview !== mediaVideoInfoBadgeView {
+          mediaVideoInfoBadgeView.addSubview(mediaVideoAudioIconView)
+        }
+        mediaVideoAudioIconView.backgroundColor = .clear
+        mediaVideoAudioIconView.layer.cornerRadius = 0
         let badgeText = mediaDurationBadge.text ?? ""
         let badgeHeight: CGFloat = 22.0
-        let badgeInsetX: CGFloat = row.visualKind == .videoNote ? 10.0 : 8.0
-        let badgeInsetY: CGFloat = row.visualKind == .videoNote ? 10.0 : 8.0
+        let badgeInsetX: CGFloat = 8.0
+        let badgeInsetY: CGFloat = 8.0
         let audioIconSize: CGFloat = mediaVideoAudioIconView.isHidden ? 0.0 : 11.0
         let textWidth = measuredTextWidth(badgeText, font: mediaDurationBadge.font)
         let badgeWidth =
@@ -10394,6 +12942,41 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     updateInlineVideoAudioIcon()
   }
 
+  /// Loads album cover onto the compact music play plate (warm cache → network).
+  private func loadMusicCoverArtwork(for row: ChatListRow) {
+    let warm = chatMusicArtworkImage(for: row)
+    mediaVoiceButtonView.setArtworkImage(warm)
+    mediaImageView.image = nil
+    guard let raw = row.musicCoverURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !raw.isEmpty,
+      chatMediaImageCache.object(forKey: chatMusicCoverCacheKey(raw) as NSString) == nil
+    else { return }
+    let rowKey = row.messageId ?? row.key
+    let coverURL = row.musicCoverURL
+    musicCoverTask?.cancel()
+    musicCoverTask = chatLoadMusicCover(urlString: raw) { [weak self] image in
+      guard let self, let current = self.row,
+        (current.messageId ?? current.key) == rowKey,
+        current.musicCoverURL == coverURL
+      else { return }
+      self.mediaVoiceButtonView.setArtworkImage(image)
+      self.mediaImageView.image = nil
+    }
+  }
+
+  /// The chat id that owns this row: the per-message `chat_id` when present, else the list's
+  /// stamped `hostChatId`. Music messages usually lack an embedded `chat_id`, so without this
+  /// the tapped track carries no chat id and the player sheet can't list the chat's other music.
+  private func effectiveHostChatId(for row: ChatListRow) -> String? {
+    if let rowChatId = row.chatId?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !rowChatId.isEmpty
+    {
+      return rowChatId
+    }
+    let trimmedHost = hostChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmedHost.isEmpty ? nil : trimmedHost
+  }
+
   @objc private func handleVoiceTap() {
     guard let row, row.visualKind == .voice else { return }
     if row.shouldShowUploadOverlay {
@@ -10403,13 +12986,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     VoiceBubblePlaybackCoordinator.shared.toggle(
       cell: self,
       messageId: row.messageId,
-      chatId: row.chatId,
+      chatId: effectiveHostChatId(for: row),
       mediaURL: resolvedVoicePlaybackURL(for: row),
       mediaKey: row.mediaKey,
       fileName: row.fileName,
       title: usesAudioMetadataVoiceLayout(row) ? resolvedAudioVoiceTitle(row) : nil,
       subtitle: usesAudioMetadataVoiceLayout(row) ? resolvedAudioVoiceStaticDetail(row) : nil,
-      artwork: usesAudioMetadataVoiceLayout(row) ? chatMediaImage(fromBase64: row.thumbnailBase64) : nil,
+      artwork: usesAudioMetadataVoiceLayout(row) ? chatMusicArtworkImage(for: row) : nil,
       duration: row.duration,
       presentsGlobalPlayer: usesAudioMetadataVoiceLayout(row)
     )
@@ -10423,6 +13006,49 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   @objc private func handleNotSentTap() {
     guard let row else { return }
     onNotSentTap?(row)
+  }
+
+  @objc private func handleAgentErrorNoticeTap() {
+    // The day pill is shared with real day/interrupt dividers, which must stay inert.
+    guard isConfiguredAgentErrorNotice, let row else { return }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    onAgentErrorRetryTap?(row)
+  }
+
+  /// Builds the centered agent-error pill text: a small warning glyph, the calm message,
+  /// and an accent "Try again" affordance, all on one line inside the day pill.
+  private func agentErrorNoticeAttributedText(message: String) -> NSAttributedString {
+    let font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+    let messageColor = appearance.dayTextColor
+    let actionColor = appearance.accent
+    let result = NSMutableAttributedString()
+
+    if let glyph = UIImage(
+      systemName: "exclamationmark.triangle.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.0, weight: .semibold))?
+      .withTintColor(.systemOrange, renderingMode: .alwaysOriginal)
+    {
+      let attachment = NSTextAttachment()
+      attachment.image = glyph
+      let dy = (font.capHeight - glyph.size.height) / 2.0
+      attachment.bounds = CGRect(x: 0, y: dy, width: glyph.size.width, height: glyph.size.height)
+      result.append(NSAttributedString(attachment: attachment))
+      result.append(NSAttributedString(string: "  "))
+    }
+
+    result.append(
+      NSAttributedString(
+        string: message,
+        attributes: [.font: font, .foregroundColor: messageColor]))
+    result.append(
+      NSAttributedString(
+        string: "   ",
+        attributes: [.font: font, .foregroundColor: messageColor]))
+    result.append(
+      NSAttributedString(
+        string: "Try again",
+        attributes: [.font: font, .foregroundColor: actionColor]))
+    return result
   }
 
   @objc private func handleAgentRegenerateTap() {
@@ -10521,9 +13147,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   func applyVoiceDownloadState(needsDownload: Bool, isDownloading: Bool, progress: CGFloat?) {
+    let downloadChromeChanged = mediaIsDownloading != isDownloading
     mediaNeedsDownload = needsDownload
     mediaIsDownloading = isDownloading
+    // Any fresh state push (idle / loading / playing) supersedes a latched failure.
+    mediaDownloadFailed = false
     mediaDownloadProgress = progress.map(Double.init)
+    // Live byte counts from the coordinator (same source the snapshot publishes for the sheet).
+    if isDownloading {
+      let counts = VoiceBubblePlaybackCoordinator.shared.activeDownloadByteCounts
+      mediaDownloadedBytes = counts.downloaded
+      mediaTotalDownloadBytes = counts.total
+    } else {
+      mediaDownloadedBytes = nil
+      mediaTotalDownloadBytes = nil
+    }
     guard !(row?.shouldShowUploadOverlay == true) else { return }
     mediaVoiceButtonView.setDownloadState(
       needsDownload: needsDownload,
@@ -10534,12 +13172,33 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaWaveformView.setPlayback(progress: progress ?? 0.0, level: 0.0, isPlaying: false)
     }
     refreshVoiceMetadataText()
+    if downloadChromeChanged {
+      setNeedsLayout()
+    }
+  }
+
+  func applyVoiceDownloadFailedState() {
+    mediaDownloadFailed = true
+    mediaNeedsDownload = true
+    mediaIsDownloading = false
+    mediaDownloadProgress = nil
+    mediaDownloadedBytes = nil
+    mediaTotalDownloadBytes = nil
+    guard !(row?.shouldShowUploadOverlay == true) else { return }
+    mediaVoiceButtonView.setDownloadFailed()
+    mediaWaveformView.setPlayback(progress: 0.0, level: 0.0, isPlaying: false)
+    refreshVoiceMetadataText()
+    setNeedsLayout()
   }
 
   func applyMediaDownloadState(needsDownload: Bool, isDownloading: Bool, progress: Double?) {
     mediaNeedsDownload = needsDownload
     mediaIsDownloading = isDownloading
     mediaDownloadProgress = progress
+    if !isDownloading {
+      mediaDownloadedBytes = nil
+      mediaTotalDownloadBytes = nil
+    }
     guard let row, !(row.shouldShowUploadOverlay) else { return }
     updateMediaTransferChrome(for: row)
     refreshInlineVideoPlaybackIfNeeded()

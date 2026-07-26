@@ -140,12 +140,18 @@ public final class ChatMainView: UIView,
   private let avatarGlassView = UIVisualEffectView(effect: nil)
   private let avatarButton = UIButton(type: .system)
   private let avatarNode = ChatAvatarNodeView()
+  /// Lives inside avatar glass — same chip morphs avatar → "Selected" + count.
+  private let selectionHeaderStack = UIStackView()
+  private let selectionTitleLabel = UILabel()
+  private let selectionCountLabel = UILabel()
 
   private let rightActionsStack = UIStackView()
   private let callButton = UIButton(type: .system)
   private let videoCallButton = UIButton(type: .system)
   private let historyButton = UIButton(type: .system)
   private let newChatButton = UIButton(type: .system)
+  /// Selection-mode confirm (replaces call/video glass on the trailing side).
+  private let selectionDoneButton = UIButton(type: .system)
 
   private let menuGlassView = UIVisualEffectView(effect: nil)
   private let savedSearchCancelGlassView = UIVisualEffectView(effect: nil)
@@ -1283,7 +1289,7 @@ public final class ChatMainView: UIView,
     profileBackGlassView.contentView.addSubview(profileBackButton)
     profileMenuGlassView.contentView.addSubview(profileMenuButton)
 
-    [backButton, titleButton, avatarButton, menuButton, profileBackButton, profileMenuButton, callButton, videoCallButton, historyButton, newChatButton].forEach
+    [backButton, titleButton, avatarButton, menuButton, profileBackButton, profileMenuButton, callButton, videoCallButton, historyButton, newChatButton, selectionDoneButton].forEach
     { button in
       button.backgroundColor = .clear
       button.contentHorizontalAlignment = .center
@@ -1325,8 +1331,9 @@ public final class ChatMainView: UIView,
     rightActionsStack.addArrangedSubview(videoCallButton)
     rightActionsStack.addArrangedSubview(historyButton)
     rightActionsStack.addArrangedSubview(newChatButton)
+    rightActionsStack.addArrangedSubview(selectionDoneButton)
 
-    [callButton, videoCallButton, historyButton, newChatButton].forEach { button in
+    [callButton, videoCallButton, historyButton, newChatButton, selectionDoneButton].forEach { button in
       button.translatesAutoresizingMaskIntoConstraints = false
       NSLayoutConstraint.activate([
         button.heightAnchor.constraint(equalToConstant: 44.0)
@@ -1341,6 +1348,16 @@ public final class ChatMainView: UIView,
     historyButton.setImage(createHistoryIcon(), for: .normal)
     newChatButton.setImage(UIImage(systemName: "plus"), for: .normal)
     newChatButton.setPreferredSymbolConfiguration(actionSymbolConfig, forImageIn: .normal)
+    selectionDoneButton.setImage(UIImage(systemName: "checkmark"), for: .normal)
+    selectionDoneButton.setPreferredSymbolConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 15, weight: .bold), forImageIn: .normal)
+    selectionDoneButton.accessibilityIdentifier = "chat.selection.done"
+    selectionDoneButton.accessibilityLabel = "Done"
+    selectionDoneButton.isHidden = true
+    selectionDoneButton.tintColor = .white
+    selectionDoneButton.backgroundColor = UIColor.systemBlue
+    selectionDoneButton.clipsToBounds = true
+    selectionDoneButton.layer.cornerCurve = .continuous
     historyButton.accessibilityIdentifier = "chat.history"
     historyButton.accessibilityLabel = "History"
     newChatButton.accessibilityIdentifier = "chat.new"
@@ -1348,6 +1365,7 @@ public final class ChatMainView: UIView,
 
     historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
     newChatButton.addTarget(self, action: #selector(handleNewChatPressed), for: .touchUpInside)
+    selectionDoneButton.addTarget(self, action: #selector(handleSelectionDonePressed), for: .touchUpInside)
 
     // TODO: Add actual targets for call/videoCall/history/newChat.
     // historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
@@ -1391,11 +1409,29 @@ public final class ChatMainView: UIView,
 
     avatarButton.addTarget(self, action: #selector(handleAvatarPressed), for: .touchUpInside)
     avatarButton.addSubview(avatarNode)
-    avatarButton.addSubview(checkmarkImageView)
-    checkmarkImageView.contentMode = .scaleAspectFit
-    checkmarkImageView.image = UIImage(systemName: "checkmark.circle.fill")
-    checkmarkImageView.tintColor = .systemBlue
-    checkmarkImageView.isHidden = true
+    // Selection title lives in the TITLE glass (same frame as username/subtitle) so
+    // enter/exit is a pure alpha cross-fade — no X/Y translation of the header text.
+    // Counter sits alongside the title (horizontal), not under it.
+    selectionTitleLabel.text = "Select messages"
+    selectionTitleLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+    selectionTitleLabel.textAlignment = .left
+    selectionTitleLabel.lineBreakMode = .byTruncatingTail
+    selectionCountLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+    selectionCountLabel.textAlignment = .left
+    selectionCountLabel.lineBreakMode = .byClipping
+    selectionCountLabel.setContentHuggingPriority(.required, for: .horizontal)
+    selectionCountLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+    selectionHeaderStack.axis = .horizontal
+    selectionHeaderStack.alignment = .center
+    selectionHeaderStack.distribution = .fill
+    selectionHeaderStack.spacing = 6
+    selectionHeaderStack.isUserInteractionEnabled = false
+    selectionHeaderStack.alpha = 0
+    selectionHeaderStack.isHidden = true
+    selectionHeaderStack.addArrangedSubview(selectionTitleLabel)
+    selectionHeaderStack.addArrangedSubview(selectionCountLabel)
+    titleButton.addSubview(selectionHeaderStack)
+    // Selection confirm lives in the trailing glass (call/video or search slot).
 
     let backSymbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
     backButton.setPreferredSymbolConfiguration(backSymbolConfig, forImageIn: .normal)
@@ -1591,7 +1627,6 @@ public final class ChatMainView: UIView,
 
   private var selectionModeActive = false
   private var selectionCount = 0
-  private let checkmarkImageView = UIImageView()
 
   private func syncListDispatchers() {
     chatListView.onNativeEvent = NativeEventDispatcher { [weak self] event in
@@ -1607,50 +1642,170 @@ public final class ChatMainView: UIView,
   private func handleInternalListEvent(_ event: [String: Any]) {
     if let type = event["type"] as? String, type == "messageSelectionChanged" {
       if let active = event["active"] as? Bool, let count = event["selectedCount"] as? Int {
-        let changed = (active != self.selectionModeActive || count != self.selectionCount)
+        let modeChanged = active != self.selectionModeActive
+        let countChanged = count != self.selectionCount
         self.selectionModeActive = active
         self.selectionCount = count
-        if changed {
-          self.updateHeaderForSelectionState()
+        if modeChanged {
+          self.updateHeaderForSelectionState(animated: true)
+        } else if countChanged && active {
+          self.updateSelectionTitleContent(count: count, animated: true)
         }
       }
     } else if let type = event["type"] as? String, type == "messageSelectionAction" {
-      // In case we want to hide selection immediately
-      self.selectionModeActive = false
-      self.updateHeaderForSelectionState()
+      // Do not hard-exit selection here — share sheet may still be open; the
+      // send path clears selection after dismiss to avoid a mid-sheet flicker.
     }
   }
 
-  private func updateHeaderForSelectionState() {
-    let isActive = selectionModeActive
-    let count = selectionCount
-    
-    UIView.transition(with: headerContentView, duration: 0.3, options: .transitionCrossDissolve) {
-      if isActive {
-        self.backButton.setTitle(nil, for: .normal)
-        self.backButton.setImage(UIImage(systemName: "xmark"), for: .normal)
-        self.backButton.accessibilityLabel = "Cancel selection"
-        self.chatTitleLabel.text = "\(count) Selected"
-        self.chatSubtitleLabel.isHidden = true
-        self.chatSubtitleDotView.isHidden = true
-        self.avatarNode.alpha = 0
-        self.checkmarkImageView.isHidden = false
-        self.checkmarkImageView.alpha = 1
-      } else {
-        self.backButton.setTitle(nil, for: .normal)
-        self.backButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
-        self.backButton.accessibilityLabel = "Back"
-        self.updateHeaderTexts() // restores chatTitleLabel and chatSubtitleLabel
-        self.avatarNode.alpha = 1
-        self.checkmarkImageView.alpha = 0
-        self.checkmarkImageView.isHidden = true
-      }
-    }
-    
-    UIView.animate(withDuration: 0.3) {
+  /// Cancels in-flight selection header morph (enter/exit).
+  private var selectionHeaderAnimator: UIViewPropertyAnimator?
+
+  /// Direct (1:1) chat — not group/channel/saved. Selection left becomes Clear Chat.
+  private var selectionShowsClearChat: Bool {
+    !isGroupOrChannel && headerMode != .savedMessages
+  }
+
+  /// Zero selected → "Select messages"; N selected → "Selected" + count (horizontal).
+  private func updateSelectionTitleContent(count: Int, animated: Bool) {
+    let empty = count <= 0
+    let nextTitle = empty ? "Select messages" : "Selected"
+    let nextCount = empty ? "" : "\(count)"
+    let showCount = !empty
+
+    let apply = {
+      self.selectionTitleLabel.text = nextTitle
+      self.selectionCountLabel.text = nextCount
+      self.selectionCountLabel.isHidden = !showCount
+      self.selectionCountLabel.alpha = showCount ? 1 : 0
       self.setNeedsLayout()
       self.layoutIfNeeded()
     }
+
+    if animated, window != nil {
+      // Cross-dissolve title + monospaced digit swap (smooth counter feel).
+      UIView.transition(
+        with: selectionHeaderStack,
+        duration: 0.22,
+        options: [.transitionCrossDissolve, .beginFromCurrentState, .allowUserInteraction]
+      ) {
+        apply()
+      }
+    } else {
+      apply()
+    }
+  }
+
+  /// Apply selection chrome *flags* synchronously so layout can measure trailing
+  /// checkmark / Clear Chat before the system bar animation runs.
+  private func applySelectionChromeFlags(isActive: Bool, count: Int) {
+    if isActive {
+      if selectionShowsClearChat {
+        // Direct chat: left morphs to Clear Chat (functional — engine + server).
+        backButton.setTitle(nil, for: .normal)
+        backButton.setImage(UIImage(systemName: "trash"), for: .normal)
+        backButton.accessibilityLabel = "Clear chat"
+        backButton.tintColor = .systemRed
+      } else {
+        backButton.setTitle(nil, for: .normal)
+        backButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        backButton.accessibilityLabel = "Cancel selection"
+        backButton.tintColor = nil  // restore from applyHeaderChromeColors
+      }
+      updateSelectionTitleContent(count: count, animated: false)
+      selectionHeaderStack.isHidden = false
+      avatarButton.isUserInteractionEnabled = false
+      callButton.isHidden = true
+      videoCallButton.isHidden = true
+      historyButton.isHidden = true
+      newChatButton.isHidden = true
+      // Saved Messages: search glass becomes the blue checkmark.
+      // Everyone else: trailing actions glass holds the checkmark.
+      if headerMode == .savedMessages {
+        menuButton.isHidden = true
+        selectionDoneButton.isHidden = false
+        rightActionsGlassView.isHidden = false
+        menuGlassView.isHidden = true
+      } else {
+        selectionDoneButton.isHidden = false
+        rightActionsGlassView.isHidden = false
+      }
+      avatarGlassView.isHidden = false
+      applySelectionDoneBlueTint()
+    } else {
+      backButton.setTitle(nil, for: .normal)
+      backButton.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
+      backButton.accessibilityLabel = "Back"
+      backButton.tintColor = nil
+      selectionHeaderStack.isHidden = true
+      selectionCountLabel.isHidden = true
+      avatarButton.isUserInteractionEnabled = headerMode != .savedMessages
+      selectionDoneButton.isHidden = true
+      updateHeaderTexts()
+      updateChatModeHeaderControls()
+    }
+  }
+
+  private func applySelectionDoneBlueTint() {
+    selectionDoneButton.tintColor = .white
+    selectionDoneButton.backgroundColor = UIColor.systemBlue
+    selectionDoneButton.clipsToBounds = true
+    let side = min(
+      max(selectionDoneButton.bounds.width, 44.0),
+      max(selectionDoneButton.bounds.height, 44.0)
+    )
+    selectionDoneButton.layer.cornerRadius = side / 2.0
+    selectionDoneButton.layer.cornerCurve = .continuous
+  }
+
+  private func updateHeaderForSelectionState(animated: Bool = true) {
+    let isActive = selectionModeActive
+    let count = selectionCount
+
+    selectionHeaderAnimator?.stopAnimation(true)
+    selectionHeaderAnimator = nil
+
+    // Flags first so layout measures Done / Clear before the fade runs.
+    applySelectionChromeFlags(isActive: isActive, count: count)
+
+    // CRITICAL: keep titleGlassView frame + avatarGlassView frame stable.
+    // Only alpha-crossfade username/subtitle ↔ selection title (no X/Y shift).
+    let applyAnimatedChrome = {
+      self.selectionHeaderStack.alpha = isActive ? 1 : 0
+      self.chatHeaderStack.alpha = isActive ? 0 : 1
+      // Avatar fades in place — no translate / scale.
+      self.avatarNode.alpha = isActive ? 0 : 1
+      self.avatarGlassView.alpha = 1
+      self.avatarGlassView.transform = .identity
+      self.titleGlassView.alpha = 1
+      self.titleGlassView.transform = .identity
+      self.chatHeaderStack.transform = .identity
+      self.selectionHeaderStack.transform = .identity
+      self.setNeedsLayout()
+      self.layoutIfNeeded()
+    }
+
+    if animated {
+      let duration = TimeInterval(UINavigationController.hideShowBarDuration)
+      let animator = UIViewPropertyAnimator(duration: max(duration, 0.32), curve: .easeInOut) {
+        applyAnimatedChrome()
+      }
+      animator.addCompletion { [weak self] _ in
+        self?.selectionHeaderAnimator = nil
+      }
+      selectionHeaderAnimator = animator
+      animator.startAnimation()
+    } else {
+      applyAnimatedChrome()
+    }
+  }
+
+  @objc private func handleSelectionDonePressed() {
+    chatListView.clearMessageSelection(animated: true)
+  }
+
+  @objc private func handleSelectionClearChatPressed() {
+    onNativeEvent(["type": "headerMenuAction", "action": "clearChat"])
   }
 
   private func updateChatModeHeaderControls() {
@@ -1703,40 +1858,62 @@ public final class ChatMainView: UIView,
     headerContainer.isUserInteractionEnabled = true
     avatarButton.isHidden = searchActive
     avatarGlassView.isHidden = searchActive
-    avatarButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
+    avatarButton.isUserInteractionEnabled =
+      !usesSavedMessagesHeader && !searchActive && !selectionModeActive
     // The title is a plain tappable name (opens the profile) for every chat now — no
     // per-chat dropdown menu, agent or not.
-    titleButton.isUserInteractionEnabled = !usesSavedMessagesHeader && !searchActive
+    titleButton.isUserInteractionEnabled =
+      !usesSavedMessagesHeader && !searchActive && !selectionModeActive
     titleButton.showsMenuAsPrimaryAction = false
     titleButton.menu = nil
-    menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
-    menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
-    savedSearchCancelGlassView.isHidden = !searchActive
 
     let isAgent = !bridgeProvider.isEmpty
     let isAgentGroup = isGroupOrChannel && chatListView.groupHasBridgeAgentsPublic
-    // Agent DMs and multi-agent groups: history / new-chat instead of call actions.
-    // Plain human groups keep call/video. Agent DMs never show call.
-    let showAgentHistory = (isAgent || isAgentGroup) && !usesSavedMessagesHeader && !searchActive
-    callButton.isHidden = isAgent || isAgentGroup || usesSavedMessagesHeader || searchActive
-    videoCallButton.isHidden = isAgent || isAgentGroup || usesSavedMessagesHeader || searchActive
-    historyButton.isHidden = !showAgentHistory
-    // Agent DMs always have a transport chat id. Gating this control on an empty
-    // engineChatId made New Chat unreachable in normal Grok/Claude/Codex sessions.
-    // Groups with agents also get New Chat so a report-scoped view can be cleared.
-    newChatButton.isHidden = !showAgentHistory
-    rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
-
-    menuButton.setImage(
-      UIImage(
-        systemName: searchActive ? "magnifyingglass" : (usesSavedMessagesHeader ? "magnifyingglass" : "ellipsis"),
-        withConfiguration: UIImage.SymbolConfiguration(
-          pointSize: searchActive || usesSavedMessagesHeader ? 16.0 : 17.0,
-          weight: searchActive || usesSavedMessagesHeader ? .medium : .semibold
-        )
-      ),
-      for: .normal
-    )
+    // Agent DMs, multi-agent groups, and the built-in Vibe AI surface: history /
+    // new-chat instead of call actions. Plain human groups keep call/video.
+    let showAgentHistory =
+      (isAgent || isAgentGroup || builtInAgentChatMode) && !usesSavedMessagesHeader && !searchActive
+    if selectionModeActive {
+      // Selection owns trailing: blue checkmark. Saved Messages search glass hides.
+      callButton.isHidden = true
+      videoCallButton.isHidden = true
+      historyButton.isHidden = true
+      newChatButton.isHidden = true
+      selectionDoneButton.isHidden = false
+      rightActionsGlassView.isHidden = false
+      menuButton.isHidden = true
+      menuGlassView.isHidden = true
+      savedSearchCancelGlassView.isHidden = true
+      applySelectionDoneBlueTint()
+    } else {
+      selectionDoneButton.isHidden = true
+      callButton.isHidden =
+        isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader || searchActive
+      videoCallButton.isHidden =
+        isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader || searchActive
+      historyButton.isHidden = !showAgentHistory
+      // Agent DMs always have a transport chat id. Gating this control on an empty
+      // engineChatId made New Chat unreachable in normal Grok/Claude/Codex sessions.
+      // Groups with agents also get New Chat so a report-scoped view can be cleared.
+      // Built-in Vibe AI uses the same chrome for conversation History / New Chat.
+      newChatButton.isHidden = !showAgentHistory
+      rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
+      menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
+      menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
+      savedSearchCancelGlassView.isHidden = !searchActive
+      menuButton.setImage(
+        UIImage(
+          systemName: searchActive
+            ? "magnifyingglass"
+            : (usesSavedMessagesHeader ? "magnifyingglass" : "ellipsis"),
+          withConfiguration: UIImage.SymbolConfiguration(
+            pointSize: searchActive || usesSavedMessagesHeader ? 16.0 : 17.0,
+            weight: searchActive || usesSavedMessagesHeader ? .medium : .semibold
+          )
+        ),
+        for: .normal
+      )
+    }
     applyHeaderSearchPresentation()
   }
 
@@ -3270,11 +3447,11 @@ public final class ChatMainView: UIView,
         x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
 
       let backWidth: CGFloat
-      if (previewHeaderCenterOnly || previewHeaderCompactLeading) && !savedSearchExpanded {
+      if selectionModeActive {
+        // Always show cancel (xmark) glass during selection — never collapse to 0.
+        backWidth = 44.0
+      } else if (previewHeaderCenterOnly || previewHeaderCompactLeading) && !savedSearchExpanded {
         backWidth = 0.0
-      } else if selectionModeActive {
-        let size = backButton.sizeThatFits(CGSize(width: .greatestFiniteMagnitude, height: 44.0))
-        backWidth = max(size.width + 24.0, 44.0)
       } else {
         backWidth = headerUnreadCount > 0 ? 62.0 : 44.0
       }
@@ -3285,8 +3462,38 @@ public final class ChatMainView: UIView,
         chatTitleLabel.intrinsicContentSize.width,
         chatSubtitleLabel.intrinsicContentSize.width + subtitleDotWidth
       )
-        
-      if previewHeaderCompactLeading && !savedSearchExpanded {
+
+      // Selection keeps the same geometry as normal chat (no title X/Y shift).
+      // Username/subtitle ↔ "Select messages" / "Selected N" is pure alpha fade.
+      // Trailing: blue checkmark (Saved Messages reuses the search trailing slot).
+      if selectionModeActive && currentPage == .chat && !savedSearchExpanded {
+        menuGlassView.frame = .zero
+        savedSearchCancelGlassView.frame = .zero
+        selectionDoneButton.frame.size = CGSize(width: 44.0, height: 44.0)
+        rightActionsGlassView.frame = CGRect(
+          x: headerContentView.bounds.width - 44.0,
+          y: 0.0,
+          width: 44.0,
+          height: 44.0
+        )
+        let glassMinX = backGlassView.frame.maxX + 8.0
+        // Avatar stays a 44 circle (fades content only — no expand / no translate).
+        if headerMode == .savedMessages {
+          avatarGlassView.frame = CGRect(
+            x: glassMinX, y: 0.0, width: 44.0, height: 44.0)
+        } else {
+          avatarGlassView.frame = CGRect(
+            x: glassMinX, y: 0.0, width: 44.0, height: 44.0)
+        }
+        let titleMinX = avatarGlassView.frame.maxX + 12.0
+        let titleMaxX = rightActionsGlassView.frame.minX - 8.0
+        titleGlassView.frame = CGRect(
+          x: titleMinX,
+          y: 0.0,
+          width: max(0.0, titleMaxX - titleMinX),
+          height: 44.0
+        )
+      } else if previewHeaderCompactLeading && !savedSearchExpanded {
         menuGlassView.frame = .zero
         savedSearchCancelGlassView.frame = .zero
         rightActionsGlassView.frame = .zero
@@ -3354,44 +3561,50 @@ public final class ChatMainView: UIView,
         }
         
       } else {
-        // Move avatar to the left side
-        avatarGlassView.frame = CGRect(x: backGlassView.frame.maxX + 8.0, y: 0.0, width: 44.0, height: 44.0)
-        menuGlassView.frame = .zero
-        savedSearchCancelGlassView.frame = .zero
-        
-        // Setup right actions
+        // Setup right actions first (call/video — or selection checkmark).
         var visibleActionCount = 0
         if !callButton.isHidden { visibleActionCount += 1 }
         if !videoCallButton.isHidden { visibleActionCount += 1 }
         if !historyButton.isHidden { visibleActionCount += 1 }
         if !newChatButton.isHidden { visibleActionCount += 1 }
-        
+        if !selectionDoneButton.isHidden { visibleActionCount += 1 }
+
         let actionWidth: CGFloat = 44.0
         let actionSpacing: CGFloat = 0.0
-        let totalActionsWidth = CGFloat(visibleActionCount) * actionWidth + CGFloat(max(0, visibleActionCount - 1)) * actionSpacing
-        
+        let totalActionsWidth =
+          CGFloat(visibleActionCount) * actionWidth
+          + CGFloat(max(0, visibleActionCount - 1)) * actionSpacing
+
         rightActionsGlassView.frame = CGRect(
-          x: headerContentView.bounds.width - totalActionsWidth,
+          x: headerContentView.bounds.width - max(totalActionsWidth, 0.0),
           y: 0.0,
-          width: totalActionsWidth,
+          width: max(totalActionsWidth, 0.0),
           height: 44.0
         )
-        
+
         callButton.frame.size = CGSize(width: 44.0, height: 44.0)
         videoCallButton.frame.size = CGSize(width: 44.0, height: 44.0)
         historyButton.frame.size = CGSize(width: 44.0, height: 44.0)
         newChatButton.frame.size = CGSize(width: 44.0, height: 44.0)
-        
-        // Setup title outside of glass, right next to the avatar
+        selectionDoneButton.frame.size = CGSize(width: 44.0, height: 44.0)
+
+        menuGlassView.frame = .zero
+        savedSearchCancelGlassView.frame = .zero
+
+        // Normal chat chrome (selection handled in the early branch above).
+        let glassMinX = backGlassView.frame.maxX + 8.0
+        let glassMaxX =
+          rightActionsGlassView.frame.minX > 0
+          ? rightActionsGlassView.frame.minX - 8.0
+          : headerContentView.bounds.width - 8.0
+        avatarGlassView.frame = CGRect(
+          x: glassMinX, y: 0.0, width: 44.0, height: 44.0)
         let titleMinX = avatarGlassView.frame.maxX + 12.0
-        let titleMaxX = rightActionsGlassView.frame.minX > 0 ? rightActionsGlassView.frame.minX - 8.0 : headerContentView.bounds.width - 8.0
-        let availableWidth = max(0, titleMaxX - titleMinX)
-        let centerWidth = availableWidth
-        
+        let availableWidth = max(0, glassMaxX - titleMinX)
         titleGlassView.frame = CGRect(
           x: titleMinX,
           y: 0.0,
-          width: centerWidth,
+          width: availableWidth,
           height: 44.0
         )
       }
@@ -3418,30 +3631,55 @@ public final class ChatMainView: UIView,
         savedSearchCancelButton.frame = .zero
       }
 
-      [backButton, avatarButton, titleButton, menuButton, savedSearchCancelButton, callButton, videoCallButton, historyButton, newChatButton].forEach {
+      [backButton, avatarButton, titleButton, menuButton, savedSearchCancelButton, callButton, videoCallButton, historyButton, newChatButton, selectionDoneButton].forEach {
         control in
-        control.layer.cornerRadius = control.bounds.height / 2.0
+        // Capsule when wide (selection pill), circle when 44×44.
+        control.layer.cornerRadius = min(control.bounds.width, control.bounds.height) / 2.0
+        control.layer.cornerCurve = .continuous
       }
       [backGlassView, avatarGlassView, titleGlassView, menuGlassView, savedSearchCancelGlassView, rightActionsGlassView]
         .forEach { view in
-          view.layer.cornerRadius = view.bounds.height / 2.0
+          view.layer.cornerRadius = min(view.bounds.width, view.bounds.height) / 2.0
+          view.layer.cornerCurve = .continuous
         }
 
+      // Avatar stays laid out; selection only fades its alpha (no zero frame).
       avatarNode.frame = avatarButton.bounds.insetBy(dx: 4.0, dy: 4.0)
-      checkmarkImageView.frame = avatarButton.bounds.insetBy(dx: 4.0, dy: 4.0)
+      applySelectionDoneBlueTint()
 
       let horizontalInset: CGFloat = (headerMode == .savedMessages || savedSearchExpanded) ? 12.0 : 4.0
+      let titleInnerWidth = max(0.0, titleButton.bounds.width - (horizontalInset * 2.0))
       let stackSize = chatHeaderStack.systemLayoutSizeFitting(
-        CGSize(width: titleButton.bounds.width - (horizontalInset * 2.0), height: UIView.layoutFittingCompressedSize.height),
+        CGSize(width: titleInnerWidth, height: UIView.layoutFittingCompressedSize.height),
         withHorizontalFittingPriority: .required,
         verticalFittingPriority: .fittingSizeLevel
       )
-      chatHeaderStack.frame = CGRect(
+      // Username/subtitle and selection title share the same rect — only alpha swaps.
+      let titleContentFrame = CGRect(
         x: horizontalInset,
         y: (titleButton.bounds.height - stackSize.height) * 0.5,
-        width: titleButton.bounds.width - (horizontalInset * 2.0),
+        width: titleInnerWidth,
         height: stackSize.height
       )
+      chatHeaderStack.frame = titleContentFrame
+      if selectionModeActive, !selectionHeaderStack.isHidden {
+        let selSize = selectionHeaderStack.systemLayoutSizeFitting(
+          CGSize(
+            width: titleInnerWidth,
+            height: UIView.layoutFittingCompressedSize.height
+          ),
+          withHorizontalFittingPriority: .fittingSizeLevel,
+          verticalFittingPriority: .fittingSizeLevel
+        )
+        selectionHeaderStack.frame = CGRect(
+          x: horizontalInset,
+          y: (titleButton.bounds.height - selSize.height) * 0.5,
+          width: min(selSize.width, titleInnerWidth),
+          height: selSize.height
+        )
+      } else {
+        selectionHeaderStack.frame = .zero
+      }
       if subtitleShimmerActive {
         chatHeaderStack.layoutIfNeeded()
         applySubtitleShimmerFrame()
@@ -3536,11 +3774,25 @@ public final class ChatMainView: UIView,
     menuGlassView.alpha = (searchActive || (headerMode == .savedMessages && currentPage == .chat))
       ? 1.0
       : 0.0
-    avatarGlassView.alpha = (currentPage == .chat && !searchActive)
-      ? 1.0
-      : 0.0
+    // Selection: avatar glass stays put; title content cross-fades in place.
+    if selectionModeActive {
+      avatarGlassView.alpha = 1.0
+      avatarGlassView.transform = .identity
+      chatHeaderStack.alpha = 0.0
+      chatHeaderStack.transform = .identity
+      selectionHeaderStack.alpha = 1.0
+      selectionHeaderStack.transform = .identity
+      titleGlassView.alpha = 1.0
+      titleGlassView.transform = .identity
+    } else {
+      avatarGlassView.alpha = (currentPage == .chat && !searchActive) ? 1.0 : 0.0
+      avatarGlassView.transform = .identity
+      chatHeaderStack.alpha = controlsAlpha
+      chatHeaderStack.transform = .identity
+      selectionHeaderStack.alpha = 0.0
+      selectionHeaderStack.transform = .identity
+    }
     backGlassView.transform = .identity
-    chatHeaderStack.alpha = controlsAlpha
     chatHeaderStack.transform = .identity
     savedSearchField.alpha = searchActive ? 1.0 : 0.0
     savedSearchCancelGlassView.alpha = searchActive ? 1.0 : 0.0
@@ -3892,7 +4144,11 @@ public final class ChatMainView: UIView,
     profileBackGlassView.contentView.backgroundColor = profileCardBg.withAlphaComponent(0.68)
     profileMenuGlassView.contentView.backgroundColor = profileCardBg.withAlphaComponent(0.68)
 
-    backButton.tintColor = text
+    if selectionModeActive, selectionShowsClearChat {
+      backButton.tintColor = .systemRed
+    } else {
+      backButton.tintColor = text
+    }
     updateBackButtonContent()
     menuButton.tintColor =
       headerMode == .savedMessages
@@ -3912,11 +4168,16 @@ public final class ChatMainView: UIView,
     [callButton, videoCallButton, historyButton, newChatButton].forEach { btn in
       btn.tintColor = actionTint
     }
+    // Selection Done is a filled blue circle with white check — never inherit text tint.
+    applySelectionDoneBlueTint()
     
     chatTitleLabel.textColor = text
     profileTitleLabel.textColor = text
     chatSubtitleLabel.textColor = secondary
     profileSubtitleLabel.textColor = secondary
+    selectionTitleLabel.textColor = text
+    // Counter sits beside "Selected" — same weight/color for a single reading unit.
+    selectionCountLabel.textColor = text
     pinnedBannerView.applyTheme(
       textColor: text,
       surfaceColor: chatBackground,
@@ -4011,6 +4272,12 @@ public final class ChatMainView: UIView,
 
 
   private func updateHeaderTexts() {
+    // Selection owns the title glass ("Select messages" / "Selected N").
+    // Don't let Ready/typing presence rewrite the header mid-select.
+    if selectionModeActive {
+      updateSelectionTitleContent(count: selectionCount, animated: false)
+      return
+    }
     let bridgeHeaderConfiguration = resolvedBridgeHeaderConfiguration()
     let bridgeConfigurationSubtitle = activeBridgeConfigurationSubtitle(
       bridgeHeaderConfiguration)
@@ -5158,13 +5425,22 @@ public final class ChatMainView: UIView,
     return true
   }
 
-  func clearMessageSelection() {
-    chatListView.clearMessageSelection()
+  func clearMessageSelection(animated: Bool = true) {
+    chatListView.clearMessageSelection(animated: animated)
+  }
+
+  func applyPendingForwardDraft(title: String, preview: String) {
+    chatListView.applyPendingForwardDraft(title: title, preview: preview)
   }
 
   @objc private func handleBackPressed() {
     if selectionModeActive {
-      chatListView.clearMessageSelection()
+      if selectionShowsClearChat {
+        // Direct chat: left trash → functional Clear Chat (engine + server).
+        handleSelectionClearChatPressed()
+      } else {
+        chatListView.clearMessageSelection()
+      }
       return
     }
     if profileMembersNode.isPresented {
@@ -5181,7 +5457,7 @@ public final class ChatMainView: UIView,
 
   @objc private func handleAvatarPressed() {
     if selectionModeActive {
-      chatListView.clearMessageSelection()
+      // Avatar is inert in selection — Done (checkmark) or Cancel (X) exit mode.
       return
     }
     guard headerMode != .savedMessages else { return }
@@ -5194,7 +5470,6 @@ public final class ChatMainView: UIView,
   /// identity/profile route in both cases.
   @objc private func handleTitlePressed() {
     if selectionModeActive {
-      chatListView.clearMessageSelection()
       return
     }
     guard headerMode != .savedMessages else { return }
@@ -5209,6 +5484,11 @@ public final class ChatMainView: UIView,
   }
 
   @objc private func handleHistoryPressed() {
+    // Built-in Vibe AI: conversation History (server + local chat ids).
+    if builtInAgentChatMode {
+      onNativeEvent(["type": "agentHistoryPressed"])
+      return
+    }
     // Agent DM: single provider. Multi-agent group: pick among member agents first
     // (or open the only one). History must open the report/session conversation.
     if !bridgeProvider.isEmpty {
@@ -5219,6 +5499,11 @@ public final class ChatMainView: UIView,
   }
 
   @objc private func handleNewChatPressed() {
+    // Built-in Vibe AI: start a blank conversation; prior chats stay in History.
+    if builtInAgentChatMode {
+      onNativeEvent(["type": "agentNewChatPressed"])
+      return
+    }
     chatListView.startNewBridgeSession()
     // Drop the History-session title so the idle header returns to "Start session"
     // instead of the previous pick's topic / "Loading…".

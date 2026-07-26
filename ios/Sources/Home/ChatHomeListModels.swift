@@ -1095,52 +1095,91 @@ struct ChatHomeListRow {
   }
 
   static func homePreviewText(from raw: [String: Any]) -> String {
-    if let text = firstSafeDisplayText(
-      raw["preview"],
-      raw["plainContent"],
-      raw["plain_content"],
-      raw["plaintext"]
-    ) {
-      return text
-    }
-
-    if let text = ChatEngine.shared.makeHomePreviewText(raw) {
-      return text
-    }
-
-    if let text = firstSafeDisplayText(raw["content"], raw["text"]) {
-      return text
-    }
-
-    let type = normalizedString(raw["type"])?.lowercased() ?? "text"
-    let fileName =
-      normalizedString(raw["fileName"] ?? raw["file_name"] ?? raw["name"] ?? raw["title"])
-
-    switch type {
-    case "image":
-      return "Photo"
-    case "video":
-      return "Video"
-    case "voice":
-      return "Voice message"
-    case "music":
-      return "Audio"
-    case "file":
-      return fileName ?? "File"
-    case "location":
-      return "Location"
-    case "contact":
-      return "Contact"
-    case "gif":
-      return "GIF"
-    case "sticker":
-      return "Sticker"
-    default:
-      if normalizedString(raw["mediaUrl"] ?? raw["media_url"]) != nil {
-        return fileName ?? "Attachment"
+    let base: String = {
+      if let text = firstSafeDisplayText(
+        raw["preview"],
+        raw["plainContent"],
+        raw["plain_content"],
+        raw["plaintext"]
+      ) {
+        return text
       }
-      return "Encrypted message"
+
+      if let text = ChatEngine.shared.makeHomePreviewText(raw) {
+        return text
+      }
+
+      if let text = firstSafeDisplayText(raw["content"], raw["text"]) {
+        return text
+      }
+
+      let type = normalizedString(raw["type"])?.lowercased() ?? "text"
+      let fileName =
+        normalizedString(raw["fileName"] ?? raw["file_name"] ?? raw["name"] ?? raw["title"])
+
+      switch type {
+      case "image":
+        return "Photo"
+      case "video":
+        return "Video"
+      case "voice":
+        return "Voice message"
+      case "music":
+        return "Audio"
+      case "file":
+        return fileName ?? "File"
+      case "location":
+        return "Location"
+      case "contact":
+        return "Contact"
+      case "gif":
+        return "GIF"
+      case "sticker":
+        return "Sticker"
+      default:
+        if normalizedString(raw["mediaUrl"] ?? raw["media_url"]) != nil {
+          return fileName ?? "Attachment"
+        }
+        return "Encrypted message"
+      }
+    }()
+
+    // Telegram-style home list: "Forwarded message" (or prefix) when last msg is a forward.
+    if isForwardedHomeMessage(raw) {
+      let trimmed = base.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty || trimmed == "Encrypted message" {
+        return "Forwarded message"
+      }
+      // Avoid double-prefix if server already formatted it.
+      if trimmed.lowercased().hasPrefix("forwarded") {
+        return trimmed
+      }
+      return "Forwarded message"
     }
+    return base
+  }
+
+  private static func isForwardedHomeMessage(_ raw: [String: Any]) -> Bool {
+    let metadata =
+      (raw["metadata"] as? [String: Any])
+      ?? (raw["meta"] as? [String: Any])
+      ?? [:]
+    if parseBool(metadata["isForwarded"] ?? metadata["is_forwarded"]) == true {
+      return true
+    }
+    if parseBool(raw["isForwarded"] ?? raw["is_forwarded"]) == true {
+      return true
+    }
+    let keys = [
+      "forwardedFromName", "forwarded_from_name",
+      "forwardedFromUserId", "forwarded_from_user_id",
+      "forwardedFromMessageId", "forwarded_from_message_id",
+    ]
+    for key in keys {
+      if normalizedString(metadata[key]) != nil { return true }
+      if normalizedString(raw[key]) != nil { return true }
+    }
+    return false
   }
 
   static func homeTimeLabel(from raw: [String: Any]) -> String {

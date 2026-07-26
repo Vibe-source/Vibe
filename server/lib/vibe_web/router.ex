@@ -257,6 +257,9 @@ defmodule VibeWeb.Router do
     get "/agent-bridge/status", AgentBridgeController, :status
     delete "/agent-bridge", AgentBridgeController, :revoke
 
+    # Share links — turn a pasted @handle or vibegram.io link into something openable.
+    get "/links/resolve", LinkController, :resolve
+
     # Media Upload
     post "/media/upload", MediaController, :upload
 
@@ -303,6 +306,12 @@ defmodule VibeWeb.Router do
     get "/agent-card/:identifier", AgentsController, :card
   end
 
+  # Apple universal links. Served unconditionally; it only starts mattering once the
+  # app ships the matching associated-domains entitlement (docs/share-links.md).
+  scope "/.well-known", VibeWeb do
+    get "/apple-app-site-association", LinkController, :aasa
+  end
+
   scope "/bridge/v1", VibeWeb do
     pipe_through [:api, :api_authenticated]
 
@@ -332,6 +341,10 @@ defmodule VibeWeb.Router do
   scope "/", VibeWeb do
     get "/r/:slug", RoomLinkController, :public
     get "/j/:token", RoomLinkController, :private
+    # Telegram-style bare handle: `/<username>` previews the person/agent/channel and
+    # jumps into the app. Unknown or reserved segments fall through to the SPA inside
+    # the action itself, so this can never shadow a web route.
+    get "/:handle", LinkController, :preview
     get "/*path", ApiController, :index
   end
 end

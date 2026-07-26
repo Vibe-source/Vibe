@@ -39,17 +39,27 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   private let refLock = NSLock()
   private let connectRequestTimeout: TimeInterval = 8.0
   private let heartbeatInterval: TimeInterval = 10.0
-  // A heartbeat reply that lands late is not a dead socket. The old 5s window
-  // false-positived on a degraded/high-latency path (mobile, congested Wi-Fi, the
-  // Cloudflare edge under load), tearing down a still-alive socket and forcing a
-  // reconnect + full history re-request — the same churn the bridge saw. 8s keeps
-  // send-dead detection responsive while tolerating ordinary jitter. Paired with the
-  // bridge's widened ws-ping watchdog (WS_PING_INTERVAL_MS / WS_PING_MAX_MISSES).
-  private let heartbeatReplyTimeout: TimeInterval = 8.0
+  // A heartbeat reply that lands late is NOT a dead socket. This false-positived hard on a
+  // high-latency path: the app↔DB round trip has a measured ~350ms floor because the app
+  // server and Postgres sit in different regions, so a client far from that region sees
+  // multi-second server jitter under load. A single slow reply used to tear down a still-
+  // alive socket and re-request full history — piling MORE load on the already-slow server
+  // (a feedback loop that made the "socket keeps going down while my network is fine"
+  // symptom worse, not better). Any inbound frame already proves the link is alive (see
+  // handleMessage → pendingHeartbeatRef = nil), so a busy socket never probes; only an idle
+  // one on a distant path can miss. So instead of killing on the first miss, we now tolerate
+  // `heartbeatMaxMisses` consecutive unanswered probes — matching the bridge's own
+  // WS_PING_MAX_MISSES contract. Genuine network loss is still caught instantly by the
+  // NWPathMonitor, and un-acked sends by the 15s push timeout; this backstop only needs to
+  // notice a silently-dead-but-connected socket, which two missed probes (~20s) covers
+  // without murdering healthy-but-slow ones.
+  private let heartbeatMaxMisses = 2
   private var session: URLSession?
   private var task: URLSessionWebSocketTask?
   private var heartbeatTimer: DispatchSourceTimer?
   private var pendingHeartbeatRef: String?
+  // Consecutive heartbeat ticks that fired with the previous probe still unanswered.
+  private var heartbeatMissCount = 0
   private var nextRefValue: Int = 1
   private var isClosing = false
 
@@ -276,13 +286,21 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     timer.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
     timer.setEventHandler { [weak self] in
       guard let self else { return }
-      // Previous heartbeat still unanswered when the next tick fires → the
-      // socket is dead even though the OS hasn't told us (backgrounding, NAT
-      // rebind, proxy reset). Without this, sends silently vanish for up to
-      // 15s before the push timeout marks them "error".
+      // Previous probe still unanswered when this tick fires = one miss. A single miss on a
+      // high-latency/idle path is ordinary jitter, not a dead socket — only tear down once
+      // we've missed `heartbeatMaxMisses` in a row (each probe got a full interval to be
+      // answered). Any inbound frame clears pendingHeartbeatRef (handleMessage), so a live
+      // socket resets to zero misses the moment real traffic arrives. Genuine network loss
+      // is caught immediately by the NWPathMonitor; un-acked sends by the 15s push timeout.
       if self.pendingHeartbeatRef != nil {
-        self.failDeadSocketLocked(reason: "heartbeat_timeout")
-        return
+        self.heartbeatMissCount += 1
+        if self.heartbeatMissCount >= self.heartbeatMaxMisses {
+          self.failDeadSocketLocked(reason: "heartbeat_timeout")
+          return
+        }
+        // else: fall through and send a fresh probe, giving the link another interval.
+      } else {
+        self.heartbeatMissCount = 0
       }
       let ref = self.nextRef()
       self.pendingHeartbeatRef = ref
@@ -293,13 +311,6 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
         event: "heartbeat",
         payload: [:]
       )
-      // Phoenix answers heartbeats from the transport process (no DB), so a
-      // healthy link replies in one RTT. Give it a generous window, then
-      // declare the socket dead instead of waiting a full extra interval.
-      self.queue.asyncAfter(deadline: .now() + self.heartbeatReplyTimeout) { [weak self] in
-        guard let self, self.pendingHeartbeatRef == ref else { return }
-        self.failDeadSocketLocked(reason: "heartbeat_reply_timeout")
-      }
     }
     heartbeatTimer = timer
     timer.resume()
@@ -309,6 +320,7 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     heartbeatTimer?.cancel()
     heartbeatTimer = nil
     pendingHeartbeatRef = nil
+    heartbeatMissCount = 0
   }
 
   /// Tear down a socket that stopped answering heartbeats and surface it as a

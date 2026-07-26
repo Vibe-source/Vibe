@@ -77,19 +77,23 @@ struct NativeMusicPlayerTrack: Codable, Equatable {
 
   static func resolveTrackId(from payload: [String: Any]) -> String? {
     let candidates: [Any?] = [
+      payload["trackId"],
       payload["track_id"],
+      payload["videoId"],
       payload["video_id"],
       payload["id"],
+      payload["previewUrl"],
       payload["preview_url"],
+      payload["streamUrl"],
       payload["stream_url"],
+      payload["mediaUrl"],
+      payload["media_url"],
+      payload["localUri"],
       payload["local_uri"],
     ]
     for candidate in candidates {
-      if let value = candidate as? String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-          return trimmed
-        }
+      if let value = Self.stringValue(candidate) {
+        return value
       }
     }
     return nil
@@ -97,77 +101,208 @@ struct NativeMusicPlayerTrack: Codable, Equatable {
 
   init?(payload: [String: Any]) {
     guard let trackId = Self.resolveTrackId(from: payload) else { return nil }
-    let titleRaw = (payload["title"] as? String) ?? (payload["name"] as? String)
+    let titleRaw =
+      Self.stringValue(payload["title"])
+      ?? Self.stringValue(payload["name"])
+      ?? Self.stringValue(payload["fileName"])
+      ?? Self.stringValue(payload["file_name"])
     let titleTrimmed = titleRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let title = titleTrimmed
     let artist =
-      (payload["artist"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      Self.stringValue(payload["artist"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard !title.isEmpty else { return nil }
 
     self.trackId = trackId
-    self.videoId = payload["video_id"] as? String
-    self.id = payload["id"] as? String
-    self.source = payload["source"] as? String
+    self.videoId = Self.stringValue(payload["videoId"]) ?? Self.stringValue(payload["video_id"])
+    self.id = Self.stringValue(payload["id"])
+    self.source = Self.stringValue(payload["source"])
     self.title = title
     self.artist = artist.isEmpty ? "Unknown Artist" : artist
-    self.album = payload["album"] as? String
-    self.duration = payload["duration"] as? String
-    self.durationSeconds =
-      (payload["duration_seconds"] as? NSNumber)?.doubleValue
-      ?? (payload["duration_seconds"] as? Double)
-    self.cover = payload["cover"] as? String
-    self.previewURL = payload["preview_url"] as? String
-    self.streamURL = payload["stream_url"] as? String
-    self.localURI = payload["local_uri"] as? String
+    self.album = Self.stringValue(payload["album"])
+    self.duration = Self.durationLabel(from: payload)
+    self.durationSeconds = Self.durationSeconds(from: payload)
+    self.cover =
+      Self.stringValue(payload["cover"])
+      ?? Self.stringValue(payload["thumbnail"])
+      ?? Self.stringValue(payload["artwork"])
+    self.previewURL =
+      Self.stringValue(payload["previewUrl"])
+      ?? Self.stringValue(payload["preview_url"])
+      ?? Self.stringValue(payload["mediaUrl"])
+      ?? Self.stringValue(payload["media_url"])
+    self.streamURL =
+      Self.stringValue(payload["streamUrl"])
+      ?? Self.stringValue(payload["stream_url"])
+      ?? Self.stringValue(payload["mediaUrl"])
+      ?? Self.stringValue(payload["media_url"])
+    self.localURI =
+      Self.stringValue(payload["localUri"]) ?? Self.stringValue(payload["local_uri"])
     self.cachedAt =
-      (payload["cached_at"] as? NSNumber)?.doubleValue
-      ?? (payload["cached_at"] as? Double)
+      Self.doubleValue(payload["cachedAt"]) ?? Self.doubleValue(payload["cached_at"])
     self.playCount =
-      (payload["play_count"] as? NSNumber)?.intValue
-      ?? (payload["play_count"] as? Int)
+      Self.intValue(payload["playCount"])
+      ?? Self.intValue(payload["play_count"])
       ?? 0
     self.lastPlayedAt =
-      (payload["last_played_at"] as? NSNumber)?.doubleValue
-      ?? (payload["last_played_at"] as? Double)
-    self.links = payload["links"] as? [String: String] ?? [:]
+      Self.doubleValue(payload["lastPlayedAt"])
+      ?? Self.doubleValue(payload["last_played_at"])
+    var links = Self.linksValue(from: payload["links"])
+    if links["chat_id"] == nil {
+      if let chatId = Self.stringValue(payload["chat_id"]) ?? Self.stringValue(payload["chatId"]) {
+        links["chat_id"] = chatId
+      }
+    }
+    self.links = links
   }
 
   func applying(payload: [String: Any]) -> NativeMusicPlayerTrack {
     var next = self
-    if let value = payload["video_id"] as? String, !value.isEmpty { next.videoId = value }
-    if let value = payload["id"] as? String, !value.isEmpty { next.id = value }
-    if let value = payload["source"] as? String, !value.isEmpty { next.source = value }
-    if let value = payload["title"] as? String, !value.isEmpty { next.title = value }
-    if let value = payload["artist"] as? String, !value.isEmpty { next.artist = value }
-    if let value = payload["album"] as? String, !value.isEmpty { next.album = value }
-    if let value = payload["duration"] as? String, !value.isEmpty { next.duration = value }
-    if let value = (payload["duration_seconds"] as? NSNumber)?.doubleValue
-      ?? (payload["duration_seconds"] as? Double)
+    if let value = Self.stringValue(payload["videoId"]) ?? Self.stringValue(payload["video_id"]),
+      !value.isEmpty
     {
+      next.videoId = value
+    }
+    if let value = Self.stringValue(payload["id"]), !value.isEmpty { next.id = value }
+    if let value = Self.stringValue(payload["source"]), !value.isEmpty { next.source = value }
+    if let value = Self.stringValue(payload["title"]) ?? Self.stringValue(payload["name"]),
+      !value.isEmpty
+    {
+      next.title = value
+    }
+    if let value = Self.stringValue(payload["artist"]), !value.isEmpty { next.artist = value }
+    if let value = Self.stringValue(payload["album"]), !value.isEmpty { next.album = value }
+    if let value = Self.durationLabel(from: payload), !value.isEmpty { next.duration = value }
+    if let value = Self.durationSeconds(from: payload) {
       next.durationSeconds = value
     }
-    if let value = payload["cover"] as? String, !value.isEmpty { next.cover = value }
-    if let value = payload["preview_url"] as? String, !value.isEmpty { next.previewURL = value }
-    if let value = payload["stream_url"] as? String, !value.isEmpty { next.streamURL = value }
-    if let value = payload["local_uri"] as? String, !value.isEmpty { next.localURI = value }
-    if let value = (payload["cached_at"] as? NSNumber)?.doubleValue
-      ?? (payload["cached_at"] as? Double)
+    if let value =
+      Self.stringValue(payload["cover"])
+      ?? Self.stringValue(payload["thumbnail"])
+      ?? Self.stringValue(payload["artwork"]),
+      !value.isEmpty
+    {
+      next.cover = value
+    }
+    if let value =
+      Self.stringValue(payload["previewUrl"])
+      ?? Self.stringValue(payload["preview_url"])
+      ?? Self.stringValue(payload["mediaUrl"])
+      ?? Self.stringValue(payload["media_url"]),
+      !value.isEmpty
+    {
+      next.previewURL = value
+    }
+    if let value =
+      Self.stringValue(payload["streamUrl"])
+      ?? Self.stringValue(payload["stream_url"])
+      ?? Self.stringValue(payload["mediaUrl"])
+      ?? Self.stringValue(payload["media_url"]),
+      !value.isEmpty
+    {
+      next.streamURL = value
+    }
+    if let value = Self.stringValue(payload["localUri"]) ?? Self.stringValue(payload["local_uri"]),
+      !value.isEmpty
+    {
+      next.localURI = value
+    }
+    if let value = Self.doubleValue(payload["cachedAt"]) ?? Self.doubleValue(payload["cached_at"])
     {
       next.cachedAt = value
     }
-    if let value = (payload["play_count"] as? NSNumber)?.intValue ?? (payload["play_count"] as? Int)
-    {
+    if let value = Self.intValue(payload["playCount"]) ?? Self.intValue(payload["play_count"]) {
       next.playCount = value
     }
-    if let value = (payload["last_played_at"] as? NSNumber)?.doubleValue
-      ?? (payload["last_played_at"] as? Double)
+    if let value =
+      Self.doubleValue(payload["lastPlayedAt"]) ?? Self.doubleValue(payload["last_played_at"])
     {
       next.lastPlayedAt = value
     }
-    if let value = payload["links"] as? [String: String] {
-      next.links = value
+    let links = Self.linksValue(from: payload["links"])
+    if !links.isEmpty {
+      next.links = links
     }
     return next
+  }
+
+  private static func stringValue(_ raw: Any?) -> String? {
+    if let value = raw as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let value = raw as? NSNumber {
+      return value.stringValue
+    }
+    return nil
+  }
+
+  private static func doubleValue(_ raw: Any?) -> Double? {
+    if let value = raw as? Double, value.isFinite { return value }
+    if let value = raw as? Float, value.isFinite { return Double(value) }
+    if let value = raw as? NSNumber { return value.doubleValue }
+    if let value = raw as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return Double(trimmed)
+    }
+    return nil
+  }
+
+  private static func intValue(_ raw: Any?) -> Int? {
+    if let value = raw as? Int { return value }
+    if let value = raw as? NSNumber { return value.intValue }
+    if let value = raw as? String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return Int(trimmed)
+    }
+    return nil
+  }
+
+  private static func durationSeconds(from payload: [String: Any]) -> Double? {
+    if let value =
+      doubleValue(payload["durationSeconds"]) ?? doubleValue(payload["duration_seconds"])
+    {
+      // Values that look like milliseconds.
+      return value > 10_000 ? value / 1000.0 : value
+    }
+    if let value = doubleValue(payload["duration"]) {
+      return value > 10_000 ? value / 1000.0 : value
+    }
+    if let label = stringValue(payload["duration"]) {
+      let parts = label.split(separator: ":").compactMap { Double($0) }
+      if parts.count == 2 { return parts[0] * 60.0 + parts[1] }
+      if parts.count == 3 { return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] }
+    }
+    return nil
+  }
+
+  private static func durationLabel(from payload: [String: Any]) -> String? {
+    if let label = stringValue(payload["duration"]), label.contains(":") {
+      return label
+    }
+    if let seconds = durationSeconds(from: payload), seconds.isFinite, seconds > 0 {
+      let total = Int(seconds.rounded())
+      return String(format: "%d:%02d", total / 60, total % 60)
+    }
+    if let label = stringValue(payload["duration"]) {
+      return label
+    }
+    return nil
+  }
+
+  private static func linksValue(from raw: Any?) -> [String: String] {
+    if let dict = raw as? [String: String] {
+      return dict
+    }
+    if let dict = raw as? [String: Any] {
+      var result: [String: String] = [:]
+      for (key, value) in dict {
+        if let string = stringValue(value) {
+          result[key] = string
+        }
+      }
+      return result
+    }
+    return [:]
   }
 
   func toPayload() -> [String: Any] {
@@ -228,6 +363,21 @@ final class NativeMusicPlayerStore {
 
   func libraryTracksPayload() -> [[String: Any]] {
     libraryTracks().map { $0.toPayload() }
+  }
+
+  func tracks(forChatId chatId: String) -> [NativeMusicPlayerTrack] {
+    let target = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !target.isEmpty else { return [] }
+    return tracks.values
+      .filter { $0.links["chat_id"] == target }
+      .sorted { lhs, rhs in
+        let lhsTime = lhs.cachedAt ?? 0.0
+        let rhsTime = rhs.cachedAt ?? 0.0
+        if lhsTime != rhsTime {
+          return lhsTime > rhsTime
+        }
+        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+      }
   }
 
   func cacheTrack(payload: [String: Any]) -> NativeMusicPlayerTrack? {

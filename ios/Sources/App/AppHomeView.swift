@@ -338,7 +338,7 @@ enum AppShellTab: Hashable {
   case calls
   case chats
   case settings
-  case search
+  case agents
 }
 
 struct ChatRoute: Identifiable, Hashable {
@@ -1376,15 +1376,26 @@ private enum ChannelRoomLinkJoinResult {
   case pending(String)
 }
 
-/// Single ingress for public/private room links. AppDelegate can receive a URL before
-/// authentication or before the tab shell exists, so the router retains one pending
-/// value and resolves it only after the authenticated coordinator registers.
+/// What a share link points at. `handle` is the Telegram-style bare `@name` form, which
+/// the server disambiguates (person, agent, or channel slug) because those three share
+/// one namespace.
+enum VibeShareLinkTarget: Equatable {
+  case room(String)
+  case handle(String)
+  case user(String)
+  case chat(String)
+}
+
+/// Single ingress for every Vibe link — room links (`/r/`, `/j/`), `@handle` links, and
+/// the `vibe://` deep links the web preview page redirects to. AppDelegate can receive a
+/// URL before authentication or before the tab shell exists, so the router retains one
+/// pending target and resolves it only after the authenticated coordinator registers.
 @MainActor
 final class VibeRoomLinkRouter {
   static let shared = VibeRoomLinkRouter()
 
   private weak var coordinator: AppShellCoordinator?
-  private var pendingValue: String?
+  private var pendingTarget: VibeShareLinkTarget?
   private var joinTask: Task<Void, Never>?
 
   private init() {}
@@ -1395,25 +1406,26 @@ final class VibeRoomLinkRouter {
   }
 
   func handle(url: URL) {
-    guard let value = Self.linkValue(from: url) else { return }
-    pendingValue = value
+    guard let target = Self.target(from: url) else { return }
+    pendingTarget = target
+    processPendingIfPossible()
+  }
+
+  /// Opens a link the user tapped inside the app (share sheet paste, chat text, QR scan).
+  func handle(target: VibeShareLinkTarget) {
+    pendingTarget = target
     processPendingIfPossible()
   }
 
   private func processPendingIfPossible() {
-    guard joinTask == nil, let value = pendingValue, let coordinator,
+    guard joinTask == nil, let target = pendingTarget, let coordinator,
       let config = AppSessionConfig.current
     else { return }
-    pendingValue = nil
+    pendingTarget = nil
     joinTask = Task { @MainActor [weak self, weak coordinator] in
       defer { self?.joinTask = nil }
       do {
-        switch try await ChannelRoomLinkService.join(value: value, config: config) {
-        case .opened(let route):
-          coordinator?.openChat(route)
-        case .pending(let message):
-          AppToastController.shared.show(message)
-        }
+        try await self?.open(target: target, config: config, coordinator: coordinator)
       } catch {
         AppToastController.shared.show(error.localizedDescription)
       }
@@ -1421,24 +1433,265 @@ final class VibeRoomLinkRouter {
     }
   }
 
-  private static func linkValue(from url: URL) -> String? {
+  private func open(
+    target: VibeShareLinkTarget,
+    config: AppSessionConfig,
+    coordinator: AppShellCoordinator?
+  ) async throws {
+    switch target {
+    case .room(let value):
+      switch try await ChannelRoomLinkService.join(value: value, config: config) {
+      case .opened(let route):
+        coordinator?.openChat(route)
+      case .pending(let message):
+        AppToastController.shared.show(message)
+      }
+
+    case .handle(let handle):
+      // One server call says what the handle is; then reuse the ordinary open paths.
+      switch try await VibeShareLinkResolver.resolve(handle: handle, config: config) {
+      case .room(let value):
+        try await open(target: .room(value), config: config, coordinator: coordinator)
+      case .user(let userId):
+        try await openDirectMessage(userId: userId, config: config, coordinator: coordinator)
+      default:
+        AppToastController.shared.show("That Vibe link could not be found.")
+      }
+
+    case .user(let userId):
+      try await openDirectMessage(userId: userId, config: config, coordinator: coordinator)
+
+    case .chat(let chatId):
+      let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if let row = ChatHomeService.cachedRows(config: config)
+        .first(where: { $0.chatId.lowercased() == key })
+      {
+        coordinator?.openChat(ChatRoute(row: row))
+      } else {
+        AppToastController.shared.show("Open that chat from your chat list.")
+      }
+    }
+  }
+
+  /// Same steps as opening a contact from search: fetch the peer (for its public key and
+  /// agent flags), create-or-reuse the DM, then push the chat.
+  private func openDirectMessage(
+    userId: String,
+    config: AppSessionConfig,
+    coordinator: AppShellCoordinator?
+  ) async throws {
+    guard let user = try await ContactSearchService.search(config: config, query: userId).first
+    else {
+      AppToastController.shared.show("That Vibe user could not be found.")
+      return
+    }
+
+    let isBridgeAgent = user.bridgeProvider != nil || user.isAgent
+    let result = try await ChatDirectMessageService.startChat(
+      config: config,
+      friendID: user.userID,
+      allowPacketFallback: !isBridgeAgent
+    )
+
+    if let publicKey = user.publicKey, !publicKey.isEmpty {
+      _ = ChatEngine.shared.cachePeerPublicKey([
+        "chatId": result.chatID,
+        "peerUserId": user.userID,
+        "publicKey": publicKey,
+      ])
+    }
+
+    coordinator?.openChat(
+      ChatRoute(
+        chatId: result.chatID,
+        title: user.username,
+        peerUserId: user.userID,
+        peerAgentId: user.bridgeAgentRouteId,
+        isAgent: isBridgeAgent,
+        avatarURI: ChatAvatarURLResolver.resolve(
+          rawAvatar: user.profileImage,
+          peerUserId: user.userID,
+          chatId: result.chatID,
+          preferPushAvatar: false
+        ),
+        isGroup: false,
+        initialRows: result.messages,
+        bridgeProvider: user.bridgeProvider
+      )
+    )
+  }
+
+  /// Pure parsing — `nonisolated` so AppDelegate can classify a URL before hopping to the
+  /// main actor (and so an unrecognized `vibe://` host, e.g. the OAuth callback scheme,
+  /// is rejected here rather than mistaken for a room link).
+  nonisolated static func target(from url: URL) -> VibeShareLinkTarget? {
     if url.scheme?.lowercased() == "vibe" {
       let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-      for key in ["link", "token", "slug", "value"] {
-        if let value = components?.queryItems?.first(where: { $0.name == key })?.value,
-          !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-          return value
-        }
+      let query = { (key: String) -> String? in
+        components?.queryItems?.first(where: { $0.name == key })?.value?
+          .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
       }
-      let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-      if !path.isEmpty { return path }
-      return nil
+
+      switch url.host?.lowercased() {
+      case "u", "user", "handle":
+        // The preview page carries the resolved id when it has one, so a tap can skip
+        // straight to the DM; the handle is the fallback.
+        if let userId = query("userId") ?? query("friendId") { return .user(userId) }
+        if let handle = query("handle") ?? query("username") { return .handle(handle) }
+        return nil
+
+      case "chat":
+        if let chatId = query("chatId") { return .chat(chatId) }
+        if let friendId = query("friendId") { return .user(friendId) }
+        return nil
+
+      case "room-link", "r", "join", "j":
+        for key in ["link", "token", "slug", "value"] {
+          if let value = query(key) { return .room(value) }
+        }
+        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return path.isEmpty ? nil : .room(path)
+
+      default:
+        // Not a share link (e.g. vibe://platforms/oauth, which ASWebAuthenticationSession
+        // consumes itself). Leave it alone.
+        return nil
+      }
     }
 
     let parts = url.pathComponents.filter { $0 != "/" }
-    guard parts.count >= 2, ["r", "j"].contains(parts[parts.count - 2]) else { return nil }
-    return url.absoluteString
+    if parts.count >= 2, ["r", "j"].contains(parts[parts.count - 2]) {
+      return .room(url.absoluteString)
+    }
+    // https://<share host>/<handle>
+    if parts.count == 1, let handle = parts.first?.nilIfBlank,
+      !VibeShareLinks.isReservedHandle(handle)
+    {
+      return .handle(handle)
+    }
+    return nil
+  }
+}
+
+/// Canonical share-link shapes, mirroring the server's `Vibe.Links`. The server is the
+/// source of truth for links it hands out (`shareLink`, `shareUrl`, `publicLink`); this
+/// only builds the fallback form and renders links for display.
+enum VibeShareLinks {
+  /// Single-segment paths the web app owns — never a user handle.
+  private static let reservedHandles: Set<String> = [
+    "about", "admin", "agent", "agents", "api", "app", "assets", "blog", "bridge",
+    "dashboard", "docs", "download", "fonts", "health", "help", "images", "j", "l",
+    "login", "logout", "pricing", "privacy", "r", "register", "robots", "settings",
+    "signup", "static", "support", "terms", "u", "uploads", "user", "users", "vibe",
+    "favicon.ico", "logo.png", "robots.txt", "sw.js", "manifest.json", "index.html",
+  ]
+
+  static func isReservedHandle(_ handle: String) -> Bool {
+    reservedHandles.contains(handle.lowercased())
+  }
+
+  /// Base the app falls back to when the server did not supply a link. Matches the
+  /// server default (the API host is what actually resolves these paths today).
+  static var baseURLString: String {
+    var base =
+      (AppSessionConfig.current?.apiBaseURLString).flatMap { $0.nilIfBlank }
+      ?? "https://api.vibegram.io"
+    while base.hasSuffix("/") { base.removeLast() }
+    if base.lowercased().hasSuffix("/api") { base = String(base.dropLast(4)) }
+    return base
+  }
+
+  static func profileURL(username: String) -> String? {
+    guard let handle = username.trimmingCharacters(in: CharacterSet(charactersIn: "@ "))
+      .nilIfBlank
+    else { return nil }
+    return "\(baseURLString)/\(handle.lowercased())"
+  }
+
+  /// Absolute form of a server link. Mirrors `Vibe.Links.room_url/1`: relative `/r/…` and
+  /// `/j/…` paths get the share host, a bare slug is treated as a public channel handle,
+  /// and an already-absolute URL is left exactly as the server sent it.
+  static func absolute(_ pathOrURL: String?) -> String? {
+    guard let value = pathOrURL?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+    else { return nil }
+    if value.lowercased().hasPrefix("http://") || value.lowercased().hasPrefix("https://") {
+      return value
+    }
+    if value.hasPrefix("/") { return baseURLString + value }
+    return "\(baseURLString)/r/\(value)"
+  }
+
+  /// `https://host/path` -> `host/path`, the form the UI shows.
+  static func display(_ link: String?) -> String? {
+    guard var value = link?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+      return nil
+    }
+    for prefix in ["https://", "http://"] where value.lowercased().hasPrefix(prefix) {
+      value = String(value.dropFirst(prefix.count))
+    }
+    while value.hasSuffix("/") { value.removeLast() }
+    return value.nilIfBlank
+  }
+}
+
+/// Asks the server what a bare `@handle` points at (person, agent, or channel).
+private enum VibeShareLinkResolver {
+  static func resolve(handle: String, config: AppSessionConfig) async throws
+    -> VibeShareLinkTarget
+  {
+    let cleaned = handle.trimmingCharacters(in: CharacterSet(charactersIn: "@ /"))
+    guard !cleaned.isEmpty else { throw ChatDirectMessageServiceError.invalidPayload }
+
+    var base = config.apiBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    let pathBase = base.lowercased().hasSuffix("/api") ? base : "\(base)/api"
+    guard
+      var components = URLComponents(string: "\(pathBase)/links/resolve")
+    else { throw ChatDirectMessageServiceError.invalidURL }
+    components.queryItems = [URLQueryItem(name: "handle", value: cleaned)]
+    guard let url = components.url else { throw ChatDirectMessageServiceError.invalidURL }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 14
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw ChatDirectMessageServiceError.invalidResponse
+    }
+
+    // An older server has no resolver: fall back to treating the handle as a room slug,
+    // which is what every pre-existing public link was.
+    if http.statusCode == 404 || http.statusCode == 405 {
+      return .room(cleaned)
+    }
+    guard (200...299).contains(http.statusCode) else {
+      throw ChatDirectMessageServiceError.http(
+        http.statusCode, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    guard
+      let payload = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        as? [String: Any],
+      let target = payload["target"] as? [String: Any],
+      let kind = (target["kind"] as? String)?.lowercased()
+    else { throw ChatDirectMessageServiceError.invalidPayload }
+
+    switch kind {
+    case "channel":
+      let slug = (target["public_slug"] as? String) ?? cleaned
+      return .room("/r/\(slug)")
+    case "user", "agent":
+      guard let userId = (target["user_id"] as? String)?.nilIfBlank else {
+        throw ChatDirectMessageServiceError.invalidPayload
+      }
+      return .user(userId)
+    default:
+      throw ChatDirectMessageServiceError.invalidPayload
+    }
   }
 }
 
@@ -2924,6 +3177,21 @@ private struct ChatHomeScreen: View {
           if !isEditingHome {
             ToolbarItem(placement: .topBarTrailing) {
               HStack(spacing: 18) {
+                // The Search tab was repurposed into a real "Agents" tab, so chat search
+                // (previously reached by tapping that dummy tab, which called this same
+                // coordinator method) lives here instead.
+                Button {
+                  coordinator.openChatSearch()
+                } label: {
+                  Image(systemName: "magnifyingglass")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(colorScheme == .dark ? .white : .black)
+                    .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+
                 Button {
                   openAgentChat()
                 } label: {
@@ -5081,128 +5349,349 @@ private struct ChatHomeEditActionBar: View {
   }
 }
 
+/// Dark near-black sheet (not light-gray ultraThin on dark). Large preferred.
 private struct ChatShareSheetPresentationModifier: ViewModifier {
+  @Binding var detent: PresentationDetent
+  @Environment(\.colorScheme) private var colorScheme
+
   func body(content: Content) -> some View {
     content
-      .background(Color.black.opacity(0.3).ignoresSafeArea())
-      .presentationDetents([.medium, .large])
-      .presentationContentInteraction(.resizes)
-      .presentationDragIndicator(.hidden)
-      .presentationCornerRadius(30)
+      .presentationDetents([.large, .medium], selection: $detent)
+      .presentationContentInteraction(.scrolls)
+      .presentationDragIndicator(.visible)
+      .presentationCornerRadius(28)
+      // Theme-based solid — ultraThinMaterial reads as light gray on dark.
+      .presentationBackground(
+        colorScheme == .dark
+          ? Color(red: 0.07, green: 0.07, blue: 0.08)
+          : Color(uiColor: .systemBackground)
+      )
   }
 }
 
-private extension View {
-  func chatShareSheetPresentation() -> some View {
-    modifier(ChatShareSheetPresentationModifier())
+/// Pending forward draft applied when opening a group/channel from the share sheet.
+enum ChatPendingForwardStore {
+  struct Draft {
+    let fromChatId: String
+    let messageIds: [String]
+    let messagePayloads: [[String: Any]]
+    let previewText: String
+  }
+
+  private static var drafts: [String: Draft] = [:]
+
+  static func set(_ draft: Draft, for chatId: String) {
+    let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return }
+    drafts[key] = draft
+  }
+
+  static func take(for chatId: String) -> Draft? {
+    let key = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !key.isEmpty else { return nil }
+    return drafts.removeValue(forKey: key)
   }
 }
 
+/// Forward target picker — nav-controlled header, home-style in-list search,
+/// Select-only multi-pick, glass composer (no bar material).
 private struct ShareChatSelectionView: View {
   @Environment(\.dismiss) private var dismiss
   @Environment(\.colorScheme) private var colorScheme
   @StateObject private var model = ChatsViewModel()
   @State private var selectedChatIDs = Set<String>()
+  @State private var isMultiSelectMode = false
+  @State private var isSending = false
+  @State private var searchText = ""
+  @State private var caption = ""
+  @State private var sheetDetent: PresentationDetent = .large
+  @FocusState private var captionFocused: Bool
+  @FocusState private var searchFocused: Bool
+
+  let previewText: String
+  let messageCount: Int
   let onSelect: ([String: Any]) -> Void
+  let onOpenTarget: ((ChatHomeListRow) -> Void)?
+
+  init(
+    previewText: String = "Message",
+    messageCount: Int = 1,
+    onSelect: @escaping ([String: Any]) -> Void,
+    onOpenTarget: ((ChatHomeListRow) -> Void)? = nil
+  ) {
+    self.previewText = previewText
+    self.messageCount = max(1, messageCount)
+    self.onSelect = onSelect
+    self.onOpenTarget = onOpenTarget
+  }
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
   }
 
-  var body: some View {
-    VStack(spacing: 0) {
-      // Grabber Handle
-      Capsule()
-        .fill(palette.secondaryText.opacity(colorScheme == .dark ? 0.28 : 0.22))
-        .frame(width: 36, height: 4)
-        .padding(.top, 12)
-        .padding(.bottom, 4)
-
-      HStack {
-        Button {
-          dismiss()
-        } label: {
-          Image(systemName: "xmark")
-            .font(.system(size: 16, weight: .semibold))
-            .foregroundStyle(palette.text)
-            .frame(width: 44, height: 44, alignment: .leading)
-        }
-        
-        Spacer()
-        
-        Text("Forward Messages")
-          .font(.system(size: 16, weight: .semibold))
-          .foregroundStyle(palette.text)
-        
-        Spacer()
-        
-        if !selectedChatIDs.isEmpty {
-          Button {
-            onSelect(["chatIds": Array(selectedChatIDs)])
-          } label: {
-            Image(systemName: "paperplane.fill")
-              .font(.system(size: 16, weight: .semibold))
-              .foregroundStyle(palette.accent)
-              .frame(width: 44, height: 44, alignment: .trailing)
-          }
-        } else {
-          Spacer()
-            .frame(width: 44, height: 44)
-        }
-      }
-      .padding(.horizontal, 16)
-      .padding(.top, 16)
-      .padding(.bottom, 8)
-      
-      listContent
-    }
-    .task {
-      await model.loadIfNeeded()
+  private var filteredRows: [ChatHomeListRow] {
+    let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let base = model.rows.filter { !$0.isArchiveEntry }
+    guard !q.isEmpty else { return base }
+    return base.filter {
+      $0.title.localizedCaseInsensitiveContains(q)
+        || $0.preview.localizedCaseInsensitiveContains(q)
     }
   }
 
+  private var forwardBannerTitle: String {
+    messageCount > 1 ? "Forward \(messageCount) Messages" : "Forward Message"
+  }
+
+  private var canSend: Bool {
+    !selectedChatIDs.isEmpty && !isSending
+  }
+
+  var body: some View {
+    NavigationStack {
+      ZStack(alignment: .bottom) {
+        listBody
+          // Room for floating composer (no safeAreaInset bar that invents edges).
+          .safeAreaPadding(.bottom, isMultiSelectMode || !selectedChatIDs.isEmpty ? 118 : 92)
+
+        forwardComposerBar
+      }
+      .background(Color.clear)
+      .navigationTitle("Forward")
+      .navigationBarTitleDisplayMode(.inline)
+      // Let NavigationStack own chrome — transparent bar, no drawer searchable.
+      .toolbarBackground(.hidden, for: .navigationBar)
+      .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
+      .toolbar {
+        // cancellationAction → single system glass chip (no nested clip).
+        ToolbarItem(placement: .cancellationAction) {
+          Button {
+            dismiss()
+          } label: {
+            Image(systemName: "xmark")
+          }
+          .disabled(isSending)
+          .accessibilityLabel("Close")
+        }
+        ToolbarItem(placement: .confirmationAction) {
+          // Native toolbar text swap (Select ↔ Done) — no custom spring.
+          Button(isMultiSelectMode ? "Done" : "Select") {
+            toggleMultiSelect()
+          }
+          .fontWeight(.semibold)
+          .disabled(isSending)
+        }
+      }
+      .task {
+        await model.loadIfNeeded()
+      }
+    }
+    .modifier(ChatShareSheetPresentationModifier(detent: $sheetDetent))
+  }
+
   @ViewBuilder
-  private var listContent: some View {
+  private var listBody: some View {
     if model.rows.isEmpty && (!model.hasLoaded || model.isLoading) {
       AppListLoadingView(palette: palette, caption: "Loading chats")
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.clear)
-    } else if model.rows.isEmpty {
-      AppShellEmptyStateView(
-        icon: "bubble.left.and.bubble.right",
-        title: "No Chats",
-        message: "You have no active chats to forward to.",
-        buttonTitle: nil,
-        palette: palette,
-        action: nil
-      )
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(Color.clear)
     } else {
-      ChatHomeNativeListRepresentable(
-        rows: model.rows,
-        isDark: colorScheme == .dark,
-        isEditing: false, // Turn off native left-side circles
-        showsRightCheckmark: true,
-        selectedChatIDs: selectedChatIDs,
-        onSelect: { row in
-          // Since isEditing is false, handle selection manually here
-          if selectedChatIDs.contains(row.chatId) {
-            selectedChatIDs.remove(row.chatId)
-          } else {
-            selectedChatIDs.insert(row.chatId)
-          }
-        },
-        onToggleSelection: { _ in },
-        onAction: { _, _ in },
-        onRefresh: {
-          await model.refresh()
-        },
-        onUnavailableAction: { _ in }
-      )
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(Color.clear)
+      VStack(spacing: 0) {
+        // Search lives in the CONTENT (scroll area), not nav drawer —
+        // same grammar as Add Members / avoids large header edge.
+        forwardSearchField
+          .padding(.horizontal, 16)
+          .padding(.top, 4)
+          .padding(.bottom, 6)
+
+        if filteredRows.isEmpty {
+          AppShellEmptyStateView(
+            icon: "bubble.left.and.bubble.right",
+            title: searchText.isEmpty ? "No Chats" : "No Results",
+            message: searchText.isEmpty
+              ? "You have no active chats to forward to."
+              : "No chats match “\(searchText)”.",
+            buttonTitle: nil,
+            palette: palette,
+            action: nil
+          )
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+          ChatHomeNativeListRepresentable(
+            rows: filteredRows,
+            isDark: colorScheme == .dark,
+            isEditing: false,
+            // Circles ONLY in Select mode — default tap auto-sends.
+            showsRightCheckmark: isMultiSelectMode,
+            selectedChatIDs: selectedChatIDs,
+            compactForwardStyle: true,
+            onSelect: { row in
+              handleRowTap(row)
+            },
+            onToggleSelection: { _ in },
+            onAction: { _, _ in },
+            onRefresh: {
+              await model.refresh()
+            },
+            onUnavailableAction: { _ in }
+          )
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+      }
     }
+  }
+
+  private var forwardSearchField: some View {
+    HStack(spacing: 8) {
+      Image(systemName: "magnifyingglass")
+        .font(.system(size: 15, weight: .medium))
+        .foregroundStyle(palette.secondaryText)
+      TextField("Search", text: $searchText)
+        .focused($searchFocused)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .font(.system(size: 16))
+        .foregroundStyle(palette.text)
+      if !searchText.isEmpty {
+        Button {
+          searchText = ""
+        } label: {
+          Image(systemName: "xmark.circle.fill")
+            .font(.system(size: 15))
+            .foregroundStyle(palette.secondaryText.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+      }
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 9)
+    .background {
+      if #available(iOS 26.0, *) {
+        Capsule(style: .continuous)
+          .fill(.clear)
+          .glassEffect(.regular.interactive(true), in: .capsule)
+      } else {
+        Capsule(style: .continuous)
+          .fill(colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
+      }
+    }
+  }
+
+  /// No bar material / blur plate — only the message capsule is glass
+  /// (matches chat input pill; list scrolls under via clear chrome).
+  private var forwardComposerBar: some View {
+    VStack(spacing: 6) {
+      // Preview strip — transparent, no fill.
+      HStack(alignment: .center, spacing: 10) {
+        Image(systemName: "arrowshape.turn.up.forward.fill")
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(Color.purple)
+        Rectangle()
+          .fill(Color.purple.opacity(0.85))
+          .frame(width: 2, height: 26)
+          .clipShape(Capsule())
+        VStack(alignment: .leading, spacing: 1) {
+          Text(forwardBannerTitle)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(Color.purple)
+          Text(previewText)
+            .font(.system(size: 12, weight: .regular))
+            .foregroundStyle(palette.secondaryText)
+            .lineLimit(1)
+        }
+        Spacer(minLength: 0)
+      }
+      .padding(.horizontal, 16)
+
+      HStack(spacing: 8) {
+        TextField("Message", text: $caption)
+          .focused($captionFocused)
+          .font(.system(size: 16))
+          .submitLabel(.send)
+          .onSubmit {
+            if canSend { sendSelected() }
+          }
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+          .background {
+            if #available(iOS 26.0, *) {
+              Capsule(style: .continuous)
+                .fill(.clear)
+                .glassEffect(.regular.interactive(true), in: .capsule)
+            } else {
+              Capsule(style: .continuous)
+                .fill(colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
+            }
+          }
+
+        Button {
+          sendSelected()
+        } label: {
+          Image(systemName: "paperplane.fill")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 36, height: 36)
+            .background(Circle().fill(canSend ? Color.purple : Color.purple.opacity(0.35)))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend)
+        // In default mode send is for multi only; single-tap already auto-sends.
+        .opacity(isMultiSelectMode || !selectedChatIDs.isEmpty ? 1 : 0.55)
+      }
+      .padding(.horizontal, 12)
+      .padding(.bottom, 8)
+    }
+    .padding(.top, 6)
+    .background(Color.clear)
+  }
+
+  private func toggleMultiSelect() {
+    // No custom spring — NavigationStack/toolbar crossfade Select↔Done natively.
+    if isMultiSelectMode {
+      isMultiSelectMode = false
+      selectedChatIDs.removeAll()
+    } else {
+      isMultiSelectMode = true
+    }
+  }
+
+  private func handleRowTap(_ row: ChatHomeListRow) {
+    guard !isSending else { return }
+
+    if isMultiSelectMode {
+      if selectedChatIDs.contains(row.chatId) {
+        selectedChatIDs.remove(row.chatId)
+      } else {
+        selectedChatIDs.insert(row.chatId)
+      }
+      return
+    }
+
+    // Default: no circles — tap DM auto-forwards; group/channel opens with draft.
+    if row.isGroup || row.isChannel {
+      if let onOpenTarget {
+        onOpenTarget(row)
+        dismiss()
+      } else {
+        selectedChatIDs = [row.chatId]
+        sendSelected()
+      }
+      return
+    }
+
+    selectedChatIDs = [row.chatId]
+    sendSelected()
+  }
+
+  private func sendSelected() {
+    guard canSend else { return }
+    isSending = true
+    var payload: [String: Any] = ["chatIds": Array(selectedChatIDs)]
+    let trimmed = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmed.isEmpty {
+      payload["caption"] = trimmed
+    }
+    onSelect(payload)
+    dismiss()
   }
 }
 
@@ -5212,6 +5701,8 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let isEditing: Bool
   let showsRightCheckmark: Bool
   let selectedChatIDs: Set<String>
+  /// Denser forward-sheet rows: smaller avatars, name-only, radio morph.
+  var compactForwardStyle: Bool = false
   var searchText: Binding<String>? = nil
   var isSearchFocused: Binding<Bool>? = nil
   /// Instant (unanimated) overlay visibility — sheet gate bookkeeping.
@@ -5252,6 +5743,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
       isEditing: isEditing,
       showsRightCheckmark: showsRightCheckmark,
       selectedChatIDs: selectedChatIDs,
+      compactForwardStyle: compactForwardStyle,
       recentRows: recentRows,
       peopleResults: peopleResults,
       isGlobalSearching: isGlobalSearching
@@ -5278,6 +5770,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
       isEditing: isEditing,
       showsRightCheckmark: showsRightCheckmark,
       selectedChatIDs: selectedChatIDs,
+      compactForwardStyle: compactForwardStyle,
       recentRows: recentRows,
       peopleResults: peopleResults,
       isGlobalSearching: isGlobalSearching
@@ -5332,6 +5825,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var isDark = false
   private var isEditingMode = false
   private var showsRightCheckmark = false
+  private var compactForwardStyle = false
   private var searchHeader: ChatHomeInListSearchHeader?
   private var lastSearchHeaderSignature = ""
   private var presentedSearchFocus = false
@@ -6454,6 +6948,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     isEditing: Bool,
     showsRightCheckmark: Bool,
     selectedChatIDs: Set<String>,
+    compactForwardStyle: Bool = false,
     recentRows: [ChatHomeListRow] = [],
     peopleResults: [ContactSearchUser] = [],
     isGlobalSearching: Bool = false
@@ -6463,7 +6958,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       isDark: isDark,
       isEditing: isEditing,
       showsRightCheckmark: showsRightCheckmark,
-      selectedChatIDs: selectedChatIDs
+      selectedChatIDs: selectedChatIDs,
+      compactForwardStyle: compactForwardStyle
     )
     let searchSig =
       "\(searchTextBinding?.wrappedValue ?? "")|\(isSearchFocusedBinding?.wrappedValue == true)|\(searchOverlayVisibleFlag)|\(searchRetractingFlag)|\(recentRows.count)|\(peopleResults.count)|\(isGlobalSearching)"
@@ -6503,7 +6999,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     self.isDark = isDark
     self.isEditingMode = isEditing
     self.showsRightCheckmark = showsRightCheckmark
+    self.compactForwardStyle = compactForwardStyle
     self.selectedChatIDs = selectedChatIDs
+    // Forward sheet: denser rows (smaller avatar + name-only). Stable height.
+    tableView.rowHeight = compactForwardStyle ? 52 : 84
+    tableView.estimatedRowHeight = tableView.rowHeight
 
     guard isViewLoaded else {
       AppUITrace.notice(
@@ -6719,7 +7219,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
           avatarGradientColors: self.resolvedAvatarGradientColors(for: row),
           isEditing: self.isEditingMode,
           isEditSelected: self.selectedChatIDs.contains(row.chatId),
-          showsRightCheckmark: self.showsRightCheckmark
+          showsRightCheckmark: self.showsRightCheckmark,
+          compactForwardStyle: self.compactForwardStyle
         )
         cell.isHidden = row.chatId == self.activePreviewChatID
       }
@@ -6736,7 +7237,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     isDark: Bool,
     isEditing: Bool,
     showsRightCheckmark: Bool,
-    selectedChatIDs: Set<String>
+    selectedChatIDs: Set<String>,
+    compactForwardStyle: Bool = false
   ) -> String {
     let rowSignature = rows.map { row in
       [
@@ -6757,7 +7259,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         firstPaintTailFingerprint(for: row),
       ].joined(separator: "\u{1F}")
     }
-    return rowSignature.joined(separator: "||") + "||\(isDark ? "dark" : "light")||\(isEditing ? "edit" : "normal")||\(showsRightCheckmark ? "check" : "no_check")||\(selectedChatIDs.sorted().joined(separator: ","))"
+    return rowSignature.joined(separator: "||") + "||\(isDark ? "dark" : "light")||\(isEditing ? "edit" : "normal")||\(showsRightCheckmark ? "check" : "no_check")||\(compactForwardStyle ? "compact" : "full")||\(selectedChatIDs.sorted().joined(separator: ","))"
   }
 
   /// The visible Home text can stay identical while its background-prefetched chat tail
@@ -7143,7 +7645,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       avatarGradientColors: resolvedAvatarGradientColors(for: row),
       isEditing: isEditingMode,
       isEditSelected: selectedChatIDs.contains(row.chatId),
-      showsRightCheckmark: showsRightCheckmark
+      showsRightCheckmark: showsRightCheckmark,
+      compactForwardStyle: compactForwardStyle
     )
     // Search pose lives on the TABLE (one dissolving surface), never on cells.
     cell.alpha = 1
@@ -7687,8 +8190,8 @@ private final class ChatHomeMiniPreviewOverlayController: UIViewController,
     backgroundGlassView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     view.addSubview(backgroundGlassView)
 
-    colorOverlayView.backgroundColor = (isDark ? UIColor.black : UIColor.white)
-      .withAlphaComponent(isDark ? 0.34 : 0.24)
+    colorOverlayView.backgroundColor = UIColor.black
+      .withAlphaComponent(isDark ? 0.55 : 0.42)
     colorOverlayView.frame = backgroundGlassView.contentView.bounds
     colorOverlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     backgroundGlassView.contentView.addSubview(colorOverlayView)
@@ -9548,6 +10051,21 @@ final class ChatConversationController: UIViewController {
     startVisibleBridgeStatusPollingIfNeeded()
     schedulePostPresentationActivation(reason: "viewDidAppear")
     refreshPersistentAgentInboxSummary()
+    applyPendingForwardDraftIfNeeded()
+  }
+
+  private var pendingForwardDraft: ChatPendingForwardStore.Draft?
+
+  private func applyPendingForwardDraftIfNeeded() {
+    if pendingForwardDraft == nil {
+      pendingForwardDraft = ChatPendingForwardStore.take(for: route.chatId)
+    }
+    guard let draft = pendingForwardDraft else { return }
+    let title =
+      draft.messageIds.count > 1
+      ? "Forward \(draft.messageIds.count) Messages"
+      : "Forward Message"
+    mainView.applyPendingForwardDraft(title: title, preview: draft.previewText)
   }
 
   override func viewDidLayoutSubviews() {
@@ -11019,6 +11537,35 @@ final class ChatConversationController: UIViewController {
       {
         currentPage = resolved
       }
+    case "forwardDraftConfirm":
+      guard let draft = pendingForwardDraft else { return }
+      let caption = (payload["caption"] as? String) ?? ""
+      let sent: Int
+      if !draft.messagePayloads.isEmpty {
+        // Agent (or pre-built) payloads — do not require live engine rows.
+        sent = ChatAgentConversationController.forwardAgentMessages(
+          messagePayloads: draft.messagePayloads,
+          messageIds: draft.messageIds,
+          toChatIds: [route.chatId],
+          caption: caption
+        )
+      } else {
+        sent = Self.forwardMessages(
+          messageIds: draft.messageIds,
+          fromChatId: draft.fromChatId,
+          toChatIds: [route.chatId],
+          caption: caption
+        )
+      }
+      pendingForwardDraft = nil
+      if sent > 0 {
+        AppToastController.shared.show(
+          sent == 1 ? "Message forwarded" : "\(sent) messages forwarded")
+      } else {
+        AppToastController.shared.show("Couldn't forward those messages")
+      }
+    case "forwardDraftCancel":
+      pendingForwardDraft = nil
     case "inputActionPressed":
       let action = Self.normalizedString(payload["action"]) ?? ""
       switch action {
@@ -11036,77 +11583,120 @@ final class ChatConversationController: UIViewController {
         }
       case "shareInside":
         guard !route.restrictSavingContent else {
+          NSLog("[ChatShare] chatShare blocked restrictSavingContent chat=%@", route.chatId)
           AppToastController.shared.show("Forwarding is disabled for this channel")
           mainView.clearMessageSelection()
           return
         }
         let messageIds = (payload["messageIds"] as? [String]) ?? []
+        let messagePayloads = (payload["messages"] as? [[String: Any]]) ?? []
+        NSLog(
+          "[ChatShare] chatShare shareInside chat=%@ ids=%d payloads=%d",
+          route.chatId,
+          messageIds.count,
+          messagePayloads.count
+        )
         appShellRouteLog(
           "ChatConversationController shareInside chatId=\(route.chatId) count=\(messageIds.count)")
-        // Present chat selection to pick a target chat for forwarding
-        if AppSessionConfig.current != nil {
-          let sourceChatId = route.chatId
-          struct ShareSheetWrapper: View {
-            let onSelect: ([String: Any]) -> Void
-            let onDismiss: () -> Void
-            @State private var isPresented = false
-
-            var body: some View {
-              Color.clear
-                .onAppear {
-                  isPresented = true
-                }
-                .sheet(isPresented: $isPresented, onDismiss: {
-                  onDismiss()
-                }) {
-                  ShareChatSelectionView(onSelect: { payload in
-                    isPresented = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                      onSelect(payload)
-                      onDismiss()
-                    }
-                  })
-                  .chatShareSheetPresentation()
-                }
+        guard AppSessionConfig.current != nil else {
+          NSLog("[ChatShare] chatShare aborted: no session")
+          AppToastController.shared.show("Sign in to forward messages")
+          return
+        }
+        let sourceChatId = route.chatId
+        let previewSnippet = Self.forwardPreviewText(
+          messageIds: messageIds, messagePayloads: messagePayloads, fromChatId: sourceChatId)
+        // Present the picker as a real page sheet (not nested sheet-in-overFullScreen).
+        let shareRoot = ShareChatSelectionView(
+          previewText: previewSnippet,
+          messageCount: max(messageIds.count, messagePayloads.count, 1),
+          onSelect: { [weak self] searchPayload in
+            guard let self else { return }
+            let targetChatIds = (searchPayload["chatIds"] as? [String]) ?? []
+            let caption = (searchPayload["caption"] as? String) ?? ""
+            NSLog(
+              "[ChatShare] chatShare send targets=%d ids=%d captionLen=%d",
+              targetChatIds.count,
+              messageIds.count,
+              caption.count
+            )
+            let sent = Self.forwardMessages(
+              messageIds: messageIds,
+              fromChatId: sourceChatId,
+              toChatIds: targetChatIds,
+              caption: caption
+            )
+            DispatchQueue.main.async {
+              self.mainView.clearMessageSelection(animated: true)
+              if sent > 0 {
+                AppToastController.shared.show(
+                  sent == 1 ? "Message forwarded" : "\(sent) messages forwarded")
+              } else {
+                AppToastController.shared.show("Couldn't forward those messages")
+              }
+              NSLog("[ChatShare] chatShare finished sent=%d", sent)
+            }
+          },
+          onOpenTarget: { [weak self] row in
+            guard let self else { return }
+            ChatPendingForwardStore.set(
+              .init(
+                fromChatId: sourceChatId,
+                messageIds: messageIds,
+                messagePayloads: messagePayloads,
+                previewText: previewSnippet
+              ),
+              for: row.chatId
+            )
+            self.mainView.clearMessageSelection(animated: true)
+            let targetRoute = ChatRoute(row: row)
+            // Dismiss sheet first, then push the target chat with pending forward.
+            self.dismiss(animated: true) {
+              DispatchQueue.main.async {
+                guard let nav = self.navigationController else { return }
+                let isDark = nav.traitCollection.userInterfaceStyle == .dark
+                let controller = ChatConversationController(
+                  route: targetRoute,
+                  isDark: isDark,
+                  onClose: { [weak nav] in
+                    guard let nav, nav.viewControllers.count > 1 else { return }
+                    nav.popViewController(animated: true)
+                  }
+                )
+                nav.pushViewController(controller, animated: true)
+              }
             }
           }
-
-          var shareVC: UIHostingController<ShareSheetWrapper>!
-          shareVC = UIHostingController(
-            rootView: ShareSheetWrapper(
-              onSelect: { [weak self] searchPayload in
-                guard let targetChatIds = searchPayload["chatIds"] as? [String] else { return }
-                for targetChatId in targetChatIds {
-                  for msgId in messageIds {
-                    if var row = ChatEngine.shared.getLiveMessageRow([
-                      "chatId": sourceChatId,
-                      "messageId": msgId,
-                    ]) {
-                      var metadata = (row["metadata"] as? [String: Any]) ?? [:]
-                      metadata["forwardedFromChatId"] = sourceChatId
-                      metadata["forwardedFromMessageId"] = msgId
-                      row["metadata"] = metadata
-                      row["chatId"] = targetChatId
-                      row.removeValue(forKey: "messageId")
-                      row.removeValue(forKey: "message_id")
-                      row.removeValue(forKey: "id")
-                      row.removeValue(forKey: "status")
-                      row.removeValue(forKey: "replyToId")
-                      row.removeValue(forKey: "reply_to_id")
-                      _ = ChatEngine.shared.sendMessage(row)
-                    }
-                  }
-                }
-                self?.mainView.clearMessageSelection()
-              },
-              onDismiss: {
-                shareVC.dismiss(animated: false)
-              }
-            )
+        )
+        let shareVC = UIHostingController(rootView: shareRoot)
+        shareVC.modalPresentationStyle = .pageSheet
+        // Near-black host so sheet chrome never flashes light-gray on dark.
+        shareVC.view.backgroundColor =
+          self.traitCollection.userInterfaceStyle == .dark
+          ? UIColor(white: 0.07, alpha: 1)
+          : .systemBackground
+        if let sheet = shareVC.sheetPresentationController {
+          if #available(iOS 16.0, *) {
+            sheet.detents = [.large(), .medium()]
+            sheet.selectedDetentIdentifier = .large
+          } else {
+            sheet.detents = [.medium(), .large()]
+          }
+          sheet.prefersGrabberVisible = true
+          sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+          sheet.preferredCornerRadius = 28
+        }
+        var presenter: UIViewController = self
+        while let presented = presenter.presentedViewController { presenter = presented }
+        NSLog(
+          "[ChatShare] chatShare presenting on %@",
+          String(describing: Swift.type(of: presenter))
+        )
+        presenter.present(shareVC, animated: true) {
+          NSLog(
+            "[ChatShare] chatShare present completion presented=%@",
+            presenter.presentedViewController != nil ? "Y" : "N"
           )
-          shareVC.view.backgroundColor = .clear
-          shareVC.modalPresentationStyle = .overFullScreen
-          present(shareVC, animated: false)
         }
       default:
         break
@@ -11178,10 +11768,289 @@ final class ChatConversationController: UIViewController {
     return presenter
   }
 
+  /// One-line preview for the share sheet bottom banner.
+  fileprivate static func forwardPreviewText(
+    messageIds: [String],
+    messagePayloads: [[String: Any]],
+    fromChatId: String
+  ) -> String {
+    if let first = messagePayloads.first {
+      let msg = unwrapLiveMessageDict(first)
+      let text = ((msg["text"] as? String) ?? (msg["plainContent"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !text.isEmpty {
+        return text.count > 72 ? String(text.prefix(69)) + "…" : text
+      }
+      let type = ((msg["type"] as? String) ?? "message").lowercased()
+      return type.capitalized
+    }
+    if let mid = messageIds.first,
+      let row = ChatEngine.shared.getLiveMessageRow([
+        "chatId": fromChatId,
+        "messageId": mid,
+      ])
+    {
+      let msg = unwrapLiveMessageDict(row)
+      let text = ((msg["text"] as? String) ?? (msg["plainContent"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !text.isEmpty {
+        return text.count > 72 ? String(text.prefix(69)) + "…" : text
+      }
+      let type = ((msg["type"] as? String) ?? "message").lowercased()
+      return type.capitalized
+    }
+    return messageIds.count > 1 ? "\(messageIds.count) messages" : "Message"
+  }
+
+  /// Live engine rows are `{ kind, key, message: {...} }`. Flat payloads (agent
+  /// share) already are the message dict. Always unwrap before reading fields.
+  private static func unwrapLiveMessageDict(_ row: [String: Any]) -> [String: Any] {
+    if let nested = row["message"] as? [String: Any] { return nested }
+    return row
+  }
+
+  private static func metadataDict(from message: [String: Any]) -> [String: Any] {
+    if let dict = message["metadata"] as? [String: Any] { return dict }
+    if let raw = message["metadata"] as? String,
+      let data = raw.data(using: .utf8),
+      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    {
+      return obj
+    }
+    return [:]
+  }
+
+  private static func stringField(_ message: [String: Any], _ keys: [String]) -> String? {
+    for key in keys {
+      if let s = message[key] as? String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+      }
+    }
+    return nil
+  }
+
+  /// Build and send forward payloads for each selected message → each target chat.
+  /// Returns how many sends were accepted by the engine.
+  @discardableResult
+  private static func forwardMessages(
+    messageIds: [String],
+    fromChatId: String,
+    toChatIds: [String],
+    caption: String = ""
+  ) -> Int {
+    guard !messageIds.isEmpty, !toChatIds.isEmpty else { return 0 }
+    let meId = AppSessionConfig.current?.userID
+    let meName = AppSessionConfig.current?.name ?? AppSessionConfig.current?.username
+    let meAvatar = AppSessionConfig.current?.profileImage
+    var sent = 0
+
+    for targetChatId in toChatIds {
+      let target = targetChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !target.isEmpty, target != fromChatId else { continue }
+      for msgId in messageIds {
+        guard
+          let liveRow = ChatEngine.shared.getLiveMessageRow([
+            "chatId": fromChatId,
+            "messageId": msgId,
+          ])
+        else {
+          NSLog("[ChatShare] forwardMessages miss live row chat=%@ msg=%@", fromChatId, msgId)
+          continue
+        }
+        // CRITICAL: getLiveMessageRow returns nested { message: {...} }, not flat.
+        let message = unwrapLiveMessageDict(liveRow)
+
+        var type = (
+          stringField(message, ["type", "messageType", "message_type"]) ?? "text"
+        ).lowercased()
+        let text =
+          stringField(message, ["text", "plainContent", "plain_content"]) ?? ""
+        var metadata = metadataDict(from: message)
+
+        // Lift media/music fields from the message body into metadata so
+        // ChatListRow (cover/mediaUrl/isForwarded) and sendMessage both see them.
+        let mediaKeys = [
+          "mediaUrl", "media_url", "localMediaUrl", "local_media_url", "fileName", "file_name",
+          "fileSize", "file_size", "duration", "width", "height", "thumbnailBase64",
+          "thumbnail_base64", "mediaKey", "media_key", "waveform", "cover", "coverUrl",
+          "cover_url", "artwork", "artworkUrl", "artist", "source", "platform", "provider",
+          "videoId", "video_id", "latitude", "longitude", "caption", "title",
+        ]
+        for key in mediaKeys {
+          if metadata[key] == nil, let value = message[key] {
+            metadata[key] = value
+          }
+        }
+        // Music often arrives as type=text with cover/artist — promote to music.
+        if type == "text" || type == "agent_progress_tree" {
+          let hasCover =
+            stringField(metadata, ["cover", "coverUrl", "cover_url", "artwork", "artworkUrl"])
+            != nil
+          let hasArtist = stringField(metadata, ["artist", "uploader", "channel"]) != nil
+          let mediaURL = stringField(
+            metadata, ["mediaUrl", "media_url"])
+            ?? stringField(message, ["mediaUrl", "media_url", "localMediaUrl"])
+          if hasCover || hasArtist,
+            let mediaURL, !mediaURL.isEmpty
+          {
+            type = "music"
+          }
+        }
+
+        let authorId =
+          stringField(message, ["fromId", "from_id", "senderId", "sender_id"])
+          ?? ((message["isMe"] as? Bool) == true ? meId : nil)
+        let authorName =
+          stringField(message, ["senderName", "sender_name", "title", "agentName"])
+          ?? ((message["isMe"] as? Bool) == true ? meName : nil)
+        let authorAvatar =
+          stringField(message, ["avatarUrl", "avatar_url", "profileImage", "profile_image"])
+          ?? ((message["isMe"] as? Bool) == true ? meAvatar : nil)
+
+        metadata["forwardedFromChatId"] = fromChatId
+        metadata["forwarded_from_chat_id"] = fromChatId
+        metadata["forwardedFromMessageId"] = msgId
+        metadata["forwarded_from_message_id"] = msgId
+        if let authorId, !authorId.isEmpty {
+          metadata["forwardedFromUserId"] = authorId
+          metadata["forwarded_from_user_id"] = authorId
+        }
+        if let authorName, !authorName.isEmpty {
+          metadata["forwardedFromName"] = authorName
+          metadata["forwarded_from_name"] = authorName
+        }
+        if let authorAvatar, !authorAvatar.isEmpty {
+          metadata["forwardedFromAvatar"] = authorAvatar
+          metadata["forwarded_from_avatar"] = authorAvatar
+        }
+        metadata["isForwarded"] = true
+        metadata["is_forwarded"] = true
+
+        // Normalize cover keys ChatListRow reads.
+        if metadata["cover"] == nil {
+          if let c = stringField(
+            metadata, ["coverUrl", "cover_url", "artwork", "artworkUrl", "artwork_url"])
+          {
+            metadata["cover"] = c
+            metadata["coverUrl"] = c
+          }
+        }
+
+        var payload: [String: Any] = [
+          "chatId": target,
+          "type": type,
+          "text": text,
+          "metadata": metadata,
+        ]
+        // Media types need a non-empty mediaUrl at top-level for sendMessage.
+        let mediaUrl =
+          stringField(metadata, ["mediaUrl", "media_url"])
+          ?? stringField(message, ["mediaUrl", "media_url"])
+        if let mediaUrl, !mediaUrl.isEmpty {
+          payload["mediaUrl"] = mediaUrl
+          metadata["mediaUrl"] = mediaUrl
+        }
+        var local =
+          stringField(metadata, ["localMediaUrl", "local_media_url"])
+          ?? stringField(message, ["localMediaUrl", "local_media_url"])
+        // Reuse durable voice/music cache so forward never re-downloads first.
+        if local == nil || local?.isEmpty == true,
+          let mediaUrl = payload["mediaUrl"] as? String,
+          let remoteURL = URL(string: mediaUrl),
+          let cached = VoiceBubblePlaybackCoordinator.shared.resolvedCachedLocalURL(
+            forRemote: remoteURL,
+            fileName: stringField(metadata, ["fileName", "file_name"])
+          )
+        {
+          local = cached.absoluteString
+        }
+        if let local, !local.isEmpty {
+          payload["localMediaUrl"] = local
+          metadata["localMediaUrl"] = local
+          if payload["mediaUrl"] == nil { payload["mediaUrl"] = local }
+        }
+        if let fileName = stringField(metadata, ["fileName", "file_name"])
+          ?? stringField(message, ["fileName", "file_name"])
+        {
+          payload["fileName"] = fileName
+          metadata["fileName"] = fileName
+        }
+        if let duration = metadata["duration"] ?? message["duration"] {
+          payload["duration"] = duration
+          metadata["duration"] = duration
+        }
+        if let thumb = stringField(metadata, ["thumbnailBase64", "thumbnail_base64"])
+          ?? stringField(message, ["thumbnailBase64", "thumbnail_base64"])
+        {
+          payload["thumbnailBase64"] = thumb
+          metadata["thumbnailBase64"] = thumb
+        }
+        if let mediaKey = stringField(metadata, ["mediaKey", "media_key"])
+          ?? stringField(message, ["mediaKey", "media_key"])
+        {
+          payload["mediaKey"] = mediaKey
+          metadata["mediaKey"] = mediaKey
+        }
+        // Music/voice with empty text: give sendMessage a non-empty push preview
+        // without changing type — empty text + type music is allowed; empty text
+        // + type text is rejected.
+        if type == "text", text.isEmpty, payload["mediaUrl"] != nil {
+          // Still missing type — infer from presence of media.
+          if metadata["cover"] != nil || metadata["artist"] != nil {
+            payload["type"] = "music"
+            type = "music"
+          } else if metadata["waveform"] != nil || metadata["duration"] != nil {
+            payload["type"] = "voice"
+            type = "voice"
+          } else if metadata["width"] != nil || metadata["thumbnailBase64"] != nil {
+            payload["type"] = "image"
+            type = "image"
+          }
+        }
+        payload["metadata"] = metadata
+
+        NSLog(
+          "[ChatShare] forwardMessages send type=%@ hasMedia=%@ hasCover=%@ isFwd=%@ textLen=%d",
+          type,
+          payload["mediaUrl"] != nil ? "Y" : "N",
+          metadata["cover"] != nil ? "Y" : "N",
+          (metadata["isForwarded"] as? Bool) == true ? "Y" : "N",
+          text.count
+        )
+
+        let result = ChatEngine.shared.sendMessage(payload)
+        if (result["accepted"] as? Bool) == true {
+          sent += 1
+        } else {
+          appShellRouteLog(
+            "forwardMessages rejected type=\(type) reason=\(result["reason"] ?? "unknown")")
+          NSLog(
+            "[ChatShare] forwardMessages rejected type=%@ reason=%@",
+            type,
+            String(describing: result["reason"] ?? "unknown")
+          )
+        }
+      }
+      // Optional caption: send as a follow-up text after the forwarded messages.
+      let trimmedCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmedCaption.isEmpty {
+        _ = ChatEngine.shared.sendMessage([
+          "chatId": target,
+          "type": "text",
+          "text": trimmedCaption,
+        ])
+      }
+    }
+    return sent
+  }
+
   private func performClearChat(deleteForEveryone: Bool) {
     if let config = AppSessionConfig.current {
       ChatHomeService.removeCachedChat(chatID: route.chatId, config: config)
     }
+    // Exit selection chrome first so header restores while the list empties.
+    mainView.clearMessageSelection(animated: true)
     if deleteForEveryone {
       _ = ChatEngine.shared.clearChat([
         "chatId": route.chatId,
@@ -11209,6 +12078,8 @@ final class ChatConversationController: UIViewController {
       return
     }
 
+    // Functional path: engine wipes local history + queues DELETE /api/chats/:id
+    // (server soft-clears via messages_cleared_at / participant delete).
     _ = ChatEngine.shared.clearChat(["chatId": route.chatId])
     mainView.clearRows()
     profileView?.setRows([])
@@ -14166,6 +15037,18 @@ final class AppRootNavigationController: UINavigationController, UIGestureRecogn
     super.viewDidLoad()
     setNavigationBarHidden(true, animated: false)
     interactivePopGestureRecognizer?.delegate = self
+    NativeMusicPlayerRootOverlay.shared.install(on: view)
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    NativeMusicPlayerRootOverlay.shared.updateLayout()
+    NativeMusicPlayerRootOverlay.shared.bringToFront()
+  }
+
+  override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+    super.traitCollectionDidChange(previousTraitCollection)
+    NativeMusicPlayerRootOverlay.shared.updateLayout()
   }
 
   // Keep edge-swipe-back working while the system nav bar is hidden, but only
@@ -14191,7 +15074,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   }
 
   /// Tab order; the index maps 1:1 to `AppShellTab`.
-  static let orderedTabs: [AppShellTab] = [.calls, .contacts, .chats, .search, .settings]
+  static let orderedTabs: [AppShellTab] = [.calls, .contacts, .chats, .agents, .settings]
   static func tabIndex(for tab: AppShellTab) -> Int? { orderedTabs.firstIndex(of: tab) }
 
   private var toastHost: UIHostingController<AppToastHostView>?
@@ -14218,15 +15101,15 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       image: UIImage(systemName: "bubble.left.and.bubble.right.fill"),
       selectedImage: nil)
 
-    let searchVC = UIViewController()
-    searchVC.tabBarItem = UITabBarItem(
-      title: "Search", image: UIImage(systemName: "magnifyingglass"), selectedImage: nil)
+    let agentsVC = makeAgentsTabRoot()
+    agentsVC.tabBarItem = UITabBarItem(
+      title: "Agents", image: UIImage(systemName: "cpu"), selectedImage: nil)
 
     let settingsVC = makeHosted(SettingsRootView())
     settingsVC.tabBarItem = UITabBarItem(
       title: "Settings", image: UIImage(systemName: "gearshape"), selectedImage: nil)
 
-    viewControllers = [callsVC, contactsVC, chatHomeVC, searchVC, settingsVC]
+    viewControllers = [callsVC, contactsVC, chatHomeVC, agentsVC, settingsVC]
     selectedIndex = Self.tabIndex(for: .chats) ?? 2
 
     // --- Coordinator wiring ----------------------------------------------
@@ -14273,6 +15156,101 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     UIHostingController(rootView: view.environmentObject(coordinator))
   }
 
+  // MARK: Agents tab
+
+  /// The Agents tab root: the same native agents-management screen already used for the
+  /// presented control panel (`ChatNativeAgentView.presentAgentControlPanel(from:)`),
+  /// wrapped as a tab instead of a modal. No session yet (should not happen — this
+  /// controller is only ever constructed post-auth) falls back to an empty placeholder
+  /// rather than crashing.
+  private func makeAgentsTabRoot() -> UIViewController {
+    guard let config = AppSessionConfig.current else {
+      return UINavigationController(rootViewController: UIViewController())
+    }
+    let apiContext = ChatNativeAgentConfigAPIContext(
+      apiBaseURL: config.apiBaseURL,
+      token: config.authToken
+    )
+    let controller = ChatNativeAgentsControlController(
+      apiContext: apiContext,
+      appearance: .fallback,
+      showsCloseButton: false
+    )
+    controller.onToast = { message in
+      AppToastController.shared.show(message)
+    }
+    controller.onCreateAgent = { [weak self] in
+      // No standalone "create agent" screen exists natively yet — agent creation is a
+      // conversational flow the built-in Vibe AI assistant already drives. Judgment call:
+      // hand off to that chat rather than build a second creation UI here.
+      self?.coordinator.openAgentConversation()
+    }
+    controller.onOpenAgentChat = { [weak self] card in
+      self?.openAgentChatFromAgentsTab(card)
+    }
+    controller.onDeleteAgent = { [weak self] card, completion in
+      self?.deleteAgentFromAgentsTab(card, completion: completion)
+    }
+    return UINavigationController(rootViewController: controller)
+  }
+
+  /// Opens (creating if needed) the DM with a real agent's shadow user, reusing the same
+  /// resolve→start-chat→push pipeline as tapping a `vibe://chat?friendId=` link — which is
+  /// exactly what `AgentCard.agentDMURL` already encodes for this agent.
+  private func openAgentChatFromAgentsTab(_ card: ChatListRow.AgentCard) {
+    guard let agentUserId = card.agentUserId, !agentUserId.isEmpty else {
+      AppToastController.shared.show("Agent chat is not available yet")
+      return
+    }
+    VibeRoomLinkRouter.shared.handle(target: .user(agentUserId))
+  }
+
+  private func deleteAgentFromAgentsTab(
+    _ card: ChatListRow.AgentCard, completion: @escaping () -> Void
+  ) {
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("Missing API session")
+      return
+    }
+    let trimmedId = card.agentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedId.isEmpty, let url = Self.agentDeleteURL(apiBaseURL: config.apiBaseURL, agentId: trimmedId)
+    else { return }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    let cardTitle = card.displayName
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      DispatchQueue.main.async {
+        if let error {
+          NSLog("[AgentsTab] delete agent failed %@", error.localizedDescription)
+          AppToastController.shared.show("Could not delete agent")
+          return
+        }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(statusCode) else {
+          AppToastController.shared.show("Delete failed")
+          return
+        }
+        completion()
+        AppToastController.shared.show("Deleted \(cardTitle)")
+      }
+    }.resume()
+  }
+
+  /// Mirrors `ChatNativeAgentsControlController.agentsURL()`'s base-URL normalization
+  /// (the configured API base may or may not already end in `/api`) so this hits the
+  /// same `DELETE /api/agents/:id` route the list screen's own GET uses.
+  private static func agentDeleteURL(apiBaseURL: URL, agentId: String) -> URL? {
+    var base = apiBaseURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+    let suffix = base.lowercased().hasSuffix("/api") ? "/agents" : "/api/agents"
+    let encodedId = agentId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? agentId
+    return URL(string: "\(base)\(suffix)/\(encodedId)")
+  }
+
   // MARK: Tab selection sync
 
   /// Re-entrancy guard/counter purely for freeze diagnosis: if a tab change
@@ -14283,13 +15261,9 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   func tabBarController(
     _ tabBarController: UITabBarController, shouldSelect viewController: UIViewController
   ) -> Bool {
-    guard let index = viewControllers?.firstIndex(of: viewController),
-          index < Self.orderedTabs.count else { return true }
-    let tab = Self.orderedTabs[index]
-    if tab == .search {
-      coordinator.openChatSearch()
-      return false
-    }
+    // Every tab (including Agents, the former dummy Search slot) now selects normally.
+    // Chat search is reachable from a toolbar button on the Chats tab itself instead
+    // (see ChatHomeScreen's topBarTrailing item), so nothing needs to intercept here.
     return true
   }
 
@@ -14355,12 +15329,8 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     let appearance = UINavigationBarAppearance()
     appearance.configureWithTransparentBackground()
     appearance.shadowColor = .clear
+    appearance.backgroundEffect = nil
     appearance.backgroundColor = .clear
-    // Dark mode: keep chrome near-black so trailing liquid-glass doesn't sample gray list wash.
-    if traitCollection.userInterfaceStyle == .dark {
-      appearance.backgroundEffect = UIBlurEffect(style: .systemChromeMaterialDark)
-      appearance.backgroundColor = UIColor.black.withAlphaComponent(0.22)
-    }
     UINavigationBar.appearance().standardAppearance = appearance
     UINavigationBar.appearance().scrollEdgeAppearance = appearance
     UINavigationBar.appearance().compactAppearance = appearance
@@ -14568,14 +15538,19 @@ private struct AppToastHostView: View {
 /// cell / `ChatInputBar`) while a hidden `ChatNativeAgentView` runs headless as
 /// the transport + row source — it owns the proven `agent:<userId>` socket,
 /// streaming, and persistence, and emits rows in the same `kind`/`message`
-/// envelope the chat list consumes. Agent-specific conditions: first message
-/// pinned to top, and the composer's send button becomes a stop button while the
-/// agent is streaming.
+/// envelope the chat list consumes. The transcript keeps normal one-to-one chat
+/// chronology and bottom anchoring; only the composer's send button becomes a stop
+/// button while the agent is streaming.
 final class ChatAgentConversationController: UIViewController {
   private let mainView = ChatMainView()
-  private let agentView = ChatNativeAgentView(frame: .zero)
+  // Transport-only from birth: this instance is hidden and never renders its own
+  // transcript, so it must not build one during init (see `ChatNativeAgentView`).
+  private let agentView = ChatNativeAgentView(frame: .zero, transportOnly: true)
   private let isDark: Bool
   private var onClose: (() -> Void)?
+  /// Anchors the `[AgentOpen]` stage timings — both stored properties above are
+  /// constructed before this runs, so `viewDidLoad`'s `sinceInitMs` is the push cost.
+  private let createdAt = ProcessInfo.processInfo.systemUptime
 
   init(isDark: Bool, onClose: (() -> Void)?) {
     self.isDark = isDark
@@ -14593,6 +15568,7 @@ final class ChatAgentConversationController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
+    let viewDidLoadStartedAt = ProcessInfo.processInfo.systemUptime
     view.backgroundColor = isDark ? .black : .white
 
     let appearance: [String: Any] = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
@@ -14642,12 +15618,21 @@ final class ChatAgentConversationController: UIViewController {
     mainView.setProfileName("Vibe AI")
     mainView.setIsGroupOrChannel(false)
     mainView.setAgentChatMode(true)
+    // Give the embedded list the built-in agent chat's canonical id. This surface bypasses
+    // applyRoute (where other chats get their engine chat id), so without this the music
+    // cells have no chat id and never register into the player-sheet list. Channel binding
+    // stays disabled above — this is identity only, so it never rebinds the transcript.
+    mainView.setEngineChatId("saved_messages")
     mainView.setInputPlaceholder("Message Vibe AI")
     mainView.setInputBarEnabled(true)
     // Route sends to us (the agent transport) instead of the chat engine.
     mainView.setNativeSendEnabled(false)
     mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
     agentView.synchronizeHostState()
+    NSLog(
+      "[AgentOpen] viewDidLoad bodyMs=%d sinceInitMs=%d",
+      Int((ProcessInfo.processInfo.systemUptime - viewDidLoadStartedAt) * 1000),
+      Int((ProcessInfo.processInfo.systemUptime - createdAt) * 1000))
   }
 
   override func viewWillAppear(_ animated: Bool) {
@@ -14657,6 +15642,16 @@ final class ChatAgentConversationController: UIViewController {
 
   private func handleMainEvent(_ payload: [String: Any]) {
     let type = (payload["type"] as? String) ?? ""
+    // Always log share-related traffic; throttle other high-volume events.
+    if type == "inputActionPressed" || type == "messageSelectionChanged"
+      || type == "agentToast" || type.hasPrefix("share")
+    {
+      NSLog(
+        "[ChatShare] agentMainEvent type=%@ keys=%@",
+        type,
+        payload.keys.sorted().joined(separator: ",")
+      )
+    }
     switch type {
     case "headerBack":
       onClose?()
@@ -14673,6 +15668,10 @@ final class ChatAgentConversationController: UIViewController {
       agentView.submitText(text, userMessageId: payload["messageId"] as? String)
     case "agentStopStreaming":
       agentView.stopStreaming()
+    case "agentHistoryPressed":
+      agentView.presentConversationHistory(from: self)
+    case "agentNewChatPressed":
+      agentView.startNewChatSession()
     case "openAgentPanel":
       agentView.presentAgentControlPanel(from: self)
     case "agentCreateRequested":
@@ -14701,9 +15700,344 @@ final class ChatAgentConversationController: UIViewController {
           bridgeProvider: bridgeProvider
         )
       }
+    case "inputActionPressed":
+      handleAgentShareAction(payload)
+    case "agentToast":
+      if let message = payload["message"] as? String, !message.isEmpty {
+        AppToastController.shared.show(message)
+      }
+    case "messageSelectionChanged":
+      let active = (payload["active"] as? Bool) ?? false
+      let count = (payload["selectedCount"] as? Int) ?? 0
+      NSLog("[ChatShare] agent selectionChanged active=%@ count=%d", active ? "Y" : "N", count)
     default:
       agentView.handleHostEvent(payload)
     }
+  }
+
+  /// Share / delete from the Vibe AI surface (does not go through ChatConversationController).
+  private func handleAgentShareAction(_ payload: [String: Any]) {
+    let action = ((payload["action"] as? String) ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let messageIds = (payload["messageIds"] as? [String]) ?? []
+    let messages = (payload["messages"] as? [[String: Any]]) ?? []
+    let firstType = (messages.first?["type"] as? String) ?? "-"
+    NSLog(
+      "[ChatShare] agentShare action=%@ ids=%d payloads=%d session=%@ firstType=%@ window=%@",
+      action,
+      messageIds.count,
+      messages.count,
+      AppSessionConfig.current != nil ? "Y" : "N",
+      firstType,
+      view.window != nil ? "Y" : "N"
+    )
+
+    switch action {
+    case "shareInside":
+      guard AppSessionConfig.current != nil else {
+        NSLog("[ChatShare] agentShare aborted: no session")
+        AppToastController.shared.show("Sign in to forward messages")
+        return
+      }
+      guard !messageIds.isEmpty || !messages.isEmpty else {
+        NSLog("[ChatShare] agentShare aborted: empty selection")
+        AppToastController.shared.show("Select a message to forward")
+        return
+      }
+      presentAgentShareSheet(messageIds: messageIds, messagePayloads: messages)
+    case "shareOutside":
+      // shareOutside is usually handled inside ChatListView; log if it reaches here.
+      NSLog("[ChatShare] agentShare shareOutside reached host (unexpected)")
+    case "delete":
+      // Local-only clear for agent transcript selection.
+      mainView.clearMessageSelection()
+      NSLog("[ChatShare] agentShare delete (selection cleared; agent transcript is local)")
+    default:
+      NSLog("[ChatShare] agentShare unhandled action=%@", action)
+    }
+  }
+
+  private func presentAgentShareSheet(
+    messageIds: [String],
+    messagePayloads: [[String: Any]]
+  ) {
+    NSLog(
+      "[ChatShare] presentAgentShareSheet ids=%d payloads=%d",
+      messageIds.count,
+      messagePayloads.count
+    )
+    // Drop keyboard so the sheet isn't covered / mis-presented.
+    view.endEditing(true)
+    mainView.endEditing(true)
+
+    let presentBlock = { [weak self] in
+      guard let self else {
+        NSLog("[ChatShare] presentAgentShareSheet aborted: self deallocated")
+        return
+      }
+      if self.presentedViewController != nil {
+        NSLog(
+          "[ChatShare] presentAgentShareSheet dismissing existing presented=%@",
+          String(describing: type(of: self.presentedViewController!))
+        )
+      }
+      let previewSnippet = ChatConversationController.forwardPreviewText(
+        messageIds: messageIds, messagePayloads: messagePayloads, fromChatId: "")
+      let shareRoot = ShareChatSelectionView(
+        previewText: previewSnippet,
+        messageCount: max(messageIds.count, messagePayloads.count, 1),
+        onSelect: { [weak self] searchPayload in
+          guard let self else { return }
+          let targetChatIds = (searchPayload["chatIds"] as? [String]) ?? []
+          let caption = (searchPayload["caption"] as? String) ?? ""
+          NSLog(
+            "[ChatShare] agentShare send targets=%d payloads=%d captionLen=%d",
+            targetChatIds.count,
+            messagePayloads.count,
+            caption.count
+          )
+          let sent = ChatAgentConversationController.forwardAgentMessages(
+            messagePayloads: messagePayloads,
+            messageIds: messageIds,
+            toChatIds: targetChatIds,
+            caption: caption
+          )
+          DispatchQueue.main.async {
+            self.mainView.clearMessageSelection(animated: true)
+            if sent > 0 {
+              AppToastController.shared.show(
+                sent == 1 ? "Message forwarded" : "\(sent) messages forwarded")
+            } else {
+              AppToastController.shared.show("Couldn't forward those messages")
+            }
+            NSLog("[ChatShare] agentShare finished sent=%d", sent)
+          }
+        },
+        onOpenTarget: { [weak self] row in
+          guard let self else { return }
+          ChatPendingForwardStore.set(
+            .init(
+              fromChatId: "",
+              messageIds: messageIds,
+              messagePayloads: messagePayloads,
+              previewText: previewSnippet
+            ),
+            for: row.chatId
+          )
+          self.mainView.clearMessageSelection(animated: true)
+          let targetRoute = ChatRoute(row: row)
+          self.dismiss(animated: true) {
+            DispatchQueue.main.async {
+              guard let nav = self.navigationController else { return }
+              let isDark = nav.traitCollection.userInterfaceStyle == .dark
+              let controller = ChatConversationController(
+                route: targetRoute,
+                isDark: isDark,
+                onClose: { [weak nav] in
+                  guard let nav, nav.viewControllers.count > 1 else { return }
+                  nav.popViewController(animated: true)
+                }
+              )
+              nav.pushViewController(controller, animated: true)
+            }
+          }
+        }
+      )
+      let shareVC = UIHostingController(rootView: shareRoot)
+      shareVC.modalPresentationStyle = .pageSheet
+      shareVC.isModalInPresentation = false
+      shareVC.view.backgroundColor =
+        self.traitCollection.userInterfaceStyle == .dark
+        ? UIColor(white: 0.07, alpha: 1)
+        : .systemBackground
+      if let sheet = shareVC.sheetPresentationController {
+        if #available(iOS 16.0, *) {
+          sheet.detents = [.large(), .medium()]
+          sheet.selectedDetentIdentifier = .large
+        } else {
+          sheet.detents = [.medium(), .large()]
+        }
+        sheet.prefersGrabberVisible = true
+        sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+        sheet.preferredCornerRadius = 28
+      }
+      var presenter: UIViewController = self
+      while let presented = presenter.presentedViewController { presenter = presented }
+      // Prefer the navigation controller when available (more reliable sheet host).
+      if let nav = self.navigationController {
+        var navPresenter: UIViewController = nav
+        while let presented = navPresenter.presentedViewController { navPresenter = presented }
+        presenter = navPresenter
+      }
+      NSLog(
+        "[ChatShare] agentShare presenting on %@ isViewLoaded=%@ window=%@",
+        String(describing: type(of: presenter)),
+        self.isViewLoaded ? "Y" : "N",
+        self.view.window != nil ? "Y" : "N"
+      )
+      presenter.present(shareVC, animated: true) {
+        let presented = presenter.presentedViewController
+        NSLog(
+          "[ChatShare] agentShare present completion presented=%@ type=%@",
+          presented != nil ? "Y" : "N",
+          presented.map { String(describing: type(of: $0)) } ?? "nil"
+        )
+      }
+    }
+
+    if Thread.isMainThread {
+      presentBlock()
+    } else {
+      DispatchQueue.main.async(execute: presentBlock)
+    }
+  }
+
+  /// Forward from agent transcript payloads (not ChatEngine live rows).
+  @discardableResult
+  fileprivate static func forwardAgentMessages(
+    messagePayloads: [[String: Any]],
+    messageIds: [String],
+    toChatIds: [String],
+    caption: String = ""
+  ) -> Int {
+    var rows = messagePayloads
+    // Fallback: resolve via engine if payloads missing (e.g. older event).
+    if rows.isEmpty {
+      for mid in messageIds {
+        if let row = ChatEngine.shared.getLiveMessageRow([
+          "chatId": "vibe_agent",
+          "messageId": mid,
+        ]) {
+          rows.append(row)
+        }
+      }
+    }
+    NSLog(
+      "[ChatShare] forwardAgentMessages rows=%d targets=%d",
+      rows.count,
+      toChatIds.count
+    )
+    guard !rows.isEmpty, !toChatIds.isEmpty else { return 0 }
+
+    let meId = AppSessionConfig.current?.userID
+    let meName = AppSessionConfig.current?.name ?? AppSessionConfig.current?.username
+    let meAvatar = AppSessionConfig.current?.profileImage
+    var sent = 0
+
+    for targetChatId in toChatIds {
+      let target = targetChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !target.isEmpty else { continue }
+      for row in rows {
+        let type = ((row["type"] as? String) ?? "text").lowercased()
+        let text = (row["text"] as? String) ?? (row["plainContent"] as? String) ?? ""
+        var metadata = (row["metadata"] as? [String: Any]) ?? [:]
+        let sourceId = (row["messageId"] as? String) ?? (row["id"] as? String) ?? UUID().uuidString
+
+        metadata["forwardedFromChatId"] = "vibe_agent"
+        metadata["forwarded_from_chat_id"] = "vibe_agent"
+        metadata["forwardedFromMessageId"] = sourceId
+        metadata["forwarded_from_message_id"] = sourceId
+        metadata["forwardedFromName"] =
+          metadata["forwardedFromName"]
+          ?? ((row["isMe"] as? Bool) == true ? (meName ?? "You") : "Vibe AI")
+        metadata["forwarded_from_name"] = metadata["forwardedFromName"]
+        if let meId, (row["isMe"] as? Bool) == true {
+          metadata["forwardedFromUserId"] = meId
+          metadata["forwarded_from_user_id"] = meId
+        } else {
+          metadata["forwardedFromUserId"] = "vibe_agent"
+          metadata["forwarded_from_user_id"] = "vibe_agent"
+        }
+        if let meAvatar, (row["isMe"] as? Bool) == true {
+          metadata["forwardedFromAvatar"] = meAvatar
+          metadata["forwarded_from_avatar"] = meAvatar
+        }
+        metadata["isForwarded"] = true
+        metadata["is_forwarded"] = true
+        // Keep snake_case mirrors for server/history round-trip.
+        if let name = metadata["forwardedFromName"] {
+          metadata["forwarded_from_name"] = name
+        }
+        if let uid = metadata["forwardedFromUserId"] {
+          metadata["forwarded_from_user_id"] = uid
+        }
+        if let av = metadata["forwardedFromAvatar"] {
+          metadata["forwarded_from_avatar"] = av
+        }
+
+        for key in [
+          "mediaUrl", "media_url", "localMediaUrl", "local_media_url", "fileName", "file_name",
+          "fileSize", "duration", "thumbnailBase64", "mediaKey", "cover", "coverUrl", "cover_url",
+          "artwork", "artist", "source", "platform",
+        ] {
+          if metadata[key] == nil, let value = row[key] {
+            metadata[key] = value
+          }
+        }
+        if metadata["cover"] == nil {
+          if let c = (metadata["coverUrl"] as? String) ?? (metadata["cover_url"] as? String)
+            ?? (metadata["artwork"] as? String)
+          {
+            metadata["cover"] = c
+            metadata["coverUrl"] = c
+          }
+        }
+
+        var payload: [String: Any] = [
+          "chatId": target,
+          "type": type == "agent_progress_tree" ? "text" : type,
+          "text": text,
+          "metadata": metadata,
+        ]
+        if let mediaUrl = metadata["mediaUrl"] as? String ?? row["mediaUrl"] as? String {
+          payload["mediaUrl"] = mediaUrl
+        }
+        if let local = metadata["localMediaUrl"] as? String ?? row["localMediaUrl"] as? String {
+          payload["localMediaUrl"] = local
+          payload["mediaUrl"] = payload["mediaUrl"] ?? local
+        }
+        if let fileName = metadata["fileName"] as? String ?? row["fileName"] as? String {
+          payload["fileName"] = fileName
+        }
+        if let duration = metadata["duration"] ?? row["duration"] {
+          payload["duration"] = duration
+        }
+        if let thumb = metadata["thumbnailBase64"] as? String ?? row["thumbnailBase64"] as? String {
+          payload["thumbnailBase64"] = thumb
+        }
+        if let mediaKey = metadata["mediaKey"] as? String ?? row["mediaKey"] as? String {
+          payload["mediaKey"] = mediaKey
+        }
+
+        // Agent turns often ship type "text" with media in metadata — normalize music.
+        if (payload["type"] as? String) == "text",
+          metadata["cover"] != nil || metadata["artist"] != nil,
+          payload["mediaUrl"] != nil
+        {
+          payload["type"] = "music"
+        }
+
+        let result = ChatEngine.shared.sendMessage(payload)
+        let ok = (result["accepted"] as? Bool) == true
+        NSLog(
+          "[ChatShare] agentForward target=%@ type=%@ accepted=%@ reason=%@",
+          String(target.prefix(12)),
+          payload["type"] as? String ?? "?",
+          ok ? "Y" : "N",
+          String(describing: result["reason"] ?? "")
+        )
+        if ok { sent += 1 }
+      }
+      let trimmedCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmedCaption.isEmpty {
+        _ = ChatEngine.shared.sendMessage([
+          "chatId": target,
+          "type": "text",
+          "text": trimmedCaption,
+        ])
+      }
+    }
+    return sent
   }
 
   private func pushAgentProfile(animated: Bool) {
@@ -14785,5 +16119,13 @@ final class ChatAgentConversationController: UIViewController {
     default:
       break
     }
+  }
+}
+
+// Same file-scoped helper the other App sources carry (AppRuntimeController, SettingsView).
+private extension String {
+  var nilIfBlank: String? {
+    let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 }

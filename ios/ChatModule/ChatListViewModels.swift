@@ -523,6 +523,19 @@ struct ChatListRow {
   let localMediaUrl: String?
   let mediaKey: String?
   let thumbnailBase64: String?
+  /// Album art / cover URL for music rows (server sends it as metadata "cover").
+  /// Rendered in the music bubble, the mini player banner, and the full player.
+  let musicCoverURL: String?
+  /// Artist / uploader for music rows (metadata "artist").
+  let musicArtist: String?
+  /// Source platform label for music rows (metadata "source", e.g. soundcloud → SoundCloud).
+  let musicSource: String?
+  /// Telegram-style forward attribution (metadata isForwarded + forwardedFrom*).
+  let isForwarded: Bool
+  let forwardedFromName: String?
+  let forwardedFromAvatar: String?
+  /// Original author id — feeds `ChatAvatarNodeView` palette / URL resolution.
+  let forwardedFromUserId: String?
   let fileName: String?
   let duration: Double?
   let waveform: [CGFloat]?
@@ -702,6 +715,13 @@ struct ChatListRow {
       localMediaUrl = nil
       mediaKey = nil
       thumbnailBase64 = nil
+      musicCoverURL = nil
+      musicArtist = nil
+      musicSource = nil
+      isForwarded = false
+      forwardedFromName = nil
+      forwardedFromAvatar = nil
+      forwardedFromUserId = nil
       fileName = nil
       duration = nil
       waveform = nil
@@ -877,13 +897,65 @@ struct ChatListRow {
       in: [message, metadata, extra],
       keys: ["thumbnailBase64", "thumbnail_base64"]
     )
+    musicCoverURL = firstNonEmptyString(
+      in: [metadata, message, extra],
+      keys: ["cover", "coverUrl", "cover_url", "artwork", "artworkUrl", "artwork_url", "albumArt", "albumArtUrl"]
+    )
+    musicArtist = firstNonEmptyString(
+      in: [metadata, message, extra],
+      keys: ["artist", "uploader", "channel", "creator"]
+    )
+    if let rawSource = firstNonEmptyString(
+      in: [metadata, message, extra],
+      keys: ["source", "platform", "provider"]
+    ) {
+      let lower = rawSource.lowercased()
+      if lower.contains("soundcloud") {
+        musicSource = "SoundCloud"
+      } else if lower.contains("youtu") {
+        musicSource = "YouTube"
+      } else {
+        musicSource = rawSource.prefix(1).uppercased() + rawSource.dropFirst()
+      }
+    } else {
+      musicSource = nil
+    }
+    let metaIsForwarded =
+      (metadata?["isForwarded"] as? Bool) == true
+      || (metadata?["is_forwarded"] as? Bool) == true
+      || firstNonEmptyString(
+        in: [metadata, message],
+        keys: [
+          "forwardedFromUserId", "forwarded_from_user_id", "forwardedFromName",
+          "forwarded_from_name", "forwardedFromMessageId", "forwarded_from_message_id",
+        ]
+      ) != nil
+    isForwarded = metaIsForwarded
+    forwardedFromName = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["forwardedFromName", "forwarded_from_name", "forwardedFromTitle", "forwarded_from_title"]
+    )
+    forwardedFromAvatar = firstNonEmptyString(
+      in: [metadata, message],
+      keys: [
+        "forwardedFromAvatar", "forwarded_from_avatar", "forwardedFromAvatarUrl",
+        "forwarded_from_avatar_url",
+      ]
+    )
+    forwardedFromUserId = firstNonEmptyString(
+      in: [metadata, message],
+      keys: ["forwardedFromUserId", "forwarded_from_user_id"]
+    )
     fileName =
       (message["fileName"] as? String)
       ?? (message["file_name"] as? String)
       ?? (metadata?["fileName"] as? String)
       ?? (metadata?["file_name"] as? String)
+      ?? (metadata?["title"] as? String)
     duration =
       parseDouble(message["duration"])
+      ?? parseDouble(metadata?["durationSeconds"])
+      ?? parseDouble(metadata?["duration_seconds"])
       ?? parseDouble(metadata?["duration"])
     waveform =
       parseWaveform(message["waveform"])
@@ -1370,6 +1442,13 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.messageType == rhs.messageType
     && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
     && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName
+    && lhs.musicCoverURL == rhs.musicCoverURL
+    && lhs.musicArtist == rhs.musicArtist
+    && lhs.musicSource == rhs.musicSource
+    && lhs.isForwarded == rhs.isForwarded
+    && lhs.forwardedFromName == rhs.forwardedFromName
+    && lhs.forwardedFromAvatar == rhs.forwardedFromAvatar
+    && lhs.forwardedFromUserId == rhs.forwardedFromUserId
     && optionalDoubleEqual(lhs.duration, rhs.duration) && lhs.isVideoNote == rhs.isVideoNote
     && optionalWaveformEqual(lhs.waveform, rhs.waveform)
     && optionalDoubleEqual(lhs.uploadProgress, rhs.uploadProgress)
@@ -1450,6 +1529,13 @@ func chatListRowSignatureFields(_ row: ChatListRow) -> [(name: String, value: St
     ("messageType", row.messageType), ("mediaUrl", String(describing: row.mediaUrl)),
     ("localMediaUrl", String(describing: row.localMediaUrl)),
     ("mediaKey", String(describing: row.mediaKey)), ("fileName", String(describing: row.fileName)),
+    ("musicCoverURL", String(describing: row.musicCoverURL)),
+    ("musicArtist", String(describing: row.musicArtist)),
+    ("musicSource", String(describing: row.musicSource)),
+    ("isForwarded", String(row.isForwarded)),
+    ("forwardedFromName", String(describing: row.forwardedFromName)),
+    ("forwardedFromAvatar", String(describing: row.forwardedFromAvatar)),
+    ("forwardedFromUserId", String(describing: row.forwardedFromUserId)),
     ("duration", String(describing: row.duration)), ("isVideoNote", String(row.isVideoNote)),
     ("waveform", String(describing: row.waveform)),
     ("uploadProgress", String(describing: row.uploadProgress)),

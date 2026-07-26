@@ -75,6 +75,10 @@ Interactive approvals for agents in this repo are governed by
 Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
 npm publish, ...) are blocked in every remote mode, even `full`.
 
+## Git checkout rule
+
+- **NEVER run `git checkout` under any circumstances.** Agents must not execute `git checkout` on any files or branches.
+
 ## Ask Fable (advisor) — only when you're actually stuck
 
 Fable runs on **paid credits** (and falls back to GPT when Fable itself is down), so

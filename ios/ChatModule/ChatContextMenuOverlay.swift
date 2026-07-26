@@ -108,7 +108,7 @@ public final class ChatContextMenuOverlay: UIView {
     self.bubbleIsMe = bubbleIsMe
     self.appearance = appearance
 
-    // Full-screen background: native system glass (ultraThin), same as Telegram
+    // Full-screen background: native system glass blur
     let bgStyle: UIBlurEffect.Style =
       appearance.isDark
       ? .systemMaterialDark
@@ -117,8 +117,8 @@ public final class ChatContextMenuOverlay: UIView {
 
     let colorOverlay = UIView()
     let isDarkMode = appearance.isDark
-    let overlayBaseColor: UIColor = isDarkMode ? .black : .white
-    let overlayAlpha: CGFloat = isDarkMode ? 0.42 : 0.32
+    let overlayBaseColor: UIColor = .black
+    let overlayAlpha: CGFloat = isDarkMode ? 0.38 : 0.28
     colorOverlay.backgroundColor = overlayBaseColor.withAlphaComponent(overlayAlpha)
     colorOverlay.translatesAutoresizingMaskIntoConstraints = false
     self.backgroundGlassView.contentView.addSubview(colorOverlay)
@@ -558,7 +558,7 @@ final class ReactionPickerView: UIView {
   private let tailBlobLarge: UIVisualEffectView
   private let tailBlobSmall: UIVisualEffectView
   private let stack: UIStackView
-  private let emojis = ["👍", "👎", "❤️", "🔥", "🎉", "💩"]
+  private let emojis = ["👍", "❤️", "👎", "🔥", "🥰", "👏", "😁"]
   private static let pickerButtonSize: CGFloat = 44.0
   private static let pickerSpacing: CGFloat = 4.0
   private static let pickerPadding: CGFloat = 12.0
@@ -580,13 +580,22 @@ final class ReactionPickerView: UIView {
   init(appearance: ChatListAppearance, messageId: String) {
     self.messageId = messageId
     let blurStyle: UIBlurEffect.Style =
-      appearance.isDark ? .systemThickMaterialDark : .systemThinMaterialLight
-    self.blurView = makeBlurMaterialView(
+      appearance.isDark ? .systemMaterialDark : .systemMaterialLight
+    self.blurView = makeChatContextLiquidGlassView(
       style: blurStyle,
-      cornerRadius: Self.pickerPillHeight * 0.5
+      cornerRadius: Self.pickerPillHeight * 0.5,
+      capsuleCorners: true
     )
-    self.tailBlobLarge = makeBlurMaterialView(style: blurStyle, cornerRadius: 5.5)
-    self.tailBlobSmall = makeBlurMaterialView(style: blurStyle, cornerRadius: 3.5)
+    self.tailBlobLarge = makeChatContextLiquidGlassView(
+      style: blurStyle,
+      cornerRadius: 5.5,
+      capsuleCorners: false
+    )
+    self.tailBlobSmall = makeChatContextLiquidGlassView(
+      style: blurStyle,
+      cornerRadius: 3.5,
+      capsuleCorners: false
+    )
     self.stack = UIStackView()
 
     super.init(frame: .zero)
@@ -604,10 +613,7 @@ final class ReactionPickerView: UIView {
     stack.alignment = .center
     stack.translatesAutoresizingMaskIntoConstraints = false
 
-    blurTintView.backgroundColor =
-      appearance.isDark
-      ? UIColor(white: 0.06, alpha: 0.30)
-      : UIColor.white.withAlphaComponent(0.18)
+    blurTintView.backgroundColor = .clear
     blurTintView.translatesAutoresizingMaskIntoConstraints = false
     blurView.contentView.addSubview(blurTintView)
 
@@ -647,10 +653,8 @@ final class ReactionPickerView: UIView {
 
     tailBlobLarge.bounds = CGRect(x: 0.0, y: 0.0, width: 11.0, height: 11.0)
     tailBlobSmall.bounds = CGRect(x: 0.0, y: 0.0, width: 7.0, height: 7.0)
-    tailBlobLarge.layer.borderColor = UIColor.white.withAlphaComponent(0.22).cgColor
-    tailBlobLarge.layer.borderWidth = 1.0 / UIScreen.main.scale
-    tailBlobSmall.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
-    tailBlobSmall.layer.borderWidth = 1.0 / UIScreen.main.scale
+    tailBlobLarge.layer.borderWidth = 0
+    tailBlobSmall.layer.borderWidth = 0
 
     for emoji in emojis {
       let btn = UIButton(type: .system)
@@ -756,45 +760,47 @@ final class ContextMenuView: UIView {
     var resolvedActions: [ActionItem] = [
       ActionItem(
         id: "reply", title: "Reply", iconName: "arrowshape.turn.up.left", isDestructive: false),
-      ActionItem(
-        id: "select", title: "Select", iconName: "checkmark.circle", isDestructive: false),
-      ActionItem(id: "copy", title: "Copy", iconName: "doc.on.doc", isDestructive: false),
       ActionItem(id: "pin", title: "Pin", iconName: "pin", isDestructive: false),
-      ActionItem(id: "delete", title: "Delete", iconName: "trash", isDestructive: true),
     ]
-    if showEditAction {
-      // Own text bubbles edit their content; own media bubbles edit (or add) the
-      // caption/description.
+    if !restrictSavingContent {
       resolvedActions.insert(
-        ActionItem(id: "edit", title: "Edit", iconName: "pencil", isDestructive: false),
+        ActionItem(id: "copy", title: "Copy", iconName: "doc.on.doc", isDestructive: false),
         at: 1
       )
     }
+    if showEditAction {
+      resolvedActions.append(
+        ActionItem(id: "edit", title: "Edit", iconName: "pencil", isDestructive: false)
+      )
+    }
     if showResendAction {
-      resolvedActions.insert(
+      resolvedActions.append(
         ActionItem(
           id: "resend",
           title: "Resend",
           iconName: "arrow.clockwise",
           isDestructive: false
-        ),
-        at: 2
+        )
       )
     }
     if showRegenerateAction {
-      // Agent bubbles: offer regenerate at the top of the hold menu.
-      resolvedActions.insert(
+      resolvedActions.append(
         ActionItem(
           id: "regenerate",
           title: "Regenerate",
           iconName: "arrow.trianglehead.2.counterclockwise",
           isDestructive: false
-        ),
-        at: 0
+        )
       )
     }
-    if restrictSavingContent {
-      resolvedActions.removeAll { $0.id == "copy" || $0.id == "select" }
+    resolvedActions.append(
+      ActionItem(id: "delete", title: "Delete", iconName: "trash", isDestructive: true)
+    )
+    if !restrictSavingContent {
+      resolvedActions.append(
+        ActionItem(
+          id: "select", title: "Select", iconName: "checkmark.circle", isDestructive: false)
+      )
     }
     self.actions = resolvedActions
     self.glassView = makeChatContextLiquidGlassView(
@@ -802,6 +808,7 @@ final class ContextMenuView: UIView {
       cornerRadius: 24,
       capsuleCorners: false
     )
+
     self.stack = UIStackView()
 
     super.init(frame: .zero)
@@ -814,8 +821,7 @@ final class ContextMenuView: UIView {
     stack.translatesAutoresizingMaskIntoConstraints = false
     glassView.contentView.addSubview(stack)
 
-    glassView.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
-    glassView.layer.borderWidth = 1.0 / UIScreen.main.scale
+    glassView.layer.borderWidth = 0
 
     NSLayoutConstraint.activate([
       glassView.topAnchor.constraint(equalTo: topAnchor),
@@ -827,11 +833,11 @@ final class ContextMenuView: UIView {
     ])
     let stackTop = stack.topAnchor.constraint(
       greaterThanOrEqualTo: glassView.contentView.topAnchor,
-      constant: 8
+      constant: 6
     )
     let stackBottom = stack.bottomAnchor.constraint(
       lessThanOrEqualTo: glassView.contentView.bottomAnchor,
-      constant: -8
+      constant: -6
     )
     let stackCenterY = stack.centerYAnchor.constraint(equalTo: glassView.contentView.centerYAnchor)
     stackTop.priority = .defaultHigh
@@ -840,7 +846,7 @@ final class ContextMenuView: UIView {
     NSLayoutConstraint.activate([stackTop, stackBottom, stackCenterY])
 
     for (index, action) in actions.enumerated() {
-      if index > 0 {
+      if action.id == "select" && index > 0 {
         let sepContainer = UIView()
         sepContainer.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(sepContainer)
@@ -853,23 +859,10 @@ final class ContextMenuView: UIView {
         let sepHeight = sepContainer.heightAnchor.constraint(
           equalToConstant: 1.0 / UIScreen.main.scale)
         sepHeight.priority = .defaultHigh
-        let lineLeading = line.leadingAnchor.constraint(
-          greaterThanOrEqualTo: sepContainer.leadingAnchor,
-          constant: 58
-        )
-        lineLeading.priority = .defaultLow
-        let lineTrailing = line.trailingAnchor.constraint(
-          lessThanOrEqualTo: sepContainer.trailingAnchor,
-          constant: -16
-        )
-        lineTrailing.priority = .defaultLow
-        let lineCenterX = line.centerXAnchor.constraint(equalTo: sepContainer.centerXAnchor)
-        lineCenterX.priority = .defaultLow
         NSLayoutConstraint.activate([
           sepHeight,
-          lineLeading,
-          lineTrailing,
-          lineCenterX,
+          line.leadingAnchor.constraint(equalTo: sepContainer.leadingAnchor, constant: 16),
+          line.trailingAnchor.constraint(equalTo: sepContainer.trailingAnchor, constant: -16),
           line.topAnchor.constraint(equalTo: sepContainer.topAnchor),
           line.bottomAnchor.constraint(equalTo: sepContainer.bottomAnchor),
         ])
@@ -922,19 +915,19 @@ final class ContextMenuRow: UIControl {
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     iconView.translatesAutoresizingMaskIntoConstraints = false
 
-    let rowHeight = heightAnchor.constraint(equalToConstant: 44)
+    let rowHeight = heightAnchor.constraint(equalToConstant: 46)
     rowHeight.priority = .defaultHigh
 
     NSLayoutConstraint.activate([
       rowHeight,
 
-      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
       iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 22),
-      iconView.heightAnchor.constraint(equalToConstant: 22),
+      iconView.widthAnchor.constraint(equalToConstant: 20),
+      iconView.heightAnchor.constraint(equalToConstant: 20),
 
-      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
-      titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16),
+      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 14),
+      titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -18),
       titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
     ])
   }

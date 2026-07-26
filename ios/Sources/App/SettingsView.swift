@@ -15,6 +15,7 @@ private enum SettingsRoute: String, Identifiable {
   case secretKey
   case appearance
   case mediaCache
+  case connectedApps
 
   var id: String { rawValue }
 }
@@ -140,8 +141,9 @@ struct SettingsView: View {
           SettingsNativeRow(
             id: "your-qr",
             icon: "qrcode",
-            label: "Your QR",
-            detailText: "Show",
+            // The link is the point of this row, so show it inline instead of "Show".
+            label: "Your Link & QR",
+            detailText: currentProfile.shareLinkDisplay ?? "Show",
             toggleValue: false,
             kind: .link,
             iconColor: UIColor(red: 0 / 255, green: 199 / 255, blue: 190 / 255, alpha: 1),
@@ -156,6 +158,17 @@ struct SettingsView: View {
             toggleValue: false,
             kind: .link,
             iconColor: UIColor(red: 255 / 255, green: 149 / 255, blue: 0 / 255, alpha: 1),
+            divider: true,
+            destructive: false
+          ),
+          SettingsNativeRow(
+            id: "connected-apps",
+            icon: "link.circle.fill",
+            label: "Connected Apps",
+            detailText: "GitHub · more",
+            toggleValue: false,
+            kind: .link,
+            iconColor: UIColor(red: 36 / 255, green: 41 / 255, blue: 47 / 255, alpha: 1),
             divider: false,
             destructive: false
           ),
@@ -372,6 +385,8 @@ struct SettingsView: View {
         AppearanceSettingsDetailView()
       case .mediaCache:
         MediaCacheSettingsDetailView()
+      case .connectedApps:
+        PlatformConnectorsView()
       }
     }
   }
@@ -416,6 +431,8 @@ struct SettingsView: View {
       activeRoute = .qr
     case "connection-manager":
       activeModal = .connectionManager
+    case "connected-apps":
+      activeRoute = .connectedApps
     case "privacy":
       activeRoute = .privacy
     case "notifications":
@@ -2070,13 +2087,16 @@ private struct EditProfileDrawingSpinner: View {
 private struct UserQRSettingsDetailView: View {
   @Environment(\.colorScheme) private var colorScheme
   let profile: AppUserProfile
+  @State private var isSharing = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
   }
 
+  /// The QR encodes the SHARE LINK, not the raw user id: scanning it in any camera app
+  /// opens the link, which opens Vibe. `vibe:<uuid>` only ever worked inside Vibe.
   private var qrCodeValue: String {
-    "vibe:\(profile.userID)"
+    profile.shareLink ?? "vibe:\(profile.userID)"
   }
 
   var body: some View {
@@ -2098,6 +2118,55 @@ private struct UserQRSettingsDetailView: View {
             }
           }
           .padding(.top, 40)
+
+          if let link = profile.shareLink, let display = profile.shareLinkDisplay {
+            VStack(alignment: .leading, spacing: 16) {
+              Text("YOUR LINK")
+                .font(.system(size: 11, weight: .bold))
+                .tracking(1.2)
+                .foregroundStyle(palette.secondaryText)
+                .padding(.leading, 4)
+
+              HStack(spacing: 12) {
+                Text(display)
+                  .font(.system(size: 16, weight: .medium))
+                  .foregroundStyle(palette.text)
+                  .lineLimit(1)
+                  .minimumScaleFactor(0.7)
+
+                Spacer(minLength: 0)
+
+                Button {
+                  UIPasteboard.general.string = link
+                  AppToastController.shared.show("Link copied")
+                } label: {
+                  Image(systemName: "doc.on.doc")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(palette.accent)
+                }
+
+                Button {
+                  isSharing = true
+                } label: {
+                  Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(palette.accent)
+                }
+              }
+              .padding(16)
+              .background(palette.card)
+              .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+              Text("Anyone with this link can open a chat with you.")
+                .font(.system(size: 13))
+                .foregroundStyle(palette.secondaryText)
+                .padding(.leading, 4)
+            }
+            .padding(.horizontal, 24)
+            .sheet(isPresented: $isSharing) {
+              AppShareSheet(items: [link])
+            }
+          }
 
           VStack(alignment: .leading, spacing: 16) {
              Text("YOUR UNIQUE ID")
@@ -2129,12 +2198,24 @@ private struct UserQRSettingsDetailView: View {
           }
           .padding(.horizontal, 24)
         }
+        .padding(.bottom, 32)
       }
     }
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Your QR")
     .navigationBarTitleDisplayMode(.inline)
   }
+}
+
+/// Thin UIActivityViewController wrapper for sharing a link out of SwiftUI.
+struct AppShareSheet: UIViewControllerRepresentable {
+  let items: [Any]
+
+  func makeUIViewController(context: Context) -> UIActivityViewController {
+    UIActivityViewController(activityItems: items, applicationActivities: nil)
+  }
+
+  func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 private struct SecretKeySettingsDetailView: View {
@@ -2265,10 +2346,31 @@ private struct MediaCacheSettingsDetailView: View {
 
   var body: some View {
     List {
-      Section("Storage") {
-        SettingsValueLine(title: "Cached tracks", value: "\(stats.trackCount)")
-        SettingsValueLine(title: "Recent plays", value: "\(stats.recentlyPlayedCount)")
-        SettingsValueLine(title: "Used storage", value: formattedBytes(stats.bytesUsed))
+      Section {
+        ForEach(stats.categories) { category in
+          HStack(spacing: 12) {
+            Image(systemName: category.systemImage)
+              .font(.system(size: 15, weight: .semibold))
+              .foregroundStyle(palette.accent)
+              .frame(width: 24)
+            VStack(alignment: .leading, spacing: 1) {
+              Text(category.title)
+                .foregroundStyle(.primary)
+              Text("\(category.fileCount) \(category.fileCount == 1 ? "file" : "files")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(formattedBytes(category.bytesUsed))
+              .foregroundStyle(.secondary)
+              .monospacedDigit()
+          }
+        }
+        SettingsValueLine(title: "Total", value: formattedBytes(stats.totalBytes))
+      } header: {
+        Text("Downloaded media")
+      } footer: {
+        Text("Space used by media downloaded from chats. Your own uploads and recordings are stored separately and are never cleared here.")
       }
       .listRowBackground(palette.card)
 
@@ -2297,16 +2399,31 @@ private struct MediaCacheSettingsDetailView: View {
       }
       .listRowBackground(palette.card)
 
-      Section("Actions") {
+      Section {
+        ForEach(stats.categories) { category in
+          Button(role: .destructive) {
+            AppMediaCacheController.clearCategory(id: category.id)
+            refreshStats()
+          } label: {
+            Text("Clear \(category.title.lowercased())")
+          }
+          .disabled(category.bytesUsed == 0)
+        }
+
         Button("Clear Expired") {
           AppMediaCacheController.clearExpired(olderThanDays: cacheExpiryDays)
           refreshStats()
         }
 
-        Button("Clear All", role: .destructive) {
+        Button("Clear All Downloads", role: .destructive) {
           AppMediaCacheController.clearAll()
           refreshStats()
         }
+        .disabled(stats.totalBytes == 0)
+      } header: {
+        Text("Clear cache")
+      } footer: {
+        Text("Cleared media re-downloads automatically the next time you open it.")
       }
       .listRowBackground(palette.card)
     }
@@ -2608,38 +2725,60 @@ private enum QRCodeRenderer {
   }
 }
 
-private struct AppMediaCacheStats {
-  let trackCount: Int
-  let recentlyPlayedCount: Int
+private struct AppCacheCategoryStat: Identifiable {
+  let id: String
+  let title: String
+  let systemImage: String
   let bytesUsed: Int64
+  let fileCount: Int
 }
 
+private struct AppMediaCacheStats {
+  let categories: [AppCacheCategoryStat]
+
+  var totalBytes: Int64 { categories.reduce(0) { $0 + $1.bytesUsed } }
+  var totalFiles: Int { categories.reduce(0) { $0 + $1.fileCount } }
+}
+
+/// App-wide DOWNLOAD cache accounting + clearing. Every directory listed here holds media
+/// that was downloaded from the server and can always be re-fetched, so clearing is safe.
+/// Upload/own-recording staging dirs (`chat-local-attachments`, `voice-local-imports`,
+/// `video-notes`) are deliberately NOT listed — clearing them would lose media that can't
+/// be re-downloaded (the user asked to clear downloads only, never their pending uploads).
 private enum AppMediaCacheController {
-  private static let directoryNames = [
-    "native-music-player-cache",
-    "music_cache",
-  ]
+  static let categories:
+    [(id: String, title: String, systemImage: String, directories: [String])] = [
+      (
+        "audio", "Voice & Music", "music.note",
+        ["voice-cache", "native-music-player-cache", "music_cache"]
+      ),
+      ("photos", "Photos", "photo", ["chat-media-images", "vibe-avatars"]),
+      ("videos", "Video Previews", "film", ["chat-media-video-preview"]),
+    ]
 
   static func cacheStats() -> AppMediaCacheStats {
-    var trackCount = 0
-    var bytesUsed: Int64 = 0
-
-    for fileURL in cachedFileURLs() {
-      trackCount += 1
-      let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-      bytesUsed += Int64(fileSize)
+    let categoryStats = categories.map { category -> AppCacheCategoryStat in
+      var bytes: Int64 = 0
+      var count = 0
+      for fileURL in fileURLs(in: category.directories) {
+        count += 1
+        bytes += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+      }
+      return AppCacheCategoryStat(
+        id: category.id,
+        title: category.title,
+        systemImage: category.systemImage,
+        bytesUsed: bytes,
+        fileCount: count
+      )
     }
-
-    return AppMediaCacheStats(
-      trackCount: trackCount,
-      recentlyPlayedCount: 0,
-      bytesUsed: bytesUsed
-    )
+    return AppMediaCacheStats(categories: categoryStats)
   }
 
   static func clearExpired(olderThanDays days: Int) {
     let threshold = Date().addingTimeInterval(-Double(max(days, 1)) * 86_400.0)
-    for fileURL in cachedFileURLs() {
+    let removableDirectories = categories.flatMap(\.directories)
+    for fileURL in fileURLs(in: removableDirectories) {
       let contentDate =
         (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
         ?? .distantPast
@@ -2650,25 +2789,34 @@ private enum AppMediaCacheController {
   }
 
   static func clearAll() {
-    for fileURL in cachedFileURLs() {
+    removeFiles(in: categories.flatMap(\.directories))
+  }
+
+  static func clearCategory(id: String) {
+    guard let category = categories.first(where: { $0.id == id }) else { return }
+    removeFiles(in: category.directories)
+  }
+
+  private static func removeFiles(in directories: [String]) {
+    for fileURL in fileURLs(in: directories) {
       try? FileManager.default.removeItem(at: fileURL)
     }
   }
 
-  private static func cachedFileURLs() -> [URL] {
+  private static func fileURLs(in directories: [String]) -> [URL] {
     let baseDirectory =
       FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
       ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
 
-    return directoryNames.flatMap { directoryName in
+    return directories.flatMap { directoryName -> [URL] in
       let directoryURL = baseDirectory.appendingPathComponent(directoryName, isDirectory: true)
-      let fileURLs =
+      let contents =
         (try? FileManager.default.contentsOfDirectory(
           at: directoryURL,
-          includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+          includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey],
           options: [.skipsHiddenFiles]
         )) ?? []
-      return fileURLs.filter { !$0.hasDirectoryPath }
+      return contents.filter { !$0.hasDirectoryPath }
     }
   }
 }

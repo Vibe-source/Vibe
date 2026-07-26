@@ -73,7 +73,7 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
   private let tapRecognizer = UITapGestureRecognizer()
 
   override var intrinsicContentSize: CGSize {
-    CGSize(width: UIView.noIntrinsicMetric, height: 58)
+    CGSize(width: UIView.noIntrinsicMetric, height: 62)
   }
 
   override init(frame: CGRect) {
@@ -95,6 +95,7 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
     highlightOverlayView.alpha = 0
     addSubview(highlightOverlayView)
 
+    // Slightly roomier tiles: 34×34, corner 8, larger glyph, softer tint.
     iconBackgroundView.translatesAutoresizingMaskIntoConstraints = false
     iconBackgroundView.layer.cornerRadius = 8
     iconBackgroundView.clipsToBounds = true
@@ -119,7 +120,7 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
     addSubview(titleLabel)
 
     valueLabel.translatesAutoresizingMaskIntoConstraints = false
-    valueLabel.font = .systemFont(ofSize: 15, weight: .regular)
+    valueLabel.font = .systemFont(ofSize: 16, weight: .regular)
     valueLabel.textAlignment = .right
     valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
     valueLabel.setContentHuggingPriority(.required, for: .horizontal)
@@ -133,7 +134,7 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
     chevronImageView.isUserInteractionEnabled = false
     chevronImageView.image = UIImage(
       systemName: "chevron.right",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
     )
     addSubview(chevronImageView)
 
@@ -148,27 +149,28 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
     addSubview(dividerView)
 
     NSLayoutConstraint.activate([
-      heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
+      heightAnchor.constraint(greaterThanOrEqualToConstant: 62),
 
       highlightOverlayView.leadingAnchor.constraint(equalTo: leadingAnchor),
       highlightOverlayView.trailingAnchor.constraint(equalTo: trailingAnchor),
       highlightOverlayView.topAnchor.constraint(equalTo: topAnchor),
       highlightOverlayView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-      iconBackgroundView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+      // More edge air (16) + larger icon tile (34) + roomier vertical pad (16).
+      iconBackgroundView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
       iconBackgroundView.centerYAnchor.constraint(equalTo: centerYAnchor),
       iconBackgroundView.widthAnchor.constraint(equalToConstant: 34),
       iconBackgroundView.heightAnchor.constraint(equalToConstant: 34),
 
       iconView.centerXAnchor.constraint(equalTo: iconBackgroundView.centerXAnchor),
       iconView.centerYAnchor.constraint(equalTo: iconBackgroundView.centerYAnchor),
-      iconView.widthAnchor.constraint(equalToConstant: 19),
-      iconView.heightAnchor.constraint(equalToConstant: 19),
+      iconView.widthAnchor.constraint(equalToConstant: 18),
+      iconView.heightAnchor.constraint(equalToConstant: 18),
 
-      titleLabel.leadingAnchor.constraint(equalTo: iconBackgroundView.trailingAnchor, constant: 12),
+      titleLabel.leadingAnchor.constraint(equalTo: iconBackgroundView.trailingAnchor, constant: 14),
       titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-      chevronImageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      chevronImageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
       chevronImageView.centerYAnchor.constraint(equalTo: centerYAnchor),
       chevronImageView.widthAnchor.constraint(equalToConstant: 12),
       chevronImageView.heightAnchor.constraint(equalToConstant: 14),
@@ -177,17 +179,17 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
       valueLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
       valueLabel.trailingAnchor.constraint(equalTo: chevronImageView.leadingAnchor, constant: -8),
 
-      switchControl.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      switchControl.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
       switchControl.centerYAnchor.constraint(equalTo: centerYAnchor),
       switchControl.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
 
       dividerView.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-      dividerView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+      dividerView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
       dividerView.bottomAnchor.constraint(equalTo: bottomAnchor),
       dividerView.heightAnchor.constraint(equalToConstant: 1.0 / UIScreen.main.scale),
 
-      topAnchor.constraint(lessThanOrEqualTo: titleLabel.topAnchor, constant: 14),
-      bottomAnchor.constraint(greaterThanOrEqualTo: titleLabel.bottomAnchor, constant: 14),
+      topAnchor.constraint(lessThanOrEqualTo: titleLabel.topAnchor, constant: 16),
+      bottomAnchor.constraint(greaterThanOrEqualTo: titleLabel.bottomAnchor, constant: 16),
     ])
   }
 
@@ -209,13 +211,14 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
     accessibilityLabel = row.label
 
     let hasAccent = row.iconColor.cgColor.alpha > 0.01
+    // Soften tile tint (was full system color — read as too loud).
     iconBackgroundView.backgroundColor =
       hasAccent
-      ? row.iconColor
+      ? row.iconColor.withAlphaComponent(theme.isDark ? 0.78 : 0.88)
       : (theme.isDark ? UIColor.white : UIColor.black).withAlphaComponent(theme.isDark ? 0.10 : 0.08)
     iconView.image = UIImage(
       systemName: row.icon,
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
     )
     iconView.tintColor = hasAccent ? .white : theme.secondaryText.withAlphaComponent(theme.isDark ? 0.92 : 0.78)
     titleLabel.text = row.label
@@ -327,7 +330,7 @@ final class SettingsNativeRowContainerView: UIView {
   private let rowView = SettingsNativeRowView()
 
   override var intrinsicContentSize: CGSize {
-    CGSize(width: UIView.noIntrinsicMetric, height: 58)
+    CGSize(width: UIView.noIntrinsicMetric, height: 62)
   }
 
   override init(frame: CGRect) {
@@ -344,7 +347,7 @@ final class SettingsNativeRowContainerView: UIView {
       rowView.trailingAnchor.constraint(equalTo: trailingAnchor),
       rowView.topAnchor.constraint(equalTo: topAnchor),
       rowView.bottomAnchor.constraint(equalTo: bottomAnchor),
-      heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
+      heightAnchor.constraint(greaterThanOrEqualToConstant: 62),
     ])
   }
 
@@ -530,11 +533,10 @@ private enum SettingsAvatarHeroMetrics {
   static let collapsedSize: CGFloat = 36
   static let bottomSpacing: CGFloat = 8
   /// Pull-down distance (rubber-banded pts) over which the live expand scrub reaches
-  /// p=1 — the moment the image "becomes the view" and the commit takes over.
-  static let expandPullTravel: CGFloat = 80
-  /// Releasing a pull past this fraction of the scrub commits the expand with the
-  /// spring; releasing earlier lets the native bounce shrink the hero back.
-  static let expandCommitFraction: CGFloat = 0.5
+  /// p=1. Kept short — iOS rubber-band resistance rarely yields 80pt of raw offset.
+  static let expandPullTravel: CGFloat = 52
+  /// Releasing a pull past this fraction finishes expand. ~0.3 ≈ one natural tug.
+  static let expandCommitFraction: CGFloat = 0.30
 
   static func expandedTop(for safeTop: CGFloat) -> CGFloat {
     _ = safeTop
@@ -817,6 +819,17 @@ private struct SettingsAvatarInnerContent: View {
   }
 }
 
+private struct SettingsHeroClipModifier: ViewModifier {
+  let clip: Bool
+  func body(content: Content) -> some View {
+    if clip {
+      content.clipped()
+    } else {
+      content
+    }
+  }
+}
+
 /// ONE continuous media morph (circle → hero). Driven by `model.heroExpandProgress`
 /// under a single spring — not a separate overlay layer.
 private struct SettingsAvatarScrollMorphView: View {
@@ -933,7 +946,9 @@ private struct SettingsAvatarScrollMorphView: View {
         .padding(.leading, 16)
     }
     .frame(width: band, height: hostBandHeight, alignment: .top)
-    .clipped()
+    // Mid-expand scrub keeps the UIKit band height collapsed (avoids rubber-band
+    // fight); allow overflow so the morph can still draw. Clip only at rest.
+    .modifier(SettingsHeroClipModifier(clip: ep < 0.001 || ep > 0.999))
   }
 
   /// Mid-flight only — pairs with UIKit [HeroMorph] ticks to expose render lag/drift.
@@ -2012,18 +2027,28 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
 
     if !heroExpanded {
       if y < 0 {
-        // Finger-tracked expand scrub — immediate response from the first pt.
+        // Finger-tracked expand scrub. Do NOT grow the UIKit band height while
+        // rubber-banding — that contentSize change eats the overscroll and caps
+        // p around ~0.15 (see logs). Visual p updates only; commit expands the band.
         let pLive = min(1, -y / SettingsAvatarHeroMetrics.expandPullTravel)
         avatarView.setScrollCollapseFade(0)
-        applyHeaderLayout(p: pLive, stretch: 0, extraTop: 0)
-        if pLive >= 1, expandGestureArmed {
+        avatarView.clipsToBounds = false
+        heroExpandProgress = pLive
+        avatarView.setHeroExpandProgress(pLive, animated: false)
+        // Keep settled collapsed band height so bounce distance stays usable.
+        let collapsedH = avatarBandHeight(for: 0)
+        if abs((avatarBandHeightConstraint?.constant ?? 0) - collapsedH) > 0.5 {
+          avatarBandHeightConstraint?.constant = collapsedH
+        }
+        if pLive >= 0.98, expandGestureArmed {
           expandGestureArmed = false
-          NSLog("[HeroMorph] full-pull commit y=%.1f", Double(y))
+          NSLog("[HeroMorph] full-pull commit y=%.1f p=%.3f", Double(y), Double(pLive))
           commitHeroExpand()
         }
         return
       }
       expandGestureArmed = true
+      avatarView.clipsToBounds = true
       if heroExpandProgress > 0 {
         applyHeaderLayout(p: 0, stretch: 0, extraTop: 0)
       }
@@ -2068,6 +2093,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
 
     isCommittingHero = true
     heroExpanded = true
+    avatarView.clipsToBounds = true
 
     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
 

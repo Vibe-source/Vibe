@@ -295,6 +295,7 @@ enum ChatNativeAgentTextRenderer {
     font: UIFont
   ) -> NSAttributedString {
     let mutable = NSMutableAttributedString(string: text, attributes: baseAttrs)
+    let linkColor = (baseAttrs[.foregroundColor] as? UIColor) ?? .label
 
     // 1) Markdown links [label](url) — replace first to preserve offsets.
     let linkMatches = chatNativeAgentMarkdownLinkRegex.matches(
@@ -312,7 +313,11 @@ enum ChatNativeAgentTextRenderer {
       let replacedRange = NSRange(location: match.range.location, length: (label as NSString).length)
       if let url = URL(string: urlString) {
         mutable.addAttribute(.link, value: url, range: replacedRange)
-        mutable.addAttribute(.foregroundColor, value: UIColor.systemBlue, range: replacedRange)
+        // Match body text color (not system blue) — Telegram-style white-on-bubble links.
+        mutable.addAttribute(.foregroundColor, value: linkColor, range: replacedRange)
+        mutable.addAttribute(
+          .underlineStyle, value: NSUnderlineStyle.single.rawValue, range: replacedRange
+        )
       }
     }
 
@@ -363,8 +368,9 @@ enum ChatNativeAgentTextRenderer {
           let display = cleanURLDisplay(url)
           var linkAttrs = baseAttrs
           linkAttrs[.link] = url
-          linkAttrs[.foregroundColor] = UIColor.systemBlue
-          // Modern compact look without underline
+          // Same color as bubble body text; single underline marks tappable.
+          linkAttrs[.foregroundColor] = linkColor
+          linkAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
           mutable.replaceCharacters(
             in: m.range,
             with: NSAttributedString(string: display, attributes: linkAttrs)
@@ -2523,6 +2529,11 @@ final class ChatNativeStreamingTextLabel: UITextView {
     self.textContainer.widthTracksTextView = true
     backgroundColor = .clear
     isUserInteractionEnabled = true
+    // Telegram-style: links use bubble body color (not system blue).
+    linkTextAttributes = [
+      .foregroundColor: UIColor.label,
+      .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
     let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
     tap.cancelsTouchesInView = false
     addGestureRecognizer(tap)
@@ -2547,6 +2558,15 @@ final class ChatNativeStreamingTextLabel: UITextView {
 
   func applyStreamingText(_ attributedText: NSAttributedString, rawText: String, isStreaming: Bool) {
     _ = rawText
+    // UITextView forces system-blue links via linkTextAttributes unless overridden.
+    let bodyColor =
+      (attributedText.length > 0
+        ? attributedText.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor
+        : nil) ?? textColor ?? .label
+    linkTextAttributes = [
+      .foregroundColor: bodyColor,
+      .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
     let previousTargetText = fullAttributedValue?.string ?? self.attributedText?.string ?? ""
     let previousTargetLength = fullAttributedValue?.length ?? self.attributedText?.length ?? 0
     let currentRenderedString = self.attributedText?.string ?? ""

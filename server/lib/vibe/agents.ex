@@ -677,6 +677,9 @@ defmodule Vibe.Agents do
       id: agent.id,
       userId: agent.agent_user_id,
       username: agent.agent_user && agent.agent_user.username,
+      # The one link an owner can share for this agent. Built here so the app, the
+      # builder, and the assistant all quote the same URL (see Vibe.Links).
+      publicLink: Vibe.Links.agent_url(agent.agent_user && agent.agent_user.username),
       displayName: agent.display_name,
       status: agent.status,
       modelProvider: agent.model_provider,
@@ -1005,13 +1008,25 @@ defmodule Vibe.Agents do
     case Map.get(attrs, "username") || Map.get(attrs, :username) do
       value when is_binary(value) ->
         if String.trim(value) == "" do
-          {:ok, generate_available_username(display_name)}
+          derive_username(display_name)
         else
           username_availability(value, nil)
         end
 
       _ ->
-        {:ok, generate_available_username(display_name)}
+        derive_username(display_name)
+    end
+  end
+
+  # The username IS the agent's public identity — it's what `vibegram.io/<username>`
+  # resolves to — so it has to read like a handle a person chose. We derive the clean
+  # one from the display name and, when it's taken, refuse instead of minting
+  # `newsroom_9f3a1c`: the caller asks the owner to pick another one (and can offer
+  # `suggest_usernames/2`).
+  defp derive_username(display_name) do
+    case username_base(display_name) do
+      nil -> {:error, :invalid_username}
+      base -> username_availability(base, nil)
     end
   end
 
@@ -1076,35 +1091,41 @@ defmodule Vibe.Agents do
     end
   end
 
-  defp generate_available_username(display_name) do
-    base =
-      display_name
-      |> to_string()
-      |> String.downcase()
-      |> String.replace(~r/[^a-z0-9_]+/, "_")
-      |> String.trim("_")
-      |> case do
-        "" -> "agent"
-        value -> value
-      end
-      |> String.slice(0, 18)
+  @doc """
+  Clean handle candidates derived from a display name, filtered to the ones that are
+  actually free. Never contains random digits — these are meant to be *offered* to the
+  owner when their first choice is taken.
+  """
+  def suggest_usernames(display_name, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 4)
+    base = username_base(display_name) || "agent"
 
-    Stream.iterate(1, &(&1 + 1))
-    |> Enum.find_value(fn attempt ->
-      suffix = Base.encode16(:crypto.strong_rand_bytes(3), case: :lower)
-      candidate = "#{base}_#{suffix}" |> String.slice(0, 30)
-
+    ([base] ++
+       Enum.map(~w[ai bot hq agent live], &"#{base}_#{&1}") ++
+       Enum.map(~w[ask my the], &"#{&1}_#{base}"))
+    |> Enum.uniq()
+    |> Enum.reduce_while([], fn candidate, acc ->
       cond do
-        reserved_username?(candidate) ->
-          nil
-
-        Accounts.username_exists?(candidate) ->
-          nil
-
-        true ->
-          candidate
+        length(acc) >= limit -> {:halt, acc}
+        match?({:ok, _}, username_availability(candidate, nil)) -> {:cont, acc ++ [candidate]}
+        true -> {:cont, acc}
       end
     end)
+  end
+
+  @doc false
+  def username_base(display_name) do
+    display_name
+    |> to_string()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9_]+/, "_")
+    |> String.replace(~r/_+/, "_")
+    |> String.trim("_")
+    |> String.slice(0, 24)
+    |> case do
+      "" -> nil
+      value -> value
+    end
   end
 
   defp generate_secret_tuple do

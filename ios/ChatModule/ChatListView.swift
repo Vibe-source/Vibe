@@ -574,12 +574,13 @@ private final class ChatNativeMusicPlayerBar: UIView {
     artworkPlaceholderView.tintColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: 0.48)
     titleLabel.textColor = isDark ? .white : UIColor(white: 0.08, alpha: 1.0)
     subtitleLabel.textColor = isDark ? UIColor(white: 1.0, alpha: 0.68) : UIColor(white: 0.16, alpha: 0.72)
-    progressTrackView.backgroundColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: isDark ? 0.12 : 0.10)
-    progressFillView.backgroundColor = appearance.bubbleMeGradient.first ?? appearance.bubbleThemColor
+    progressTrackView.backgroundColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: isDark ? 0.18 : 0.12)
+    // White bar fill to match white play/download icon chrome.
+    progressFillView.backgroundColor = .white
     playbackButton.applyStyle(
-      fillColor: UIColor(white: 1.0, alpha: 0.96),
-      iconTint: appearance.bubbleMeGradient.first ?? UIColor.systemBlue,
-      ringTint: (appearance.bubbleMeGradient.first ?? UIColor.systemBlue).withAlphaComponent(0.8)
+      fillColor: UIColor(white: isDark ? 0.22 : 0.18, alpha: 0.96),
+      iconTint: .white,
+      ringTint: .white
     )
   }
 
@@ -595,8 +596,8 @@ private final class ChatNativeMusicPlayerBar: UIView {
 
     let newSubtitle: String
     if snapshot.isDownloading {
-      let percent = Int(round(Double(snapshot.downloadProgress ?? 0.0) * 100.0))
-      newSubtitle = percent > 0 ? "Downloading \(percent)%" : "Downloading"
+      // Quiet status — no percent spam that reflows the subtitle every tick.
+      newSubtitle = "Loading"
     } else if snapshot.duration > 0.0 {
       let current = snapshot.duration * Double(snapshot.progress)
       newSubtitle = "\(formatNativeMusicPlayerTime(current)) / \(formatNativeMusicPlayerTime(snapshot.duration))"
@@ -613,7 +614,7 @@ private final class ChatNativeMusicPlayerBar: UIView {
       playbackButton.setDownloadState(
         needsDownload: true,
         isDownloading: true,
-        progress: snapshot.downloadProgress
+        progress: snapshot.downloadProgress.map { CGFloat($0) }
       )
     } else {
       playbackButton.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
@@ -626,8 +627,16 @@ private final class ChatNativeMusicPlayerBar: UIView {
 
     if bounds.width > 0 {
       let progressWidth = max(0.0, closeButton.frame.minX - 10.0 - titleLabel.frame.minX)
-      progressFillView.frame.size.width = progressWidth * max(0.0, min(1.0, snapshot.progress))
-      let hideProgress = snapshot.isDownloading || snapshot.duration <= 0.0
+      // While loading, drive the bar from download progress (smooth muted fill).
+      // While playing, use playback progress.
+      let fillFraction: CGFloat
+      if snapshot.isDownloading {
+        fillFraction = max(0.04, min(1.0, CGFloat(snapshot.downloadProgress ?? 0.12)))
+      } else {
+        fillFraction = max(0.0, min(1.0, snapshot.progress))
+      }
+      let hideProgress = !snapshot.isDownloading && snapshot.duration <= 0.0
+      progressFillView.frame.size.width = progressWidth * fillFraction
       if progressTrackView.isHidden != hideProgress {
         progressTrackView.isHidden = hideProgress
         progressFillView.isHidden = hideProgress
@@ -671,15 +680,23 @@ private final class ChatNativeMusicPlayerBar: UIView {
     let progressX = textX
     let progressY = bounds.height - 10.0
     let progressWidth = max(0.0, closeButton.frame.minX - 10.0 - progressX)
+    let fillFraction: CGFloat
+    if snapshot.isDownloading {
+      fillFraction = max(0.04, min(1.0, CGFloat(snapshot.downloadProgress ?? 0.12)))
+    } else {
+      fillFraction = max(0.0, min(1.0, snapshot.progress))
+    }
     progressTrackView.frame = CGRect(x: progressX, y: progressY, width: progressWidth, height: 3.0)
     progressFillView.frame = CGRect(
       x: progressX,
       y: progressY,
-      width: progressWidth * max(0.0, min(1.0, snapshot.progress)),
+      width: progressWidth * fillFraction,
       height: 3.0
     )
-    progressTrackView.isHidden = snapshot.isDownloading || snapshot.duration <= 0.0
-    progressFillView.isHidden = progressTrackView.isHidden
+    // Keep the muted bar visible during load (fill shows download), hide only when idle with no duration.
+    let hideProgress = !snapshot.isDownloading && snapshot.duration <= 0.0
+    progressTrackView.isHidden = hideProgress
+    progressFillView.isHidden = hideProgress
   }
 
   @objc private func handleTogglePlayback() {
@@ -804,6 +821,51 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var deferredPresentationSeedSourceRows: [[String: Any]]? = nil
   private var deferredPresentationSeedPreferredRows: [ChatListRow]? = nil
   private var deferredPresentationSeedStashedAt: TimeInterval = 0
+  /// Where a presentation seed's rows came from. THREE producers race to feed the seed
+  /// during a single push — the warm same-run snapshot, the route's bounded
+  /// `initialRows` preview, and the off-main authoritative engine read — and they land
+  /// in whatever order the engine's serial queue allows.
+  ///
+  /// The old rule was "last writer wins, then the first mount latches", and both halves
+  /// bite: a 16-row route preview arriving second REPLACED a 129-row already-parsed warm
+  /// stash (seen in the device log as `DEFER rows=129` immediately followed by
+  /// `DEFER rows=16`), and once ANY seed had mounted, `installPresentationSeedIfNeeded`
+  /// bailed on non-empty `rows` while `applyRows` returned right after calling it — so a
+  /// full transcript arriving after the mount tick was dropped on the floor entirely.
+  /// The chat then sat on the tiny seed for the whole push and only filled in at
+  /// presentation-complete, which re-read the SAME queue it had just lost a race to.
+  ///
+  /// That is the intermittent "wallpaper for a second, then the list slams in", and it is
+  /// why it only misbehaves after a relaunch: in a live session there IS a warm snapshot
+  /// and `getChatRows` returns in ~1ms, so the full payload wins the race by luck. After
+  /// a relaunch there is no snapshot and the engine queue is saturated (chat-list load,
+  /// other chats' history, socket join), so it reliably loses.
+  ///
+  /// The replacement rule is monotone: a seed may only ever be UPGRADED, ranked by
+  /// (source authority, row count). Raw count alone is a freshness proxy, not freshness —
+  /// a large warm snapshot can be staler than a small route preview holding a
+  /// just-arrived message — so authority leads and count only breaks ties.
+  private enum PresentationSeedSource: Int, Comparable {
+    /// Bounded preview carried down by the chat-list row. Smallest and least complete.
+    case routePreview = 0
+    /// Previous open's fully parsed transcript, valid for this process run only.
+    case warmSnapshot = 1
+    /// `setAuthoritativeRows` — a full engine read. Always the best answer available.
+    case engineSnapshot = 2
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+  }
+
+  /// Rank of the seed currently mounted, and of the one currently stashed for mounting.
+  /// `nil` = nothing seeded/stashed yet, so anything is an upgrade.
+  private var mountedPresentationSeedRank: (source: PresentationSeedSource, count: Int)?
+  private var stashedPresentationSeedRank: (source: PresentationSeedSource, count: Int)?
+  /// A payload that arrived during the defer window but could not be seeded (it was not
+  /// an upgrade, or the seed had already mounted). Retained rather than dropped so
+  /// presentation-complete can apply rows it ALREADY HAS instead of queueing a second
+  /// `getChatRows` behind the same busy serial queue that made it late in the first place.
+  private var deferredPresentationPendingRows: [[String: Any]]?
+  private var deferredPresentationPendingAuthority: RowsAuthority = .incremental
   /// Frame-1 content for reopens: a bitmap of the transcript captured when the chat
   /// was last closed, shown in the otherwise-empty shell the commit-first push
   /// presents, then crossfaded out once the deferred seed mounts. Memory-only by
@@ -868,7 +930,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// rows never changed), and trusting them renders bubbles taller or shorter than
   /// their cells — the overlapping-RTL-bubbles bug. Restore discards mismatched files
   /// wholesale; the next open re-measures fresh behind the reopen raster.
-  private static let bubbleLayoutRevision = "r2"
+  // r4: r3 was written to disk by a build where RTL bubbles used the INLINE layout. That
+  // layout was reverted (RTL stacks its meta again), so every persisted r3 RTL height is
+  // one meta-row too short — the cell comes back shorter than the bubble it renders and the
+  // bubbles overlap. A revision is only reusable while the geometry that produced it is
+  // still the geometry in force; reverting a layout needs a NEW revision, not the old one.
+  // Bumped when agent-turn height floor / width rule changes so disk heights re-measure.
+  private static let bubbleLayoutRevision = "r5-agent-cell-selfsize"
   private struct PersistedHeightsFile: Codable {
     let rev: String
     let e: [String: PersistedHeightEntry]
@@ -980,6 +1048,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var searchQuery = ""
   private var nativeSendEnabled = false
   private var agentChatMode = false
+  /// Agent mode still owns composer controls and transport, but its transcript follows the
+  /// same chronological/bottom-anchored layout as a one-to-one chat. Keep the former
+  /// push-question-to-top implementation gated independently so it cannot reserve blank space.
+  private let agentTopAnchoringEnabled = false
   // When the user taps "!" on a failed agent message, its id is armed here so the
   // next composer send re-uses it (triggering a clean truncate-and-resend).
   private var editingAgentMessageId: String?
@@ -1008,6 +1080,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// freely (ChatGPT-style: pinned until you scroll, then free until next send).
   /// Reset on each send.
   private var agentPinUserDetached = false
+  private var lastAgentPinLogSignature: String?
   private var engineSurfaceId: String = ""
   private var engineChatId: String = ""
   private var engineMyUserId: String = ""
@@ -1154,6 +1227,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var selectedMessageIds = Set<String>()
   private var pendingSendTransition: SendTransitionPayload?
   private var activeSendTransition: SendTransitionState?
+  /// Snapshot + start frame for video-note release morph (set from Notification).
+  private var pendingVideoNoteMorphImage: UIImage?
+  private var pendingVideoNoteMorphFrame: CGRect = .zero
+  private weak var videoNoteMorphFlightView: UIImageView?
   // The overlay outlives activeSendTransition by the ~55ms reveal crossfade.
   // Scroll/rows updates landing inside that window still move the real cell, so
   // the fading overlay must keep tracking it or the two paint ~1px apart
@@ -1207,27 +1284,53 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     view.isHidden = true
     return view
   }()
-  private let scrollingDateLabel: UILabel = {
-    let label = UILabel()
-    label.font = .systemFont(ofSize: 12.0, weight: .semibold)
-    label.textAlignment = .center
-    label.textColor = .label
-    label.isUserInteractionEnabled = false
-    return label
-  }()
-  private lazy var scrollingDatePill: UIView = {
-    let view = UIView()
-    // Clean solid capsule (radius set in layout from the real height) — identical to the
-    // in-list day separators so the header stick reads as the same element.
-    view.layer.cornerCurve = .circular
-    view.clipsToBounds = true
-    view.isUserInteractionEnabled = false
-    view.isHidden = true
-    view.addSubview(self.scrollingDateLabel)
-    self.scrollingDateLabel.textColor = appearance.dayTextColor
-    view.backgroundColor = appearance.dayBackgroundColor
-    return view
-  }()
+  /// A day separator promoted out of the list. Same font, paddings and capsule as the
+  /// in-list one (see ChatListCell's `.day` branch) because it IS that separator — the
+  /// floating copy has to be pixel-identical or the promotion reads as a swap.
+  private final class ScrollingDatePillView: UIView {
+    let label: UILabel = {
+      let label = UILabel()
+      label.font = .systemFont(ofSize: 12.0, weight: .semibold)
+      label.textAlignment = .center
+      label.isUserInteractionEnabled = false
+      return label
+    }()
+
+    override init(frame: CGRect) {
+      super.init(frame: frame)
+      layer.cornerCurve = .circular
+      clipsToBounds = true
+      isUserInteractionEnabled = false
+      addSubview(label)
+    }
+
+    @available(*, unavailable) required init?(coder: NSCoder) {
+      fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      label.frame = bounds
+      layer.cornerRadius = bounds.height / 2.0
+    }
+  }
+
+  /// ONE CAPSULE PER DAY RUN, keyed by the day row's key — the same shape as the group
+  /// sender avatars (`senderAvatarViews`), and for the same reason.
+  ///
+  /// A single shared view cannot render the handoff. With one view, the moment the
+  /// arriving day claimed the slot that view had to jump from wherever the outgoing day
+  /// had dragged it back down to the slot: you saw the pill ride up with the scroll and
+  /// then shift back down, every single time a day changed. Per-run views make the
+  /// handoff pure geometry — the outgoing capsule keeps riding its own run out of the
+  /// viewport while the arriving one is already sitting still at the slot. Nothing that
+  /// should be stationary ever moves.
+  ///
+  /// At most two exist at once: a run only earns a floating capsule once its separator
+  /// has reached the slot. Below that it is an ordinary in-list separator riding up on
+  /// its own, which is also what makes the promotion seamless — at the instant of the
+  /// swap the float lands on exactly the pixels the in-list capsule occupied.
+  private var scrollingDatePills: [String: ScrollingDatePillView] = [:]
   /// Precomputed while rows are applied, so a scroll tick only does an index lookup.
   private var scrollingDateLabelsByRowKey: [String: String] = [:]
   /// Signed per-tick scroll delta — drives the sticky date pill's push direction.
@@ -1395,6 +1498,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   static var groupIncomingExtraLeading: CGFloat { groupAvatarSize + groupAvatarGap }
   /// Vertical space reserved above a bubble for the sender's name (first msg of a run).
   static let groupSenderNameHeight: CGFloat = 25.0
+  /// Telegram-style forward strip inside the plate:
+  /// "Forwarded from" + avatar/name row. Must match `ForwardedFromHeaderView.preferredHeight`.
+  static let forwardedHeaderHeight: CGFloat = 36.0
   /// Telegram-like separation between different sender runs. The flow layout already
   /// contributes 2pt between every cell; this additional air appears only before a new
   /// incoming run, keeping consecutive bubbles compact without pressing authors together.
@@ -1645,15 +1751,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return nil
   }
 
-  /// Width available for the bubble body + extra top for the sender name (first of run).
-  /// Shared by `sizeForItemAt` and height-delta checks so they cannot diverge.
+  /// Width available for the bubble body + extra top for the sender name (first of run)
+  /// and/or the forwarded-from header. Shared by `sizeForItemAt` and height-delta checks
+  /// so they cannot diverge from cell chrome reservation.
   private func groupMeasurementExtras(at indexPath: IndexPath) -> (
     measurementWidth: CGFloat, extraTop: CGFloat, extraLeading: CGFloat
   ) {
     let width = max(0.0, bounds.width - (messageHorizontalInset * 2.0))
     let ctx = groupCellContext(at: indexPath)
     let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
-    let extraTop = (ctx.showsName ? Self.groupSenderNameHeight : 0.0) + ctx.topSpacing
+    var extraTop = (ctx.showsName ? Self.groupSenderNameHeight : 0.0) + ctx.topSpacing
+    // DM / group: every forwarded message needs plate-top chrome so body text cannot
+    // paint under "Forwarded from / avatar / name".
+    if indexPath.item >= 0, indexPath.item < rows.count {
+      let row = rows[indexPath.item]
+      if row.kind == .message, row.isForwarded {
+        extraTop += Self.forwardedHeaderHeight
+      }
+    }
     return (max(1.0, width - extraLeading), extraTop, extraLeading)
   }
 
@@ -1718,6 +1833,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         row.isGroupOrChannel ? "Y" : "N"
       )
     }
+    cell.hostChatId = engineChatId
     cell.configure(
       row: row,
       hiddenMessageId: hiddenMessageId ?? self.hiddenMessageId,
@@ -1849,7 +1965,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   override init(frame: CGRect) {
     let layout = ChatCollectionFlowLayout()
-    layout.minimumLineSpacing = 2
+    layout.minimumLineSpacing = 6
     layout.sectionInset = UIEdgeInsets(
       top: sectionTopInset, left: messageHorizontalInset, bottom: sectionBottomInset,
       right: messageHorizontalInset)
@@ -1934,9 +2050,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     transitionOverlayHost.clipsToBounds = false
     addSubview(transitionOverlayHost)
 
-    // Telegram-style viewport date feedback. It is screen-fixed, non-interactive and
-    // changes text without an opacity transition, so it never participates in list layout.
-    addSubview(scrollingDatePill)
+    // Telegram-style viewport date feedback: capsules are created per day run on demand
+    // (see updateScrollingDatePill) and are screen-fixed and non-interactive, so they
+    // never participate in list layout.
 
     if chatGapDebugOverlayEnabled {
       gapDebugOverlay.isUserInteractionEnabled = false
@@ -1957,6 +2073,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     setupActivityOverlay()
     setupDebugPanel()
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleVideoNoteReleaseMorphNotification(_:)),
+      name: .videoNoteReleaseMorph,
+      object: nil
+    )
 
     // Keyboard observers
     NotificationCenter.default.addObserver(
@@ -2060,6 +2183,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // at a lower z-index than the input). The host is non-interactive and empty
     // at rest, so this doesn't block the composer's controls.
     bringSubviewToFront(transitionOverlayHost)
+    // If a video-note is recording, re-pin input above the recorder (and above
+    // this host only for hit-testing — host is non-interactive).
+    if let bar = activeNativeInputView {
+      bringSubviewToFront(bar)
+    }
   }
 
   private func reactionDebugLog(_ message: String) {
@@ -2082,6 +2210,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     super.didMoveToWindow()
     updateChatEngineBinding()
     updateChatEngineChannelBinding()
+    // Leaving the chat while a note is mid-play → promote floating mini-player on root.
+    if window == nil {
+      VideoNoteGlobalMiniPlayer.shared.promoteIfPlayingAwayFromChat()
+    }
     if window != nil {
       // A disk decode that landed while this view was still detached had nowhere to
       // attach (the callback requires a window) and never retried — the cover was lost
@@ -2112,15 +2244,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let sourceRows = self.deferredPresentationSeedSourceRows
       else { return }
       let preferred = self.deferredPresentationSeedPreferredRows
+      // Replay the stash under the SOURCE it was stashed as, so the rank guard inside
+      // the install can still tell a route preview from an engine snapshot.
+      let stashedSource = self.stashedPresentationSeedRank?.source ?? .routePreview
       self.deferredPresentationSeedSourceRows = nil
       self.deferredPresentationSeedPreferredRows = nil
-      guard self.rows.isEmpty else { return }
+      self.stashedPresentationSeedRank = nil
+      // No `rows.isEmpty` bail here any more: the install's own rank guard decides, and
+      // it is the thing that knows whether this stash would be an upgrade or a downgrade.
       NSLog(
         "[ChatOpen] seed-mount POST-COMMIT chat=%@ rows=%d waitMs=%d",
         String(self.engineChatId.prefix(12)), sourceRows.count,
         Int((ProcessInfo.processInfo.systemUptime - self.deferredPresentationSeedStashedAt) * 1000))
       self.installPresentationSeedIfNeeded(
-        sourceRows: sourceRows, preferredParsedRows: preferred)
+        sourceRows: sourceRows, preferredParsedRows: preferred, source: stashedSource)
       // Hand off ONLY if the mount actually produced rows. An install that bails (source
       // parsed to nothing, or a live setRows beat it) used to peel the raster off anyway
       // and leave bare wallpaper behind — the cover must outlive a failed mount.
@@ -2161,8 +2298,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // userInitiated, not utility: the per-open disk decode races the shell commit
   // (~30-50ms) — at utility it lost essentially every first-open race and the chat
   // showed the spinner despite a valid raster sitting on disk.
+  //
+  // Bulk-prewarm ONLY. On a cold launch the home list fans a raster decode out for
+  // EVERY visible chat onto this serial queue (see prewarmReopenSnapshotRaster). The one
+  // chat the user actually taps must never queue BEHIND that backlog — a serial line of
+  // ~N × 10-40ms decodes is exactly the 0.2-0.5s empty-shell window on the first open.
+  // The per-open decode runs on its own userInteractive queue below so it jumps the line.
   private static let reopenSnapshotIOQueue = DispatchQueue(
     label: "vibe.reopen-snapshot.io", qos: .userInitiated)
+
+  // The TAPPED chat's cover decode: a dedicated, higher-priority lane so it is never
+  // stuck behind the launch-time bulk prewarm on the serial queue above. userInteractive
+  // (one notch over the bulk's userInitiated) so it also wins CPU if both run at once —
+  // a ~10-40ms JPEG decode then reliably beats the ~30-50ms shell commit and the cover is
+  // ready by first frame instead of landing a few hundred ms late.
+  private static let reopenSnapshotOpenIOQueue = DispatchQueue(
+    label: "vibe.reopen-snapshot.open-io", qos: .userInteractive)
 
   private static func reopenSnapshotFileURL(for key: NSString) -> URL? {
     guard
@@ -2334,7 +2485,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     else { return }
     let chatId = engineChatId
     let screenScale = UIScreen.main.scale
-    Self.reopenSnapshotIOQueue.async { [weak self] in
+    // Dedicated userInteractive lane (NOT the shared bulk-prewarm queue): the tapped
+    // chat's cover must jump the launch-time prewarm backlog or it lands after the shell.
+    Self.reopenSnapshotOpenIOQueue.async { [weak self] in
       // JPEG data carries pixels, not scale — decoding without the screen scale made
       // the image report 3x the point size, and the .bottom overlay drew it unscaled:
       // the "zoomed transcript" on the first open after a relaunch.
@@ -2603,10 +2756,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       bringSubviewToFront(jumpToBottomButton)
     }
     layoutCachedHistoryPullIndicator()
-    layoutScrollingDatePill()
-    // The pinned date is part of the chrome, not a scroll-only affordance: re-derive it
-    // on every layout so it is already attached under the header when a chat opens and
-    // stays attached at rest, instead of only existing while a finger is on the list.
+    // Capsules are positioned entirely by the run walk, so there is nothing to lay out
+    // separately — just re-derive.
     updateScrollingDatePill(visible: true)
     layoutDebugPanel()
     updateTallBubbleGlassToggles(animatedIcons: false)
@@ -5407,7 +5558,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // any more — presentation completion reconciles against ONE engine read (v2).
       installPresentationSeedIfNeeded(
         sourceRows: snapshot.sourceRows,
-        preferredParsedRows: snapshot.rows
+        preferredParsedRows: snapshot.rows,
+        source: .warmSnapshot
       )
       NSLog(
         "[ChatOpen] warm-cache DEFER chat=%@ cached=%d heights=%d",
@@ -5723,24 +5875,67 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    let key = progressiveHeightWarmupKeys.removeFirst()
-    guard let index = rows.firstIndex(where: { $0.key == key }), rows[index].kind == .message else {
-      scheduleNextProgressiveHeightWarmup(generation: generation, delay: 0.0)
+    // DRAIN the already-exact keys in this hop instead of burning one main-queue
+    // round-trip each. A settled transcript is almost entirely cached (measured on
+    // device: `keys=92 measured=3`), so the old one-key-per-12ms-hop shape spent 89
+    // hops doing a dictionary lookup and re-dispatching — ~1.2s of main-queue
+    // ping-pong per sweep, restarted after EVERY setRows (three overlapping sweeps
+    // inside 7s of one agent turn), and each hop back-pressures to 80ms while the
+    // finger is on the glass. That is how a 3-measurement sweep billed 8894ms and why
+    // it competed with the scroll. A real measurement still gets its own hop below:
+    // it invalidates layout, and more than one per frame is what shears the ride.
+    let hopStartedAt = ProcessInfo.processInfo.systemUptime
+    var indexForWarmupKey: [String: Int] = [:]
+    indexForWarmupKey.reserveCapacity(rows.count)
+    for (offset, row) in rows.enumerated() where indexForWarmupKey[row.key] == nil {
+      indexForWarmupKey[row.key] = offset
+    }
+    var resolved:
+      (
+        row: ChatListRow,
+        extras: (measurementWidth: CGFloat, extraTop: CGFloat, extraLeading: CGFloat)
+      )?
+    while !progressiveHeightWarmupKeys.isEmpty {
+      let key = progressiveHeightWarmupKeys.removeFirst()
+      guard let index = indexForWarmupKey[key], rows[index].kind == .message else { continue }
+      let candidate = rows[index]
+      let candidateExtras = groupMeasurementExtras(at: IndexPath(item: index, section: 0))
+      if !hasExactProgressiveHeight(row: candidate, rowWidth: candidateExtras.measurementWidth) {
+        resolved = (candidate, candidateExtras)
+        break
+      }
+      // Cached keys are near-free, but never hold the main thread past a frame slice.
+      if ProcessInfo.processInfo.systemUptime - hopStartedAt > 0.004 { break }
+    }
+    guard let (row, extras) = resolved else {
+      if progressiveHeightWarmupKeys.isEmpty {
+        progressiveHeightWarmupWorkItem = nil
+      } else {
+        scheduleNextProgressiveHeightWarmup(generation: generation, delay: 0.0)
+      }
       return
     }
-    let row = rows[index]
-    let extras = groupMeasurementExtras(at: IndexPath(item: index, section: 0))
     if !hasExactProgressiveHeight(row: row, rowWidth: extras.measurementWidth) {
       progressiveHeightWarmupMeasuredCount += 1
       let anchor = topVisibleMessageAnchor()
-      let wasNearBottom = currentDistanceFromBottom() <= listBottomThreshold
+      // Follow the bottom on a height correction only when the reader actually wants to be
+      // pinned there: either truly AT the bottom (streaming follow), or during the initial
+      // open settle before they have taken control. Once they have scrolled up to read,
+      // "within 88pt of the bottom" must NOT count as pinned — otherwise every corrected
+      // media/agent estimate near the bottom yanked the viewport back down, which is exactly
+      // the "I scroll up and it shoves me back to the bottom / can't scroll" bug. When not
+      // following, PRESERVE their position by re-anchoring the top-visible row instead.
+      let distanceFromBottom = currentDistanceFromBottom()
+      let followsBottom =
+        distanceFromBottom <= 4.0
+        || (!userHasScrolledSinceOpen && distanceFromBottom <= listBottomThreshold)
       let estimated = presentationSeedMessageHeight(row, rowWidth: extras.measurementWidth)
       let exact = estimateMessageHeight(row, rowWidth: extras.measurementWidth)
       if abs(exact - estimated) > 0.5 {
         UIView.performWithoutAnimation {
           flowLayout.invalidateLayout()
           collectionView.layoutIfNeeded()
-          if wasNearBottom {
+          if followsBottom {
             scrollToBottom(animated: false, force: true)
           } else if let anchor,
             let newIndex = rows.firstIndex(where: { $0.key == anchor.key }),
@@ -6317,6 +6512,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     NSLog(
       "[ChatOpen] presentation-complete chat=%@ — reconciling from engine",
       String(engineChatId.prefix(12)))
+    // Apply what we ALREADY have before asking the engine again. A payload that arrived
+    // mid-push but could not be seeded is still the freshest transcript in the process;
+    // spending another queue round-trip to re-derive it is what stretched a lost seed
+    // race into a full second of near-empty list.
+    if let pending = deferredPresentationPendingRows {
+      let pendingAuthority = deferredPresentationPendingAuthority
+      deferredPresentationPendingRows = nil
+      NSLog(
+        "[Seed] src=%@ rows=%d action=apply-pending chat=%@",
+        pendingAuthority == .fullSnapshot ? "engineSnapshot" : "routePreview", pending.count,
+        String(engineChatId.prefix(12)))
+      applyRows(pending, authority: pendingAuthority)
+    }
     refreshRowsFromEngineDelta()
     scheduleProgressiveHeightWarmup()
     auditSeedTrustedHeights()
@@ -6386,6 +6594,49 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       hiddenCells, clearCells, ghostCells, hiddenBubbles, clearBubbles,
       reopenSnapshotOverlay == nil ? "N" : "Y",
       defersTranscriptUpdatesForPresentation ? "Y" : "N")
+    logViewportOccluders(stage)
+  }
+
+  /// Third half of the blank-open probe, and the one the other two cannot answer.
+  ///
+  /// "cover=88%, every cell visible and opaque, nothing hidden — and the user still sees
+  /// only wallpaper until they tap the screen" cannot be explained by alpha or layout: the
+  /// cells ARE there. What neither existing probe inspects is Z-ORDER. A sibling drawn
+  /// ABOVE the list (a re-rastered wallpaper re-inserted at the wrong index, a transition
+  /// overlay that outlived its transition, a snapshot host) covers a perfectly healthy
+  /// transcript, and the first `layoutSubviews` a touch provokes puts the order right
+  /// again — which is exactly the reported "it appears when I pinch or tap".
+  ///
+  /// So: report every sibling stacked above the list (and above the collection view inside
+  /// it) that actually overlaps the viewport and could paint. Silent when nothing does.
+  private func logViewportOccluders(_ stage: String) {
+    func describeOccluders(above target: UIView, in parent: UIView) -> [String] {
+      guard let index = parent.subviews.firstIndex(of: target) else { return [] }
+      let viewport = parent.convert(bounds, from: self)
+      return parent.subviews[(index + 1)...].compactMap { sibling -> String? in
+        guard !sibling.isHidden, sibling.alpha > 0.02 else { return nil }
+        let overlap = sibling.frame.intersection(viewport)
+        guard !overlap.isNull, overlap.width > 1, overlap.height > 1 else { return nil }
+        // Anything smaller than a third of the viewport is chrome (jump button, chips,
+        // date capsules) and is SUPPOSED to be on top — not an occluder.
+        guard overlap.height > viewport.height / 3.0 else { return nil }
+        // Only views that can actually PAINT count. `UIView.isOpaque` is true by default
+        // even with no background at all, so it says nothing — a transparent passthrough
+        // host would report `opaque=Y` and bury the real culprit in noise. What paints is
+        // a background colour with real alpha, or layer contents (an image/snapshot).
+        let bgAlpha = sibling.backgroundColor?.cgColor.alpha ?? 0.0
+        let hasContents = sibling.layer.contents != nil
+        guard bgAlpha > 0.02 || hasContents else { return nil }
+        return
+          "\(type(of: sibling))(a=\(String(format: "%.2f", sibling.alpha)) bg=\(String(format: "%.2f", bgAlpha)) contents=\(hasContents ? "Y" : "N") \(Int(overlap.width))x\(Int(overlap.height)))"
+      }
+    }
+    var found = describeOccluders(above: collectionView, in: self)
+    if let host = superview { found += describeOccluders(above: self, in: host) }
+    guard !found.isEmpty else { return }
+    NSLog(
+      "[ChatOpen] viewport-occluded %@ chat=%@ above-list=[%@]",
+      stage, String(engineChatId.prefix(12)), found.joined(separator: " "))
   }
 
   /// The verify half of the seed's trust-then-verify sizing. The mount promoted
@@ -6517,29 +6768,48 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// AgentKit measurement. The normal rows pipeline replaces this seed after viewDidAppear.
   private func installPresentationSeedIfNeeded(
     sourceRows: [[String: Any]],
-    preferredParsedRows: [ChatListRow]? = nil
+    preferredParsedRows: [ChatListRow]? = nil,
+    source: PresentationSeedSource = .routePreview
   ) {
-    guard defersTranscriptUpdatesForPresentation, rows.isEmpty, !sourceRows.isEmpty else {
+    guard defersTranscriptUpdatesForPresentation, !sourceRows.isEmpty else { return }
+    // Monotone seed: only ever upgrade. Rank against whichever record applies — the
+    // stash while detached, the mounted seed once something is on screen — so neither a
+    // late-arriving preview nor a re-delivery of the same payload can walk the seed
+    // backwards or pay for a redundant reload mid-push.
+    let incoming = (source: source, count: sourceRows.count)
+    let benchmark = window == nil ? (stashedPresentationSeedRank ?? mountedPresentationSeedRank) : mountedPresentationSeedRank
+    if let benchmark,
+      !(incoming.source > benchmark.source
+        || (incoming.source == benchmark.source && incoming.count > benchmark.count))
+    {
+      NSLog(
+        "[Seed] src=%@ rows=%d action=keep (have src=%@ rows=%d) chat=%@",
+        String(describing: source), sourceRows.count, String(describing: benchmark.source),
+        benchmark.count, String(engineChatId.prefix(12)))
       return
     }
     if window == nil {
       // Detached = the push hasn't presented this view yet. Mount nothing now — stash
-      // the freshest inputs and let didMoveToWindow mount them one tick after the
-      // transition's first frame commits. Repeated calls during the defer window
-      // (route rows, engine snapshot, warm restore) keep replacing the stash.
+      // the best inputs seen so far and let didMoveToWindow mount them one tick after
+      // the transition's first frame commits. Repeated calls during the defer window
+      // (route rows, engine snapshot, warm restore) UPGRADE the stash; the rank guard
+      // above is what stops a bounded route preview from clobbering a full snapshot.
       deferredPresentationSeedSourceRows = sourceRows
       // Preferred rows are only valid for the sourceRows they were parsed from; a
       // stash replace without its own preferred set must drop the old one (the reuse
       // cache still parses unchanged rows cheaply, changed rows parse fresh).
       deferredPresentationSeedPreferredRows = preferredParsedRows
       deferredPresentationSeedStashedAt = ProcessInfo.processInfo.systemUptime
+      stashedPresentationSeedRank = incoming
       NSLog(
-        "[ChatOpen] presentation-seed DEFER chat=%@ rows=%d (await window attach)",
-        String(engineChatId.prefix(12)), sourceRows.count)
+        "[Seed] src=%@ rows=%d action=stash chat=%@ (await window attach)",
+        String(describing: source), sourceRows.count, String(engineChatId.prefix(12)))
       return
     }
+    let isSeedUpgrade = mountedPresentationSeedRank != nil
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
+    stashedPresentationSeedRank = nil
     let seedStartedAt = ProcessInfo.processInfo.systemUptime
     var seedPhaseMarkAt = seedStartedAt
     func seedPhaseMs() -> Int {
@@ -6662,6 +6932,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     rows = seedRows
+    mountedPresentationSeedRank = incoming
     scrollingDateLabelsByRowKey = Self.scrollingDateLabels(from: normalizedTail)
     // A group tail seed must be frame-stable because its sender labels and floating
     // avatars are tied to row geometry — it is bounded to 16 rows, so measure those
@@ -6773,6 +7044,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
     }
     let seedMountMs = seedPhaseMs()
+    NSLog(
+      "[Seed] src=%@ rows=%d action=%@ chat=%@",
+      String(describing: source), sourceRows.count, isSeedUpgrade ? "upgrade" : "mount",
+      String(engineChatId.prefix(12)))
     NSLog(
       "[ChatOpen] presentation-seed chat=%@ visible=%d retained=%d cachedHeights=%d sizing=%@ window=%@ normMs=%d parseMs=%d filterMs=%d posMs=%d layoutMs=%d mountMs=%d totalMs=%d sinceOpenMs=%d",
       String(engineChatId.prefix(12)), seedRows.count, sourceRows.count,
@@ -6927,9 +7202,34 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // history is loaded, and pre-history partial arrays ARE the truth.
     let effectiveRows = nextRows
     if defersTranscriptUpdatesForPresentation, !isExplicitEmpty {
-      // Mid-push: keep the seed fresh; presentation completion reconciles from the
-      // engine, so nothing is retained here any more.
-      installPresentationSeedIfNeeded(sourceRows: effectiveRows)
+      // Mid-push: upgrade the seed if this payload beats what is already on screen.
+      // `setAuthoritativeRows` IS the engine read, so it outranks everything; plain
+      // `setRows` during a push is the route's bounded preview.
+      let seedSource: PresentationSeedSource =
+        authority == .fullSnapshot ? .engineSnapshot : .routePreview
+      installPresentationSeedIfNeeded(sourceRows: effectiveRows, source: seedSource)
+      // RETAIN what the seed could NOT take, never drop it. This used to `return`
+      // outright, so a full transcript that arrived a beat after the seed mounted was
+      // gone — and presentation-complete then queued a SECOND getChatRows behind the same
+      // saturated engine queue that had just made this one late.
+      //
+      // But retain only what is actually still owed: when the seed DID mount this exact
+      // payload, replaying it at presentation-complete is a wasted full reloadData on
+      // rows already on screen (the log's `apply-pending` immediately followed by
+      // `reconcile equal=Y changed=0`), and a redundant reload landing one frame after
+      // viewDidAppear is not something to do to a list that is already suspected of
+      // presenting badly.
+      let seedTookIt =
+        mountedPresentationSeedRank?.source == seedSource
+        && mountedPresentationSeedRank?.count == effectiveRows.count
+      if seedTookIt {
+        deferredPresentationPendingRows = nil
+      } else if authority == .fullSnapshot || deferredPresentationPendingRows == nil
+        || deferredPresentationPendingAuthority != .fullSnapshot
+      {
+        deferredPresentationPendingRows = effectiveRows
+        deferredPresentationPendingAuthority = authority
+      }
       VibeDebugLog.log(
         "[ChatOpen] setRows presentation-DEFER chat=%@ incoming=%d authority=%@",
         String(engineChatId.prefix(12)), nextRows.count,
@@ -6940,6 +7240,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // racing a pop that detached the view before its post-commit mount tick ran).
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
+    stashedPresentationSeedRank = nil
+    mountedPresentationSeedRank = nil
+    deferredPresentationPendingRows = nil
     isApplyingRowsUpdate = true
     _setRowsGeneration &+= 1
     let mySetRowsGeneration = _setRowsGeneration
@@ -7319,7 +7622,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // bridge DM (currentBridgeProvider != nil) now renders in the NORMAL chat list and
       // must behave like any other chat — stick-to-bottom / stationary-anchor — so it
       // falls through to the normal branches below instead of pinning to the top.
-      let agentSurface = self.agentChatMode
+      let agentSurface = self.agentTopAnchoringEnabled
       if self.applyOpeningViewportIfNeeded() {
         // Initial unread/saved positioning owns this one finalize pass.
       } else if agentSurface, self.pendingAgentPushToTop {
@@ -7721,7 +8024,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let postSendPreContentH = collectionView.contentSize.height
     let logPostSendSettle: (String) -> Void = { [weak self] path in
-      guard let self, !meInsertKeys.isEmpty || !meReloadKeys.isEmpty else { return }
+      // Paging older history inserts a whole page of own messages, which is not a send:
+      // it was dumping ~66 NSLog lines (plus per-cell layout lookups) into the exact
+      // main-thread beat that already stalls on the prepend's batch update.
+      guard let self, !isHistoryRevealPrepend else { return }
+      guard !meInsertKeys.isEmpty || !meReloadKeys.isEmpty else { return }
       let pendingSend = self.pendingSendTransition != nil || self.activeSendTransition != nil
       NSLog(
         "[PostSend] settle path=%@ pendingSend=%@ group=%@ offset=%.0f→%.0f contentH=%.0f→%.0f "
@@ -7884,10 +8191,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         // Same group-aware width as sizeForItemAt — full-width measurement here used
         // to misclassify reloads and then reconfigure without invalidating layout.
+        // Forward chrome is outside bubble metrics (`extraTop`); isForwarded flips must
+        // force layout or reopen paints a short cell and the header overlaps body text.
+        if previousRow.isForwarded != nextRow.isForwarded {
+          return true
+        }
         let extras = groupMeasurementExtras(at: indexPath)
+        let prevTop =
+          (previousRow.isForwarded ? Self.forwardedHeaderHeight : 0.0)
+        let nextTop = (nextRow.isForwarded ? Self.forwardedHeaderHeight : 0.0)
+        // extras.extraTop already includes next's forward bit for this index; use body
+        // delta + explicit forward delta so either side of a flip invalidates.
         return abs(
-          estimateMessageHeight(previousRow, rowWidth: extras.measurementWidth)
-            - estimateMessageHeight(nextRow, rowWidth: extras.measurementWidth)
+          (estimateMessageHeight(previousRow, rowWidth: extras.measurementWidth) + prevTop)
+            - (estimateMessageHeight(nextRow, rowWidth: extras.measurementWidth) + nextTop)
         ) > 0.5
       }
 
@@ -8772,8 +9089,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// and for the cell's live `configure(row:...)` call so the two never disagree.
   private func agentTurnBubbleState(for row: ChatListRow) -> AgentTurnBubbleState {
     let id = row.messageId ?? row.key
+    // Vibe AI / tool turns: keep the step feed expanded so agentic progress is visible
+    // live and after settle (Codex-style continuous growth, not a collapsed "Worked" only).
+    let hasToolSteps = row.agentProgressNodes.contains {
+      let kind = ($0.kind ?? "").lowercased()
+      return kind != "text" && kind != "thread_start"
+    }
+    let autoExpand =
+      agentChatMode
+      && hasToolSteps
+      && (row.isStreamingText || row.messageType == "agent_progress_tree" || !row.agentProgressNodes.isEmpty)
     return AgentTurnBubbleState(
-      isProgressExpanded: agentTurnProgressExpandedRowIds.contains(id),
+      isProgressExpanded: autoExpand || agentTurnProgressExpandedRowIds.contains(id),
       isRuntimeExpanded: agentTurnRuntimeExpandedRowIds.contains(id),
       expandedStepIds: agentTurnExpandedStepIdsByRow[id] ?? [],
       streamingStartDate: agentTurnStreamStartByRow[id],
@@ -8817,6 +9144,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     pendingPresentationSeedWindowStart = false
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
+    // Seed ranks are per-open: carrying the previous chat's rank across a rebind would
+    // make the new chat's first payload look like a downgrade and get thrown away.
+    stashedPresentationSeedRank = nil
+    mountedPresentationSeedRank = nil
+    deferredPresentationPendingRows = nil
     removeReopenSnapshotOverlay(reason: "chat-switch", animated: false)
     removeSeedLoadingIndicator(reason: "chat-switch")
     replyAccentMemoByRowKey.removeAll(keepingCapacity: true)
@@ -9019,6 +9351,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard !resolvedMessageId.isEmpty else { return }
     let wasActive = selectionMode
     let inserted = selectedMessageIds.insert(resolvedMessageId).inserted
+    // Stay in selection until Done/Cancel — never auto-exit on empty set.
     selectionMode = true
     guard !wasActive || inserted else { return }
     refreshMessageSelectionLayout()
@@ -9034,7 +9367,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     } else {
       selectedMessageIds.insert(messageId)
     }
-    selectionMode = !selectedMessageIds.isEmpty
+    // Deselecting the last item keeps selection chrome ("Select messages") until
+    // the user taps Done / Cancel.
+    selectionMode = true
     refreshMessageSelectionLayout()
     emitMessageSelectionChanged()
   }
@@ -9048,18 +9383,55 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     )
     let before = selectedMessageIds
     selectedMessageIds = Set(selectedMessageIds.filter { validIds.contains($0) })
-    let wasActive = selectionMode
-    selectionMode = !selectedMessageIds.isEmpty
-    if before != selectedMessageIds || wasActive != selectionMode {
+    // Pruning deleted rows must not exit selection mode.
+    if before != selectedMessageIds {
       emitMessageSelectionChanged()
+      if selectionMode {
+        refreshMessageSelectionLayout(animated: false)
+      }
     }
   }
 
-  private func refreshMessageSelectionLayout() {
-    collectionView.collectionViewLayout.invalidateLayout()
-    UIView.performWithoutAnimation {
-      collectionView.reloadData()
-      collectionView.layoutIfNeeded()
+  private func refreshMessageSelectionLayout(animated: Bool = true) {
+    // Only touch selection chrome + bubble X inset — full cell reconfigure was the
+    // jumpy/flicker path (media reload, label restyle). Off-screen cells pick up
+    // selectionMode on the next cellForItem.
+    let applyVisible: () -> Void = { [weak self] in
+      guard let self else { return }
+      for case let cell as ChatListCell in self.collectionView.visibleCells {
+        guard let indexPath = self.collectionView.indexPath(for: cell),
+          indexPath.item >= 0, indexPath.item < self.rows.count
+        else { continue }
+        let row = self.rows[indexPath.item]
+        let isSelected =
+          row.messageId.map { self.selectedMessageIds.contains($0) } ?? false
+        cell.applyMessageSelectionState(
+          mode: self.selectionMode,
+          selected: isSelected,
+          appearance: self.appearance,
+          animated: false
+        )
+        cell.setNeedsLayout()
+        cell.layoutIfNeeded()
+      }
+      self.collectionView.collectionViewLayout.invalidateLayout()
+      self.collectionView.layoutIfNeeded()
+    }
+
+    if animated, window != nil {
+      UIView.animate(
+        withDuration: 0.38,
+        delay: 0,
+        usingSpringWithDamping: 0.92,
+        initialSpringVelocity: 0.12,
+        options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseInOut]
+      ) {
+        applyVisible()
+      }
+    } else {
+      UIView.performWithoutAnimation {
+        applyVisible()
+      }
     }
   }
 
@@ -9073,10 +9445,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     ])
   }
 
-  func clearMessageSelection() {
+  func clearMessageSelection(animated: Bool = true) {
     selectedMessageIds.removeAll()
     selectionMode = false
-    refreshMessageSelectionLayout()
+    refreshMessageSelectionLayout(animated: animated)
     emitMessageSelectionChanged()
   }
 
@@ -9278,7 +9650,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom on every link-preview / markdown relayout once a turn had ended). The
     // only exception is `force` (first open of the chat), where we genuinely want to
     // land at the latest message.
-    if agentChatMode, !force {
+    if agentTopAnchoringEnabled, !force {
       return
     }
     collectionView.layoutIfNeeded()
@@ -9462,36 +9834,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// behind the header's masking edge (the old fixed `safeTop + 63` did exactly that).
   /// Clamped on both sides so an unusually large reserved inset can't drop it mid-screen.
   private func scrollingDatePillSlotY() -> CGFloat {
-    max(safeAreaInsets.top + 71.0, min(contentPaddingTop + 8.0, safeAreaInsets.top + 132.0))
+    max(safeAreaInsets.top + 63.0, min(contentPaddingTop, safeAreaInsets.top + 124.0))
   }
 
-  /// Y the pill is currently drawn at: its owning separator's own position while it is
-  /// still riding up through the list, the sticky slot once it has arrived.
-  private var scrollingDatePillRideY: CGFloat?
-
-  private func layoutScrollingDatePill() {
-    guard !scrollingDatePill.isHidden else { return }
-    // Metrics mirror the in-list day pill exactly (same paddings, same capsule) so the
-    // header stick reads as the SAME element, not a second material.
-    let textSize = scrollingDateLabel.sizeThatFits(
-      CGSize(width: max(0.0, bounds.width - 80.0), height: 24.0))
+  /// Size a capsule to its text, using the in-list separator's exact metrics.
+  private func scrollingDatePillSize(for text: String) -> CGSize {
+    let probe = UILabel()
+    probe.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    probe.text = text
+    let textSize = probe.sizeThatFits(CGSize(width: max(0.0, bounds.width - 80.0), height: 24.0))
     let width = min(
       max(58.0, ceil(textSize.width) + (dayPillHorizontalPadding * 2.0)),
       max(58.0, bounds.width - 40.0))
-    let height = ceil(textSize.height) + (dayPillVerticalPadding * 2.0)
-    scrollingDatePill.frame = CGRect(
-      x: floor((bounds.width - width) * 0.5),
-      y: scrollingDatePillRideY ?? scrollingDatePillSlotY(),
-      width: width,
-      height: height)
-    scrollingDatePill.layer.cornerRadius = height / 2.0
-    scrollingDateLabel.frame = scrollingDatePill.bounds
+    return CGSize(width: width, height: ceil(textSize.height) + (dayPillVerticalPadding * 2.0))
   }
 
   private func applyScrollingDatePillAppearance(_ value: ChatListAppearance) {
-    scrollingDateLabel.textColor = value.dayTextColor
-    scrollingDatePill.backgroundColor = value.dayBackgroundColor
-    scrollingDatePill.layer.borderWidth = 0.0
+    for pill in scrollingDatePills.values {
+      pill.label.textColor = value.dayTextColor
+      pill.backgroundColor = value.dayBackgroundColor
+      pill.layer.borderWidth = 0.0
+    }
   }
 
   private func cancelScrollingDatePillLinger() {
@@ -9508,19 +9871,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     cancelScrollingDatePillLinger()
     // Re-assert against the settled viewport: a fling can end between updates.
     updateScrollingDatePill(visible: true)
-    guard !scrollingDatePill.isHidden else { return }
+    guard !scrollingDatePills.isEmpty else { return }
     let work = DispatchWorkItem { [weak self] in
-      guard let self, !self.scrollingDatePill.isHidden else { return }
+      guard let self, !self.scrollingDatePills.isEmpty else { return }
       self.scrollingDatePillHideWorkItem = nil
+      let retiring = self.scrollingDatePills
       UIView.animate(
         withDuration: 0.22, delay: 0.0, options: [.beginFromCurrentState, .curveEaseOut]
       ) {
-        self.scrollingDatePill.alpha = 0.0
+        retiring.values.forEach { $0.alpha = 0.0 }
       } completion: { finished in
-        guard finished, self.scrollingDatePill.alpha <= 0.01 else { return }
-        self.scrollingDatePill.isHidden = true
-        self.scrollingDatePill.alpha = 1.0
-        self.scrollingDatePillRideY = nil
+        guard finished else { return }
+        for (key, pill) in retiring where pill.alpha <= 0.01 {
+          pill.removeFromSuperview()
+          self.scrollingDatePills.removeValue(forKey: key)
+        }
         // The day is the list's again.
         self.releaseDaySeparatorRepresentation()
       }
@@ -9539,21 +9904,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  /// Put the day back in the list and take the floating capsule off screen at once.
+  /// Put every day back in the list and take all floating capsules off screen at once.
   private func hideScrollingDatePill() {
     cancelScrollingDatePillLinger()
-    scrollingDatePill.layer.removeAllAnimations()
-    if !scrollingDatePill.isHidden { releaseDaySeparatorRepresentation() }
-    scrollingDatePill.isHidden = true
-    scrollingDatePill.alpha = 1.0
-    scrollingDatePill.transform = .identity
-    scrollingDatePillRideY = nil
+    guard !scrollingDatePills.isEmpty else { return }
+    for pill in scrollingDatePills.values {
+      pill.layer.removeAllAnimations()
+      pill.removeFromSuperview()
+    }
+    scrollingDatePills.removeAll()
+    releaseDaySeparatorRepresentation()
   }
 
   private func updateScrollingDatePill(visible: Bool) {
     // The history progress control and date use one viewport-pinned safe-area slot.
     // Showing both would read as a warped double material while pulling toward history.
-    guard visible, !rows.isEmpty, cachedHistoryPullIndicator.alpha <= 0.01 else {
+    // Test INSTALLED first: the indicator is a lazy var whose alpha is zeroed by its
+    // installer, so touching `.alpha` before that both creates the view and reads UIView's
+    // default 1.0 — which read as "history indicator is up", suppressing the date pill on
+    // every call, forever, before any of this could log why.
+    let historyIndicatorIsUp =
+      cachedHistoryPullIndicatorInstalled && cachedHistoryPullIndicator.alpha > 0.01
+    guard visible, !rows.isEmpty, !historyIndicatorIsUp else {
       hideScrollingDatePill()
       return
     }
@@ -9563,7 +9935,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // header. Once engaged it keeps updating until the settle linger retires it.
     let listIsMoving =
       collectionView.isTracking || collectionView.isDragging || collectionView.isDecelerating
-    guard listIsMoving || !scrollingDatePill.isHidden else { return }
+    guard listIsMoving || !scrollingDatePills.isEmpty else { return }
     let visibleItems = collectionView.indexPathsForVisibleItems.sorted { lhs, rhs in
       guard
         let left = collectionView.layoutAttributesForItem(at: lhs),
@@ -9599,12 +9971,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
       }
     }
-    let label = resolvedLabel
-    guard let label, !label.isEmpty else {
+    guard resolvedLabel?.isEmpty == false else {
       // Never silent: a hidden pill is a bug report, so say which row starved it.
       let reason = "no-label|top=\(String(row.key.suffix(12)))|kind=\(row.kind)"
-      if reason != lastScrollingDatePillLogSignature {
-        lastScrollingDatePillLogSignature = reason
+      // Dedup on the STATE, not the row: the top row key changes on every scroll
+      // tick, so keying the signature on it re-logged this line ~60×/s for the whole
+      // gesture (a chat with `mapped=0` starves the pill on every row, so it never
+      // stops). One line per (kind, mapped) state is the actual signal.
+      let logSignature = "no-label|kind=\(row.kind)|mapped=\(scrollingDateLabelsByRowKey.count)"
+      if logSignature != lastScrollingDatePillLogSignature {
+        lastScrollingDatePillLogSignature = logSignature
         NSLog(
           "[ChatOpen] date-pin HIDDEN chat=%@ reason=%@ visible=%d mapped=%d",
           String(engineChatId.prefix(12)), reason, visibleItems.count,
@@ -9614,99 +9990,120 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    // ONE capsule, and it is the LIST'S OWN separator, promoted. The floating pill is drawn
-    // at that separator's real position while it is still travelling, and only clamps to the
-    // sticky slot once it has actually reached the header — so you watch a single element
-    // ride up out of the list, stick, get shoved out by the next day, and (scrolling the
-    // other way) come unstuck and rejoin the list. Pinning it at the slot unconditionally is
-    // what made it teleport: the in-list capsule vanished mid-list and a "separate" one
-    // appeared under the header without ever travelling there.
+    // The LIST'S OWN separators, promoted — one floating capsule per day RUN, exactly like
+    // updateFloatingSenderAvatars. A run earns a capsule only once its separator has
+    // reached the slot; below that it is an ordinary in-list separator riding up on its
+    // own. So at a handoff there are two capsules and each does exactly one thing: the
+    // ARRIVING one sits still at the slot, and the OUTGOING one is dragged up and out by
+    // its own run's bottom edge. Nothing snaps back.
+    //
+    // The single shared capsule this replaces could not express that. It had to be both
+    // the outgoing and the arriving pill, so the instant the new day claimed the slot it
+    // jumped from wherever the old day had dragged it back down to the slot — the
+    // reported "it moves with the scroll and then shifts to the bottom again".
     let slotY = scrollingDatePillSlotY()
     let offsetY = collectionView.contentOffset.y
     let listTop = collectionView.frame.minY
-    let pillHeightEstimate = max(scrollingDatePill.bounds.height, 22.0)
-    var ownerNaturalY: CGFloat?
-    for candidate in visibleItems {
-      guard candidate.item < rows.count, rows[candidate.item].kind == .day,
-        dateLabel(for: rows[candidate.item]) == label,
-        let attrs = collectionView.layoutAttributesForItem(at: candidate)
+    let targetTopInContent = slotY + offsetY - listTop
+
+    // Walk every day run that starts at or above the slot, newest first. Runs whose
+    // separator is still below the slot are deliberately skipped: they are riding up in
+    // the list and must not be duplicated by a float.
+    var liveKeys = Set<String>()
+    var loggedState: (label: String, y: CGFloat, stuck: Bool)?
+    var dayIndex = (visibleItems.last?.item).map { min($0, rows.count - 1) } ?? rows.count - 1
+    while dayIndex >= 0 {
+      defer { dayIndex -= 1 }
+      guard rows[dayIndex].kind == .day,
+        let dayAttrs = collectionView.layoutAttributesForItem(
+          at: IndexPath(item: dayIndex, section: 0))
       else { continue }
-      ownerNaturalY = attrs.frame.midY - offsetY + listTop - (pillHeightEstimate / 2.0)
-      break
+      guard let runLabel = dateLabel(for: rows[dayIndex]), !runLabel.isEmpty else { continue }
+
+      let size = scrollingDatePillSize(for: runLabel)
+      // The in-list capsule is CENTERED in its day cell, so that — not the cell's top —
+      // is the pixel row the float has to land on for the promotion to be invisible.
+      let runTop = dayAttrs.frame.minY + ((dayAttrs.frame.height - size.height) * 0.5)
+      // Below the slot: still the list's own. Release it and move on.
+      guard runTop <= targetTopInContent + 0.5 else { continue }
+
+      // The run ends where the next day begins; that edge is what shoves this capsule out.
+      var runBottom = collectionView.contentSize.height
+      var next = dayIndex + 1
+      while next < rows.count {
+        if rows[next].kind == .day {
+          if let attrs = collectionView.layoutAttributesForItem(
+            at: IndexPath(item: next, section: 0))
+          {
+            runBottom = attrs.frame.minY
+          }
+          break
+        }
+        next += 1
+      }
+      // Everything above the slot is fully consumed by this run and the ones the loop has
+      // already placed; nothing further up can be on screen.
+      let clampedTop = max(runTop, min(runBottom - size.height, targetTopInContent))
+      let pillY = clampedTop - offsetY + listTop
+      // Off the top entirely — the shove finished. Let it be pruned.
+      guard pillY + size.height > listTop - 4.0 else { break }
+
+      let key = rows[dayIndex].key
+      liveKeys.insert(key)
+      let pill: ScrollingDatePillView
+      if let existing = scrollingDatePills[key] {
+        pill = existing
+      } else {
+        pill = ScrollingDatePillView()
+        pill.label.textColor = appearance.dayTextColor
+        pill.backgroundColor = appearance.dayBackgroundColor
+        scrollingDatePills[key] = pill
+        addSubview(pill)
+      }
+      pill.layer.removeAnimation(forKey: "opacity")
+      pill.alpha = 1.0
+      pill.label.text = runLabel
+      pill.frame = CGRect(
+        x: floor((bounds.width - size.width) * 0.5), y: pillY,
+        width: size.width, height: size.height)
+      bringSubviewToFront(pill)
+      // First placed = lowest = the run that owns the slot.
+      if loggedState == nil {
+        loggedState = (runLabel, pillY, abs(pillY - slotY) <= 0.5)
+      }
+      // Keep walking upward: the run ABOVE the slot owner is the one being shoved out,
+      // and it is pinned to `runBottom - h`, i.e. riding the slot owner's top edge. The
+      // off-screen guard above terminates the walk — positions only decrease from here.
     }
-    // Above the slot (or scrolled off entirely) means arrived: stick. Below means it is
-    // still in the list and the pill simply stands in for it, pixel-for-pixel.
-    let rideY = max(slotY, ownerNaturalY ?? slotY)
-    scrollingDatePillRideY = rideY
-    let isStuck = rideY <= slotY + 0.5
+
+    // Retire capsules whose run left the band, and hand each day back to whichever owner
+    // it now has: the float if one is live for it, the in-list separator otherwise.
+    for (key, pill) in scrollingDatePills where !liveKeys.contains(key) {
+      pill.removeFromSuperview()
+      scrollingDatePills.removeValue(forKey: key)
+    }
     for candidate in visibleItems {
       guard candidate.item < rows.count, rows[candidate.item].kind == .day,
         let cell = collectionView.cellForItem(at: candidate) as? ChatListCell
       else { continue }
-      cell.setDaySeparatorRepresentedByPinnedDate(dateLabel(for: rows[candidate.item]) == label)
+      cell.setDaySeparatorRepresentedByPinnedDate(liveKeys.contains(rows[candidate.item].key))
     }
-
+    if scrollingDatePills.isEmpty { return }
     cancelScrollingDatePillLinger()
-    scrollingDatePill.layer.removeAnimation(forKey: "opacity")
-    let wasVisible = !scrollingDatePill.isHidden && scrollingDatePill.alpha > 0.01
-    if scrollingDateLabel.text != label {
-      // Day boundary crossed while stuck: the incoming date pushes the old one out the
-      // way the in-list separator is travelling (up toward now, down toward history).
-      // While RIDING the capsule is already moving with the list, so a push here would be
-      // a second, contradictory motion.
-      if wasVisible, isStuck {
-        let push = CATransition()
-        push.type = .push
-        push.subtype = lastScrollDeltaY < 0.0 ? .fromTop : .fromBottom
-        push.duration = 0.18
-        push.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        scrollingDatePill.layer.add(push, forKey: "datePillPush")
-      }
-      scrollingDateLabel.text = label
-    }
-    scrollingDatePill.isHidden = false
-    scrollingDatePill.alpha = 1.0
-    layoutScrollingDatePill()
 
-    // Pinned-section-header shove: when the NEXT day's in-list separator rises into the
-    // sticky slot from below, translate the current floating date UP so it tucks up behind
-    // the header, then that separator hands off as the new sticky date (the reverse,
-    // scroll-up direction, is covered by the same-label suppression above). This is what
-    // makes the date read as an attached element that y-translates behind the header,
-    // rather than a fixed pill that only cross-fades its text in place.
-    let pillHeight = scrollingDatePill.bounds.height
-    var shoveUp: CGFloat = 0.0
-    if pillHeight > 0.0, isStuck {
-      for candidate in visibleItems {
-        guard candidate.item < rows.count, rows[candidate.item].kind == .day,
-          rows[candidate.item].label != label,
-          let attrs = collectionView.layoutAttributesForItem(at: candidate)
-        else { continue }
-        let separatorTop = attrs.frame.midY - offsetY - (pillHeight / 2.0)
-        guard separatorTop >= slotY - 0.5 else { continue }  // only separators still below the slot
-        if separatorTop <= slotY + pillHeight {
-          shoveUp = min(pillHeight, max(0.0, (slotY + pillHeight) - separatorTop))
-        }
-        break  // the nearest upcoming boundary owns the shove
-      }
-    }
-    if shoveUp > 0.5 {
-      scrollingDatePill.transform = CGAffineTransform(translationX: 0.0, y: -shoveUp)
-      scrollingDatePill.alpha = max(0.0, 1.0 - (shoveUp / pillHeight))
-    } else {
-      scrollingDatePill.transform = .identity
-      scrollingDatePill.alpha = 1.0
-    }
-    // One line per state change (label / shown-ness / slot), so "the date isn't sticking"
+    // One line per state change (label / stuck-ness / slot), so "the date isn't sticking"
     // is answerable from a log instead of from the screen.
-    let stateSignature = "\(label)|\(Int(slotY))|\(Int(shoveUp))|\(isStuck)"
-    if stateSignature != lastScrollingDatePillLogSignature {
-      lastScrollingDatePillLogSignature = stateSignature
-      NSLog(
-        "[ChatOpen] date-pin chat=%@ label=%@ state=%@ slotY=%.0f pillY=%.0f own=%.0f shove=%.0f safeTop=%.0f padTop=%.0f",
-        String(engineChatId.prefix(12)), label, isStuck ? "STUCK" : "riding", slotY,
-        scrollingDatePill.frame.minY, ownerNaturalY ?? -1.0, shoveUp,
-        safeAreaInsets.top, contentPaddingTop)
+    if let loggedState {
+      let stateSignature =
+        "\(loggedState.label)|\(Int(slotY))|\(loggedState.stuck)|\(scrollingDatePills.count)"
+      if stateSignature != lastScrollingDatePillLogSignature {
+        lastScrollingDatePillLogSignature = stateSignature
+        NSLog(
+          "[ChatOpen] date-pin chat=%@ label=%@ state=%@ pills=%d slotY=%.0f pillY=%.0f safeTop=%.0f padTop=%.0f",
+          String(engineChatId.prefix(12)), loggedState.label,
+          loggedState.stuck ? "STUCK" : "riding", scrollingDatePills.count, slotY,
+          loggedState.y, safeAreaInsets.top, contentPaddingTop)
+      }
     }
   }
 
@@ -9907,6 +10304,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     cell.onRetryMessageTap = { [weak self] row in
       self?.retryOutgoingMessage(row: row, source: "inline_retry")
+    }
+    cell.onAgentErrorRetryTap = { [weak self] row in
+      self?.retryAgentErrorNotice(row: row)
     }
     cell.onNotSentTap = { [weak self] row in
       self?.handleNotSentTap(row: row)
@@ -10158,6 +10558,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           mediaKey: resolvedMediaKey(for: row),
           fileName: row.fileName
         )
+      }
+      return
+    }
+    // Video notes play in-list (Telegram) — never open the video player / gallery.
+    if row.visualKind == .videoNote {
+      if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell {
+        toggleVideoNoteInListPlayback(cell: cell, row: row, mediaURL: mediaURL)
       }
       return
     }
@@ -11335,7 +11742,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
       // Agent turn: once the user physically drags the list, stop re-pinning the
       // question to the top so they can scroll freely for the rest of the turn.
-      if (agentChatMode || currentBridgeProvider != nil), agentStreaming || agentPushToTopSpacer > 0,
+      if agentTopAnchoringEnabled, agentStreaming || agentPushToTopSpacer > 0,
         collectionView.isTracking || collectionView.isDragging
       {
         agentPinUserDetached = true
@@ -11803,7 +12210,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let contentHeight = collectionView.collectionViewLayout.collectionViewContentSize.height
     let contentWithoutInsets = max(0.0, contentHeight - currentInsets.top - currentInsets.bottom)
     let desiredTop =
-      agentChatMode
+      agentTopAnchoringEnabled
       ? baseInsets.top
       : max(baseInsets.top, collectionView.bounds.height - contentWithoutInsets - baseInsets.bottom)
 
@@ -11820,19 +12227,27 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     updateScrollToneOverlay(offsetY: collectionView.contentOffset.y)
   }
 
+  /// Content fingerprint for an agent-turn height cache entry: body length + progress node
+  /// count + label lengths + the streaming flag, so settle / history upsert / live ticks
+  /// can never reuse a stale height (which paints as bubble overlap). Shared by every
+  /// sizing path — the seed pass and `estimateMessageHeight` MUST agree on it or they hand
+  /// each other heights the other considers valid.
+  private func contentVersionForAgentTurn(_ row: ChatListRow) -> String {
+    "\(row.plainContent?.count ?? row.text.count).\(row.agentProgressNodes.count)."
+      + "\(row.agentProgressNodes.reduce(0) { $0 + $1.label.count }).\(row.isStreamingText)"
+  }
+
   /// Transition-time sizing is cache-only when possible and otherwise uses a bounded
   /// plain-text/media estimate. In particular it never asks VibeAgentTurnContentView to
   /// parse progress payloads or run an offscreen Auto Layout pass during navigation.
   private func presentationSeedMessageHeight(_ row: ChatListRow, rowWidth: CGFloat) -> CGFloat {
-    if agentSystemDividerText(for: row) != nil {
+    if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
       return 36.0
     }
 
     let state = agentTurnBubbleState(for: row)
     if bubbleUsesAgentTurnContent(row) {
-      let contentVersion =
-        "\(row.plainContent?.count ?? row.text.count).\(row.agentProgressNodes.count)."
-        + "\(row.agentProgressNodes.reduce(0) { $0 + $1.label.count }).\(row.isStreamingText)"
+      let contentVersion = contentVersionForAgentTurn(row)
       if let cached = agentTurnHeightCache[row.key],
         cached.rowWidth == rowWidth,
         cached.state == state,
@@ -11860,17 +12275,44 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     switch row.visualKind {
     case .voice:
-      return 72.0
+      // Was a hardcoded 72. The real bubble measures 69, and [BubbleFrames] caught the
+      // consequence on every voice send: the row inserts at cellH=72 bubY=3, the height
+      // warmup re-measures it to cellH=69 bubY=0 ~0.5s later, and the whole list below
+      // slides up 3pt per voice cell (contentH 5088→5082, offset 4132→4126 for two of
+      // them). That is the reported "adding voice shifts the list slightly".
+      //
+      // Nothing here justified guessing: a voice bubble is a waveform, a duration label
+      // and the meta row — pure metrics, no decode, no offscreen layout — so it measures
+      // as cheaply as it estimates. Measuring also seeds messageHeightCache, so the
+      // warmup skips the row and there is no second pass to shift anything.
+      let voiceMetrics = measureMessageBubbleLayout(
+        row: row, rowWidth: rowWidth, agentTurnState: state
+      )
+      let voiceHeight = voiceMetrics.bubbleHeight + voiceMetrics.tallOuterToggleReserve
+      messageHeightCache[row.key] = RowHeightCacheEntry(
+        row: row, rowWidth: rowWidth, state: state, height: voiceHeight)
+      return voiceHeight
     case .videoNote:
       return 220.0
     case .sticker:
       return 184.0
     case .video, .media:
-      let mediaWidth = max(1.0, row.mediaWidth ?? 1.0)
-      let mediaHeight = max(1.0, row.mediaHeight ?? 0.78)
-      let displayWidth = min(286.0, max(160.0, rowWidth * 0.74))
-      let aspectHeight = displayWidth * CGFloat(mediaHeight / mediaWidth)
-      return min(360.0, max(148.0, aspectHeight))
+      // Same argument as .text below: a media bubble measures from cached natural sizes and
+      // pure metrics, never an image decode or an offscreen layout pass, so estimating it
+      // saves nothing — and the estimate was WRONG. It capped at 360 and modelled the media
+      // box ALONE, ignoring the caption, reply preview, sender name and meta row stacked
+      // around it. [CellFit] caught the result directly: cellH=360 bubbleH=380, a 20pt
+      // overflow on an image row whose estimate had simply hit the cap. The list mounts at
+      // the short estimate, the warmup re-measures exact, and the gap under every image row
+      // grows a beat after the chat opens — the reported "small shift when there's an image".
+      // Measuring here also seeds messageHeightCache, so the warmup skips the row entirely.
+      let metrics = measureMessageBubbleLayout(
+        row: row, rowWidth: rowWidth, agentTurnState: state
+      )
+      let height = metrics.bubbleHeight + metrics.tallOuterToggleReserve
+      messageHeightCache[row.key] = RowHeightCacheEntry(
+        row: row, rowWidth: rowWidth, state: state, height: height)
+      return height
     case .text:
       // A plain text bubble measures with pure text metrics — the very same
       // NSAttributedString.boundingRect the estimate below would run — so estimating
@@ -11895,6 +12337,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           row: row, rowWidth: rowWidth, state: state, height: height)
         return height
       }
+      // …but a LIVE turn measures, for the same reason voice/media/text do above: the
+      // estimate below was wrong by a lot at exactly the moment it shows most. On the first
+      // chunk of a reply (one text node, 1 char) it returns
+      // ((1+27)/28)*22 + 72 + 1*28 = 122pt against a real 44 — so the response opened with
+      // ~78pt of empty plate, and the next pass measured it back down: `[LayoutShift]
+      // heightReload deltas=[Δ19 (44→63)]` with contentH 10152→10093. That −59 collapse one
+      // frame after the agent starts talking IS the reported "gap, then the list shifts".
+      //
+      // The cost argument for estimating agent turns holds for the presentation seed (a
+      // whole transcript of settled turns, each a full progress parse + offscreen layout);
+      // it does not hold for the single row that is streaming right now — measured at 10ms
+      // once (`[CellPerf] measure 10ms`), and it is about to be measured anyway.
+      let isLiveAgentTurn = row.isStreamingText || agentTurnRowCouldBeLive(row)
+      if isLiveAgentTurn {
+        let liveMetrics = measureMessageBubbleLayout(
+          row: row, rowWidth: rowWidth, agentTurnState: state
+        )
+        let liveHeight = liveMetrics.bubbleHeight + liveMetrics.tallOuterToggleReserve
+        agentTurnHeightCache[row.key] = RowHeightCacheEntry(
+          row: row, rowWidth: rowWidth, state: state, height: liveHeight,
+          contentVersion: contentVersionForAgentTurn(row))
+        return liveHeight
+      }
       let text = (row.plainContent ?? row.text)
         .trimmingCharacters(in: .whitespacesAndNewlines)
       if text.isEmpty { return 52.0 }
@@ -11915,9 +12380,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func estimateMessageHeight(_ row: ChatListRow, rowWidth: CGFloat) -> CGFloat {
-    // Agent control/context events (interrupt, /compact) render as a centered divider
-    // pill, not a bubble — give them a fixed compact height like the day separator.
-    if agentSystemDividerText(for: row) != nil {
+    // Agent control/context events (interrupt, /compact) and failed agent turns render
+    // as a centered pill, not a bubble — give them a fixed compact height like the day
+    // separator.
+    if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
       return 36.0
     }
     // Agent turns are the one row type whose measurement is genuinely expensive
@@ -11929,11 +12395,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // streaming row misses the cache exactly once per chunk, which is the minimum.
     if bubbleUsesAgentTurnContent(row) {
       let state = agentTurnBubbleState(for: row)
-      // Content-version fingerprint: progress node count + label lengths + text length
-      // so settle / history upsert / live ticks never reuse a stale height (overlap).
-      let contentVersion =
-        "\(row.plainContent?.count ?? row.text.count).\(row.agentProgressNodes.count)."
-        + "\(row.agentProgressNodes.reduce(0) { $0 + $1.label.count }).\(row.isStreamingText)"
+      let contentVersion = contentVersionForAgentTurn(row)
       if let cached = agentTurnHeightCache[row.key],
         cached.rowWidth == rowWidth,
         cached.state == state,
@@ -11996,24 +12458,34 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return height
   }
 
+  /// ALWAYS false — a send never defers its bottom scroll. Kept as one named place
+  /// to explain why, because the deferral looked reasonable and was actively harmful.
+  ///
+  /// It used to return true for a "tall" text send (bubble ≥112pt and ≥44pt taller
+  /// than the composer plate — i.e. anything with a link preview) and then park the
+  /// list at its pre-send offset for the whole 0.36s flight, scrolling to bottom only
+  /// after reveal. Two bugs fell out of that, both reported:
+  ///
+  ///  1. The morph's target (`projectedTransitionTargetRect`) is "flush above the
+  ///     input bar" — where the bubble sits ONCE THE LIST IS AT THE BOTTOM. With the
+  ///     scroll deferred that spot was a full bubble-height too high, so the opaque
+  ///     plate flew over rows that were still there. Measured on a SoundCloud link
+  ///     send (382pt bubble): target y=175 vs real y=565 — a 390pt full-width overlay
+  ///     on the previous messages, then a snap at reveal.
+  ///  2. Making the target honest instead just moved the damage: the bubble landed at
+  ///     its un-scrolled slot (screen y 565…947) which is *behind the composer and
+  ///     keyboard*, invisible until the late async scroll dragged it up.
+  ///
+  /// A send has exactly one correct behaviour, the same one plain text already gets:
+  /// scroll to bottom in the same pass as the insert, so the previous rows ride UP on
+  /// the morph's own clock (`animDuration = SendMorphProfile.duration`, the additive
+  /// per-cell ride) while the plate flies into the slot they vacated. Nothing is ever
+  /// covered, nothing lands off-screen, and the projected target is truthful again.
   private func shouldDeferBottomScrollForPendingSend(
     _ payload: SendTransitionPayload,
     parsedRows: [ChatListRow]
   ) -> Bool {
-    guard
-      let row = parsedRows.first(where: { $0.messageId == payload.messageId }),
-      row.kind == .message,
-      row.visualKind == .text
-    else {
-      return false
-    }
-    let rowWidth = max(1.0, collectionView.bounds.width - (messageHorizontalInset * 2.0))
-    let metrics = measureMessageBubbleLayout(
-      row: row, rowWidth: rowWidth, agentTurnState: agentTurnBubbleState(for: row)
-    )
-    let sourceHeight = max(1.0, payload.resolvedSourceBackgroundRect.height)
-    let heightDelta = metrics.bubbleHeight - sourceHeight
-    return metrics.bubbleHeight >= 112.0 && heightDelta >= 44.0
+    false
   }
 
   private func currentDistanceFromBottom() -> CGFloat {
@@ -12028,7 +12500,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // bottom. That value grows as the answer streams in (and is recomputed on every
     // link-preview / markdown relayout), so re-applying it drags the user back down
     // and prevents scrolling. The user owns the scroll; only the send pin moves it.
-    if agentChatMode {
+    if agentTopAnchoringEnabled {
       return
     }
     let targetOffset = max(
@@ -12052,7 +12524,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// owns the scroll; and (c) animates with `.beginFromCurrentState` so back-to-back
   /// chunks chase the bottom as one continuous glide instead of a per-chunk snap.
   private func followBottomForAgentTurnGrowth() {
-    guard !agentChatMode else { return }  // agent surface: pin logic owns the offset
+    guard !agentTopAnchoringEnabled else { return }  // optional pinned surface owns the offset
     guard
       !collectionView.isTracking, !collectionView.isDragging, !collectionView.isDecelerating
     else { return }
@@ -12558,8 +13030,51 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return false
   }
 
+  /// Vibe AI native-agent DM: its engine payload is the VOLATILE current-session
+  /// transcript, authoritative only for its own time range. Rows OLDER than the session
+  /// (e.g. media from an earlier turn, on screen only because the cold-open history seed
+  /// mounted them) are simply not covered by the payload — pipeline-v2's no-union rule
+  /// drops them the moment you send, then a fuller read re-adds them on finish (the
+  /// "media disappears then reappears" + list-shift churn). Retain ONLY the strictly-older
+  /// displayed prefix the payload does not speak to: rows whose id is absent from the
+  /// payload AND whose timestamp precedes the payload's earliest message (and that were
+  /// not just deleted). The just-sent bubble and the live streaming row are the NEWEST, so
+  /// they are never in this prefix — no double-paint, no resurrected tombstones. Id and
+  /// timestamp presence only; never decrypt. No-op for every non-agent surface, for bridge
+  /// DMs, and for a fresh chat (no older rows to retain). Canonical ordering downstream
+  /// re-sorts by timestamp, so a prepend lands each retained row back in its true slot.
+  private func retainingOlderVolatileAgentPrefix(_ payload: [[String: Any]]) -> [[String: Any]] {
+    guard agentChatMode, currentBridgeProvider == nil,
+      ChatEngine.shared.isChatHistoryLoaded(chatId: engineChatId),
+      !payload.isEmpty, !sourceRowsPayload.isEmpty
+    else { return payload }
+    var payloadIds = Set<String>()
+    var payloadMinDate: Date?
+    for row in payload {
+      if let id = messageId(fromRawRow: row) { payloadIds.insert(id) }
+      guard let date = Self.rawMessageDate(from: row) else { continue }
+      if payloadMinDate == nil || date < payloadMinDate! { payloadMinDate = date }
+    }
+    guard let minDate = payloadMinDate else { return payload }
+    var retained: [[String: Any]] = []
+    for row in sourceRowsPayload {
+      guard let id = messageId(fromRawRow: row),
+        !payloadIds.contains(id),
+        !nativeDeletedMessageIds.contains(id),
+        let date = Self.rawMessageDate(from: row),
+        date < minDate
+      else { continue }
+      retained.append(row)
+    }
+    guard !retained.isEmpty else { return payload }
+    NSLog(
+      "[AgentPrefix] retained older=%d payload=%d displayed=%d minDate=%.0f",
+      retained.count, payload.count, sourceRowsPayload.count, minDate.timeIntervalSince1970)
+    return retained + payload
+  }
+
   private func mergedRowsPayload(from baseRows: [[String: Any]]) -> [[String: Any]] {
-    let effectiveBaseRows: [[String: Any]] = {
+    let basePayloadRows: [[String: Any]] = {
       guard statusAuthorityEnabled, !engineChatId.isEmpty else { return baseRows }
       // Delta-driven applies (stage B1) already fetched a fresh engine read off-main;
       // repeating the synchronous fetch below would re-add the main-thread
@@ -12593,6 +13108,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return baseRows
     }()
+
+    // Protect the strictly-older displayed rows a volatile Vibe AI DM payload doesn't
+    // cover (media/older turns from the cold-open seed). No-op elsewhere.
+    let effectiveBaseRows = retainingOlderVolatileAgentPrefix(basePayloadRows)
 
     var engineMergedRows = effectiveBaseRows
     if !nativeEngineRowsById.isEmpty || !nativeDeletedMessageIds.isEmpty {
@@ -13040,6 +13559,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     duration: Double? = nil,
     mediaSize: CGSize? = nil,
     thumbnailBase64: String? = nil,
+    waveform: [Double]? = nil,
+    isVideoNote: Bool = false,
     replyToId: String? = nil
   ) {
     let isPreviousMe: Bool = {
@@ -13066,6 +13587,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let thumbnailBase64, !thumbnailBase64.isEmpty {
       metadata["thumbnailBase64"] = thumbnailBase64
     }
+    if let waveform, !waveform.isEmpty {
+      metadata["waveform"] = waveform
+    }
+    // Drives MessageVisualKind.videoNote — without it the round note renders as a
+    // plain rectangular video bubble.
+    if isVideoNote { metadata["isVideoNote"] = true }
 
     var message: [String: Any] = [
       "id": messageId,
@@ -13096,6 +13623,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if let thumbnailBase64, !thumbnailBase64.isEmpty {
       message["thumbnailBase64"] = thumbnailBase64
     }
+    if let waveform, !waveform.isEmpty { message["waveform"] = waveform }
+    if isVideoNote { message["isVideoNote"] = true }
     if let replyToId { message["replyToId"] = replyToId }
 
     nativeOutgoingRowsById[messageId] = [
@@ -13194,6 +13723,52 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
   }
 
+  /// Retry a failed agent turn from the centered "Something went wrong · Try again"
+  /// notice. The turn itself carries no re-runnable state on the main DM surface (the
+  /// old in-cell regenerate action was a dead tap here), so we re-send the prompt that
+  /// triggered it — the source text the server stamped on the error row, or, failing
+  /// that, the nearest preceding user message — as a brand-new send. That re-invokes the
+  /// agent exactly as if the user had asked again.
+  private func retryAgentErrorNotice(row: ChatListRow) {
+    let candidates: [String?] = [
+      row.agentActionSourceText,
+      row.agentRegeneratePrompt,
+      precedingUserMessageText(before: row),
+    ]
+    let sourceText =
+      candidates
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first { !$0.isEmpty }
+    guard let text = sourceText else {
+      NSLog("[AgentErrorRetry] no source prompt to retry for row %@", row.messageId ?? "-")
+      return
+    }
+    NSLog("[AgentErrorRetry] re-sending source prompt len=%lu", text.count)
+    // Re-send verbatim: the source text already includes any @mention that originally
+    // routed the request, so the same agent is re-invoked without double-mentioning.
+    handleNativeSend(text: text)
+  }
+
+  /// The text of the nearest human (non-agent) message above `row` — the fallback prompt
+  /// to re-send when an errored agent turn didn't carry its own source text.
+  private func precedingUserMessageText(before row: ChatListRow) -> String? {
+    let targetKey = row.messageId ?? row.key
+    guard let idx = rows.firstIndex(where: { ($0.messageId ?? $0.key) == targetKey }) else {
+      return nil
+    }
+    var cursor = idx - 1
+    while cursor >= 0 {
+      let candidate = rows[cursor]
+      if candidate.kind == .message, !candidate.isAgentMessage, candidate.visualKind == .text {
+        let body = (candidate.plainContent ?? candidate.text)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !body.isEmpty { return body }
+      }
+      cursor -= 1
+    }
+    return nil
+  }
+
   func retryOutgoingMessage(row: ChatListRow, source: String) {
     guard let messageId = normalizedMessageId(row.messageId) else { return }
     // Agent chat: the headless agent transport owns these bubbles (not the
@@ -13280,9 +13855,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if row.kind == .day {
       rowHeight = 30.0
     } else {
+      // Snapshot cells must reserve the same forward header height as the live list.
+      let forwardTop = row.isForwarded ? Self.forwardedHeaderHeight : 0.0
       rowHeight =
         estimateMessageHeight(row, rowWidth: groupExtras?.measurementWidth ?? rowWidth)
-        + (groupExtras?.extraTop ?? 0.0)
+        + (groupExtras?.extraTop ?? forwardTop)
     }
 
     let renderCell = ChatListCell(
@@ -13306,9 +13883,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       )
     } else {
       // Preserve the direct-chat snapshot configuration, plus reply palette when present.
+      // Forwarded DMs still need the full configure path so header chrome is painted.
       renderCell.configure(
         row: row,
         hiddenMessageId: nil,
+        groupSenderNameHeight: Self.groupSenderNameHeight,
         replyAccentColors: replyColors
       )
     }
@@ -14164,6 +14743,28 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       shifted, newSlide, maxDelta, scrollDelta, debugAnimDuration, debugAnimSlideOffset)
   }
 
+  // MARK: - Video note overlay host
+
+  /// Installs the recording overlay above the message list and below the composer
+  /// so the circle is visible while the input stays interactive on top.
+  func installVideoNoteRecorderView(_ recorderView: UIView, belowInput input: UIView) {
+    recorderView.frame = bounds
+    recorderView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    if recorderView.superview !== self {
+      insertSubview(recorderView, belowSubview: input)
+    } else {
+      insertSubview(recorderView, belowSubview: input)
+    }
+    // Transition host is non-interactive but was brought to front for send morph —
+    // keep the recorder above the collection and under the input.
+    bringSubviewToFront(input)
+    NSLog(
+      "[VideoNote] list.install z: inputFront=%@ recorderUnderInput=%@",
+      subviews.last === input ? "Y" : "N",
+      recorderView.superview === self ? "Y" : "N"
+    )
+  }
+
   // MARK: - Native Input Bar
 
   func setInputBarEnabled(_ enabled: Bool) {
@@ -14280,16 +14881,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     agentChatMode = enabled
     inputBar?.setAgentControlMode(enabled)
     updateAgentBridgeControlTitle()
+    pendingAgentPushToTop = false
+    clearAgentPushToTopSpacer()
     updateBottomAnchorInset()
-    if enabled {
-      performInternalScrollAdjustment {
-        collectionView.setContentOffset(.zero, animated: false)
-      }
-      previousOffsetY = collectionView.contentOffset.y
-    } else {
-      pendingAgentPushToTop = false
-      clearAgentPushToTopSpacer()
-    }
   }
 
   /// True when this surface has a live/streaming agent turn — used to force the
@@ -14488,7 +15082,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// tracks the answer (even after the user takes over scrolling) so it collapses
   /// to zero as the answer fills the viewport, leaving no dead space to scroll into.
   private func applyAgentPin(forceOffset: Bool) {
-    guard agentChatMode || currentBridgeProvider != nil else { return }
+    guard agentTopAnchoringEnabled else { return }
     guard let userIndex = rows.lastIndex(where: { $0.kind == .message && $0.isMe }) else {
       clearAgentPushToTopSpacer()
       return
@@ -14498,6 +15092,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     collectionView.layoutIfNeeded()
     guard let attrs = collectionView.layoutAttributesForItem(at: indexPath) else { return }
     let target = agentReservedSpacer(forUserMinY: attrs.frame.minY)
+    // The reserve deliberately makes maxOffset == pinnedOffset, so "cannot scroll down" is
+    // CORRECT while it is positive and a hard lock once it stops collapsing. Two ways it
+    // stops: `agentPinUserDetached` freezes it the moment a drag starts (it only ever
+    // shrinks, and never runs again after that), or `contentSize` is read mid-batch and
+    // reports an answer shorter than it really is. This line separates them — compare
+    // `reserve` against `belowUser` and watch whether maxOff ever passes off.
+    let pinMaxOffset =
+      max(0.0, collectionView.contentSize.height + target - collectionView.bounds.height)
+    let pinSignature = "\(Int(target))|\(agentPinUserDetached)|\(Int(pinMaxOffset))"
+    if pinSignature != lastAgentPinLogSignature {
+      lastAgentPinLogSignature = pinSignature
+      NSLog(
+        "[AgentPin] %@ reserve=%.0f→%.0f detached=%@ streaming=%@ userMinY=%.0f belowUser=%.0f "
+          + "contentH=%.0f boundsH=%.0f off=%.0f maxOff=%.0f padTop=%.0f padBot=%.0f",
+        forceOffset ? "SEND-PIN" : "frame", agentPushToTopSpacer, target,
+        agentPinUserDetached ? "Y" : "N", agentStreaming ? "Y" : "N", attrs.frame.minY,
+        max(0.0, collectionView.contentSize.height - attrs.frame.minY),
+        collectionView.contentSize.height, collectionView.bounds.height,
+        collectionView.contentOffset.y, pinMaxOffset, contentPaddingTop, contentPaddingBottom)
+    }
 
     // ── Deliberate send pin ──────────────────────────────────────────────────
     // This is the ONLY place the agent surface ever moves the scroll offset, and
@@ -15527,9 +16141,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Claude/Codex bridge DMs are handled below by the native dispatch path. This
     // host event branch is only for the built-in agent surface.
     if agentChatMode && currentBridgeProvider == nil && !fromAgentSurface {
-      inputBar?.dismissReplyBanner(animated: false)
-      inputBar?.clearText()
-      pendingAgentPushToTop = true
+      pendingAgentPushToTop = agentTopAnchoringEnabled
       // Re-use the armed id when resending an edited failed message so the
       // transport truncates the stale turn instead of appending a duplicate.
       let outgoingMessageId = editingAgentMessageId ?? messageId
@@ -15547,7 +16159,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       if !bridgeMetadata.isEmpty {
         sendPayload["metadata"] = bridgeMetadata
       }
+      // Same Telegram composer→bubble morph as every other chat (this surface used to skip
+      // it and just hand the text off). The built-in agent's user bubble is echoed back by
+      // the engine with THIS id — not through queueNativeOutgoingMessage — so once setRows
+      // delivers the row the pending morph resolves it (resolveTransitionRow → rows by id)
+      // and lands on it exactly like a normal send. Top-anchoring is off (agentTopAnchoring
+      // Enabled == false), so the turn lands at the bottom where the flight aims. Arm BEFORE
+      // clearing the input: the capture snapshots the live composer text.
+      armSendMorph(messageId: outgoingMessageId, text: text, timestamp: timestamp)
+      inputBar?.dismissReplyBanner(animated: false)
+      inputBar?.clearText()
       onNativeEvent(sendPayload)
+      // Safety net: if the engine never echoes a row with this id (server-reassigned id or a
+      // dropped socket), the hidden cell would stay invisible. Un-hide after a grace so an
+      // un-fired morph can never permanently swallow the user's own bubble.
+      let armedMorphId = outgoingMessageId
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+        guard let self, self.activeSendTransition == nil,
+          self.pendingSendTransition?.messageId == armedMorphId
+        else { return }
+        NSLog(
+          "[SendMorph] agent morph never fired for %@ — un-hiding bubble",
+          String(armedMorphId.prefix(12)))
+        self.pendingSendTransition = nil
+        if self.hiddenMessageId == armedMorphId { self.hiddenMessageId = nil }
+        self.collectionView.reloadData()
+      }
       return
     }
 
@@ -15563,30 +16200,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // optimistic media row stays visible.
     let hasAttachmentBlobs = !attachmentBlobs.isEmpty
     let isGroupAgentSurface = groupHasBridgeAgents()
-    if (currentBridgeProvider != nil || (isGroupAgentSurface && hasAttachmentBlobs))
-      && !fromAgentSurface
-    {
+    let isBridgeDM = currentBridgeProvider != nil
+
+    // A LIVE run owns the CLI right now: dispatching would spawn a second concurrent
+    // run (or be dropped by the daemon's duplicate guard) and its mirrored prompt
+    // rows corrupt the visible thread. Hold the message in the pending queue instead:
+    // it shows as a "waiting" preview above the input (cancel ✕ / Steer ⚡) and
+    // auto-sends the moment the current run settles. Edited-resends keep their
+    // truncate semantics and never queue. Independent of morph: a queued message has
+    // no destination cell to fly to.
+    if isBridgeDM, !fromAgentSurface, editingAgentMessageId == nil, bridgeRunIsLive() {
       inputBar?.dismissReplyBanner(animated: false)
       inputBar?.clearText()
-      // A LIVE run owns the CLI right now: dispatching would spawn a second concurrent
-      // run (or be dropped by the daemon's duplicate guard) and its mirrored prompt
-      // rows corrupt the visible thread. Hold the message in the pending queue instead:
-      // it shows as a "waiting" preview above the input (cancel ✕ / Steer ⚡) and
-      // auto-sends the moment the current run settles. Edited-resends keep their
-      // truncate semantics and never queue.
-      if currentBridgeProvider != nil, editingAgentMessageId == nil, bridgeRunIsLive() {
-        enqueuePendingBridgeSend(
-          messageId: messageId,
-          text: text,
-          replyToMessageId: replyToMessageId,
-          bridgeMetadata: bridgeMetadata,
-          agentMention: agentMention,
-          agentText: agentText,
-          mentionedAgentUsername: mentionedAgentUsername
-        )
-        return
-      }
-      // Inline bridge DM / group-agent image send: no morph, no hidden cell.
+      enqueuePendingBridgeSend(
+        messageId: messageId,
+        text: text,
+        replyToMessageId: replyToMessageId,
+        bridgeMetadata: bridgeMetadata,
+        agentMention: agentMention,
+        agentText: agentText,
+        mentionedAgentUsername: mentionedAgentUsername
+      )
+      return
+    }
+
+    // ATTACHMENTS skip the chat-view send morph: it captures text only and hides the
+    // cell until complete, which drops image previews. That is the whole reason this
+    // bypass exists — but it was keyed on "is a bridge DM" rather than "has blobs", so
+    // plain TEXT in a Claude/Codex DM lost the morph too and the agent chat animated
+    // differently from every other chat. Groups were already narrowed this way; this
+    // brings DMs onto the same rule, and the send then flows through the shared native
+    // transition below (the optimistic native row is what the morph lands on, and a
+    // bridge send creates one exactly like any other send).
+    if (isBridgeDM || isGroupAgentSurface), hasAttachmentBlobs, !fromAgentSurface {
+      inputBar?.dismissReplyBanner(animated: false)
+      inputBar?.clearText()
       let outgoingMessageId = editingAgentMessageId ?? messageId
       editingAgentMessageId = nil
       if !bridgeMetadata.isEmpty {
@@ -15609,7 +16257,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Preserve the group retry id/fresh-row bookkeeping, but let renderable text continue
     // into the shared native transition below; agent fan-out is not a morph capability test.
     var nativeTransitionMessageId = messageId
-    if isGroupAgentSurface && !fromAgentSurface && !bridgeMetadata.isEmpty {
+    let keepsAgentSendBookkeeping =
+      !fromAgentSurface && (isBridgeDM || (isGroupAgentSurface && !bridgeMetadata.isEmpty))
+    if keepsAgentSendBookkeeping {
       let outgoingMessageId = editingAgentMessageId ?? messageId
       editingAgentMessageId = nil
       if !bridgeMetadata.isEmpty {
@@ -15659,10 +16309,44 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
 
-    // 1. Hide the message cell immediately (before it even exists).
-    hiddenMessageId = nativeTransitionMessageId
+    // 1-3. Arm the composer→bubble morph: hide the cell, capture source geometry, store the
+    // pending transition (it fires when the cell with this id arrives). Shared verbatim with
+    // the built-in agent send below so both surfaces animate identically.
+    armSendMorph(messageId: nativeTransitionMessageId, text: text, timestamp: timestamp)
 
-    // 2. Compute source rects and capture live text snapshot (BEFORE clearing).
+    // 4. Dismiss reply banner after capture, so reply sends morph from the same composer height.
+    inputBar?.dismissReplyBanner(animated: false)
+
+    // 5. Clear the input bar.
+    inputBar?.clearText()
+
+    // 6. Either append natively (no JS dependency) or delegate to JS.
+    dispatchOutgoingSend(
+      messageId: nativeTransitionMessageId,
+      text: text,
+      timestamp: timestamp,
+      timestampMs: timestampMs,
+      replyToMessageId: replyToMessageId,
+      bridgeMetadata: bridgeMetadata,
+      agentMention: agentMention,
+      agentText: agentText,
+      mentionedAgentUsername: mentionedAgentUsername
+    )
+  }
+
+  /// Capture the composer→bubble morph source geometry and arm the pending transition for
+  /// `messageId`. Shared by the normal chat send AND the built-in "Vibe AI" agent send: the
+  /// agent dispatches through its own transport (onNativeEvent) rather than
+  /// queueNativeOutgoingMessage, but its user bubble is echoed back by the engine with THIS
+  /// exact id, so the identical morph resolves and lands on it (resolveTransitionRow → rows by
+  /// id) once setRows delivers the row. MUST run BEFORE the input is cleared — the capture
+  /// snapshots the live composer text.
+  private func armSendMorph(messageId: String, text: String, timestamp: String) {
+    // Hide the message cell immediately (before it even exists); cellForItemAt checks
+    // hiddenMessageId.
+    hiddenMessageId = messageId
+
+    // Compute source rects and capture live text snapshot (BEFORE clearing).
     let sourceRect: CGRect
     let sourceContainerRect: CGRect?
     let sourceBackgroundRectInContainer: CGRect?
@@ -15703,9 +16387,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sourceContentSnapshotView = nil
     }
 
-    // 3. Store pending transition so it starts when the cell arrives.
+    // Store pending transition so it starts when the cell arrives.
     let payload = SendTransitionPayload(
-      messageId: nativeTransitionMessageId,
+      messageId: messageId,
       text: text,
       timestamp: timestamp,
       startRect: sourceRect,
@@ -15717,25 +16401,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       sourceContentSnapshotView: sourceContentSnapshotView
     )
     pendingSendTransition = payload
-
-    // 4. Dismiss reply banner after capture, so reply sends morph from the same composer height.
-    inputBar?.dismissReplyBanner(animated: false)
-
-    // 5. Clear the input bar.
-    inputBar?.clearText()
-
-    // 6. Either append natively (no JS dependency) or delegate to JS.
-    dispatchOutgoingSend(
-      messageId: nativeTransitionMessageId,
-      text: text,
-      timestamp: timestamp,
-      timestampMs: timestampMs,
-      replyToMessageId: replyToMessageId,
-      bridgeMetadata: bridgeMetadata,
-      agentMention: agentMention,
-      agentText: agentText,
-      mentionedAgentUsername: mentionedAgentUsername
-    )
   }
 
   /// Append the outgoing row (native path) and hand the message to the transport —
@@ -16038,16 +16703,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       pendingSendTransition = transitionPayload
     }
 
-    // Compute a durable thumbnail early so optimistic + profile grids show the image
-    // even after sealed blobs are stripped from the server copy.
+    // Durable micro-thumb (Telegram-style, ≤~4KB): paints the bubble instantly while
+    // full media uploads/downloads. Server keeps thumbnailBase64; sealed blobs stripped.
     let optimisticThumb: String? = {
       if let thumbnailBase64, !thumbnailBase64.isEmpty { return thumbnailBase64 }
       guard type == "image",
         let fileURL = localAttachmentFileURL(for: uri),
-        let image = UIImage(contentsOfFile: fileURL.path),
-        let jpeg = image.jpegData(compressionQuality: 0.45)
+        let image = UIImage(contentsOfFile: fileURL.path)
       else { return nil }
-      return jpeg.base64EncodedString()
+      return chatMicroThumbnailJPEGBase64(from: image)
     }()
 
     queueNativeOutgoingMediaMessage(
@@ -16129,13 +16793,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // Always stamp sealed blobs even when group metadata is repo-only (no provider key).
         metadata["agentBridgeAttachmentsEnc"] = blobs
         metadata["attachmentsEnc"] = blobs
-        // Durable multi-image thumbs (server strips sealed blobs; these stay in metadata).
+        // Durable multi-image micro-thumbs (server strips sealed blobs; these stay).
         let thumbs = allURIs.compactMap { raw -> String? in
           guard let fileURL = localAttachmentFileURL(for: raw),
-            let image = UIImage(contentsOfFile: fileURL.path),
-            let jpeg = image.jpegData(compressionQuality: 0.4)
+            let image = UIImage(contentsOfFile: fileURL.path)
           else { return nil }
-          return jpeg.base64EncodedString()
+          return chatMicroThumbnailJPEGBase64(from: image)
         }
         if !thumbs.isEmpty {
           metadata["attachmentThumbnailsB64"] = thumbs
@@ -16301,6 +16964,222 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         }
         return accepted ? "sent" : "error"
       }()
+      DispatchQueue.main.async {
+        self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+      }
+    }
+  }
+
+  /// Send a just-recorded voice message through the native pipeline.
+  ///
+  /// The recorder used to hand its file to `onNativeEvent("attachmentVoice")`, which
+  /// nothing in the app consumes anymore — releasing the mic silently dropped the
+  /// recording. This is the audio-file path (`handleNativeAudioFileSend`) with the
+  /// two things a voice message has and a music file doesn't: type `voice`, and the
+  /// waveform the bubble draws its bars from.
+  private func handleNativeVoiceSend(uri: String, duration: Double, waveform: [Double]) {
+    let messageId = UUID().uuidString.lowercased()
+    let now = Date()
+    let timestampMs = now.timeIntervalSince1970 * 1000
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm"
+    let timestamp = formatter.string(from: now)
+    let replyToMessageId = inputBar?.activeReplyToMessageId
+    let fileName = localAttachmentFileName(for: uri) ?? "voice-message.m4a"
+    let fileSize = localAttachmentFileSize(for: uri)
+    // The asset's own duration is exact; the recorder's wall-clock figure is the
+    // fallback for the beat where the file isn't readable yet.
+    let resolvedDuration = localMediaDurationSeconds(for: uri) ?? (duration > 0 ? duration : nil)
+
+    inputBar?.dismissReplyBanner(animated: false)
+
+    queueNativeOutgoingMediaMessage(
+      messageId: messageId,
+      type: "voice",
+      localUri: uri,
+      caption: nil,
+      timestamp: timestamp,
+      timestampMs: timestampMs,
+      fileName: fileName,
+      fileSize: fileSize,
+      duration: resolvedDuration,
+      waveform: waveform,
+      replyToId: replyToMessageId
+    )
+
+    DispatchQueue.main.async { [weak self] in
+      self?.scrollToBottom(animated: true)
+    }
+
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let myUserId = engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let peerUserId = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let peerAgentId = enginePeerAgentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if chatId.isEmpty {
+      NSLog("[VoiceSend] abort messageId=%@ reason=empty_chat_id", messageId)
+      setNativeOutgoingMessageStatus(messageId, status: "error")
+      return
+    }
+
+    var metadata: [String: Any] = ["mediaUrl": uri, "fileName": fileName]
+    if let fileSize, fileSize > 0 { metadata["fileSize"] = fileSize }
+    if let resolvedDuration { metadata["duration"] = resolvedDuration }
+    if !waveform.isEmpty { metadata["waveform"] = waveform }
+
+    let sendPayload: [String: Any] = [
+      "chatId": chatId,
+      "messageId": messageId,
+      "type": "voice",
+      "text": "",
+      "timestampMs": timestampMs,
+      "replyToId": replyToMessageId as Any,
+      "metadata": metadata,
+      "mediaUrl": uri,
+      "myUserId": myUserId,
+      "peerUserId": peerUserId,
+      "peerAgentId": peerAgentId,
+      "isGroup": isGroupOrChannel,
+    ]
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let result = ChatEngine.shared.sendMessage(sendPayload)
+      let accepted = (result["accepted"] as? Bool) == true
+      let resolvedStatus: String = {
+        if let stateValue = result["state"] as? String {
+          let normalized = stateValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+          if normalized == "error" || normalized == "pending" || normalized == "sent"
+            || normalized == "delivered" || normalized == "read"
+          {
+            return normalized
+          }
+        }
+        return accepted ? "sent" : "error"
+      }()
+      NSLog(
+        "[VoiceSend] engine messageId=%@ accepted=%@ status=%@ reason=%@",
+        messageId, accepted ? "true" : "false", resolvedStatus,
+        (result["reason"] as? String) ?? "-")
+      DispatchQueue.main.async {
+        self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
+      }
+    }
+  }
+
+  /// Send a just-recorded round video note through the native pipeline.
+  ///
+  /// Same dead end as voice: the recorder's file went to an `attachmentVideoNote`
+  /// event with no listener. A note is a `video` message carrying `isVideoNote`,
+  /// which is what makes it render round rather than as a rectangular video bubble.
+  private func handleNativeVideoNoteSend(uri: String, duration: Double) {
+    let messageId = UUID().uuidString.lowercased()
+    let now = Date()
+    let timestampMs = now.timeIntervalSince1970 * 1000
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm"
+    let timestamp = formatter.string(from: now)
+    let replyToMessageId = inputBar?.activeReplyToMessageId
+    let fileName = localAttachmentFileName(for: uri) ?? "video-note.mov"
+    let fileSize = localAttachmentFileSize(for: uri)
+    let resolvedDuration = localMediaDurationSeconds(for: uri) ?? (duration > 0 ? duration : nil)
+    let mediaSize = localVideoNaturalSize(for: uri)
+    let thumbnailBase64 = localVideoThumbnailBase64(for: uri)
+
+    inputBar?.dismissReplyBanner(animated: false)
+
+    // Hide optimistic cell until release morph lands (same pattern as text send morph).
+    if pendingVideoNoteMorphImage != nil {
+      hiddenMessageId = messageId
+    }
+
+    queueNativeOutgoingMediaMessage(
+      messageId: messageId,
+      type: "video",
+      localUri: uri,
+      caption: nil,
+      timestamp: timestamp,
+      timestampMs: timestampMs,
+      fileName: fileName,
+      fileSize: fileSize,
+      duration: resolvedDuration,
+      mediaSize: mediaSize,
+      thumbnailBase64: thumbnailBase64,
+      isVideoNote: true,
+      replyToId: replyToMessageId
+    )
+
+    // Flight toward predicted bottom-trailing slot; retarget when cell lays out.
+    if let image = pendingVideoNoteMorphImage, pendingVideoNoteMorphFrame.width > 1 {
+      runVideoNoteReleaseMorph(
+        messageId: messageId,
+        image: image,
+        fromFrameInList: pendingVideoNoteMorphFrame
+      )
+      pendingVideoNoteMorphImage = nil
+      pendingVideoNoteMorphFrame = .zero
+    } else {
+      DispatchQueue.main.async { [weak self] in
+        self?.scrollToBottom(animated: true)
+      }
+    }
+
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let myUserId = engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let peerUserId = enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let peerAgentId = enginePeerAgentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if chatId.isEmpty {
+      NSLog("[VideoNoteSend] abort messageId=%@ reason=empty_chat_id", messageId)
+      setNativeOutgoingMessageStatus(messageId, status: "error")
+      return
+    }
+
+    var metadata: [String: Any] = [
+      "mediaUrl": uri,
+      "fileName": fileName,
+      "isVideoNote": true,
+    ]
+    if let fileSize, fileSize > 0 { metadata["fileSize"] = fileSize }
+    if let resolvedDuration { metadata["duration"] = resolvedDuration }
+    if let mediaSize, mediaSize.width > 1.0, mediaSize.height > 1.0 {
+      metadata["width"] = Int(mediaSize.width)
+      metadata["height"] = Int(mediaSize.height)
+    }
+    if let thumbnailBase64, !thumbnailBase64.isEmpty {
+      metadata["thumbnailBase64"] = thumbnailBase64
+    }
+
+    let sendPayload: [String: Any] = [
+      "chatId": chatId,
+      "messageId": messageId,
+      "type": "video",
+      "text": "",
+      "timestampMs": timestampMs,
+      "replyToId": replyToMessageId as Any,
+      "metadata": metadata,
+      "mediaUrl": uri,
+      "myUserId": myUserId,
+      "peerUserId": peerUserId,
+      "peerAgentId": peerAgentId,
+      "isGroup": isGroupOrChannel,
+    ]
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let result = ChatEngine.shared.sendMessage(sendPayload)
+      let accepted = (result["accepted"] as? Bool) == true
+      let resolvedStatus: String = {
+        if let stateValue = result["state"] as? String {
+          let normalized = stateValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+          if normalized == "error" || normalized == "pending" || normalized == "sent"
+            || normalized == "delivered" || normalized == "read"
+          {
+            return normalized
+          }
+        }
+        return accepted ? "sent" : "error"
+      }()
+      NSLog(
+        "[VideoNoteSend] engine messageId=%@ accepted=%@ status=%@ reason=%@",
+        messageId, accepted ? "true" : "false", resolvedStatus,
+        (result["reason"] as? String) ?? "-")
       DispatchQueue.main.async {
         self?.setNativeOutgoingMessageStatus(messageId, status: resolvedStatus)
       }
@@ -16802,7 +17681,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         return
       }
 
-      if self.agentChatMode {
+      if self.agentTopAnchoringEnabled {
         // While the user is physically scrolling, running the full layout
         // invalidation + batch update on every streaming token competes with the
         // scroll gesture and makes it stutter (the reported "laggy" scroll). The
@@ -16820,16 +17699,30 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         return
       }
 
+      // Follow the growing/revealing answer down ONLY when the reader is genuinely
+      // pinned to the bottom (true streaming-follow) or still in the pre-scroll open
+      // settle — and NEVER while their finger owns the scroll. A reveal/token tick
+      // calling scrollToBottom while the user drags up is exactly the reported "I
+      // can't scroll, it shoves me back down" fight (the oscillation after a reply,
+      // driven by the post-finish typewriter reveal still firing this handler). Once
+      // they have taken control, touch nothing: performBatchUpdates(nil) preserves
+      // their contentOffset, so the answer grows off-screen below without moving
+      // what they are reading. `animated:false` also stops the animated scroll from
+      // visibly chasing the bubble ("agent cell goes out of view / list shifts").
       let distanceFromBottom = self.currentDistanceFromBottom()
-      let wasNearBottom = distanceFromBottom <= listBottomThreshold
+      let interacting =
+        self.collectionView.isTracking || self.collectionView.isDragging
+        || self.collectionView.isDecelerating
+      let followsBottom =
+        !interacting
+        && (distanceFromBottom <= 4.0
+          || (!self.userHasScrolledSinceOpen && distanceFromBottom <= listBottomThreshold))
 
       self.flowLayout.invalidateLayout()
       self.collectionView.performBatchUpdates(nil) { [weak self] _ in
         guard let self else { return }
-        if wasNearBottom {
-          self.scrollToBottom(animated: true)
-        } else {
-          self.restoreStationaryDistance(distanceFromBottom)
+        if followsBottom {
+          self.scrollToBottom(animated: false)
         }
       }
     }
@@ -16844,7 +17737,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// dead space collapses as the answer fills the viewport. Once the turn ends (no pin,
   /// no reserve) we leave the offset exactly where the user/content left it.
   private func performAgentStreamingRelayout() {
-    guard agentChatMode, window != nil else { return }
+    guard agentTopAnchoringEnabled, window != nil else { return }
     UIView.performWithoutAnimation {
       self.flowLayout.invalidateLayout()
       self.collectionView.performBatchUpdates(nil) { [weak self] _ in
@@ -17283,7 +18176,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func remoteMediaCacheKey(remoteURL: URL, mediaKey: String?) -> String {
     let trimmedKey = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return remoteURL.absoluteString + "|" + trimmedKey
+    let identity = chatStableRemoteMediaIdentity(remoteURL)
+    return identity + "|" + trimmedKey
   }
 
   private func persistedPreviewLocalURL(
@@ -17294,11 +18188,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     tempURL: URL? = nil
   ) -> URL {
     let fileManager = FileManager.default
-    let baseDir =
-      fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
-      ?? fileManager.temporaryDirectory
-    let previewDir = baseDir.appendingPathComponent("vibe-chat-preview-docs", isDirectory: true)
+    // Application Support — not Caches (OS purges Caches → forced re-download on reopen).
+    let previewDir = vibeDurableMediaCacheRoot()
+      .appendingPathComponent("vibe-chat-preview-docs", isDirectory: true)
     try? fileManager.createDirectory(at: previewDir, withIntermediateDirectories: true)
+    migrateLegacyPreviewDocsIfNeeded(into: previewDir)
 
     let preferredName =
       fileName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -17322,6 +18216,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let destinationName =
       "\(safeBase)-\(hashComponent)\(preferredExtension.isEmpty ? "" : ".\(preferredExtension)")"
     return previewDir.appendingPathComponent(destinationName, isDirectory: false)
+  }
+
+  private func migrateLegacyPreviewDocsIfNeeded(into destination: URL) {
+    let fm = FileManager.default
+    guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+    let legacy = caches.appendingPathComponent("vibe-chat-preview-docs", isDirectory: true)
+    guard fm.fileExists(atPath: legacy.path),
+      let items = try? fm.contentsOfDirectory(atPath: legacy.path)
+    else { return }
+    for item in items {
+      let src = legacy.appendingPathComponent(item)
+      let dst = destination.appendingPathComponent(item)
+      if fm.fileExists(atPath: dst.path) { continue }
+      try? fm.copyItem(at: src, to: dst)
+    }
   }
 
   private func cachedDownloadedMediaURL(
@@ -17729,10 +18638,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         originalFileName: row.fileName
       )
       DispatchQueue.main.async {
-        self.documentPreviewInFlightURLs.remove(remoteKey)
-        self.onDemandRemoteMediaDownloadKeys.remove(remoteKey)
+        // Finish progress FIRST (1.0), then clear in-flight bookkeeping so the
+        // spinner never blanks mid-flight or flashes download→gone→download.
+        if let localURL {
+          self.mediaDownloadProgressByRemoteKey[remoteKey] = 1.0
+        }
         self.mediaDownloadObservations.removeValue(forKey: remoteKey)?.invalidate()
-        self.mediaDownloadProgressByRemoteKey.removeValue(forKey: remoteKey)
         self.mediaDownloadTasks.removeValue(forKey: remoteKey)
         if let localURL,
           self.usableLocalMediaURL(
@@ -17745,6 +18656,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         {
           self.documentPreviewCacheByRemoteURL[remoteKey] = localURL
           self.cacheDownloadedMediaURL(localURL, for: row)
+          self.documentPreviewInFlightURLs.remove(remoteKey)
+          self.onDemandRemoteMediaDownloadKeys.remove(remoteKey)
+          self.mediaDownloadProgressByRemoteKey.removeValue(forKey: remoteKey)
           self.updateVisibleMediaDownloadState(for: row, reloadCell: true)
           chatListDebugLog(
             chatListMediaVerboseDebugLogs,
@@ -17773,6 +18687,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             )
             try? FileManager.default.removeItem(at: localURL)
           }
+          self.documentPreviewInFlightURLs.remove(remoteKey)
+          self.onDemandRemoteMediaDownloadKeys.remove(remoteKey)
+          self.mediaDownloadProgressByRemoteKey.removeValue(forKey: remoteKey)
           self.updateVisibleMediaDownloadState(for: row)
           NSLog("[ChatListView] remote media download failed url=%@", remoteURL.absoluteString)
         }
@@ -17784,13 +18701,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       options: [.initial, .new]
     ) { [weak self] progress, _ in
       guard let self else { return }
+      // Monotonic progress — never jump backwards (avoids spinner reset flicker).
       let value = max(0.027, min(1.0, progress.fractionCompleted))
       DispatchQueue.main.async {
         let previous = self.mediaDownloadProgressByRemoteKey[remoteKey] ?? 0.0
-        if abs(previous - value) < 0.01 {
+        let next = max(previous, value)
+        if abs(previous - next) < 0.005 {
           return
         }
-        self.mediaDownloadProgressByRemoteKey[remoteKey] = value
+        self.mediaDownloadProgressByRemoteKey[remoteKey] = next
         self.updateVisibleMediaDownloadState(for: row)
       }
     }
@@ -18321,7 +19240,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
 extension ChatListView: ChatInputBarDelegate {
   func inputBarDidRequestSelectionAction(_ action: String, payload: [String: Any]?) {
+    let sampleIds = Array(selectedMessageIds.prefix(3)).joined(separator: ",")
+    NSLog(
+      "[ChatShare] selectionAction action=%@ selectedCount=%d restrict=%@ agentMode=%@ handler=%@ sampleIds=%@",
+      action,
+      selectedMessageIds.count,
+      restrictSavingContent ? "Y" : "N",
+      agentChatMode ? "Y" : "N",
+      onNativeEvent.handler != nil ? "Y" : "N",
+      sampleIds
+    )
     if restrictSavingContent, (action == "shareOutside" || action == "shareInside") {
+      NSLog("[ChatShare] selectionAction blocked by restrictSavingContent")
       clearMessageSelection()
       onNativeEvent([
         "type": "agentToast",
@@ -18332,10 +19262,38 @@ extension ChatListView: ChatInputBarDelegate {
 
     if action == "shareOutside" {
       let selectedRows = rows.filter { selectedMessageIds.contains($0.messageId ?? "") }
+      var items: [Any] = []
       let textToShare = selectedRows.map { $0.text }.filter { !$0.isEmpty }.joined(separator: "\n\n")
-      guard !textToShare.isEmpty else { return }
+      if !textToShare.isEmpty {
+        items.append(textToShare)
+      } else {
+        // Music / media-only agent bubbles often have empty text.
+        for row in selectedRows {
+          if let urlStr = row.mediaUrl ?? row.localMediaUrl, let url = URL(string: urlStr) {
+            items.append(url)
+          } else if let title = row.plainContent, !title.isEmpty {
+            items.append(title)
+          }
+        }
+      }
+      NSLog(
+        "[ChatShare] shareOutside rows=%d items=%d textLen=%d hasWindow=%@ agentMode=%@",
+        selectedRows.count,
+        items.count,
+        textToShare.count,
+        window != nil ? "Y" : "N",
+        agentChatMode ? "Y" : "N"
+      )
+      guard !items.isEmpty else {
+        NSLog("[ChatShare] shareOutside aborted: empty share items")
+        onNativeEvent([
+          "type": "agentToast",
+          "message": "Nothing to share from this selection",
+        ])
+        return
+      }
 
-      let activityVC = UIActivityViewController(activityItems: [textToShare], applicationActivities: nil)
+      let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
       if let popover = activityVC.popoverPresentationController {
         popover.sourceView = inputBar
         popover.sourceRect = inputBar?.bounds ?? .zero
@@ -18347,7 +19305,15 @@ extension ChatListView: ChatInputBarDelegate {
         while let presented = topVC.presentedViewController {
           topVC = presented
         }
-        topVC.present(activityVC, animated: true, completion: nil)
+        NSLog("[ChatShare] shareOutside presenting on %@", String(describing: type(of: topVC)))
+        topVC.present(activityVC, animated: true) {
+          NSLog(
+            "[ChatShare] shareOutside present completion presented=%@",
+            topVC.presentedViewController != nil ? "Y" : "N"
+          )
+        }
+      } else {
+        NSLog("[ChatShare] shareOutside FAILED: no window/rootVC")
       }
 
       // Optionally clear selection after sharing
@@ -18364,12 +19330,124 @@ extension ChatListView: ChatInputBarDelegate {
     // For delete and shareInside, append the selected message IDs
     if action == "delete" || action == "shareInside" {
       event["messageIds"] = Array(selectedMessageIds)
+      // Agent / engine-less surfaces need full row payloads (not only ids).
+      if action == "shareInside" {
+        let payloads = selectedRowsAsForwardPayloads()
+        event["messages"] = payloads
+        let firstType = (payloads.first?["type"] as? String) ?? "-"
+        let firstTextLen = ((payloads.first?["text"] as? String) ?? "").count
+        NSLog(
+          "[ChatShare] shareInside event ids=%d payloads=%d firstType=%@ firstTextLen=%d agentMode=%@",
+          selectedMessageIds.count,
+          payloads.count,
+          firstType,
+          firstTextLen,
+          agentChatMode ? "Y" : "N"
+        )
+        if selectedMessageIds.isEmpty && payloads.isEmpty {
+          NSLog("[ChatShare] shareInside aborted before emit: empty selection")
+          onNativeEvent([
+            "type": "agentToast",
+            "message": "Select a message to forward",
+          ])
+          return
+        }
+      }
     }
+    NSLog(
+      "[ChatShare] emitting inputActionPressed action=%@ keys=%@",
+      action,
+      event.keys.sorted().joined(separator: ",")
+    )
     onNativeEvent(event)
 
     if action == "delete" {
       clearMessageSelection()
     }
+  }
+
+  /// Snapshot selected bubbles as sendable dictionaries (agent chat has no ChatEngine live rows).
+  private func selectedRowsAsForwardPayloads() -> [[String: Any]] {
+    let payloads: [[String: Any]] = rows.compactMap { row -> [String: Any]? in
+      guard let mid = row.messageId, selectedMessageIds.contains(mid) else { return nil }
+      var payload: [String: Any] = [
+        "messageId": mid,
+        "id": mid,
+        "type": row.messageType,
+        "text": row.text,
+        "isMe": row.isMe,
+      ]
+      if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty { payload["mediaUrl"] = mediaUrl }
+      // Prefer an on-disk cache file so share/forward does not re-download then re-upload.
+      let resolvedLocal = resolvedLocalMediaForShare(row: row)
+      if let local = resolvedLocal, !local.isEmpty {
+        payload["localMediaUrl"] = local
+      } else if let local = row.localMediaUrl, !local.isEmpty {
+        payload["localMediaUrl"] = local
+      }
+      if let fileName = row.fileName, !fileName.isEmpty { payload["fileName"] = fileName }
+      if let duration = row.duration { payload["duration"] = duration }
+      if let thumb = row.thumbnailBase64, !thumb.isEmpty { payload["thumbnailBase64"] = thumb }
+      if let mediaKey = row.mediaKey, !mediaKey.isEmpty { payload["mediaKey"] = mediaKey }
+      var metadata: [String: Any] = [:]
+      if let cover = row.musicCoverURL { metadata["cover"] = cover }
+      if let artist = row.musicArtist { metadata["artist"] = artist }
+      if let source = row.musicSource { metadata["source"] = source }
+      if let local = resolvedLocal ?? row.localMediaUrl, !local.isEmpty {
+        metadata["localMediaUrl"] = local
+      }
+      // Prefer a readable title for music / empty-text bubbles.
+      if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        let plain = row.plainContent, !plain.isEmpty
+      {
+        payload["text"] = plain
+      }
+      if !metadata.isEmpty { payload["metadata"] = metadata }
+      if let plain = row.plainContent, !plain.isEmpty { payload["plainContent"] = plain }
+      return payload
+    }
+    NSLog(
+      "[ChatShare] selectedRowsAsForwardPayloads built=%d selectedIds=%d totalRows=%d",
+      payloads.count,
+      selectedMessageIds.count,
+      rows.count
+    )
+    return payloads
+  }
+
+  /// Local file for share/forward: row.localMediaUrl, durable voice-cache, or doc cache.
+  private func resolvedLocalMediaForShare(row: ChatListRow) -> String? {
+    if let local = usableLocalMediaURL(
+      from: row.localMediaUrl, for: row, logContext: "share.local")
+    {
+      return local.absoluteString
+    }
+    guard
+      let remoteRaw = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+      let remoteURL = URL(string: remoteRaw),
+      let scheme = remoteURL.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else { return nil }
+
+    // Voice/music durable cache (same slot play/download uses).
+    if row.visualKind == .voice
+      || row.messageType == "music"
+      || row.messageType == "audio"
+      || row.messageType == "voice"
+    {
+      let slot = VoiceBubblePlaybackCoordinator.shared.resolvedCachedLocalURL(
+        forRemote: remoteURL, fileName: row.fileName)
+      if let slot, FileManager.default.fileExists(atPath: slot.path) {
+        return slot.absoluteString
+      }
+    }
+
+    if let cached = validatedCachedDownloadedMediaURL(
+      remoteURL: remoteURL, row: row, logContext: "share.cached")
+    {
+      return cached.absoluteString
+    }
+    return nil
   }
 
   func inputBarDidSend(text: String, attachments: [String], imageLocalURIs: [String]) {
@@ -18529,6 +19607,13 @@ extension ChatListView: ChatInputBarDelegate {
   }
 
   func inputBarDidRecordVoice(uri: String, duration: Double, waveform: [Double]) {
+    NSLog(
+      "[VoiceSend] recorded uri=%@ duration=%.2f waveform=%d nativeSend=%@",
+      uri, duration, waveform.count, nativeSendEnabled ? "true" : "false")
+    if nativeSendEnabled {
+      handleNativeVoiceSend(uri: uri, duration: duration, waveform: waveform)
+      return
+    }
     onNativeEvent([
       "type": "attachmentVoice",
       "uri": uri,
@@ -18538,7 +19623,152 @@ extension ChatListView: ChatInputBarDelegate {
     ])
   }
 
+  @objc private func handleVideoNoteReleaseMorphNotification(_ note: Notification) {
+    guard let image = note.userInfo?["image"] as? UIImage else { return }
+    let frame = (note.userInfo?["frame"] as? NSValue)?.cgRectValue ?? .zero
+    guard frame.width > 1 else { return }
+    pendingVideoNoteMorphImage = image
+    pendingVideoNoteMorphFrame = frame
+  }
+
+  /// Telegram-style release flight: camera circle → list cell, crossfade mid-flight.
+  /// Avoids a "duplicate" by keeping the real cell hidden until the flight ends.
+  private func runVideoNoteReleaseMorph(
+    messageId: String,
+    image: UIImage,
+    fromFrameInList: CGRect
+  ) {
+    videoNoteMorphFlightView?.removeFromSuperview()
+    videoNoteMorphFlightView = nil
+    positionTransitionOverlayHost()
+    bringSubviewToFront(transitionOverlayHost)
+    if let bar = activeNativeInputView {
+      bringSubviewToFront(bar)
+    }
+
+    let flight = UIImageView(image: image)
+    flight.contentMode = .scaleAspectFill
+    flight.clipsToBounds = true
+    flight.layer.cornerCurve = .continuous
+    flight.frame = fromFrameInList
+    flight.layer.cornerRadius = min(fromFrameInList.width, fromFrameInList.height) * 0.5
+    transitionOverlayHost.addSubview(flight)
+    videoNoteMorphFlightView = flight
+    // Real cell stays hidden for the whole flight (no second circle).
+    hiddenMessageId = messageId
+
+    let noteSide: CGFloat = 200
+    let sidePad: CGFloat = 14
+    let bottomPad = contentPaddingBottom + 12
+    let dest = CGRect(
+      x: bounds.width - noteSide - sidePad,
+      y: max(80, bounds.height - bottomPad - noteSide),
+      width: noteSide,
+      height: noteSide
+    )
+
+    // Immediate scroll so the landing slot is visible; cell is still hidden.
+    scrollToBottom(animated: false)
+
+    let animator = UIViewPropertyAnimator(
+      duration: 0.40,
+      timingParameters: UISpringTimingParameters(
+        dampingRatio: 0.88,
+        initialVelocity: CGVector(dx: 0.12, dy: 0.3)
+      )
+    )
+    animator.addAnimations {
+      // Shrink toward list cell size while flying.
+      flight.frame = dest
+      flight.layer.cornerRadius = noteSide * 0.5
+    }
+    animator.addCompletion { [weak self] _ in
+      guard let self else { return }
+      // Crossfade: reveal cell, fade flight — one circle only.
+      if self.hiddenMessageId == messageId {
+        self.hiddenMessageId = nil
+        self.collectionView.collectionViewLayout.invalidateLayout()
+        self.collectionView.reloadData()
+      }
+      UIView.animate(
+        withDuration: 0.14,
+        delay: 0,
+        options: [.curveEaseOut, .beginFromCurrentState]
+      ) {
+        flight.alpha = 0
+      } completion: { _ in
+        flight.removeFromSuperview()
+        if self.videoNoteMorphFlightView === flight {
+          self.videoNoteMorphFlightView = nil
+        }
+      }
+    }
+    // Mid-flight retarget to the real cell media frame when it exists.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+      guard let self, self.videoNoteMorphFlightView === flight else { return }
+      if let ip = self.indexPathForMessageId(messageId),
+        let cell = self.collectionView.cellForItem(at: ip) as? ChatListCell,
+        let mediaView = cell.currentMediaImageView()
+      {
+        let real = mediaView.convert(mediaView.bounds, to: self.transitionOverlayHost)
+        if real.width > 1 {
+          UIViewPropertyAnimator(duration: 0.26, dampingRatio: 0.92) {
+            flight.frame = real
+            flight.layer.cornerRadius = min(real.width, real.height) * 0.5
+          }.startAnimation()
+        }
+      }
+    }
+    animator.startAnimation()
+  }
+
+  private func indexPathForMessageId(_ messageId: String) -> IndexPath? {
+    for (idx, row) in rows.enumerated() where row.messageId == messageId {
+      return IndexPath(item: idx, section: 0)
+    }
+    return nil
+  }
+
+  private func toggleVideoNoteInListPlayback(
+    cell: ChatListCell,
+    row: ChatListRow,
+    mediaURL: String
+  ) {
+    let state = remoteMediaDownloadState(for: row)
+    if state.needsDownload {
+      startRemoteMediaDownload(for: row, presentOnComplete: false)
+    }
+    let active = !cell.isInlineVideoPlaybackActive
+    cell.setInlineVideoPlaybackActive(active)
+    cell.setVideoNoteExpandedPlayback(active)
+    if active {
+      // Reuse the exact URL the cell's own inline player just resolved (local-cache
+      // preferring) — the raw row.mediaUrl is often a remote URL video notes refuse
+      // to stream directly, which is why the floating player used to sit on the
+      // seed image forever instead of ever producing real frames.
+      let resolvedPlaybackURL =
+        cell.currentInlineVideoPlaybackURL()?.absoluteString ?? mediaURL
+      // Register only — floating mini-player stays hidden until this list leaves the window.
+      VideoNoteGlobalMiniPlayer.shared.registerPlayback(
+        messageId: row.messageId,
+        mediaURL: resolvedPlaybackURL,
+        mediaKey: resolvedMediaKey(for: row),
+        seedImage: cell.currentMediaImage(),
+        hostList: self
+      )
+    } else {
+      VideoNoteGlobalMiniPlayer.shared.detachIfMessage(row.messageId)
+    }
+  }
+
   func inputBarDidRecordVideoNote(uri: String, duration: Double) {
+    NSLog(
+      "[VideoNoteSend] recorded uri=%@ duration=%.2f nativeSend=%@",
+      uri, duration, nativeSendEnabled ? "true" : "false")
+    if nativeSendEnabled {
+      handleNativeVideoNoteSend(uri: uri, duration: duration)
+      return
+    }
     onNativeEvent([
       "type": "attachmentVideoNote",
       "uri": uri,
@@ -18881,34 +20111,18 @@ extension ChatListView: ChatInputBarDelegate {
       NSLog("[ChatVideoThumb] generation failed uri=%@", raw)
       return nil
     }
-    let maxDimension: CGFloat = 480.0
-    let imageSize = thumbnailImage.size
-    let scaleRatio = min(
-      1.0,
-      min(
-        maxDimension / max(1.0, imageSize.width),
-        maxDimension / max(1.0, imageSize.height)
-      )
-    )
-    let targetSize = CGSize(
-      width: max(1.0, floor(imageSize.width * scaleRatio)),
-      height: max(1.0, floor(imageSize.height * scaleRatio))
-    )
-    let renderer = UIGraphicsImageRenderer(size: targetSize)
-    let renderedImage = renderer.image { _ in
-      thumbnailImage.draw(in: CGRect(origin: .zero, size: targetSize))
-    }
-    guard let jpegData = renderedImage.jpegData(compressionQuality: 0.72) else {
+    // Micro-thumb for durable wire + first paint (video + video-note). Full frames
+    // still load via the media pipeline; this only prevents empty solid cells.
+    guard let encoded = chatMicroThumbnailJPEGBase64(from: thumbnailImage) else {
       NSLog("[ChatVideoThumb] jpeg encode failed uri=%@", raw)
       return nil
     }
     NSLog(
-      "[ChatVideoThumb] generated uri=%@ bytes=%lu size=%@",
+      "[ChatVideoThumb] generated micro uri=%@ b64Len=%lu",
       raw,
-      jpegData.count,
-      NSCoder.string(for: CGRect(origin: .zero, size: targetSize))
+      encoded.count
     )
-    return jpegData.base64EncodedString()
+    return encoded
   }
 
   private func localAudioThumbnailBase64(for raw: String) -> String? {
@@ -19017,6 +20231,22 @@ extension ChatListView: ChatInputBarDelegate {
 
   func inputBarReplyDismissed() {
     onNativeEvent(["type": "replyDismissed"])
+  }
+
+  func inputBarDidConfirmForward(caption: String) {
+    onNativeEvent([
+      "type": "forwardDraftConfirm",
+      "caption": caption,
+    ])
+  }
+
+  func inputBarDidCancelForward() {
+    onNativeEvent(["type": "forwardDraftCancel"])
+  }
+
+  /// Apply a pending forward draft (group/channel open-from-share sheet).
+  func applyPendingForwardDraft(title: String, preview: String) {
+    inputBar?.showForwardBanner(title: title, preview: preview)
   }
 
   // MARK: - Activity Overlay (Typing / Agent Progress)

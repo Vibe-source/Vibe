@@ -600,9 +600,27 @@ final class ChatEngine {
   private var chatIngestGenerationByChat: [String: Int] = [:]
   private var historyFullyLoadedChats = Set<String>()
   private var historyRowsRestoredFromCacheChats = Set<String>()
+  /// Last successful *network* history sync (ms). Restores from SQLite used to force a
+  /// full re-fetch on every cold open even when merge was unchanged — that was the
+  /// "network remount on every reopen" cost. Soft TTL skips revalidation while fresh.
+  private var historyLastNetworkSyncAtByChat: [String: Int] = [:]
+  /// Soft revalidation window after a successful network history load.
+  private let historyRevalidationTTLMs: Int = 20 * 60 * 1000
   // Run-scoped memo of chats whose SQLite store is known-empty, so repeated restore
   // calls stop re-querying the store. Cleared by any successful store write.
   private var historyRestoreMissChats = Set<String>()
+  // Agent/bridge DMs are VOLATILE-per-session: their transcript must be empty on every
+  // cold launch and only live for the duration of a running app process. The single
+  // reliable cross-launch signal is a durable set of "this chatId is an agent DM",
+  // stamped whenever a provider resolves during a run (peer→provider maps are still
+  // empty at the cold-launch restore call, so we can't classify from them there). See
+  // isAgentDMForPersistenceLocked / markAgentDMChatForPersistenceLocked.
+  private var agentDMChatIdsPersisted = Set<String>()
+  private var agentDMChatIdsLoaded = false
+  // One-shot per-run guard so the durable-era transcript (persisted while agent DMs were
+  // durable) is deleted from SQLite exactly once per chat, not on every restore probe.
+  private var agentDMStorePurgedChats = Set<String>()
+  private static let agentDMChatIdsDefaultsKey = "VibeAgentDMChatIds"
   private var cachedSavedMessagesResponse: [[String: Any]]?
   private var historyLoadingChats = Set<String>()
   private var historyOlderExhaustedChats = Set<String>()
@@ -4166,15 +4184,38 @@ final class ChatEngine {
             if finalMediaKey == nil { finalMediaKey = uploadResult.mediaKey }
 
             // Seed the remote-media disk cache with the file we just uploaded so the
-            // sender never re-downloads its own media after a restart/history reload
-            // (the echo row keeps only the remote URL). Voice has its own seeding in
-            // VoiceBubblePlaybackCoordinator.
+            // sender never re-downloads its own media after a restart/history reload.
+            // This is THE moment to do it: the local path and the remote URL are both
+            // in hand here and nowhere else — the server echo rebuilds the row from
+            // encrypted_content, which carries the remote URL and has never heard of
+            // `localMediaUrl`, so the link between message and on-disk file is gone
+            // roughly a second later and never comes back.
             if ["image", "gif", "video"].contains(type) {
               chatMediaSeedRemoteCacheFromLocalFile(
                 localURI: localMediaUrl,
                 remoteURL: uploadResult.remoteUrl,
                 mediaKey: finalMediaKey
               )
+            } else if ["voice", "audio", "music"].contains(type) {
+              // Voice used to be seeded from `applyExternalVoicePlaybackIfNeeded` — a
+              // CELL method, so it only ran if a materialized cell happened to be handed
+              // playback state during the ~1.5s window between upload-complete and the
+              // server echo (measured 18.121 → 19.687 on device). Lose that race, as a
+              // cold list or a scrolled-away bubble always does, and the sender
+              // re-downloads its own voice note on every relaunch forever. Seeding here
+              // instead makes it unconditional. The cache slot holds DECRYPTED audio (the
+              // download path decrypts before writing it), which is exactly what the
+              // local recording already is.
+              let localForSeed = localPlaybackMediaUrl ?? localMediaUrl
+              let remoteForSeed = uploadResult.remoteUrl
+              let seedFileName = finalFileName ?? fileName
+              DispatchQueue.main.async {
+                VoiceBubblePlaybackCoordinator.shared.seedRemoteVoiceCacheFromLocal(
+                  localMediaURL: localForSeed,
+                  remoteMediaURL: remoteForSeed,
+                  fileName: seedFileName
+                )
+              }
             }
 
             var nextMetadata = (localEffectivePayload["metadata"] as? [String: Any]) ?? [:]
@@ -4189,6 +4230,13 @@ final class ChatEngine {
             localEffectivePayload["messageId"] = messageId
             localEffectivePayload["type"] = type
             localEffectivePayload["text"] = text
+            // Point the DRAFT's top-level mediaUrl at the durable remote URL now that the
+            // upload is done. `needsUpload` keys off mediaUrl being a *local* URI, so a
+            // replay/retry of this draft (socket_open, chat_joined) would otherwise
+            // re-upload the exact same file — measured 3× on a flapping socket, each adding
+            // ~3s to the reconnect ack and firing another full cell reconfigure. The local
+            // playback path stays preserved in metadata.localMediaUrl above.
+            localEffectivePayload["mediaUrl"] = uploadResult.remoteUrl
 
             if var message = localOptimisticRow["message"] as? [String: Any] {
               message["mediaUrl"] = uploadResult.remoteUrl
@@ -8303,12 +8351,19 @@ final class ChatEngine {
     peerAgentId: String? = nil,
     metadata: [String: Any] = [:]
   ) -> Bool {
-    bridgeProviderForChatLocked(
-      chatId: chatId,
-      peerUserId: peerUserId,
-      peerAgentId: peerAgentId,
-      metadata: metadata
-    ) != nil
+    let isAgent =
+      bridgeProviderForChatLocked(
+        chatId: chatId,
+        peerUserId: peerUserId,
+        peerAgentId: peerAgentId,
+        metadata: metadata
+      ) != nil
+    // Provider just resolved for a real chatId — remember it so a future cold launch
+    // (peer maps empty) still knows this DM is agent and keeps its transcript off disk.
+    if isAgent, let chatId, !chatId.isEmpty {
+      markAgentDMChatForPersistenceLocked(chatId: chatId)
+    }
+    return isAgent
   }
 
   private func resolvePeerAgentIdLocked(chatId: String, peerUserIdHint: String?) -> String? {
@@ -8998,6 +9053,26 @@ final class ChatEngine {
               continue
             }
             mergedMessage[key] = value
+          }
+          // Prefer local agentTurnStructureVersion >= 2 full progressNodes over a
+          // thinner server copy so cold-open keeps intro→note→summary (never clobber).
+          if let existingMeta = existingMessage["metadata"] as? [String: Any] {
+            let localVersion =
+              (existingMeta["agentTurnStructureVersion"] as? Int)
+              ?? (existingMeta["agentTurnStructureVersion"] as? NSNumber)?.intValue
+              ?? 0
+            if localVersion >= 2,
+              let localNodes = existingMeta["progressNodes"] as? [[String: Any]],
+              !localNodes.isEmpty
+            {
+              var meta = mergedMessage["metadata"] as? [String: Any] ?? [:]
+              let remoteNodes = (meta["progressNodes"] as? [[String: Any]]) ?? []
+              if remoteNodes.count < localNodes.count || meta["agentTurnStructureVersion"] == nil {
+                meta["progressNodes"] = localNodes
+                meta["agentTurnStructureVersion"] = localVersion
+                mergedMessage["metadata"] = meta
+              }
+            }
           }
           mergedRow["message"] = mergedMessage
         }
@@ -9743,8 +9818,21 @@ final class ChatEngine {
       !isAgentMessage && hadEncryptedContent && encryptedLooksHybrid && decryptedText.isEmpty
 
     var decryptedFields = parseDecryptedMessagePayload(decryptedText)
-    if let metadata = payload["metadata"] as? [String: Any], decryptedFields["metadata"] == nil {
-      decryptedFields["metadata"] = metadata
+    // Always merge server/wire metadata in (forward chrome, covers, etc.). Decrypted
+    // E2E JSON often has only text and used to leave `metadata` nil/empty so reopen
+    // lost isForwarded / forwardedFrom* / cover after history reload.
+    if let metadata = payload["metadata"] as? [String: Any], !metadata.isEmpty {
+      var merged = (decryptedFields["metadata"] as? [String: Any]) ?? [:]
+      for (key, value) in metadata {
+        if merged[key] == nil { merged[key] = value }
+      }
+      // Prefer durable remote mediaUrl from server metadata over any local path.
+      if let remote = metadata["mediaUrl"] as? String ?? metadata["media_url"] as? String,
+        remote.hasPrefix("http")
+      {
+        merged["mediaUrl"] = remote
+      }
+      decryptedFields["metadata"] = merged
     }
     if let rawReplyToId = normalizedString(payload["replyToId"] ?? payload["reply_to_id"]),
       normalizedString(decryptedFields["replyToId"]) == nil
@@ -11078,17 +11166,80 @@ final class ChatEngine {
     return id.hasPrefix("stream-") || id.hasPrefix("lan-") || id.hasPrefix("bridge-")
   }
 
+  // MARK: - Agent/bridge DM volatility (empty on cold launch, live only within a run)
+
+  private func loadAgentDMChatIdsIfNeededLocked() {
+    guard !agentDMChatIdsLoaded else { return }
+    agentDMChatIdsLoaded = true
+    if let stored = UserDefaults.standard.array(forKey: Self.agentDMChatIdsDefaultsKey)
+      as? [String]
+    {
+      agentDMChatIdsPersisted = Set(stored.filter { !$0.isEmpty })
+    }
+  }
+
+  /// True when `chatId` is a bridge/agent DM whose transcript must NOT survive a process
+  /// kill. Combines the durable stamped set (reliable at cold launch, when the peer maps
+  /// are empty) with the live provider resolution (reliable once maps are populated).
+  private func isAgentDMForPersistenceLocked(chatId: String) -> Bool {
+    guard !chatId.isEmpty else { return false }
+    loadAgentDMChatIdsIfNeededLocked()
+    if agentDMChatIdsPersisted.contains(chatId) { return true }
+    return isVolatileBridgeAgentChatLocked(chatId: chatId)
+  }
+
+  /// Remember that `chatId` is an agent DM so future cold launches skip its durable
+  /// transcript without needing the peer→provider maps. Stamped at every point a provider
+  /// resolves during a run; the write is tiny and rare (once per new chat).
+  private func markAgentDMChatForPersistenceLocked(chatId: String) {
+    guard !chatId.isEmpty else { return }
+    loadAgentDMChatIdsIfNeededLocked()
+    guard !agentDMChatIdsPersisted.contains(chatId) else { return }
+    agentDMChatIdsPersisted.insert(chatId)
+    UserDefaults.standard.set(
+      Array(agentDMChatIdsPersisted), forKey: Self.agentDMChatIdsDefaultsKey)
+  }
+
+  /// Delete an agent DM's durable-era transcript exactly once per run — from SQLite AND
+  /// from memory. Reuses clearCachedHistoryRowsLocked (which logs the WIPE + clears the
+  /// legacy blob) for disk, then drops the in-memory pile so the transition run (the first
+  /// launch after this build ships, when an early restore loaded the pile before the
+  /// provider resolved) stops re-seeding those rows every time the chat opens.
+  private func purgeAgentDMDurableStoreIfNeededLocked(chatId: String) {
+    guard !chatId.isEmpty, !agentDMStorePurgedChats.contains(chatId) else { return }
+    agentDMStorePurgedChats.insert(chatId)
+    clearCachedHistoryRowsLocked(chatId: chatId)
+    // Bridge DMs never populate historyRowsByChat except via restore (server-load +
+    // backfill are gated for them), so the pile here is exactly the stale durable
+    // transcript — the live session lives in liveMessageRowsByChat and is untouched.
+    guard let existing = historyRowsByChat[chatId], !existing.isEmpty else { return }
+    let removedIds = existing.compactMap { messageId(fromRow: $0) }
+    historyRowsByChat.removeValue(forKey: chatId)
+    historyFullyLoadedChats.remove(chatId)
+    historyRowsRestoredFromCacheChats.remove(chatId)
+    NSLog(
+      "[HistoryStore] agent-DM drop in-memory chat=%@ rows=%d (volatile-per-session)",
+      String(chatId.prefix(12)), existing.count)
+    postChatDeltaLocked(
+      chatId: chatId, inserted: [], updated: [], deleted: removedIds, source: "agentDMPurge")
+  }
+
   private func restoreCachedHistoryRowsLocked(chatId: String) -> Bool {
     guard !chatId.isEmpty else { return false }
-    // Agent/bridge DMs restore like every other chat. They used to SKIP here (their
-    // transcript was fully volatile), which is exactly why a Claude/Codex DM opened
-    // EMPTY on every cold launch — the one behavior left that broke "a chat has its
-    // content by default". The hazards that motivated the skip are each handled
-    // structurally now: session mirrors (`bridge-…`) and live placeholders
-    // (`stream-`/`lan-`) never persist, so nothing here can bleed a session across
-    // chatIds; the merge terminalizes any persisted row still claiming to stream, so a
-    // dead run can never repaint as a live cell. What restores is the settled,
-    // server-canonical transcript — which is precisely what a cold open should show.
+    // Agent/bridge DMs are volatile-per-session: never paint a persisted transcript on a
+    // cold launch. Fast path when we already know (stamped set, or provider resolves).
+    // Their in-session rows live in historyRowsByChat/liveMessageRowsByChat (in-memory)
+    // + the launch-purged VibeBridgeRows cache — untouched here — so a warm reopen inside
+    // a run still shows the ongoing session; only the DISK transcript stays empty.
+    if isAgentDMForPersistenceLocked(chatId: chatId) {
+      purgeAgentDMDurableStoreIfNeededLocked(chatId: chatId)
+      return false
+    }
+    // NORMAL chats restore their settled, server-canonical transcript here so a cold open
+    // paints offline. (Agent DMs are handled by the volatile fast-path above — they were
+    // briefly made durable like normal chats, but that caused a cold-launch flicker where
+    // the persisted transcript painted and then the volatile session layer wiped it, so
+    // they are volatile-per-session again.)
     // The in-memory entry only counts as "already restored" when it actually HOLDS rows.
     // An EMPTY array here is a poison pill: a background history load whose server page
     // came back with zero rows installs `[]` plus the fullyLoaded flag, and from then on
@@ -11161,9 +11312,9 @@ final class ChatEngine {
   }
 
   private func storeCachedHistoryRowsLocked(chatId: String, rows: [[String: Any]]) {
-    // Bridge DMs persist like every chat — see restoreCachedHistoryRowsLocked for why
-    // the old skip is gone. The transient filter in persistHistoryRowsToStoreLocked
-    // keeps `stream-`/`lan-`/`bridge-` rows out, so only settled server rows land.
+    // Normal chats persist their settled server rows here. Agent/bridge DMs are gated out
+    // inside persistHistoryRowsToStoreLocked (the single write choke) so their transcript
+    // never reaches disk — it lives only in memory for the current run.
     guard !chatId.isEmpty, !rows.isEmpty else { return }
     let stored = persistHistoryRowsToStoreLocked(chatId: chatId, rows: rows)
     guard stored > 0 else { return }
@@ -11187,6 +11338,14 @@ final class ChatEngine {
     skipPrune: Bool = false
   ) -> Int {
     guard let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable else { return 0 }
+    // Agent/bridge DMs are volatile-per-session — their transcript must never reach disk,
+    // so it can't paint on the next cold launch. Classify at WRITE time, where the
+    // provider is reliably resolved (unlike cold-launch restore). This is the single
+    // choke for every persist path (store, background load, legacy migration).
+    if isAgentDMForPersistenceLocked(chatId: chatId) {
+      markAgentDMChatForPersistenceLocked(chatId: chatId)
+      return 0
+    }
     var entries: [(messageId: String, ts: Int64, payload: Data)] = []
     entries.reserveCapacity(rows.count)
     for row in rows {
@@ -11599,6 +11758,7 @@ final class ChatEngine {
     guard historyRowsByChat[chatId] != nil else { return }
     guard chatId != "saved_messages",
       !isBuiltInAgentChatId(chatId),
+      !isAgentDMForPersistenceLocked(chatId: chatId),
       !historyBackfillingChats.contains(chatId)
     else { return }
     let now = Int64(nowMs())
@@ -11787,6 +11947,7 @@ final class ChatEngine {
     guard !historyLoadingOlderChats.contains(chatId), !historyLoadingChats.contains(chatId),
       chatId != "saved_messages",
       !isBuiltInAgentChatId(chatId),
+      !isAgentDMForPersistenceLocked(chatId: chatId),
       !historyOlderExhaustedChats.contains(chatId),
       let boundary = oldestHistoryBoundaryLocked(chatId: chatId)
     else { return false }
@@ -11999,6 +12160,39 @@ final class ChatEngine {
     return true
   }
 
+  private func historyNetworkSyncDefaultsKey(userId: String, chatId: String) -> String {
+    "chat.history.lastNetworkSyncMs.\(userId).\(chatId)"
+  }
+
+  private func lastHistoryNetworkSyncAtLocked(chatId: String) -> Int? {
+    if let cached = historyLastNetworkSyncAtByChat[chatId] {
+      return cached
+    }
+    guard let userId = chatHistoryCacheUserIdLocked() else { return nil }
+    let value = UserDefaults.standard.object(
+      forKey: historyNetworkSyncDefaultsKey(userId: userId, chatId: chatId)) as? NSNumber
+    let ms = value?.intValue
+    if let ms, ms > 0 {
+      historyLastNetworkSyncAtByChat[chatId] = ms
+    }
+    return ms
+  }
+
+  private func markHistoryNetworkSyncedLocked(chatId: String) {
+    let ms = Int(nowMs())
+    historyLastNetworkSyncAtByChat[chatId] = ms
+    guard let userId = chatHistoryCacheUserIdLocked() else { return }
+    UserDefaults.standard.set(
+      ms, forKey: historyNetworkSyncDefaultsKey(userId: userId, chatId: chatId))
+  }
+
+  private func isHistoryNetworkSyncFreshLocked(chatId: String) -> Bool {
+    guard let last = lastHistoryNetworkSyncAtLocked(chatId: chatId), last > 0 else {
+      return false
+    }
+    return (Int(nowMs()) - last) < historyRevalidationTTLMs
+  }
+
   private func loadChatHistoryIfNeededLocked(chatId: String, force: Bool = false) {
     guard !chatId.isEmpty else { return }
     // Only the built-in agent surface has no server chat to fetch. Bridge DMs are
@@ -12006,8 +12200,14 @@ final class ChatEngine {
     // messages, and fetching them is what backfills SQLite so a cold open paints — the
     // old skip here (plus the in-memory wipe it did) is why an agent DM could show
     // content only for as long as the process lived.
-    guard !isBuiltInAgentChatId(chatId) else {
+    guard !isBuiltInAgentChatId(chatId), !isAgentDMForPersistenceLocked(chatId: chatId) else {
       historyLoadingChats.remove(chatId)
+      // Agent/bridge DMs are volatile-per-session: a server backfill would repaint the
+      // very transcript we keep off disk, so a cold launch would flicker (paint→wipe)
+      // again. Skip the fetch; the live bridge pipeline delivers the current run's rows.
+      if isAgentDMForPersistenceLocked(chatId: chatId) {
+        markAgentDMChatForPersistenceLocked(chatId: chatId)
+      }
       appendJournalLocked(
         event: "native-chat-history-skip",
         payload: ["chatId": chatId, "reason": "agent_surface"]
@@ -12016,10 +12216,22 @@ final class ChatEngine {
       return
     }
     if historyLoadingChats.contains(chatId) || historyLoadingOlderChats.contains(chatId) { return }
-    if !force, historyFullyLoadedChats.contains(chatId),
-      !historyRowsRestoredFromCacheChats.contains(chatId)
-    {
-      return
+    if !force, historyFullyLoadedChats.contains(chatId) {
+      // Already network-confirmed this process — no need to hit the server again.
+      if !historyRowsRestoredFromCacheChats.contains(chatId) {
+        return
+      }
+      // Restored from SQLite on cold open. Previously we ALWAYS revalidated every
+      // restored chat on launch (logs: 8 MERGEs with unchanged=Y, seconds of work).
+      // If the last successful network sync is still within TTL, trust the local
+      // store and skip — realtime socket still delivers live deltas.
+      if isHistoryNetworkSyncFreshLocked(chatId: chatId) {
+        historyRowsRestoredFromCacheChats.remove(chatId)
+        NSLog(
+          "[ChatEngine] loadChatHistory SKIP chatId=%@ reason=restored_fresh_ttl",
+          String(chatId.prefix(12)))
+        return
+      }
     }
     let isBridgeText = isBridgeTextModeLocked()
     let apiBase = apiBaseURLLocked()
@@ -12221,6 +12433,9 @@ final class ChatEngine {
       historyFullyLoadedChats.insert(chatId)
       historyRowsRestoredFromCacheChats.remove(chatId)
     }
+    // Stamp network success even when the merge is unchanged — next cold open can
+    // skip revalidation while this TTL holds.
+    markHistoryNetworkSyncedLocked(chatId: chatId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
     state["updatedAt"] = nowMs()
     appendJournalLocked(
@@ -12299,6 +12514,7 @@ final class ChatEngine {
     historyRowsByChat[chatId] = rows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.remove(chatId)
+    markHistoryNetworkSyncedLocked(chatId: chatId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
     state["updatedAt"] = nowMs()
     appendJournalLocked(
