@@ -2232,6 +2232,79 @@ private let stickerMaxDisplayWidth: CGFloat = 152.0
 private let stickerMaxDisplayHeight: CGFloat = 184.0
 private let stickerMetaTopSpacing: CGFloat = 1.0
 
+// ── سلولِ سند ──────────────────────────────────────────────────────────────
+// اندازه‌گیریِ حباب و چیدمانِ سلول هر دو به این‌ها نیاز دارند، پس در سطح فایل‌اند.
+
+let documentRowVerticalInset: CGFloat = 9.0
+let documentPreviewSide: CGFloat = 62.0
+let documentPreviewCornerRadius: CGFloat = 10.0
+let documentRowHeight: CGFloat = documentPreviewSide + documentRowVerticalInset * 2.0
+
+/// نامِ نمایشیِ سند.
+///
+/// روی `row.fileName` تنها تکیه نمی‌کنیم: هم نشانیِ امضاشدهٔ سند
+/// (`/api/containers/3/pdf`) و هم نامِ فایلِ کش، جزءِ پایانیِ بی‌پسوند دارند و در
+/// سلول به‌صورت «pdf» یا «3» ظاهر می‌شدند. نامی نام است که پسوند داشته باشد.
+func chatDocumentDisplayName(_ row: ChatListRow) -> String {
+  if let named = chatDocumentFileNameCandidate(row.fileName) { return named }
+  if let mediaUrl = row.mediaUrl {
+    let component =
+      URL(string: mediaUrl)?.lastPathComponent ?? (mediaUrl as NSString).lastPathComponent
+    if let named = chatDocumentFileNameCandidate(component.removingPercentEncoding ?? component) {
+      return named
+    }
+  }
+  // عنوانِ خودِ پیوست بهتر از یک برچسبِ عمومی است.
+  if let title = row.fileName?.trimmingCharacters(in: .whitespacesAndNewlines),
+    title.count > 1
+  {
+    return title
+  }
+  return chatDocumentTypeLabel(row)
+}
+
+private func chatDocumentFileNameCandidate(_ raw: String?) -> String? {
+  guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty
+  else {
+    return nil
+  }
+  let ext = (trimmed as NSString).pathExtension
+  let stem = (trimmed as NSString).deletingPathExtension
+  // «pdf» پسوند ندارد و «3» ریشه‌ای است بی‌پسوند — هیچ‌کدام نامِ فایل نیستند.
+  guard !ext.isEmpty, !stem.isEmpty, ext.count <= 8 else { return nil }
+  return trimmed
+}
+
+func chatDocumentIsPDF(_ row: ChatListRow) -> Bool {
+  if (row.mimeType ?? "").lowercased().contains("pdf") { return true }
+  let name = row.fileName ?? row.mediaUrl ?? ""
+  return (name as NSString).pathExtension.lowercased() == "pdf"
+}
+
+func chatDocumentTypeLabel(_ row: ChatListRow) -> String {
+  if chatDocumentIsPDF(row) { return "PDF Document" }
+  let mime = (row.mimeType ?? "").lowercased()
+  if mime.contains("html") { return "Web Page" }
+  if mime.contains("zip") { return "Archive" }
+  if mime.contains("csv") || mime.contains("spreadsheet") || mime.contains("excel") {
+    return "Spreadsheet"
+  }
+  if mime.contains("word") || mime.contains("msword") { return "Document" }
+  if mime.hasPrefix("text/") { return "Text File" }
+  return "File"
+}
+
+func chatDocumentGlyphName(_ row: ChatListRow) -> String {
+  if chatDocumentIsPDF(row) { return "doc.richtext" }
+  let mime = (row.mimeType ?? "").lowercased()
+  if mime.contains("html") { return "globe" }
+  if mime.contains("zip") { return "doc.zipper" }
+  if mime.contains("csv") || mime.contains("spreadsheet") || mime.contains("excel") {
+    return "tablecells"
+  }
+  return "doc"
+}
+
 private func hasInlineFileAttachment(_ row: ChatListRow) -> Bool {
   guard row.visualKind == .text else { return false }
   guard let mediaUrl = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -4472,8 +4545,18 @@ func measureMessageBubbleLayout(
       targetWidth = 200.0
       mediaHeight = 200.0
     case .document:
-      targetWidth = maxContentWidth
-      mediaHeight = 72.0
+      // حباب به‌اندازهٔ نام فایل کشیده می‌شود، نه همیشه تا آخرِ عرضِ ممکن —
+      // یک نامِ کوتاه داخل حبابی تمام‌عرض، همان چیزی است که «تمیز نیست» به نظر
+      // می‌رسید.
+      let nameWidth = (chatDocumentDisplayName(row) as NSString).size(
+        withAttributes: [.font: UIFont.systemFont(ofSize: 15, weight: .semibold)]
+      ).width
+      let detailWidth = (chatDocumentTypeLabel(row) as NSString).size(
+        withAttributes: [.font: UIFont.systemFont(ofSize: 13, weight: .regular)]
+      ).width
+      let textWidth = max(nameWidth, detailWidth + 78.0)
+      targetWidth = min(maxContentWidth, ceil(documentPreviewSide + 12.0 + textWidth) + 2.0)
+      mediaHeight = documentRowHeight
     case .video, .media, .sticker:
       let gridCount = chatMediaGridImageCount(row)
       if gridCount > 1 {
@@ -8750,6 +8833,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var mediaDownloadedBytes: Int64?
   private var mediaTotalDownloadBytes: Int64?
   private var documentPageCount: Int?
+  private var documentByteSize: Int64?
   private var skipRemoteMediaLoad = false
   private var preferredLocalMediaURLOverride: String?
   private weak var wallpaperCoordinateView: UIView?
@@ -9353,6 +9437,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !isSameMediaIdentity {
       mediaPixelQuality = .none
       documentPageCount = nil
+      documentByteSize = nil
     } else if preservedMediaImage != nil, mediaPixelQuality == .none {
       // Reused cell with pixels but no quality stamp (old path) — treat as full so
       // a late micro-thumb cannot downgrade a sharp image.
@@ -12007,38 +12092,43 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaBorderLayer.isHidden = true
 
     case .document:
-      mediaContainerView.backgroundColor =
-        appearance.isDark
-        ? UIColor(white: 1.0, alpha: 0.08)
-        : UIColor(white: 0.0, alpha: 0.07)
+      // بدونِ پس‌زمینه: تلگرام ردیفِ سند را مستقیم داخل حباب می‌چیند. یک جعبهٔ
+      // گردِ دیگر داخل حباب، دو قاب تودرتو می‌سازد که همان چیزی است که چیدمان را
+      // شلوغ و ناتمیز نشان می‌داد.
+      mediaContainerView.backgroundColor = .clear
       mediaBorderLayer.lineWidth = 0.0
       mediaBorderLayer.isHidden = true
       mediaImageView.isHidden = false
       mediaImageView.contentMode = .scaleAspectFill
       mediaTitleLabel.isHidden = false
-      mediaTitleLabel.textAlignment = .left
+      mediaTitleLabel.textAlignment = .natural
       mediaTitleLabel.lineBreakMode = .byTruncatingMiddle
-      mediaTitleLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+      mediaTitleLabel.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
       let documentTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       mediaTitleLabel.textColor = documentTextColor
-      mediaTitleLabel.text = row.fileName?.isEmpty == false ? row.fileName : "Document"
+      mediaTitleLabel.text = chatDocumentDisplayName(row)
       mediaDetailLabel.isHidden = false
-      mediaDetailLabel.textAlignment = .left
+      mediaDetailLabel.textAlignment = .natural
       mediaDetailLabel.lineBreakMode = .byTruncatingTail
-      mediaDetailLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
-      mediaDetailLabel.textColor = documentTextColor.withAlphaComponent(0.68)
-      mediaDetailLabel.text = documentDetailText(for: row)
-      mediaPrimaryIconView.isHidden = false
+      mediaDetailLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+      mediaDetailLabel.textColor = documentTextColor.withAlphaComponent(0.62)
+      mediaDetailLabel.attributedText = documentDetailAttributedText(
+        for: row, baseColor: documentTextColor, accent: appearance.accent)
+      let hasPagePixels = mediaPixelQuality == .full && mediaImageView.image != nil
+      // نشانِ نوعِ سند فقط وقتی دیده می‌شود که هنوز پیش‌نمایشی نداریم؛ روی
+      // صفحهٔ رندرشده گذاشتنش، همان صفحه را می‌پوشاند.
+      mediaPrimaryIconView.isHidden = hasPagePixels
       mediaPrimaryIconView.image = UIImage(
-        systemName: "doc.text.fill",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold))
+        systemName: chatDocumentGlyphName(row),
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 24, weight: .regular))
       mediaPrimaryIconView.tintColor = .white
-      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.88)
-      if let placeholder = chatMediaImage(fromBase64: row.thumbnailBase64) {
+      mediaPrimaryIconView.contentMode = .center
+      mediaPrimaryIconView.backgroundColor = documentPlateColor(for: row, appearance: appearance)
+      if !hasPagePixels, let placeholder = chatMediaImage(fromBase64: row.thumbnailBase64) {
         mediaImageView.image = placeholder
         mediaPixelQuality = .microThumb
         mediaPlaceholderBlurView.isHidden = false
-      } else {
+      } else if !hasPagePixels {
         mediaImageView.image = nil
         mediaPlaceholderBlurView.isHidden = false
       }
@@ -12721,9 +12811,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
 
     case .document:
-      let previewSide = min(56.0, max(44.0, height - 16.0))
+      // نسبت‌های تلگرام: تصویرِ بزرگ و مربع در لبه، متن کنارش با یک خط فاصله،
+      // و هیچ حاشیهٔ اضافه‌ای که ردیف را از حباب جدا نشان بدهد.
+      let previewSide = max(44.0, height - documentRowVerticalInset * 2.0)
       let previewFrame = CGRect(
-        x: 8.0,
+        x: 0.0,
         y: floor((height - previewSide) * 0.5),
         width: previewSide,
         height: previewSide
@@ -12731,15 +12823,36 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaImageView.frame = previewFrame
       mediaPlaceholderBlurView.frame = previewFrame
       mediaPlaceholderTintView.frame = mediaPlaceholderBlurView.contentView.bounds
-      mediaImageView.layer.cornerRadius = 9.0
+      mediaImageView.layer.cornerRadius = documentPreviewCornerRadius
+      mediaImageView.layer.cornerCurve = .continuous
       mediaPrimaryIconView.frame = previewFrame
-      mediaPrimaryIconView.layer.cornerRadius = 9.0
-      let textX = previewFrame.maxX + 10.0
-      let textWidth = max(1.0, width - textX - 8.0)
+      mediaPrimaryIconView.layer.cornerRadius = documentPreviewCornerRadius
+      mediaPrimaryIconView.layer.cornerCurve = .continuous
+
+      // چرخِ پیشرفت روی خودِ تصویر می‌نشیند — همان جایی که کاربر برای دانلود
+      // یا لغو ضربه می‌زند.
+      if mediaIsDownloading || mediaNeedsDownload || row.shouldShowUploadOverlay {
+        mediaProgressOverlayView.frame = previewFrame
+        let ringSize: CGFloat = min(36.0, previewSide - 16.0)
+        mediaProgressRingView.frame = CGRect(
+          x: floor((previewSide - ringSize) * 0.5),
+          y: floor((previewSide - ringSize) * 0.5),
+          width: ringSize,
+          height: ringSize
+        )
+        mediaProgressSpinner.center = CGPoint(x: previewSide * 0.5, y: previewSide * 0.5)
+      }
+
+      let textX = previewFrame.maxX + 12.0
+      let textWidth = max(1.0, width - textX)
+      let titleHeight: CGFloat = 21.0
+      let detailHeight: CGFloat = 18.0
+      let stackHeight = titleHeight + 2.0 + detailHeight
+      let stackTop = floor((height - stackHeight) * 0.5)
       mediaTitleLabel.frame = CGRect(
-        x: textX, y: 15.0, width: textWidth, height: 20.0)
+        x: textX, y: stackTop, width: textWidth, height: titleHeight)
       mediaDetailLabel.frame = CGRect(
-        x: textX, y: mediaTitleLabel.frame.maxY + 3.0, width: textWidth, height: 17.0)
+        x: textX, y: mediaTitleLabel.frame.maxY + 2.0, width: textWidth, height: detailHeight)
 
     case .video, .videoNote, .media, .sticker:
       let btnSize: CGFloat = 44.0
@@ -13297,7 +13410,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     documentPageCount = pageCount > 0 ? pageCount : nil
     mediaPixelQuality = .full
-    mediaDetailLabel.text = documentDetailText(for: row)
+    refreshDocumentDetail()
     let apply = {
       self.mediaImageView.image = image
       self.mediaImageView.isHidden = false
@@ -13316,15 +13429,78 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
   }
 
-  private func documentDetailText(for row: ChatListRow) -> String {
-    var parts: [String] = []
-    if let bytes = row.fileSize, bytes > 0 {
-      parts.append(formatDownloadByteCount(bytes))
+  /// اندازهٔ فایل که با HEAD کشف شده؛ سرور برای پیوست‌های بیرونی طولی نمی‌فرستد.
+  func applyDocumentByteSize(_ bytes: Int64, messageId: String?) {
+    guard let row, row.visualKind == .document,
+      (row.messageId ?? row.key) == (messageId ?? row.key), bytes > 0
+    else {
+      return
+    }
+    documentByteSize = bytes
+    refreshDocumentDetail()
+  }
+
+  private func refreshDocumentDetail() {
+    guard let row, row.visualKind == .document else { return }
+    let color = row.isMe ? appearance.textColorMe : appearance.textColorThem
+    mediaDetailLabel.attributedText = documentDetailAttributedText(
+      for: row, baseColor: color, accent: appearance.accent)
+  }
+
+  private func documentPlateColor(for row: ChatListRow, appearance: ChatListAppearance) -> UIColor {
+    // رنگِ بی‌طرف، نه رنگِ تأکید: نشان نباید با دکمهٔ دانلود اشتباه گرفته شود.
+    appearance.isDark
+      ? UIColor(white: 1.0, alpha: 0.16)
+      : UIColor(white: 0.0, alpha: 0.20)
+  }
+
+  private func documentByteSizeValue(for row: ChatListRow) -> Int64? {
+    if let bytes = row.fileSize, bytes > 0 { return bytes }
+    if let documentByteSize, documentByteSize > 0 { return documentByteSize }
+    if let total = mediaTotalDownloadBytes, total > 0 { return total }
+    return nil
+  }
+
+  /// «۲۰٫۹ KB» یا هنگام نبودِ نسخهٔ محلی «۲۰٫۹ KB · Download» با واژهٔ رنگی —
+  /// همان قراردادی که تلگرام دارد و کاربر انتظارش را دارد.
+  private func documentDetailAttributedText(
+    for row: ChatListRow, baseColor: UIColor, accent: UIColor
+  ) -> NSAttributedString {
+    let font = UIFont.systemFont(ofSize: 13, weight: .regular)
+    var lead: [String] = []
+    if let bytes = documentByteSizeValue(for: row) {
+      lead.append(formatDownloadByteCount(bytes))
     }
     if let documentPageCount, documentPageCount > 0 {
-      parts.append(documentPageCount == 1 ? "1 page" : "\(documentPageCount) pages")
+      lead.append(documentPageCount == 1 ? "1 page" : "\(documentPageCount) pages")
     }
-    return parts.isEmpty ? "PDF document" : parts.joined(separator: " · ")
+    if lead.isEmpty { lead.append(chatDocumentTypeLabel(row)) }
+
+    if mediaIsDownloading {
+      let percent = Int(((mediaDownloadProgress ?? 0.0) * 100.0).rounded())
+      let text = percent > 0 ? "\(lead[0]) · Downloading \(percent)%" : "\(lead[0]) · Downloading"
+      return NSAttributedString(
+        string: text,
+        attributes: [.font: font, .foregroundColor: baseColor.withAlphaComponent(0.62)])
+    }
+
+    let result = NSMutableAttributedString(
+      string: lead.joined(separator: " · "),
+      attributes: [.font: font, .foregroundColor: baseColor.withAlphaComponent(0.62)])
+
+    if mediaNeedsDownload {
+      result.append(
+        NSAttributedString(
+          string: " · ",
+          attributes: [.font: font, .foregroundColor: baseColor.withAlphaComponent(0.62)]))
+      result.append(
+        NSAttributedString(
+          string: "Download",
+          attributes: [
+            .font: UIFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: accent,
+          ]))
+    }
+    return result
   }
 
   func setExternalVoicePlayback(messageId: String?, isPlaying: Bool, progress: CGFloat) {

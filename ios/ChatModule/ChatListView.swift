@@ -446,6 +446,33 @@ private final class ChatListDocumentPreviewDataSource: NSObject, QLPreviewContro
   }
 }
 
+/// صفحهٔ اولِ سند به‌شکلِ یک مربع، لنگر‌انداخته به **بالای** صفحه.
+///
+/// `PDFPage.thumbnail(of:for:)` کلِ صفحه را داخل کادر جا می‌دهد و بعد
+/// `scaleAspectFill` وسطِ آن را می‌بُرد — وسطِ یک برگهٔ A4 معمولاً سفیدِ خالی است،
+/// که همان بندانگشتیِ سفید بود. عرض را پر می‌کنیم و از بالا می‌بُریم تا سرصفحه
+/// دیده شود.
+func chatDocumentPageThumbnail(_ page: PDFPage, side: CGFloat = 240.0) -> UIImage {
+  let pageRect = page.bounds(for: .cropBox)
+  guard pageRect.width > 0, pageRect.height > 0 else {
+    return page.thumbnail(of: CGSize(width: side, height: side), for: .cropBox)
+  }
+  let scale = side / pageRect.width
+  let renderer = UIGraphicsImageRenderer(size: CGSize(width: side, height: side))
+  return renderer.image { context in
+    UIColor.white.setFill()
+    context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+    let ctx = context.cgContext
+    ctx.saveGState()
+    // مبدأ PDF پایین‌چپ است؛ برای دیدنِ بالای صفحه باید بالای کادر بایستد.
+    ctx.translateBy(x: 0, y: side)
+    ctx.scaleBy(x: scale, y: -scale)
+    ctx.translateBy(x: -pageRect.minX, y: -pageRect.maxY + side / scale)
+    page.draw(with: .cropBox, to: ctx)
+    ctx.restoreGState()
+  }
+}
+
 private final class ChatPDFPreviewViewController: UIViewController {
   private let fileURL: URL
   private let document: PDFDocument
@@ -1427,8 +1454,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }()
   private static let documentPagePreviewCache = NSCache<NSString, UIImage>()
   private static let documentPageCountCache = NSCache<NSString, NSNumber>()
+  private static let documentByteSizeCache = NSCache<NSString, NSNumber>()
   private static let documentPagePreviewQueue = DispatchQueue(
     label: "chat.document.page-preview", qos: .userInitiated)
+  private var documentByteSizeProbeKeys: Set<String> = []
 
   private var isPeerTyping: Bool = false
   private var isGroupOrChannel: Bool = false
@@ -1905,45 +1934,100 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
+  /// حدِ خودکار برای گرفتنِ سند فقط به‌خاطرِ پیش‌نمایش. برگه‌های باربری چند ده
+  /// کیلوبایت‌اند؛ سندِ بزرگ تا وقتی کاربر نخواهد دانلود نمی‌شود.
+  private static let documentAutoPreviewByteLimit: Int64 = 2 * 1024 * 1024
+
   private func resolveDocumentPagePreview(for row: ChatListRow, cell: ChatListCell) {
-    let messageKey = (row.messageId ?? row.key) as NSString
-    if let cached = Self.documentPagePreviewCache.object(forKey: messageKey) {
-      let pageCount = Self.documentPageCountCache.object(forKey: messageKey)?.intValue ?? 0
-      cell.applyDocumentPreview(cached, pageCount: pageCount, messageId: row.messageId)
-      return
+    // کلید بر مبنای خودِ فایل است نه شناسهٔ پیام: یک سند که در چند پیام تکرار
+    // می‌شود باید یک بار رندر شود، و کش با اسکرول از بین نرود.
+    let cacheKey = (row.mediaKey ?? row.mediaUrl ?? row.messageId ?? row.key) as NSString
+    let messageId = row.messageId
+
+    if let cached = Self.documentPagePreviewCache.object(forKey: cacheKey) {
+      let pageCount = Self.documentPageCountCache.object(forKey: cacheKey)?.intValue ?? 0
+      cell.applyDocumentPreview(cached, pageCount: pageCount, messageId: messageId)
     }
-    guard let raw = resolvedPreferredMediaURL(for: row) else {
-      return
+    if let bytes = Self.documentByteSizeCache.object(forKey: cacheKey)?.int64Value {
+      cell.applyDocumentByteSize(bytes, messageId: messageId)
     }
-    let url: URL? = {
-      if let parsed = URL(string: raw), parsed.isFileURL { return parsed }
-      if raw.hasPrefix("/") { return URL(fileURLWithPath: raw) }
+
+    let localURL: URL? = {
+      guard let raw = resolvedPreferredMediaURL(for: row) else { return nil }
+      if let parsed = URL(string: raw), parsed.isFileURL,
+        FileManager.default.fileExists(atPath: parsed.path)
+      {
+        return parsed
+      }
+      if raw.hasPrefix("/"), FileManager.default.fileExists(atPath: raw) {
+        return URL(fileURLWithPath: raw)
+      }
       return nil
     }()
-    guard let url,
-      FileManager.default.fileExists(atPath: url.path)
+
+    guard let localURL else {
+      // بدونِ نسخهٔ محلی: اندازه را با HEAD می‌گیریم تا سلول پیش از دانلود هم
+      // «۲۰٫۹ KB» را نشان بدهد، و اگر سند کوچک بود خودمان می‌آوریمش تا
+      // پیش‌نمایشِ صفحهٔ اول ساخته شود — همان رفتاری که تلگرام دارد.
+      resolveDocumentRemoteByteSize(for: row, cacheKey: cacheKey, cell: cell)
+      return
+    }
+
+    guard Self.documentPagePreviewCache.object(forKey: cacheKey) == nil else { return }
+    guard chatDocumentIsPDF(row) else { return }
+
+    Self.documentPagePreviewQueue.async { [weak cell] in
+      guard let document = PDFDocument(url: localURL), let page = document.page(at: 0) else {
+        return
+      }
+      let image = chatDocumentPageThumbnail(page)
+      let pageCount = document.pageCount
+      Self.documentPagePreviewCache.setObject(image, forKey: cacheKey)
+      Self.documentPageCountCache.setObject(NSNumber(value: pageCount), forKey: cacheKey)
+      let bytes = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size])
+        .flatMap { ($0 as? NSNumber)?.int64Value } ?? 0
+      if bytes > 0 {
+        Self.documentByteSizeCache.setObject(NSNumber(value: bytes), forKey: cacheKey)
+      }
+      DispatchQueue.main.async {
+        cell?.applyDocumentPreview(image, pageCount: pageCount, messageId: messageId)
+        if bytes > 0 { cell?.applyDocumentByteSize(bytes, messageId: messageId) }
+      }
+    }
+  }
+
+  private func resolveDocumentRemoteByteSize(
+    for row: ChatListRow, cacheKey: NSString, cell: ChatListCell
+  ) {
+    guard Self.documentByteSizeCache.object(forKey: cacheKey) == nil,
+      let raw = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+      let remoteURL = URL(string: raw),
+      let scheme = remoteURL.scheme?.lowercased(),
+      scheme == "http" || scheme == "https",
+      !documentByteSizeProbeKeys.contains(raw)
     else {
       return
     }
+    documentByteSizeProbeKeys.insert(raw)
+
+    var request = URLRequest(url: remoteURL)
+    request.httpMethod = "HEAD"
+    request.timeoutInterval = 15.0
+
     let messageId = row.messageId
-    Self.documentPagePreviewQueue.async { [weak self, weak cell] in
-      guard let document = PDFDocument(url: url),
-        let page = document.page(at: 0)
-      else {
-        return
-      }
-      let image = page.thumbnail(
-        of: CGSize(width: 240.0, height: 240.0),
-        for: .cropBox
-      )
-      Self.documentPagePreviewCache.setObject(image, forKey: messageKey)
-      let pageCount = document.pageCount
-      Self.documentPageCountCache.setObject(NSNumber(value: pageCount), forKey: messageKey)
+    Self.documentPreviewSession.dataTask(with: request) { [weak self, weak cell] _, response, _ in
+      let bytes = (response as? HTTPURLResponse)?.expectedContentLength ?? -1
       DispatchQueue.main.async {
-        guard self != nil else { return }
-        cell?.applyDocumentPreview(image, pageCount: pageCount, messageId: messageId)
+        guard let self else { return }
+        self.documentByteSizeProbeKeys.remove(raw)
+        guard bytes > 0 else { return }
+        Self.documentByteSizeCache.setObject(NSNumber(value: bytes), forKey: cacheKey)
+        cell?.applyDocumentByteSize(bytes, messageId: messageId)
+        if bytes <= Self.documentAutoPreviewByteLimit, chatDocumentIsPDF(row) {
+          self.startRemoteMediaDownload(for: row, presentOnComplete: false)
+        }
       }
-    }
+    }.resume()
   }
 
   private static func debugUIColorHex(_ color: UIColor) -> String {

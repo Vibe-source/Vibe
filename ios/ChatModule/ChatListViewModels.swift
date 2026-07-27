@@ -543,6 +543,10 @@ struct ChatListRow {
   /// Original author id — feeds `ChatAvatarNodeView` palette / URL resolution.
   let forwardedFromUserId: String?
   let fileName: String?
+  /// Server-declared content type. A document cell cannot label itself from the
+  /// name alone — a printable page arrives with an extensionless url and would
+  /// otherwise claim to be a PDF.
+  let mimeType: String?
   let duration: Double?
   let waveform: [CGFloat]?
   let isVideoNote: Bool
@@ -735,6 +739,7 @@ struct ChatListRow {
       forwardedFromAvatar = nil
       forwardedFromUserId = nil
       fileName = nil
+      mimeType = nil
       duration = nil
       waveform = nil
       isVideoNote = false
@@ -964,6 +969,12 @@ struct ChatListRow {
       ?? (metadata?["fileName"] as? String)
       ?? (metadata?["file_name"] as? String)
       ?? (metadata?["title"] as? String)
+    mimeType =
+      (message["mimeType"] as? String)
+      ?? (message["mime_type"] as? String)
+      ?? (metadata?["mimeType"] as? String)
+      ?? (metadata?["mime_type"] as? String)
+      ?? (metadata?["mime"] as? String)
     duration =
       parseDouble(message["duration"])
       ?? parseDouble(metadata?["durationSeconds"])
@@ -1454,6 +1465,7 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.messageType == rhs.messageType
     && lhs.mediaUrl == rhs.mediaUrl && lhs.localMediaUrl == rhs.localMediaUrl
     && lhs.mediaKey == rhs.mediaKey && lhs.fileName == rhs.fileName
+    && lhs.mimeType == rhs.mimeType
     && lhs.musicCoverURL == rhs.musicCoverURL
     && lhs.musicArtist == rhs.musicArtist
     && lhs.musicSource == rhs.musicSource

@@ -1639,22 +1639,36 @@ defmodule Vibe.AI.AgentEventRuntime do
       agent,
       thread.chat_id,
       body,
+      caption_body(title, detail),
       metadata,
       normalize_attachments_payload(normalized.attachments),
       silent
     )
   end
 
+  # نسخهٔ بدونِ سرتیترِ متن، برای وقتی که به‌جای حبابِ مستقل، caption یک سلولِ
+  # سند می‌شود. `# ` داخل یک حبابِ فایل، تیتری غول‌پیکر بالای نامِ فایل می‌سازد.
+  defp caption_body(title, nil), do: title
+  defp caption_body(title, detail), do: "#{title}\n\n#{detail}"
+
   # خلاصهٔ رویداد روی نخستین پیوست می‌نشیند و بقیه بی‌عنوان پشت سرش می‌آیند —
   # همان قاعدهٔ آلبومِ تلگرام. جدا فرستادنِ خلاصه یک حبابِ متنیِ یتیم بالای
   # فایل‌ها می‌سازد و سلولِ سند بی‌عنوان می‌ماند؛ کلاینت caption را داخل همان
   # حبابِ سند می‌چیند، پس اینجا باید یک ردیف باشد نه دو.
-  defp post_event_body_and_attachments(agent, chat_id, body, metadata, [first | rest], false) do
+  defp post_event_body_and_attachments(
+         agent,
+         chat_id,
+         _body,
+         caption,
+         metadata,
+         [first | rest],
+         false
+       ) do
     with {:ok, primary_message} <-
            post_attachment_message(
              agent,
              chat_id,
-             merged_attachment_caption(body, first),
+             merged_attachment_caption(caption, first),
              metadata,
              first,
              nil
@@ -1667,7 +1681,15 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   # بدون پیوست، یا حالت silent. در silent خلاصه از رونوشت پنهان است ولی پیوست‌ها
   # نیستند، پس ادغام‌شان یعنی تحمیلِ یک visibility به هر دو — نگه‌شان می‌داریم جدا.
-  defp post_event_body_and_attachments(agent, chat_id, body, metadata, attachments, silent) do
+  defp post_event_body_and_attachments(
+         agent,
+         chat_id,
+         body,
+         _caption,
+         metadata,
+         attachments,
+         silent
+       ) do
     with {:ok, primary_message} <-
            maybe_post_event_summary(agent, chat_id, body, metadata, nil, silent),
          {:ok, _attachment_messages} <-
