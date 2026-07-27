@@ -142,15 +142,30 @@ defmodule VibeWeb.AgentsController do
     end
   end
 
-  def rotate_secret(conn, %{"id" => id}) do
+  def rotate_secret(conn, %{"id" => id} = params) do
     owner_id = conn.assigns.current_user.id
+    # نبودِ این پارامتر یعنی ابطالِ فوری — حالتِ «کلیدم لو رفته».
+    grace_hours = params["graceHours"] || params["grace_hours"]
 
     with %{} = agent <- Agents.get_agent(id, owner_id),
-         {:ok, updated, secret} <- Agents.rotate_secret(agent, owner_id) do
-      json(conn, %{agent: Agents.agent_payload(updated), secret: secret})
+         {:ok, updated, secret} <-
+           Agents.rotate_secret(agent, owner_id, grace_hours: grace_hours) do
+      json(conn, %{
+        agent: Agents.agent_payload(updated),
+        secret: secret,
+        previousSecretExpiresAt: updated.previous_secret_expires_at
+      })
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, :invalid_grace_hours} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "graceHours must be a whole number of hours"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 

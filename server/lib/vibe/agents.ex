@@ -235,23 +235,71 @@ defmodule Vibe.Agents do
     end
   end
 
-  def rotate_secret(%Agent{} = agent, owner_user_id) do
+  @max_secret_grace_hours 168
+
+  @doc """
+  Issues a new agent secret.
+
+  Revocation is immediate by default: a rotation is usually a response to a
+  leaked key, and the safe behaviour must not be the one you have to remember
+  to ask for. Pass `grace_hours:` for a *planned* rotation — the outgoing
+  secret keeps verifying until the window closes, so live integrations can be
+  updated without a hard cutover. Capped at #{@max_secret_grace_hours} hours.
+  """
+  def rotate_secret(%Agent{} = agent, owner_user_id, opts \\ []) do
     if agent.owner_user_id != owner_user_id do
       {:error, :forbidden}
     else
-      with {:ok, secret_tuple} <- generate_secret_tuple(),
+      with {:ok, grace_hours} <- normalize_grace_hours(Keyword.get(opts, :grace_hours)),
+           {:ok, secret_tuple} <- generate_secret_tuple(),
            {:ok, updated} <-
              agent
-             |> Agent.changeset(%{
-               webhook_secret_hash: secret_tuple.hash,
-               webhook_secret_encrypted: secret_tuple.encrypted,
-               secret_hint: secret_tuple.hint
-             })
+             |> Agent.changeset(
+               Map.merge(
+                 %{
+                   webhook_secret_hash: secret_tuple.hash,
+                   webhook_secret_encrypted: secret_tuple.encrypted,
+                   secret_hint: secret_tuple.hint
+                 },
+                 previous_secret_attrs(agent, grace_hours)
+               )
+             )
              |> Repo.update() do
         {:ok, Repo.preload(updated, :agent_user), secret_tuple.secret}
       end
     end
   end
+
+  # بدونِ مهلت، ردِ رمزِ قبلی هم پاک می‌شود — وگرنه یک چرخشِ فوری بعد از یک
+  # چرخشِ مهلت‌دار، رمزِ قدیمی‌تر را همچنان معتبر می‌گذاشت.
+  defp previous_secret_attrs(_agent, nil),
+    do: %{previous_secret_hash: nil, previous_secret_expires_at: nil}
+
+  defp previous_secret_attrs(%Agent{webhook_secret_hash: nil}, _hours),
+    do: %{previous_secret_hash: nil, previous_secret_expires_at: nil}
+
+  defp previous_secret_attrs(%Agent{webhook_secret_hash: hash}, hours) do
+    %{
+      previous_secret_hash: hash,
+      previous_secret_expires_at:
+        DateTime.utc_now() |> DateTime.add(hours * 3600, :second) |> DateTime.truncate(:second)
+    }
+  end
+
+  defp normalize_grace_hours(nil), do: {:ok, nil}
+  defp normalize_grace_hours(0), do: {:ok, nil}
+
+  defp normalize_grace_hours(hours) when is_integer(hours) and hours > 0,
+    do: {:ok, min(hours, @max_secret_grace_hours)}
+
+  defp normalize_grace_hours(hours) when is_binary(hours) do
+    case Integer.parse(String.trim(hours)) do
+      {parsed, ""} -> normalize_grace_hours(parsed)
+      _ -> {:error, :invalid_grace_hours}
+    end
+  end
+
+  defp normalize_grace_hours(_), do: {:error, :invalid_grace_hours}
 
   def archive_agent(%Agent{} = agent, owner_user_id) do
     if agent.owner_user_id != owner_user_id do
@@ -298,10 +346,43 @@ defmodule Vibe.Agents do
 
   def verify_secret(%Agent{} = agent, secret) when is_binary(secret) do
     expected = hash_secret(secret)
-    secure_compare(expected, agent.webhook_secret_hash || "")
+
+    secure_compare(expected, agent.webhook_secret_hash || "") or
+      previous_secret_valid?(agent, expected)
   end
 
   def verify_secret(_agent, _secret), do: false
+
+  # رمزِ قبلی فقط تا پایانِ مهلت معتبر است. مقایسه همچنان زمان‌ثابت می‌ماند،
+  # ولی وقتی مهلتی در کار نیست اصلاً انجام نمی‌شود.
+  defp previous_secret_valid?(%Agent{previous_secret_hash: hash} = agent, expected)
+       when is_binary(hash) and hash != "" do
+    case agent.previous_secret_expires_at do
+      %DateTime{} = expires_at ->
+        DateTime.compare(DateTime.utc_now(), expires_at) == :lt and
+          secure_compare(expected, hash)
+
+      _ ->
+        false
+    end
+  end
+
+  defp previous_secret_valid?(_agent, _expected), do: false
+
+  # پنجرهٔ منقضی‌شده اصلاً گزارش نمی‌شود تا UI «تا فلان ساعت» ننویسد در حالی که
+  # دیگر گذشته است.
+  defp previous_secret_window(%Agent{previous_secret_hash: hash} = agent)
+       when is_binary(hash) and hash != "" do
+    case agent.previous_secret_expires_at do
+      %DateTime{} = expires_at ->
+        if DateTime.compare(DateTime.utc_now(), expires_at) == :lt, do: expires_at, else: nil
+
+      _ ->
+        nil
+    end
+  end
+
+  defp previous_secret_window(_agent), do: nil
 
   def callback_signing_secret(%Agent{webhook_secret_encrypted: encrypted}) when is_binary(encrypted) do
     decrypt_secret(encrypted)
@@ -722,6 +803,8 @@ defmodule Vibe.Agents do
       voiceProfile: agent.voice_profile,
       callbackUrl: agent.callback_url,
       secretHint: agent.secret_hint,
+      # تا این لحظه رمزِ قبلی هم پذیرفته می‌شود؛ nil یعنی فقط رمزِ فعلی کار می‌کند.
+      previousSecretExpiresAt: previous_secret_window(agent),
       publishedAt: agent.published_at,
       lastInvokedAt: agent.last_invoked_at,
       attachedChats: attached_chats(agent),

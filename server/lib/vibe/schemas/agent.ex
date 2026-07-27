@@ -35,6 +35,10 @@ defmodule Vibe.Agent do
     field :webhook_secret_hash, :string
     field :webhook_secret_encrypted, :string
     field :secret_hint, :string
+    # Outgoing secret during a planned rotation's grace window. Never set when
+    # the rotation was an immediate revoke.
+    field :previous_secret_hash, :string
+    field :previous_secret_expires_at, :utc_datetime
     field :published_at, :utc_datetime
     field :last_invoked_at, :utc_datetime
     # Runtime-only: whether the CURRENT request is the owner talking to this agent in
@@ -77,6 +81,8 @@ defmodule Vibe.Agent do
       :webhook_secret_hash,
       :webhook_secret_encrypted,
       :secret_hint,
+      :previous_secret_hash,
+      :previous_secret_expires_at,
       :published_at,
       :last_invoked_at
     ])
