@@ -496,6 +496,7 @@ struct ChatListRow {
     case video
     case videoNote
     case media
+    case document
     case sticker
   }
 
@@ -664,7 +665,7 @@ struct ChatListRow {
       if inferredAudio {
         return .voice
       }
-      return isAgentMessage ? .text : .media
+      return .document
     default:
       if inferredVideo {
         return .video
@@ -674,6 +675,12 @@ struct ChatListRow {
       }
       if inferredAudio {
         return .voice
+      }
+      let hasAttachmentReference =
+        !(fileName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        || !(mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+      if hasAttachmentReference {
+        return .document
       }
       return .text
     }

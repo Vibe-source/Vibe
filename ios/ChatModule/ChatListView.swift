@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import AVKit
 import OSLog
+import PDFKit
 import QuickLook
 import UIKit
 
@@ -442,6 +443,52 @@ private final class ChatListDocumentPreviewDataSource: NSObject, QLPreviewContro
     -> QLPreviewItem
   {
     previewURL as NSURL
+  }
+}
+
+private final class ChatPDFPreviewViewController: UIViewController {
+  private let fileURL: URL
+  private let document: PDFDocument
+  private let pdfView = PDFView()
+
+  init(fileURL: URL, document: PDFDocument) {
+    self.fileURL = fileURL
+    self.document = document
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .systemBackground
+    title = document.pageCount == 1 ? "1 page" : "\(document.pageCount) pages"
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .close, target: self, action: #selector(closeViewer))
+    navigationItem.rightBarButtonItem = UIBarButtonItem(
+      barButtonSystemItem: .action, target: self, action: #selector(shareDocument))
+    pdfView.autoScales = true
+    pdfView.displayMode = .singlePageContinuous
+    pdfView.displayDirection = .vertical
+    pdfView.document = document
+    view.addSubview(pdfView)
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    pdfView.frame = view.bounds
+  }
+
+  @objc private func shareDocument() {
+    let activity = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+    activity.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
+    present(activity, animated: true)
+  }
+
+  @objc private func closeViewer() {
+    dismiss(animated: true)
   }
 }
 
@@ -1378,6 +1425,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     return URLSession.shared
   }()
+  private static let documentPagePreviewCache = NSCache<NSString, UIImage>()
+  private static let documentPageCountCache = NSCache<NSString, NSNumber>()
+  private static let documentPagePreviewQueue = DispatchQueue(
+    label: "chat.document.page-preview", qos: .userInitiated)
 
   private var isPeerTyping: Bool = false
   private var isGroupOrChannel: Bool = false
@@ -1849,6 +1900,50 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       groupTopSpacing: groupContext.topSpacing,
       replyAccentColors: replyPreviewAccentColors(for: row)
     )
+    if row.visualKind == .document {
+      resolveDocumentPagePreview(for: row, cell: cell)
+    }
+  }
+
+  private func resolveDocumentPagePreview(for row: ChatListRow, cell: ChatListCell) {
+    let messageKey = (row.messageId ?? row.key) as NSString
+    if let cached = Self.documentPagePreviewCache.object(forKey: messageKey) {
+      let pageCount = Self.documentPageCountCache.object(forKey: messageKey)?.intValue ?? 0
+      cell.applyDocumentPreview(cached, pageCount: pageCount, messageId: row.messageId)
+      return
+    }
+    guard let raw = resolvedPreferredMediaURL(for: row) else {
+      return
+    }
+    let url: URL? = {
+      if let parsed = URL(string: raw), parsed.isFileURL { return parsed }
+      if raw.hasPrefix("/") { return URL(fileURLWithPath: raw) }
+      return nil
+    }()
+    guard let url,
+      FileManager.default.fileExists(atPath: url.path)
+    else {
+      return
+    }
+    let messageId = row.messageId
+    Self.documentPagePreviewQueue.async { [weak self, weak cell] in
+      guard let document = PDFDocument(url: url),
+        let page = document.page(at: 0)
+      else {
+        return
+      }
+      let image = page.thumbnail(
+        of: CGSize(width: 240.0, height: 240.0),
+        for: .cropBox
+      )
+      Self.documentPagePreviewCache.setObject(image, forKey: messageKey)
+      let pageCount = document.pageCount
+      Self.documentPageCountCache.setObject(NSNumber(value: pageCount), forKey: messageKey)
+      DispatchQueue.main.async {
+        guard self != nil else { return }
+        cell?.applyDocumentPreview(image, pageCount: pageCount, messageId: messageId)
+      }
+    }
   }
 
   private static func debugUIColorHex(_ color: UIColor) -> String {
@@ -10526,7 +10621,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       onNativeEvent(payload)
       return
     }
-    guard let mediaURLRaw = row.mediaUrl else { return }
+    guard
+      let mediaURLRaw =
+        row.mediaUrl ?? (row.visualKind == .document ? row.localMediaUrl : nil)
+    else {
+      return
+    }
     let mediaURL = mediaURLRaw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !mediaURL.isEmpty else { return }
     let hasFileNameHint =
@@ -10536,6 +10636,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let isUploadCancelableVisual =
       row.visualKind == .voice
       || row.visualKind == .media
+      || row.visualKind == .document
       || row.visualKind == .video
       || row.visualKind == .videoNote
       || row.visualKind == .sticker
@@ -10577,7 +10678,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return
     }
     let isMediaOrVideo =
-      row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote
+      row.visualKind == .media || row.visualKind == .document
+      || row.visualKind == .video || row.visualKind == .videoNote
     if isMediaOrVideo {
       let mediaDownloadState = remoteMediaDownloadState(for: row)
       if mediaDownloadState.needsDownload {
@@ -12296,7 +12398,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return 220.0
     case .sticker:
       return 184.0
-    case .video, .media:
+    case .video, .media, .document:
       // Same argument as .text below: a media bubble measures from cached natural sizes and
       // pure metrics, never an image decode or an offscreen layout pass, so estimating it
       // saves nothing — and the estimate was WRONG. It capped at 360 and modelled the media
@@ -17835,7 +17937,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func shouldAutoDownloadRemoteMedia(for row: ChatListRow) -> Bool {
     switch row.visualKind {
-    case .video, .videoNote:
+    case .video, .videoNote, .document:
       return true
     case .media:
       return row.messageType != "file"
@@ -18259,7 +18361,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func remoteMediaDownloadState(for row: ChatListRow) -> (
     needsDownload: Bool, isDownloading: Bool, progress: Double?
   ) {
-    guard row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote,
+    guard row.visualKind == .media || row.visualKind == .document
+      || row.visualKind == .video || row.visualKind == .videoNote,
       let mediaURL = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
       let remoteURL = URL(string: mediaURL),
       let scheme = remoteURL.scheme?.lowercased(),
@@ -18862,6 +18965,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if presentPlainTextDocumentPreviewIfSupported(localURL: localURL, presenter: presenter) {
+      return
+    }
+
+    if localURL.pathExtension.lowercased() == "pdf",
+      let document = PDFDocument(url: localURL)
+    {
+      let controller = ChatPDFPreviewViewController(fileURL: localURL, document: document)
+      let navigation = UINavigationController(rootViewController: controller)
+      navigation.modalPresentationStyle = .pageSheet
+      if let sheet = navigation.sheetPresentationController {
+        sheet.detents = [.large()]
+        sheet.prefersGrabberVisible = true
+      }
+      presenter.present(navigation, animated: true)
       return
     }
 

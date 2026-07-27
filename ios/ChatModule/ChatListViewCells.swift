@@ -1976,6 +1976,7 @@ private func trimmedBubbleText(_ row: ChatListRow) -> String {
 private func hasMediaCaptionLayout(_ row: ChatListRow) -> Bool {
   guard row.kind == .message else { return false }
   guard row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote
+    || row.visualKind == .document
   else {
     return false
   }
@@ -2232,6 +2233,7 @@ private let stickerMaxDisplayHeight: CGFloat = 184.0
 private let stickerMetaTopSpacing: CGFloat = 1.0
 
 private func hasInlineFileAttachment(_ row: ChatListRow) -> Bool {
+  guard row.visualKind == .text else { return false }
   guard let mediaUrl = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
     !mediaUrl.isEmpty
   else {
@@ -4438,7 +4440,7 @@ func measureMessageBubbleLayout(
   }
 
   switch row.visualKind {
-  case .voice, .video, .videoNote, .media, .sticker:
+  case .voice, .video, .videoNote, .media, .document, .sticker:
     var targetWidth: CGFloat
     var mediaHeight: CGFloat
     switch row.visualKind {
@@ -4469,6 +4471,9 @@ func measureMessageBubbleLayout(
     case .videoNote:
       targetWidth = 200.0
       mediaHeight = 200.0
+    case .document:
+      targetWidth = maxContentWidth
+      mediaHeight = 72.0
     case .video, .media, .sticker:
       let gridCount = chatMediaGridImageCount(row)
       if gridCount > 1 {
@@ -8744,6 +8749,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var mediaDownloadProgress: Double?
   private var mediaDownloadedBytes: Int64?
   private var mediaTotalDownloadBytes: Int64?
+  private var documentPageCount: Int?
   private var skipRemoteMediaLoad = false
   private var preferredLocalMediaURLOverride: String?
   private weak var wallpaperCoordinateView: UIView?
@@ -9346,6 +9352,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let preservedMediaImage = isSameMediaIdentity ? mediaImageView.image : nil
     if !isSameMediaIdentity {
       mediaPixelQuality = .none
+      documentPageCount = nil
     } else if preservedMediaImage != nil, mediaPixelQuality == .none {
       // Reused cell with pixels but no quality stamp (old path) — treat as full so
       // a late micro-thumb cannot downgrade a sharp image.
@@ -11225,6 +11232,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let supportsPlaceholder =
       row.visualKind == .video
       || row.visualKind == .videoNote
+      || row.visualKind == .document
       || (row.visualKind == .media && row.messageType != "file")
     guard supportsPlaceholder else {
       mediaPlaceholderBlurView.isHidden = true
@@ -11242,6 +11250,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       return
     }
     let hasPixels = mediaImageView.image != nil
+    if row.visualKind == .document {
+      let resolvedPage = mediaPixelQuality == .full
+      mediaPlaceholderBlurView.isHidden = resolvedPage
+      mediaPlaceholderTintView.backgroundColor = UIColor(
+        white: appearance.isDark ? 0.0 : 1.0,
+        alpha: resolvedPage ? 0.0 : (appearance.isDark ? 0.28 : 0.14)
+      )
+      return
+    }
     let transferPending =
       mediaIsDownloading || mediaNeedsDownload || row.shouldShowUploadOverlay
     if hasPixels {
@@ -11650,6 +11667,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         return true
       case .media:
         return row.messageType == "file"
+      case .document:
+        return mediaImageView.image == nil
       case .text, .voice, .sticker:
         return false
       }
@@ -11841,6 +11860,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       : UIColor(white: 0.0, alpha: 0.16)
     mediaImageView.contentMode = isTransparentSticker ? .scaleAspectFit : .scaleAspectFill
     mediaImageView.clipsToBounds = !isTransparentSticker
+    mediaImageView.layer.cornerRadius = 0.0
 
     do {
       let vkName: String
@@ -11850,6 +11870,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       case .video: vkName = "video"
       case .videoNote: vkName = "videoNote"
       case .media: vkName = "media"
+      case .document: vkName = "document"
       case .sticker: vkName = "sticker"
       }
       chatCellDebugLog(
@@ -11984,6 +12005,43 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaBorderLayer.lineWidth = 0.0
       mediaBorderLayer.strokeColor = nil
       mediaBorderLayer.isHidden = true
+
+    case .document:
+      mediaContainerView.backgroundColor =
+        appearance.isDark
+        ? UIColor(white: 1.0, alpha: 0.08)
+        : UIColor(white: 0.0, alpha: 0.07)
+      mediaBorderLayer.lineWidth = 0.0
+      mediaBorderLayer.isHidden = true
+      mediaImageView.isHidden = false
+      mediaImageView.contentMode = .scaleAspectFill
+      mediaTitleLabel.isHidden = false
+      mediaTitleLabel.textAlignment = .left
+      mediaTitleLabel.lineBreakMode = .byTruncatingMiddle
+      mediaTitleLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+      let documentTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
+      mediaTitleLabel.textColor = documentTextColor
+      mediaTitleLabel.text = row.fileName?.isEmpty == false ? row.fileName : "Document"
+      mediaDetailLabel.isHidden = false
+      mediaDetailLabel.textAlignment = .left
+      mediaDetailLabel.lineBreakMode = .byTruncatingTail
+      mediaDetailLabel.font = UIFont.systemFont(ofSize: 12, weight: .regular)
+      mediaDetailLabel.textColor = documentTextColor.withAlphaComponent(0.68)
+      mediaDetailLabel.text = documentDetailText(for: row)
+      mediaPrimaryIconView.isHidden = false
+      mediaPrimaryIconView.image = UIImage(
+        systemName: "doc.text.fill",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold))
+      mediaPrimaryIconView.tintColor = .white
+      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.88)
+      if let placeholder = chatMediaImage(fromBase64: row.thumbnailBase64) {
+        mediaImageView.image = placeholder
+        mediaPixelQuality = .microThumb
+        mediaPlaceholderBlurView.isHidden = false
+      } else {
+        mediaImageView.image = nil
+        mediaPlaceholderBlurView.isHidden = false
+      }
 
     case .media, .sticker:
       mediaImageView.isHidden = false
@@ -12122,7 +12180,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if forceImageLoad {
       mediaImageView.isHidden = false
     }
-    if !mediaImageView.isHidden || forceImageLoad {
+    // PDF pixels come only from PDFKit's page renderer in ChatListView. Keeping this
+    // branch closed is the invariant that prevents a document from reaching UIImage
+    // decode, the image editor, or the gallery cache.
+    if row.visualKind != .document && (!mediaImageView.isHidden || forceImageLoad) {
       let prefersVideoPreview = row.visualKind == .video || row.visualKind == .videoNote
       // Sync micro-thumb first paint (Telegram): never leave a solid empty plate while
       // full media is still on disk/network. Decode is capped + cached (≤4KB wire thumbs).
@@ -12658,6 +12719,27 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           height: waveHeight
         )
       }
+
+    case .document:
+      let previewSide = min(56.0, max(44.0, height - 16.0))
+      let previewFrame = CGRect(
+        x: 8.0,
+        y: floor((height - previewSide) * 0.5),
+        width: previewSide,
+        height: previewSide
+      )
+      mediaImageView.frame = previewFrame
+      mediaPlaceholderBlurView.frame = previewFrame
+      mediaPlaceholderTintView.frame = mediaPlaceholderBlurView.contentView.bounds
+      mediaImageView.layer.cornerRadius = 9.0
+      mediaPrimaryIconView.frame = previewFrame
+      mediaPrimaryIconView.layer.cornerRadius = 9.0
+      let textX = previewFrame.maxX + 10.0
+      let textWidth = max(1.0, width - textX - 8.0)
+      mediaTitleLabel.frame = CGRect(
+        x: textX, y: 15.0, width: textWidth, height: 20.0)
+      mediaDetailLabel.frame = CGRect(
+        x: textX, y: mediaTitleLabel.frame.maxY + 3.0, width: textWidth, height: 17.0)
 
     case .video, .videoNote, .media, .sticker:
       let btnSize: CGFloat = 44.0
@@ -13205,6 +13287,44 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     updateMediaPlaceholderVisibility()
     refreshVoiceMetadataText()
     setNeedsLayout()
+  }
+
+  func applyDocumentPreview(_ image: UIImage, pageCount: Int, messageId: String?) {
+    guard let row, row.visualKind == .document,
+      (row.messageId ?? row.key) == (messageId ?? row.key)
+    else {
+      return
+    }
+    documentPageCount = pageCount > 0 ? pageCount : nil
+    mediaPixelQuality = .full
+    mediaDetailLabel.text = documentDetailText(for: row)
+    let apply = {
+      self.mediaImageView.image = image
+      self.mediaImageView.isHidden = false
+      self.mediaPrimaryIconView.isHidden = true
+      self.mediaPlaceholderBlurView.isHidden = true
+    }
+    if window != nil {
+      UIView.transition(
+        with: mediaImageView,
+        duration: 0.22,
+        options: [.transitionCrossDissolve, .beginFromCurrentState, .allowAnimatedContent],
+        animations: apply
+      )
+    } else {
+      apply()
+    }
+  }
+
+  private func documentDetailText(for row: ChatListRow) -> String {
+    var parts: [String] = []
+    if let bytes = row.fileSize, bytes > 0 {
+      parts.append(formatDownloadByteCount(bytes))
+    }
+    if let documentPageCount, documentPageCount > 0 {
+      parts.append(documentPageCount == 1 ? "1 page" : "\(documentPageCount) pages")
+    }
+    return parts.isEmpty ? "PDF document" : parts.joined(separator: " · ")
   }
 
   func setExternalVoicePlayback(messageId: String?, isPlaying: Bool, progress: CGFloat) {
