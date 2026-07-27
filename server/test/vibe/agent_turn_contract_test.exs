@@ -94,6 +94,45 @@ defmodule Vibe.AgentTurnContractTest do
   end
 
   @tag :db
+  test "the agent can read and set its own destination chat", %{owner: owner, agent: agent} do
+    {:ok, dm_id, _status} = Vibe.Chat.ensure_dm_chat(owner.id, agent.agent_user_id)
+
+    # خواندن: حتی وقتی چیزی ذخیره نشده، مقصدِ مؤثر باید گزارش شود — پیش از این
+    # ایجنت می‌گفت «نمی‌توانم chat مقصد را پیدا کنم».
+    assert Repo.get!(Agent, agent.id).default_destination_chat_id == nil
+
+    read = ChatAgent.get_current_agent_config(%{}, agent.id, owner.id)
+    assert read["ok"]
+    assert read["agent"]["effective_destination_chat_id"] == dm_id
+
+    # نوشتن با «here» — کاربر id را نمی‌داند.
+    set =
+      ChatAgent.update_current_agent_config(
+        %{"default_destination_chat_id" => "here"},
+        agent.id,
+        owner.id,
+        dm_id
+      )
+
+    assert set["ok"], inspect(set)
+    assert Repo.get!(Agent, agent.id).default_destination_chat_id == dm_id
+
+    # chat‌ای که ایجنت عضوش نیست باید رد شود، وگرنه رویداد بعداً بی‌دلیل می‌افتد.
+    stranger_chat = Ecto.UUID.generate()
+
+    rejected =
+      ChatAgent.update_current_agent_config(
+        %{"default_destination_chat_id" => stranger_chat},
+        agent.id,
+        owner.id,
+        nil
+      )
+
+    refute rejected["ok"]
+    assert Repo.get!(Agent, agent.id).default_destination_chat_id == dm_id
+  end
+
+  @tag :db
   test "room tools attach only for the agent owner", %{
     owner: owner,
     subscriber: subscriber,

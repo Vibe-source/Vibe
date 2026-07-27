@@ -412,6 +412,11 @@ defmodule Vibe.AI.Agent do
             type: "array",
             items: %{type: "string", enum: ["text", "media", "voice"]},
             description: "Updated output modes for this agent."
+          },
+          default_destination_chat_id: %{
+            type: "string",
+            description:
+              "Chat id that inbound integration events land in when the sender does not name one. Pass \"here\" (or \"this chat\") to use the current chat. The agent must already be a participant of the target chat."
           }
         }
       }
@@ -1278,7 +1283,7 @@ defmodule Vibe.AI.Agent do
           get_current_agent_config(tool_input, agent_id, requester_user_id)
 
         tool_name == "update_current_agent_config" ->
-          update_current_agent_config(tool_input, agent_id, requester_user_id)
+          update_current_agent_config(tool_input, agent_id, requester_user_id, chat_id)
 
         tool_name == "create_chat_space" ->
           Vibe.AI.Tools.Channel.create_chat_space(tool_input, agent_id, requester_user_id)
@@ -2171,7 +2176,8 @@ defmodule Vibe.AI.Agent do
 
   defp present_string(_), do: nil
 
-  defp get_current_agent_config(input, agent_id, requester_user_id) do
+  @doc false
+  def get_current_agent_config(input, agent_id, requester_user_id) do
     include_prompt =
       case Map.get(input, "include_prompt") do
         false -> false
@@ -2190,9 +2196,11 @@ defmodule Vibe.AI.Agent do
   end
 
   @doc false
-  def update_current_agent_config(input, agent_id, requester_user_id) do
+  def update_current_agent_config(input, agent_id, requester_user_id, chat_id \\ nil) do
     with {:ok, agent} <- resolve_owned_agent(agent_id, requester_user_id),
          {:ok, attrs} <- current_agent_update_attrs(input),
+         {:ok, attrs} <- maybe_put_destination_chat(attrs, input, agent, chat_id),
+         {:ok, attrs} <- reject_empty_update(attrs),
          {:ok, updated_agent} <- persist_current_agent_update(agent, attrs, requester_user_id) do
       %{
         "ok" => true,
@@ -2211,6 +2219,20 @@ defmodule Vibe.AI.Agent do
 
       {:error, :invalid_output_modes} ->
         %{"ok" => false, "error" => "output_modes must contain only text, media, or voice."}
+
+      {:error, :unknown_destination_chat} ->
+        %{
+          "ok" => false,
+          "error" =>
+            "Could not tell which chat to use. Pass a chat id, or \"here\" to use this chat."
+        }
+
+      {:error, :destination_chat_not_attached} ->
+        %{
+          "ok" => false,
+          "error" =>
+            "This agent is not a participant of that chat, so events sent there would be rejected. Attach the agent to the chat first."
+        }
 
       {:error, reason} ->
         %{"ok" => false, "error" => inbox_error_message(reason)}
@@ -2563,14 +2585,54 @@ defmodule Vibe.AI.Agent do
       |> maybe_put_trimmed(input, "voice_profile")
       |> maybe_put_status(input)
 
+    # تهی بودن اینجا خطا نیست: ممکن است تنها تغییرِ خواسته‌شده chat مقصد باشد
+    # که یک گام بعد افزوده می‌شود. بررسیِ «هیچ تغییری خواسته نشده» به caller رفت.
     with {:ok, attrs} <- maybe_put_tool_list(base_attrs, input),
          {:ok, attrs} <- maybe_put_output_modes(attrs, input),
          {:ok, attrs} <- maybe_put_system_prompt(attrs, input) do
-      if map_size(attrs) == 0, do: {:error, :no_changes_requested}, else: {:ok, attrs}
+      {:ok, attrs}
     end
   end
 
   defp current_agent_update_attrs(_input), do: {:error, :no_changes_requested}
+
+  defp reject_empty_update(attrs) when map_size(attrs) == 0, do: {:error, :no_changes_requested}
+  defp reject_empty_update(attrs), do: {:ok, attrs}
+
+  # chat مقصدِ پیش‌فرض: جایی که رویدادهای ورودیِ یکپارچه‌سازی می‌نشینند وقتی
+  # فرستنده chat را نام نبرده. کاربر معمولاً id را نمی‌داند، پس «here» را هم
+  # می‌پذیریم و به chat جاری ترجمه می‌کنیم.
+  defp maybe_put_destination_chat(attrs, input, agent, chat_id) do
+    case Map.get(input, "default_destination_chat_id") do
+      nil ->
+        {:ok, attrs}
+
+      value ->
+        case resolve_destination_chat_value(value, chat_id) do
+          nil ->
+            {:error, :unknown_destination_chat}
+
+          resolved ->
+            # ایجنت باید عضو آن chat باشد، وگرنه رویداد بعداً با
+            # `:chat_not_attached` رد می‌شود و علتش معلوم نیست.
+            if Vibe.Chat.is_participant?(resolved, agent.agent_user_id) do
+              {:ok, Map.put(attrs, "default_destination_chat_id", resolved)}
+            else
+              {:error, :destination_chat_not_attached}
+            end
+        end
+    end
+  end
+
+  defp resolve_destination_chat_value(value, chat_id) when is_binary(value) do
+    case String.trim(value) |> String.downcase() do
+      v when v in ["here", "this chat", "this", "current", "current chat"] -> chat_id
+      "" -> nil
+      _ -> String.trim(value)
+    end
+  end
+
+  defp resolve_destination_chat_value(_value, _chat_id), do: nil
 
   defp maybe_put_tool_list(attrs, input) do
     case Map.fetch(input, "enabled_tools") do
@@ -2678,6 +2740,10 @@ defmodule Vibe.AI.Agent do
       "events_url" => build_events_url(agent),
       "default_destination_chat_id" => payload.defaultDestinationChatId,
       "default_destination_chat" => default_destination_chat,
+      # مقصدِ واقعیِ رویدادها. اگر چیزی ذخیره نشده باشد، runtime به DM مالک
+      # برمی‌گردد — پس گزارشِ «مقصدی ندارم» گمراه‌کننده بود. همان مقداری را
+      # نشان بده که رویداد در عمل به آن می‌رسد.
+      "effective_destination_chat_id" => effective_destination_chat_id(agent),
       "attached_chats" => attached_chats,
       "incoming_chat_enabled" => Agents.incoming_chat_enabled?(agent),
       "event_inbox_mode" => current_event_inbox_mode(agent),
@@ -2687,6 +2753,19 @@ defmodule Vibe.AI.Agent do
       "prompt_preview" => condensed_prompt_preview(agent.system_prompt)
     }
     |> maybe_put("system_prompt", if(include_prompt, do: agent.system_prompt, else: nil))
+  end
+
+  defp effective_destination_chat_id(agent) do
+    case agent.default_destination_chat_id do
+      value when is_binary(value) and value != "" ->
+        value
+
+      _ ->
+        case Vibe.Chat.ensure_dm_chat(agent.owner_user_id, agent.agent_user_id) do
+          {:ok, chat_id, _status} -> chat_id
+          _ -> nil
+        end
+    end
   end
 
   defp chat_payload(%{} = chat) do
