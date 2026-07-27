@@ -57,6 +57,23 @@ defmodule Vibe.AgentAdminModeTest do
       assert {:ok, %{admin_mode: false}} =
                Chat.effective_agent_policy(chat_id, agent, other_owner.id)
     end
+
+    # رگرسیون: شاخهٔ DM کلیدهای `permissions`/`trigger_config` را برنمی‌گرداند و
+    # StandaloneAgent با `policy.permissions` می‌خواند — دسترسیِ نقطه‌ای روی مپِ
+    # بدون آن کلید KeyError می‌انداخت و هر پیامِ DM به ایجنت بی‌پاسخ می‌ماند.
+    test "DM policy carries the same keys as the channel policy", %{owner: owner} do
+      agent = insert_agent(owner, display_name: "Helper")
+      {:ok, chat_id, _status} = Chat.ensure_dm_chat(owner.id, agent.agent_user_id)
+
+      assert {:ok, policy} = Chat.effective_agent_policy(chat_id, agent, owner.id)
+
+      for key <- [:enabled_tools, :output_modes, :trigger_config, :permissions, :admin_mode] do
+        assert Map.has_key?(policy, key), "policy is missing #{inspect(key)}"
+      end
+
+      # همان دسترسی‌ای که در عمل می‌ترکید.
+      assert policy.permissions == %{}
+    end
   end
 
   describe "Vibe.AI.Agent tool gating" do

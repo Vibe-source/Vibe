@@ -2076,8 +2076,16 @@ defmodule Vibe.Chat do
 
       {%Room{}, _} ->
         if is_participant?(channel_id, agent.agent_user_id) do
+          # DM/گروه سقفی ندارد، ولی شکلِ policy باید با شاخهٔ channel یکی بماند:
+          # مصرف‌کننده با `policy.permissions` می‌خواند و دسترسیِ نقطه‌ای روی مپ،
+          # پیش از آنکه `||` فرصت جبران پیدا کند، KeyError می‌اندازد.
           {:ok,
-           %{enabled_tools: agent.enabled_tools || [], output_modes: agent.output_modes || []}}
+           %{
+             enabled_tools: agent.enabled_tools || [],
+             output_modes: agent.output_modes || [],
+             trigger_config: %{},
+             permissions: %{}
+           }}
         else
           {:error, :chat_not_attached}
         end

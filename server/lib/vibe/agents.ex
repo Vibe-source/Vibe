@@ -140,9 +140,29 @@ defmodule Vibe.Agents do
              secret_hint: secret_tuple.hint
            })
            |> Repo.insert() do
+      agent = ensure_default_destination_chat(agent)
       {:ok, Repo.preload(agent, :agent_user), secret_tuple.secret}
     end
   end
+
+  # ایجنتِ تازه بدون chat مقصد ساخته می‌شد و کاربر هر بار مجبور بود دستی
+  # chat id بدهد. DM مالک‌↔ایجنت را همان‌جا می‌سازیم و به‌عنوان مقصد پیش‌فرض
+  # می‌نشانیم تا در UI هم دیده شود. اگر ساختِ DM شکست خورد، ایجنت را از دست
+  # نمی‌دهیم؛ `owner_dm_chat_id/1` در زمانِ رویداد دوباره تلاش می‌کند.
+  defp ensure_default_destination_chat(%Agent{default_destination_chat_id: nil} = agent) do
+    with {:ok, chat_id, _status} <-
+           Vibe.Chat.ensure_dm_chat(agent.owner_user_id, agent.agent_user_id),
+         {:ok, updated} <-
+           agent
+           |> Ecto.Changeset.change(default_destination_chat_id: chat_id)
+           |> Repo.update() do
+      updated
+    else
+      _ -> agent
+    end
+  end
+
+  defp ensure_default_destination_chat(%Agent{} = agent), do: agent
 
   def update_agent(%Agent{} = agent, attrs, owner_user_id) do
     if agent.owner_user_id != owner_user_id do

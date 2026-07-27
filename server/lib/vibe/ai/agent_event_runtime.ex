@@ -200,6 +200,20 @@ defmodule Vibe.AI.AgentEventRuntime do
     finalize_stream_content(to_string(text || ""), content)
   end
 
+  @doc """
+  Normalizes event attachments from both the legacy top-level field and the
+  provider event payload's `data.attachments` field.
+  """
+  def normalize_event_attachments(params) when is_map(params) do
+    payload = params["data"] || params["payload"] || %{}
+
+    List.wrap(params["attachments"])
+    |> Kernel.++(List.wrap(payload["attachments"] || payload[:attachments]))
+    |> normalize_attachments()
+  end
+
+  def normalize_event_attachments(_), do: %{"items" => []}
+
   # ── message.stream runtime ─────────────────────────────────────────────────
 
   defp handle_message_stream(%Agent{} = agent, integration, params) do
@@ -244,7 +258,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     dest =
       frame.destination_chat_id ||
         (integration && integration.default_destination_chat_id) ||
-        agent.default_destination_chat_id
+        agent.default_destination_chat_id ||
+        owner_dm_chat_id(agent)
 
     case normalize_string(dest) do
       nil -> {:error, :missing_destination_chat}
@@ -564,7 +579,7 @@ defmodule Vibe.AI.AgentEventRuntime do
             |> Repo.insert!()
 
           {thread, event, message_payload} =
-            case policy.post_event_message? do
+            case policy.post_event_message? or attachment_items?(normalized.attachments) do
               true ->
                 # In batched_summary mode, still post each event but SILENTLY so
                 # it populates the dedicated Inbox view (clients route eventThread
@@ -680,10 +695,14 @@ defmodule Vibe.AI.AgentEventRuntime do
               }
 
             {:error, reason} ->
-              Repo.rollback(reason)
+              # Keep the accepted event and its already-posted attachment rows even
+              # when the later runbook/action fails. The caller still receives the
+              # original error after the transaction commits.
+              {:runtime_error, reason}
           end
         end)
         |> case do
+          {:ok, {:runtime_error, reason}} -> {:error, reason}
           {:ok, result} -> {:ok, result}
           {:error, reason} -> {:error, reason}
         end
@@ -748,7 +767,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     destination_chat_id =
       normalize_string(params["destinationChatId"] || params["destination_chat_id"]) ||
         (integration && integration.default_destination_chat_id) ||
-        agent.default_destination_chat_id
+        agent.default_destination_chat_id ||
+        owner_dm_chat_id(agent)
 
     cond do
       is_nil(event_type) ->
@@ -766,13 +786,28 @@ defmodule Vibe.AI.AgentEventRuntime do
            title: title || humanize_event_type(event_type),
            text: text,
            payload: payload,
-           attachments: normalize_attachments(params["attachments"]),
+           attachments: normalize_event_attachments(params),
            occurred_at: occurred_at,
            thread_key: thread_key,
            destination_chat_id: destination_chat_id
          }}
     end
   end
+
+  # آخرین حلقهٔ زنجیرهٔ مقصد. هر ایجنت در هر حال یک DM با مالکش دارد، پس نبودِ
+  # chat مقصد دلیلی برای رد کردنِ رویداد با `:missing_destination_chat` نیست —
+  # فرستندهٔ بیرونی (مثلاً cargo-tracker) نباید مجبور باشد chat id را بداند.
+  # چون در زمانِ رویداد حل می‌شود، ایجنت‌های ساخته‌شدهٔ قبلی هم بدون migration
+  # درست کار می‌کنند.
+  defp owner_dm_chat_id(%Agent{owner_user_id: owner, agent_user_id: agent_user})
+       when is_binary(owner) and is_binary(agent_user) do
+    case Chat.ensure_dm_chat(owner, agent_user) do
+      {:ok, chat_id, _status} -> chat_id
+      _ -> nil
+    end
+  end
+
+  defp owner_dm_chat_id(_agent), do: nil
 
   defp ensure_destination_chat(%Agent{} = agent, chat_id) do
     if Chat.is_participant?(chat_id, agent.agent_user_id),
@@ -1759,11 +1794,13 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp post_event_attachments(_agent, _chat_id, [], _metadata, _reply_to_id, _silent),
     do: {:ok, []}
 
-  defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id, silent) do
+  defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id, _silent) do
     attachments
     |> Enum.reduce_while({:ok, []}, fn attachment, {:ok, acc} ->
       attachment_metadata =
         metadata
+        |> Map.put("eventInboxRole", "attachment")
+        |> Map.put("hiddenFromTranscript", false)
         |> Map.put("attachment", attachment)
         |> maybe_put("fileName", normalize_string(attachment["name"] || attachment[:name]))
         |> maybe_put(
@@ -1786,7 +1823,8 @@ defmodule Vibe.AI.AgentEventRuntime do
 
       caption =
         normalize_string(
-          attachment["caption"] || attachment[:caption] || attachment["text"] || attachment[:text]
+          attachment["caption"] || attachment[:caption] || attachment["title"] ||
+            attachment[:title] || attachment["text"] || attachment[:text]
         ) || ""
 
       case post_chat_message(
@@ -1797,7 +1835,7 @@ defmodule Vibe.AI.AgentEventRuntime do
              reply_to_id,
              type: attachment_message_type(attachment),
              media_url: attachment["url"],
-             silent: silent
+             silent: false
            ) do
         {:ok, message_payload} ->
           {:cont, {:ok, acc ++ [message_payload]}}
@@ -1875,12 +1913,19 @@ defmodule Vibe.AI.AgentEventRuntime do
           "url" =>
             normalize_string(item["url"] || item[:url] || item["mediaUrl"] || item[:mediaUrl]),
           "name" =>
-            normalize_string(item["name"] || item[:name] || item["fileName"] || item[:fileName]),
+            normalize_string(
+              item["name"] || item[:name] || item["fileName"] || item[:fileName] ||
+                item["filename"] || item[:filename]
+            ),
           "mimeType" =>
             normalize_string(
-              item["mimeType"] || item[:mimeType] || item["mime_type"] || item[:mime_type]
+              item["mimeType"] || item[:mimeType] || item["mime_type"] || item[:mime_type] ||
+                item["mime"] || item[:mime]
             ),
-          "caption" => normalize_rich_text(item["caption"] || item[:caption]),
+          "caption" =>
+            normalize_rich_text(
+              item["caption"] || item[:caption] || item["title"] || item[:title]
+            ),
           "text" => normalize_rich_text(item["text"] || item[:text]),
           "duration" => normalize_number(item["duration"] || item[:duration]),
           "fileSize" =>
@@ -1905,6 +1950,9 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_attachments_payload(%{"items" => items}) when is_list(items), do: items
   defp normalize_attachments_payload(_), do: []
+
+  defp attachment_items?(%{"items" => items}) when is_list(items), do: items != []
+  defp attachment_items?(_), do: false
 
   defp normalize_rich_text(value) do
     value

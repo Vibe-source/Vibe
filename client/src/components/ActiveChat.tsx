@@ -5,7 +5,7 @@ import './ChatScreen.css';
 import { motion, AnimatePresence, useMotionValue, animate, useTransform } from 'framer-motion';
 import { useDrag } from '@use-gesture/react';
 import {
-    ArrowLeft, ArrowUp, Mic, X, Paperclip, Copy,
+    ArrowLeft, ArrowUp, Mic, X, Paperclip, Copy, FileText, ExternalLink,
     AlertCircle, Trash2, Pencil, CornerUpLeft, Search, Check, CheckCheck, Phone, Smile, Lock
 } from 'lucide-react';
 import Haptics from '../haptics';
@@ -18,6 +18,43 @@ import { Chat, Message } from '../types';
 import { formatTime, formatDuration } from '../utils';
 import PatternWallpaper from './PatternWallpaper';
 import { VIBE_APPEARANCE } from '../theme/appearance';
+
+function agentImageSource(m: Message, decryptedMedia: { [id: string]: string }): string | undefined {
+    const decrypted = decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || ''];
+    return decrypted || (m.metadata?.isAgentMessage ? m.mediaUrl : undefined);
+}
+
+function renderFileAttachment(m: Message) {
+    if (!m.mediaUrl) {
+        return <div className="msg-error-text">File unavailable</div>;
+    }
+
+    const attachment = m.metadata?.attachment;
+    const fileName = m.metadata?.fileName || attachment?.name || attachment?.caption || 'Attachment';
+    const mimeType = m.metadata?.mimeType || attachment?.mimeType || '';
+    const kind =
+        mimeType === 'application/pdf' || attachment?.type === 'pdf'
+            ? 'PDF'
+            : mimeType === 'text/html' || attachment?.type === 'html'
+                ? 'HTML'
+                : 'File';
+
+    return (
+        <a
+            className="msg-file-card"
+            href={m.mediaUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+        >
+            <FileText size={22} aria-hidden="true" />
+            <span className="msg-file-card__text">
+                <span className="msg-file-card__name">{fileName}</span>
+                <span className="msg-file-card__kind">{kind}</span>
+            </span>
+            <ExternalLink size={16} aria-hidden="true" />
+        </a>
+    );
+}
 
 function emitProviderEvent(chatId: string, payload: Record<string, string>): void {
     const socket = ConnectionManager.getInstance().getSocket();
@@ -167,15 +204,16 @@ const MessageRow = React.memo(({
         }
 
         if (m.type === 'image' || m.type === 'gif') {
+            const imageSource = agentImageSource(m, decryptedMedia);
             return (
                 <div className="msg-media">
-                    {decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || ''] || m.mediaUrl ? (
-                        (decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || '']) ? (
+                    {imageSource || m.mediaUrl ? (
+                        imageSource ? (
                             <img
-                                src={decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || '']}
+                                src={imageSource}
                                 alt={m.type === 'gif' ? 'GIF' : 'Photo'}
                                 className="msg-image"
-                                onClick={() => setLightboxImage(decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || ''])}
+                                onClick={() => setLightboxImage(imageSource)}
                             />
                         ) : (
                             <div className="media-skeleton"><div className="media-skeleton-inner"></div></div>
@@ -189,6 +227,10 @@ const MessageRow = React.memo(({
 
         if (m.type === 'voice') {
             return <VoiceBubble src={decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || '']} />;
+        }
+
+        if (m.type === 'file') {
+            return renderFileAttachment(m);
         }
 
         if (m.type === 'call') {
@@ -367,14 +409,15 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
         }
 
         if (m.type === 'image' || m.type === 'gif') {
+            const imageSource = agentImageSource(m, decryptedMedia);
             return (
                 <div className="msg-media">
-                    {decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || ''] ? (
+                    {imageSource ? (
                         <img
-                            src={decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || '']}
+                            src={imageSource}
                             alt={m.type === 'gif' ? 'GIF' : 'Photo'}
                             className="msg-image"
-                            onClick={() => setLightboxImage(decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || ''])}
+                            onClick={() => setLightboxImage(imageSource)}
                         />
                     ) : (
                         <div className="media-skeleton"><div className="media-skeleton-inner"></div></div>
@@ -385,6 +428,10 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
         if (m.type === 'voice') {
             return <VoiceBubble src={decryptedMedia[m.id] || decryptedMedia[m.mediaUrl || '']} />;
+        }
+
+        if (m.type === 'file') {
+            return renderFileAttachment(m);
         }
 
         if (m.type === 'call') {

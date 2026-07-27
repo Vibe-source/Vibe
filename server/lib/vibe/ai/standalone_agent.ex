@@ -96,10 +96,11 @@ defmodule Vibe.AI.StandaloneAgent do
       {:ok,
        %{
          agent
-         | enabled_tools: policy.enabled_tools || [],
-           output_modes: policy.output_modes || [],
-           system_prompt: scoped_system_prompt(agent.system_prompt, policy.permissions || %{}),
-           admin_mode: policy.admin_mode
+         | enabled_tools: Map.get(policy, :enabled_tools) || [],
+           output_modes: Map.get(policy, :output_modes) || [],
+           system_prompt:
+             scoped_system_prompt(agent.system_prompt, Map.get(policy, :permissions) || %{}),
+           admin_mode: Map.get(policy, :admin_mode, false)
        }}
     end
   end
