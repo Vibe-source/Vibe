@@ -66,6 +66,18 @@ defmodule Vibe.AgentEventDocumentTest do
       assert AgentEventRuntime.attachment_file_name(%{"url" => "https://example.test"}) == nil
       assert AgentEventRuntime.attachment_file_name(%{}) == nil
     end
+
+    # `/print/container/2` تولید می‌کرد سلولی با نامِ «2».
+    test "an extensionless path is not a file name" do
+      assert AgentEventRuntime.attachment_file_name(%{
+               "url" => "https://example.test/print/container/2?exp=1&sig=a"
+             }) == nil
+
+      assert AgentEventRuntime.attachment_file_name(%{
+               "url" => "https://example.test/print/container/2",
+               "name" => "manifest.html"
+             }) == "manifest.html"
+    end
   end
 
   describe "attachment_mime_type/1" do

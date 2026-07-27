@@ -2189,8 +2189,18 @@ defmodule Vibe.AI.AgentEventRuntime do
         case path |> Path.basename() |> URI.decode() |> normalize_string() do
           nil -> nil
           "/" -> nil
-          name -> name
+          name -> if named_file?(name), do: name
         end
+    end
+  end
+
+  # فقط وقتی basename را نام فایل حساب می‌کنیم که واقعاً شبیه نام فایل باشد.
+  # مسیرهایی مثل `/print/container/2` وگرنه سلولی می‌سازند که اسمش «2» است؛
+  # nil بهتر است، چون آن‌وقت کلاینت عنوان/caption را نشان می‌دهد.
+  defp named_file?(name) do
+    case Path.extname(name) do
+      "" -> false
+      ext -> String.match?(ext, ~r/^\.[A-Za-z0-9]{1,8}$/)
     end
   end
 
