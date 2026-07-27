@@ -450,6 +450,15 @@ defmodule VibeWeb.AgentsController do
           Logger.warning("[AgentsController] ingest_event chat not attached identifier=#{identifier}")
           conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
 
+        # همان ردهٔ chat_not_attached است — ردِ مجوز، نه ورودیِ نامعتبر. بدون این
+        # بند، اتم خام داخل بدنهٔ ۴۲۲ چاپ می‌شد.
+        {:error, :event_trigger_not_enabled} ->
+          Logger.warning("[AgentsController] ingest_event trigger not enabled identifier=#{identifier}")
+
+          conn
+          |> put_status(:forbidden)
+          |> json(%{error: "event_trigger_not_enabled"})
+
         {:error, :missing_destination_chat} ->
           Logger.warning("[AgentsController] ingest_event missing destination chat identifier=#{identifier}")
           conn |> put_status(:unprocessable_entity) |> json(%{error: "Missing destination chat"})
