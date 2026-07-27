@@ -221,7 +221,11 @@ defmodule Vibe.AI.AgentEventRuntime do
 
     with {:ok, frame0} <- normalize_stream_params(params),
          {:ok, frame} <- resolve_stream_destination(frame0, agent, integration),
-         :ok <- ensure_destination_chat(agent, frame.destination_chat_id) do
+         :ok <- ensure_destination_chat(agent, frame.destination_chat_id),
+         # استریم هم باید از همان دروازهٔ رویدادِ کانال رد شود. بدون این، دارندهٔ
+         # secret می‌توانست در کانالی که سیاستش تریگرِ event ندارد پیام بگذارد و
+         # فریم‌به‌فریم بازنویسی‌اش کند — چیزی که مسیر عادیِ ingest جلویش را می‌گیرد.
+         :ok <- ensure_event_trigger(agent, frame.destination_chat_id) do
       key = stream_state_key(agent.id, frame.stream_id)
       state = stream_lookup(key)
       decision = stream_frame_decision(state, frame)
@@ -1631,18 +1635,56 @@ defmodule Vibe.AI.AgentEventRuntime do
       "attachments" => normalize_attachments_payload(normalized.attachments)
     }
 
+    post_event_body_and_attachments(
+      agent,
+      thread.chat_id,
+      body,
+      metadata,
+      normalize_attachments_payload(normalized.attachments),
+      silent
+    )
+  end
+
+  # خلاصهٔ رویداد روی نخستین پیوست می‌نشیند و بقیه بی‌عنوان پشت سرش می‌آیند —
+  # همان قاعدهٔ آلبومِ تلگرام. جدا فرستادنِ خلاصه یک حبابِ متنیِ یتیم بالای
+  # فایل‌ها می‌سازد و سلولِ سند بی‌عنوان می‌ماند؛ کلاینت caption را داخل همان
+  # حبابِ سند می‌چیند، پس اینجا باید یک ردیف باشد نه دو.
+  defp post_event_body_and_attachments(agent, chat_id, body, metadata, [first | rest], false) do
     with {:ok, primary_message} <-
-           maybe_post_event_summary(agent, thread.chat_id, body, metadata, nil, silent),
-         {:ok, _attachment_messages} <-
-           post_event_attachments(
+           post_attachment_message(
              agent,
-             thread.chat_id,
-             normalize_attachments_payload(normalized.attachments),
+             chat_id,
+             merged_attachment_caption(body, first),
              metadata,
-             nil,
-             silent
-           ) do
+             first,
+             nil
+           ),
+         {:ok, _attachment_messages} <-
+           post_event_attachments(agent, chat_id, rest, metadata, nil, false) do
       {:ok, primary_message}
+    end
+  end
+
+  # بدون پیوست، یا حالت silent. در silent خلاصه از رونوشت پنهان است ولی پیوست‌ها
+  # نیستند، پس ادغام‌شان یعنی تحمیلِ یک visibility به هر دو — نگه‌شان می‌داریم جدا.
+  defp post_event_body_and_attachments(agent, chat_id, body, metadata, attachments, silent) do
+    with {:ok, primary_message} <-
+           maybe_post_event_summary(agent, chat_id, body, metadata, nil, silent),
+         {:ok, _attachment_messages} <-
+           post_event_attachments(agent, chat_id, attachments, metadata, nil, silent) do
+      {:ok, primary_message}
+    end
+  end
+
+  # هر دو متن را نگه می‌داریم مگر آنکه یکی داخل دیگری تکرار شده باشد؛ گم کردنِ
+  # عنوانِ رویداد به‌خاطر داشتنِ caption روی فایل، اطلاعات را دور می‌ریزد.
+  @doc false
+  def merged_attachment_caption(body, attachment) do
+    case {normalize_string(body), attachment_own_caption(attachment)} do
+      {nil, nil} -> nil
+      {text, nil} -> text
+      {nil, caption} -> caption
+      {text, caption} -> if String.contains?(text, caption), do: text, else: "#{text}\n\n#{caption}"
     end
   end
 
@@ -1797,45 +1839,13 @@ defmodule Vibe.AI.AgentEventRuntime do
   defp post_event_attachments(agent, chat_id, attachments, metadata, reply_to_id, _silent) do
     attachments
     |> Enum.reduce_while({:ok, []}, fn attachment, {:ok, acc} ->
-      attachment_metadata =
-        metadata
-        |> Map.put("eventInboxRole", "attachment")
-        |> Map.put("hiddenFromTranscript", false)
-        |> Map.put("attachment", attachment)
-        |> maybe_put("fileName", normalize_string(attachment["name"] || attachment[:name]))
-        |> maybe_put(
-          "fileSize",
-          normalize_integer(attachment["fileSize"] || attachment[:fileSize])
-        )
-        |> maybe_put(
-          "duration",
-          normalize_number(attachment["duration"] || attachment[:duration])
-        )
-        |> maybe_put(
-          "mimeType",
-          normalize_string(attachment["mimeType"] || attachment[:mimeType])
-        )
-        |> maybe_put(
-          "isVideoNote",
-          normalize_boolean(attachment["isVideoNote"] || attachment[:isVideoNote])
-        )
-        |> maybe_put("caption", normalize_string(attachment["caption"] || attachment[:caption]))
-
-      caption =
-        normalize_string(
-          attachment["caption"] || attachment[:caption] || attachment["title"] ||
-            attachment[:title] || attachment["text"] || attachment[:text]
-        ) || ""
-
-      case post_chat_message(
+      case post_attachment_message(
              agent,
              chat_id,
-             caption,
-             attachment_metadata,
-             reply_to_id,
-             type: attachment_message_type(attachment),
-             media_url: attachment["url"],
-             silent: false
+             attachment_own_caption(attachment),
+             metadata,
+             attachment,
+             reply_to_id
            ) do
         {:ok, message_payload} ->
           {:cont, {:ok, acc ++ [message_payload]}}
@@ -1844,6 +1854,47 @@ defmodule Vibe.AI.AgentEventRuntime do
           {:halt, error}
       end
     end)
+  end
+
+  defp post_attachment_message(agent, chat_id, caption, metadata, attachment, reply_to_id) do
+    attachment_metadata =
+      metadata
+      |> Map.put("eventInboxRole", "attachment")
+      |> Map.put("hiddenFromTranscript", false)
+      |> Map.put("attachment", attachment)
+      |> maybe_put("fileName", attachment_file_name(attachment))
+      |> maybe_put(
+        "fileSize",
+        normalize_integer(attachment["fileSize"] || attachment[:fileSize])
+      )
+      |> maybe_put(
+        "duration",
+        normalize_number(attachment["duration"] || attachment[:duration])
+      )
+      |> maybe_put("mimeType", attachment_mime_type(attachment))
+      |> maybe_put(
+        "isVideoNote",
+        normalize_boolean(attachment["isVideoNote"] || attachment[:isVideoNote])
+      )
+      |> maybe_put("caption", caption)
+
+    post_chat_message(
+      agent,
+      chat_id,
+      caption || "",
+      attachment_metadata,
+      reply_to_id,
+      type: attachment_message_type(attachment),
+      media_url: attachment["url"],
+      silent: false
+    )
+  end
+
+  defp attachment_own_caption(attachment) do
+    normalize_string(
+      attachment["caption"] || attachment[:caption] || attachment["title"] ||
+        attachment[:title] || attachment["text"] || attachment[:text]
+    )
   end
 
   defp touch_integration!(%AgentIntegration{} = integration) do
@@ -2091,7 +2142,7 @@ defmodule Vibe.AI.AgentEventRuntime do
   end
 
   defp infer_attachment_message_type(attachment) do
-    mime_type = normalize_string(attachment["mimeType"] || attachment[:mimeType]) || ""
+    mime_type = attachment_mime_type(attachment) || ""
     url = normalize_string(attachment["url"] || attachment[:url]) || ""
     lowered_mime = String.downcase(mime_type)
     lowered_url = String.downcase(url)
@@ -2115,6 +2166,65 @@ defmodule Vibe.AI.AgentEventRuntime do
 
       true ->
         "file"
+    end
+  end
+
+  # سلولِ سند باید پیش از دانلود، نام و نوع را نشان بدهد. فرستنده‌های بیرونی
+  # معمولاً فقط url می‌دهند، پس نام را از خودِ مسیر برمی‌داریم — بدون هیچ درخواستِ
+  # شبکه‌ای به url ای که فرستنده انتخاب کرده است.
+  @doc false
+  def attachment_file_name(attachment) do
+    normalize_string(attachment["name"] || attachment[:name]) ||
+      file_name_from_url(normalize_string(attachment["url"] || attachment[:url]))
+  end
+
+  defp file_name_from_url(nil), do: nil
+
+  defp file_name_from_url(url) do
+    case URI.parse(url).path do
+      nil ->
+        nil
+
+      path ->
+        case path |> Path.basename() |> URI.decode() |> normalize_string() do
+          nil -> nil
+          "/" -> nil
+          name -> name
+        end
+    end
+  end
+
+  @doc false
+  def attachment_mime_type(attachment) do
+    normalize_string(attachment["mimeType"] || attachment[:mimeType]) ||
+      mime_type_from_extension(attachment_file_name(attachment))
+  end
+
+  defp mime_type_from_extension(nil), do: nil
+
+  defp mime_type_from_extension(name) do
+    case name |> Path.extname() |> String.downcase() do
+      ".pdf" -> "application/pdf"
+      ".png" -> "image/png"
+      ".jpg" -> "image/jpeg"
+      ".jpeg" -> "image/jpeg"
+      ".webp" -> "image/webp"
+      ".heic" -> "image/heic"
+      ".gif" -> "image/gif"
+      ".mp4" -> "video/mp4"
+      ".mov" -> "video/quicktime"
+      ".mp3" -> "audio/mpeg"
+      ".m4a" -> "audio/mp4"
+      ".ogg" -> "audio/ogg"
+      ".wav" -> "audio/wav"
+      ".csv" -> "text/csv"
+      ".txt" -> "text/plain"
+      ".zip" -> "application/zip"
+      ".doc" -> "application/msword"
+      ".docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      ".xls" -> "application/vnd.ms-excel"
+      ".xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      _ -> nil
     end
   end
 
