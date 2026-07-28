@@ -856,7 +856,7 @@ defmodule Vibe.AI.Agent do
     model_provider = Keyword.get(opts, :model_provider, "anthropic")
     model_id = Keyword.get(opts, :model_id, @claude_model)
     thinking_level = Keyword.get(opts, :thinking_level, "medium")
-    tools = filter_tools(enabled_tools, admin_mode)
+    tools = filter_tools(enabled_tools, admin_mode, Keyword.get(opts, :mcp_tools, []))
 
     messages = build_messages(conversation_history, user_message, image_urls)
 
@@ -1255,6 +1255,10 @@ defmodule Vibe.AI.Agent do
 
         tool_name == "call_connected_app" ->
           Vibe.AI.Tools.ConnectedApp.invoke(tool_input, agent_id, requester_user_id)
+
+        Vibe.AI.MCP.mcp_tool_name?(tool_name) ->
+          on_step.("Calling connected server…")
+          Vibe.AI.MCP.invoke(tool_name, tool_input, agent_id, requester_user_id, chat_id)
 
         tool_name == "list_platform_connections" ->
           Vibe.AI.Tools.Platform.list_connections(
@@ -3071,13 +3075,27 @@ defmodule Vibe.AI.Agent do
   defp inbox_error_message(:invalid_mode), do: "That inbox mode is not supported."
   defp inbox_error_message(reason), do: inspect(reason)
 
-  defp filter_tools(enabled_tools, admin_mode) do
+  defp filter_tools(enabled_tools, admin_mode), do: filter_tools(enabled_tools, admin_mode, [])
+
+  # MCP tools are discovered at runtime, so they cannot be listed in
+  # `enabled_tools` the way built-ins are — a channel allowlist written last
+  # week has never heard of a tool the far side added this morning. One gate
+  # id (`call_mcp_tool`) turns the whole set on, which keeps the existing
+  # intersect-based channel policy meaningful without pinning tool names.
+  defp filter_tools(enabled_tools, admin_mode, mcp_tools) do
     allowed = MapSet.new(List.wrap(enabled_tools) |> Enum.map(&to_string/1))
 
-    Enum.filter(available_tools(), fn tool ->
-      MapSet.member?(allowed, tool.name) or
-        (admin_mode and tool.name in @always_available_tool_names)
-    end)
+    builtins =
+      Enum.filter(available_tools(), fn tool ->
+        MapSet.member?(allowed, tool.name) or
+          (admin_mode and tool.name in @always_available_tool_names)
+      end)
+
+    if MapSet.member?(allowed, Vibe.AI.MCP.gate_tool_id()) do
+      builtins ++ List.wrap(mcp_tools)
+    else
+      builtins
+    end
   end
 
   @doc false

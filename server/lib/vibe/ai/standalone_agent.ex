@@ -186,7 +186,8 @@ defmodule Vibe.AI.StandaloneAgent do
                agent.enabled_tools || [],
                conversation_history,
                turn_memory,
-               agent.admin_mode
+               agent.admin_mode,
+               mcp_tool_specs(agent)
              ) do
         accumulated = Elixir.Agent.get(collected, & &1)
 
@@ -337,6 +338,12 @@ defmodule Vibe.AI.StandaloneAgent do
         do: Vibe.AI.Tools.Platform.prompt_guidance(agent),
         else: nil
       ),
+      # The MCP servers describe their own usage rules; we pass those through
+      # instead of asking the owner to copy them into the agent prompt by hand.
+      if(Vibe.AI.MCP.gate_tool_id() in (agent.enabled_tools || []),
+        do: Vibe.AI.MCP.prompt_guidance(agent),
+        else: nil
+      ),
       prompt_variables_guidance(agent),
       if(agent.persona, do: "Persona: #{agent.persona}", else: nil),
       if(agent.welcome_message && !has_prior_messages,
@@ -417,7 +424,8 @@ defmodule Vibe.AI.StandaloneAgent do
          enabled_tools,
          conversation_history,
          turn_memory,
-         admin_mode
+         admin_mode,
+         mcp_tools
        ) do
     case ChatAgent.stream_response(
            message,
@@ -433,7 +441,8 @@ defmodule Vibe.AI.StandaloneAgent do
            model_id: model_id,
            system_prompt: system_prompt,
            enabled_tools: enabled_tools,
-           admin_mode: admin_mode
+           admin_mode: admin_mode,
+           mcp_tools: mcp_tools
          ) do
       {:ok, final_text} ->
         {:ok, final_text}
@@ -444,6 +453,20 @@ defmodule Vibe.AI.StandaloneAgent do
       other ->
         other
     end
+  end
+
+  # Discovery talks to a remote server, so it is wrapped: an MCP server that is
+  # down should cost the agent its MCP tools for this turn, not the whole reply.
+  defp mcp_tool_specs(agent) do
+    if Vibe.AI.MCP.gate_tool_id() in (agent.enabled_tools || []) do
+      Vibe.AI.MCP.tool_specs(agent)
+    else
+      []
+    end
+  rescue
+    error ->
+      Logger.warning("[StandaloneAgent] MCP discovery failed: #{inspect(error)}")
+      []
   end
 
   defp build_attachment_context(attachments) when is_list(attachments) do
@@ -560,6 +583,12 @@ defmodule Vibe.AI.StandaloneAgent do
     else
       _ -> []
     end
+  end
+
+  # An MCP tool that returned files: the bytes were already stored by
+  # `MCP.Content`, so the URLs just need to become delivery outputs.
+  def tool_outputs_from_result("mcp__" <> _rest, result) when is_map(result) do
+    Vibe.AI.MCP.outputs_from_result(result)
   end
 
   def tool_outputs_from_result("search_music", result) when is_map(result) do

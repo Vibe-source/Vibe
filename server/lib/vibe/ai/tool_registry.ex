@@ -119,6 +119,15 @@ defmodule Vibe.AI.ToolRegistry do
       always_on: false
     },
     %{
+      id: "call_mcp_tool",
+      name: "MCP Servers",
+      description:
+        "Use tools from connected MCP servers — their tools appear with full schemas and can return files (PDF, images) that are delivered to the chat.",
+      category: "integrations",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
       id: "list_platform_connections",
       name: "Platform Connections",
       description:

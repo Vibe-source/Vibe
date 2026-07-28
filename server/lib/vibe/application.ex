@@ -22,6 +22,9 @@ defmodule Vibe.Application do
     ensure_ets_table(:agent_bridge_pairings)
     ensure_ets_table(:agent_bridge_requests)
     ensure_ets_table(:agent_bridge_pending_tasks)
+    # MCP tool discovery cache — without it every agent turn pays a tools/list
+    # round trip to each connected server before the model starts thinking.
+    ensure_ets_table(:vibe_mcp_tool_cache)
 
     children = [
       # Start the Telemetry supervisor

@@ -290,6 +290,14 @@ defmodule Vibe.SupabaseStorage do
       String.ends_with?(path, ".heic") -> "image/heic"
       String.ends_with?(path, ".wav") -> "audio/wav"
       String.ends_with?(path, ".mov") -> "video/quicktime"
+      # Documents. The stored Content-Type is what the CDN serves back, so a
+      # PDF landing here as octet-stream downloads as an unnamed blob instead
+      # of previewing — which is most of the value of receiving it in chat.
+      String.ends_with?(path, ".pdf") -> "application/pdf"
+      String.ends_with?(path, ".csv") -> "text/csv"
+      String.ends_with?(path, ".txt") -> "text/plain"
+      String.ends_with?(path, ".json") -> "application/json"
+      String.ends_with?(path, ".xlsx") -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       true -> "application/octet-stream"
     end
   end
