@@ -796,14 +796,21 @@ defmodule Vibe.Chat do
 
   def can_delete_message_for_everyone?(chat_id, user_id, from_id) do
     from_id == user_id ||
-      Repo.exists?(
-        from(p in Participant,
-          where:
-            p.chat_id == ^chat_id and
-              p.user_id == ^user_id and
-              p.role in ["owner", "admin"]
-        )
-      )
+      case Repo.get(Room, chat_id) do
+        %Room{} = room ->
+          direct_room?(room) ||
+            Repo.exists?(
+              from(p in Participant,
+                where:
+                  p.chat_id == ^chat_id and
+                    p.user_id == ^user_id and
+                    p.role in ["owner", "admin"]
+              )
+            )
+
+        nil ->
+          false
+      end
   end
 
   def delete_message(chat_id, message_id, user_id, for_everyone \\ true) do
