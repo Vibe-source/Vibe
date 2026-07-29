@@ -3,7 +3,7 @@ defmodule Vibe.MessageDeleteScopeTest do
 
   alias Vibe.Accounts.User
   alias Vibe.Chat
-  alias Vibe.Chat.Message
+  alias Vibe.Chat.{Message, MessageRead}
   alias Vibe.Repo
 
   setup do
@@ -35,6 +35,19 @@ defmodule Vibe.MessageDeleteScopeTest do
 
     assert {:error, :forbidden} = Chat.delete_message(room.id, message.id, second.id, true)
     assert Repo.get(Message, message.id)
+  end
+
+  test "a late read receipt for an already-deleted message is harmless", %{
+    first: first,
+    second: second
+  } do
+    chat_id = "delete-read-race-#{System.unique_integer([:positive])}"
+    assert {:ok, _room} = Chat.create_chat(chat_id, [first.id, second.id])
+    message = insert_message(chat_id, first.id)
+
+    assert {:ok, _deleted} = Chat.delete_message(chat_id, message.id, first.id, true)
+    assert {:ok, :message_missing} = Chat.mark_read(message.id, second.id)
+    assert Repo.aggregate(MessageRead, :count) == 0
   end
 
   defp insert_message(chat_id, from_id) do

@@ -768,14 +768,21 @@ defmodule Vibe.Chat do
   def mark_read(message_id, reader_id) do
     result =
       RepoRLS.with_user(reader_id, fn ->
-        # 1. Record the read receipt
-        %MessageRead{}
-        |> MessageRead.changeset(%{message_id: message_id, reader_id: reader_id})
-        |> Repo.insert(on_conflict: :nothing)
+        # Lock/update the parent row before inserting the receipt. A receipt can
+        # legitimately race a delete that was already broadcast to another
+        # participant. In that case there is no receipt to persist; attempting
+        # the child insert first raises a foreign-key error and kills the entire
+        # Phoenix chat-channel process, leaving clients joined to a dead topic.
+        case from(m in Message, where: m.id == ^message_id)
+             |> Repo.update_all(set: [status: "read"]) do
+          {0, _} ->
+            {:ok, :message_missing}
 
-        # 2. Update message status to 'read'
-        from(m in Message, where: m.id == ^message_id)
-        |> Repo.update_all(set: [status: "read"])
+          {_count, _} ->
+            %MessageRead{}
+            |> MessageRead.changeset(%{message_id: message_id, reader_id: reader_id})
+            |> Repo.insert(on_conflict: :nothing)
+        end
       end)
 
     invalidate_home_cache_for_message(message_id)
