@@ -705,13 +705,28 @@ defmodule Vibe.Notifications do
   defp stringify_push_data(_), do: %{}
 
   defp normalize_token_value(value) when is_binary(value) do
-    case String.trim(value) do
+    case value |> String.trim() |> unwrap_swift_optional() do
       "" -> nil
       trimmed -> trimmed
     end
   end
 
   defp normalize_token_value(_), do: nil
+
+  # Heals tokens the iOS client stored as the literal text `Optional("…")`.
+  #
+  # VibeCallStore boxed a String? into Any, so String(describing:) rendered the
+  # Optional rather than its contents, and every device registered a 76-character
+  # string APNs rejected as BadDeviceToken. The client is fixed, but installed
+  # builds keep sending the wrapped form until users update — and a push system
+  # that only works after an App Store release is not fixed. Unwrapping here
+  # means existing devices start receiving notifications immediately.
+  defp unwrap_swift_optional(value) do
+    case Regex.run(~r/^Optional\("(.*)"\)$/s, value) do
+      [_, inner] -> String.trim(inner)
+      _ -> value
+    end
+  end
 
   defp describe_push_targets(push_targets) when is_map(push_targets) do
     %{

@@ -165,7 +165,10 @@ defmodule VibeWeb.UserController do
   end
 
   defp merge_push_token_bundle(acc, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    # Unwrapped first for the same reason as above: the client boxed whatever it
+    # held, so the whole JSON bundle can arrive wrapped too, and it would then
+    # fail the `{` test and be dropped whole.
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
 
     cond do
       trimmed == "" ->
@@ -185,7 +188,10 @@ defmodule VibeWeb.UserController do
   defp merge_push_token_bundle(acc, _), do: acc
 
   defp merge_explicit_push_token(acc, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    # Unwrapped before classifying, not after: a wrapped token fails the hex test
+    # and would be dropped here, which is precisely the population the healing
+    # below exists for.
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
 
     cond do
       trimmed == "" ->
@@ -209,11 +215,23 @@ defmodule VibeWeb.UserController do
   defp maybe_put_token(acc, _key, nil), do: acc
 
   defp maybe_put_token(acc, key, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
     if trimmed == "", do: acc, else: Map.put(acc, key, trimmed)
   end
 
   defp maybe_put_token(acc, _key, _value), do: acc
+
+  # iOS shipped a build that registered its token as the literal text
+  # Optional("…") — a String? boxed into Any and then String(describing:)'d.
+  # Unwrapping on the way in keeps the corrupted form out of the database
+  # entirely, so a device self-corrects the moment it re-registers instead of
+  # carrying a broken token until the user updates the app.
+  defp unwrap_swift_optional(value) do
+    case Regex.run(~r/^Optional\("(.*)"\)$/s, value) do
+      [_, inner] -> String.trim(inner)
+      _ -> value
+    end
+  end
 
   defp merge_existing_push_token_update(update_attrs, user) do
     case Map.fetch(update_attrs, :push_token) do
@@ -266,11 +284,10 @@ defmodule VibeWeb.UserController do
 
   defp push_token_to_map(_), do: %{}
 
-  # APNs device tokens are hex, but NOT a fixed 32 bytes — Apple documents the
-  # length as variable and this fleet already registers 76-char tokens, so a
-  # `== 64` test would silently drop the very tokens we see in production.
-  # Bounds instead of an exact length: long enough not to swallow a stray word,
-  # loose enough to survive Apple lengthening the token again.
+  # APNs device tokens are hex, but Apple documents the length as variable and
+  # tells clients not to hardcode 32 bytes, so this bounds rather than pins it.
+  # (The 76-character tokens seen in production were not long tokens — they were
+  # 64 hex characters wrapped in `Optional("…")`, healed above.)
   defp apns_device_token?(token) when is_binary(token) do
     length = String.length(token)
 
