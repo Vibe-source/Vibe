@@ -236,14 +236,10 @@ final class NotificationService: UNNotificationServiceExtension {
       log("finalize media attachment skipped: no media data")
     }
 
-    #if DEBUG
-      let marker = avatarData == nil ? "nse:noimg" : "nse:img"
-      if mutableContent.subtitle.isEmpty {
-        mutableContent.subtitle = marker
-      } else {
-        mutableContent.subtitle = "\(mutableContent.subtitle) • \(marker)"
-      }
-    #endif
+    // A DEBUG-only marker used to write "nse:img" / "nse:noimg" into the
+    // subtitle. The subtitle is shown to the customer, so debug builds put that
+    // string on the lock screen. The same information is already in the log
+    // line above, which is where it belongs.
 
     applyCommunicationStyle(to: mutableContent, payload: payload, avatarData: avatarData)
     emitBestAttemptContent()
