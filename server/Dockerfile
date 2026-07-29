@@ -42,10 +42,17 @@ RUN mix release
 FROM alpine:3.18
 
 # Runtime dependencies + yt-dlp (SoundCloud/YouTube) + Python doc renderer stack
+#
+# The yt-dlp floor below is also this layer's cache key. YouTube's bot checks move
+# faster than anything else we depend on, and a stale yt-dlp fails extraction with
+# "Sign in to confirm you're not a bot" even when the cookies are perfectly good —
+# so when that starts happening, **bump this string** to force a fresh install
+# rather than assuming the cached layer is current. pip always takes the newest
+# release that satisfies it; the floor only guarantees how far back we can land.
 RUN apk add --no-cache libstdc++ openssl ncurses-libs python3 py3-pip ffmpeg curl \
   pango cairo gdk-pixbuf font-noto font-noto-arabic font-noto-extra \
-  && pip3 install --break-system-packages \
-       "yt-dlp>=2024.1.0" \
+  && pip3 install --break-system-packages --upgrade \
+       "yt-dlp>=2025.6.1" \
        flask==3.1.* \
        waitress==3.0.* \
        weasyprint==63.* \

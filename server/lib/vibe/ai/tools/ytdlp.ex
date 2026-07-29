@@ -77,7 +77,7 @@ defmodule Vibe.AI.Tools.YtDlp do
       "--user-agent", random_user_agent(),
       "--referer", referer_for(url),
       "--add-header", "Accept-Language:en-US,en;q=0.9"
-    ]
+    ] ++ player_client_args()
 
     args =
       case get_cookies_path() do
@@ -191,7 +191,7 @@ defmodule Vibe.AI.Tools.YtDlp do
       "--referer", "https://www.youtube.com/",
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    ]
+    ] ++ player_client_args()
 
     args = case get_cookies_path() do
       nil -> base_args ++ [search_query]
@@ -564,16 +564,43 @@ defmodule Vibe.AI.Tools.YtDlp do
   bare and tripped bot checks that the extraction paths here survive.
   """
   def hardening_args do
-    base = [
-      "--extractor-retries", "3",
-      "--user-agent", random_user_agent(),
-      "--referer", "https://www.youtube.com/",
-      "--add-header", "Accept-Language:en-US,en;q=0.9"
-    ]
+    base =
+      [
+        "--extractor-retries", "3",
+        "--user-agent", random_user_agent(),
+        "--referer", "https://www.youtube.com/",
+        "--add-header", "Accept-Language:en-US,en;q=0.9"
+      ] ++ player_client_args()
 
     case get_cookies_path() do
       nil -> base
       path -> base ++ ["--cookies", path]
+    end
+  end
+
+  @default_player_clients "tv_simply,web_safari,mweb"
+
+  @doc """
+  Which YouTube player clients to ask, in order.
+
+  Which clients YouTube gates changes week to week — `android_vr` (yt-dlp's fallback
+  when the others are refused) is currently one of the hardest-gated, and landing on
+  it is what surfaces "Sign in to confirm you're not a bot". Because that moves
+  faster than our deploys, the list is an env var: set `YTDLP_PLAYER_CLIENTS` on the
+  host to retune without a rebuild, or to `""` to hand the choice back to yt-dlp's
+  own defaults. Namespaced to `youtube:`, so SoundCloud and everything else is
+  unaffected.
+  """
+  def player_client_args do
+    clients =
+      System.get_env("YTDLP_PLAYER_CLIENTS", @default_player_clients)
+      |> to_string()
+      |> String.trim()
+
+    if clients == "" do
+      []
+    else
+      ["--extractor-args", "youtube:player_client=#{clients}"]
     end
   end
 

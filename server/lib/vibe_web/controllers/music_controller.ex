@@ -13,6 +13,7 @@ defmodule VibeWeb.MusicController do
 
   alias Vibe.AI.Tools.YtDlp
   alias Vibe.MusicCache
+  alias Vibe.MusicCacheFill
   alias Vibe.SupabaseStorage
   alias Vibe.Repo
   import Ecto.Query
@@ -107,8 +108,15 @@ defmodule VibeWeb.MusicController do
     end
   end
 
-  # Get direct stream URL without downloading (for fallback)
+  # Get direct stream URL without downloading (for fallback).
+  # Gated too, under its own key: this is the *second* yt-dlp run of a failed
+  # request, so on a source the extractor cannot touch at all it doubled the cost of
+  # every retry.
   defp get_direct_stream_url(video_id) do
+    MusicCacheFill.fill("direct:" <> video_id, fn -> do_get_direct_stream_url(video_id) end)
+  end
+
+  defp do_get_direct_stream_url(video_id) do
     source = resolve_source_url(video_id)
 
     # Never hand yt-dlp a bare sc_* id — that is not a resolvable page.
@@ -213,7 +221,26 @@ defmodule VibeWeb.MusicController do
 
   defp stringify_map(_), do: %{}
 
+  # Every entry point goes through the single-flight gate. `info` and `stream` are
+  # called seconds apart by the same client for the same track, and both used to
+  # spawn their own yt-dlp writing the *same* `-o` path; a failing source then paid
+  # that cost again on every retry, forever.
   defp download_and_upload(video_id) do
+    MusicCacheFill.fill(video_id, fn ->
+      # The winner re-checks: a fill that finished while this caller was queued has
+      # already written the row, and re-downloading it would be pure waste.
+      case get_cached_url(video_id) do
+        {:ok, url} ->
+          Logger.info("[MusicController] Cache filled while queued: #{video_id}")
+          {:ok, url}
+
+        :not_cached ->
+          do_fill(video_id)
+      end
+    end)
+  end
+
+  defp do_fill(video_id) do
     Logger.info("[MusicController] Downloading audio for: #{video_id}")
 
     # Ensure temp directory exists

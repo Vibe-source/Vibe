@@ -64,6 +64,9 @@ defmodule Vibe.Application do
       # Unlinked pool for in-turn agent tool calls: a raising tool must surface as an
       # error the model can read, never take the whole agent turn down with it.
       {Task.Supervisor, name: Vibe.TaskSupervisor},
+      # Single-flight + failure backoff for music cache fills (runs its work under
+      # Vibe.TaskSupervisor above, so it must start after it).
+      Vibe.MusicCacheFill,
       # Zero-token watchdogs for coordinated team runs (one transient GenServer
       # per {chat_id, team_run_id}; docs/team-architecture-v2.md §4)
       {Registry, keys: :unique, name: Vibe.AI.TeamRunRegistry},
