@@ -16,8 +16,12 @@ defmodule VibeWeb.SettingsController do
     })
   end
 
+  # `/account/notification-preferences` is the canonical camelCase contract
+  # (docs/settings-account-architecture.md), so it answers in the stored shape.
+  # It still *accepts* the client shape — being lenient on input costs nothing
+  # and a caller sending `categories` here plainly means the same thing.
   def index(conn, _params) do
-    json(conn, wire_preferences(conn.assigns.current_user.id))
+    json(conn, Notifications.get_notification_preferences(conn.assigns.current_user.id))
   end
 
   def update(conn, params) when is_map(params) do
@@ -45,7 +49,7 @@ defmodule VibeWeb.SettingsController do
   def update_notifications(conn, %{"notifications" => notifications})
       when is_map(notifications) do
     case update_preferences(conn.assigns.current_user.id, notifications) do
-      {:ok, preferences} -> json(conn, %{notifications: preferences})
+      {:ok, preferences} -> json(conn, %{notifications: NotificationPreference.to_wire(preferences)})
       {:error, changeset} -> validation_error(conn, changeset)
     end
   end
@@ -56,12 +60,10 @@ defmodule VibeWeb.SettingsController do
   # The clients' shape is translated here rather than inside Notifications so the
   # push path keeps reading the stored keys directly.
   defp update_preferences(user_id, params) do
-    user_id
-    |> Notifications.update_notification_preferences(NotificationPreference.from_wire(params))
-    |> case do
-      {:ok, preferences} -> {:ok, NotificationPreference.to_wire(preferences)}
-      other -> other
-    end
+    Notifications.update_notification_preferences(
+      user_id,
+      NotificationPreference.from_wire(params)
+    )
   end
 
   defp wire_preferences(user_id) do
