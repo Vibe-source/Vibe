@@ -28,6 +28,10 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "26.0"
+    entitlements:
+      path: App/Vibe.entitlements
+      properties:
+        aps-environment: "$(APS_ENVIRONMENT)"
     sources:
       - path: App
       - path: Sources
@@ -39,6 +43,11 @@ targets:
     dependencies:
       - package: GiphyUISDK
         product: GiphyUISDK
+      # Embeds the notification service extension. Without it the app ships
+      # without an NSE, `mutable-content: 1` has nothing to act on, and rich
+      # notifications fall back to the app icon instead of the sender's avatar.
+      - target: VibeNotificationServiceExtension
+        embed: true
     info:
       path: App/Info.plist
       properties:
@@ -74,6 +83,62 @@ targets:
       base:
         DEVELOPMENT_TEAM: BXY4DH6H7D
         CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: App/Vibe.entitlements
+      configs:
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
+  # Downloads the sender avatar and applies the iOS 15 communication style so a
+  # message notification shows the person, not the app icon. Restored from the
+  # retired React Native app, where expo-notifications supplied the extension;
+  # rebuilding natively left the project with no NSE at all.
+  VibeNotificationServiceExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: NotificationServiceExtension
+    entitlements:
+      path: NotificationServiceExtension/NotificationServiceExtension.entitlements
+      properties:
+        aps-environment: "$(APS_ENVIRONMENT)"
+    info:
+      path: NotificationServiceExtension/Info.plist
+      # XcodeGen owns any plist named here and rewrites it on every generate, so
+      # these must be declared rather than left in the file — otherwise the
+      # NSExtension dict is silently stripped and iOS never loads the extension.
+      properties:
+        CFBundleDisplayName: Vibe Notify Service
+        CFBundlePackageType: XPC!
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+          NSExtensionAttributes:
+            # Required for the communication-style notification the extension
+            # donates; without it iOS refuses the INSendMessageIntent update.
+            IntentsSupported:
+              - INSendMessageIntent
+    settings:
+      base:
+        PRODUCT_NAME: VibeNotificationServiceExtension
+        PRODUCT_MODULE_NAME: VibeNotificationServiceExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.vibegram.app.NotificationServiceExtension
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: NotificationServiceExtension/NotificationServiceExtension.entitlements
+        DEVELOPMENT_TEAM: BXY4DH6H7D
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        # The project-level base settings are written for the app: they point at
+        # the Packet bridging header and link libphantom_client.a. An extension
+        # neither has nor needs those, and inheriting them fails the link.
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+        OTHER_LDFLAGS: ""
+      configs:
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
   VibeUITests:
     type: bundle.ui-testing
     platform: iOS
@@ -101,6 +166,7 @@ schemes:
     build:
       targets:
         Vibe: all
+        VibeNotificationServiceExtension: all
         VibeUITests: [test]
     run:
       config: Debug
