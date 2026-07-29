@@ -33,6 +33,123 @@ defmodule Vibe.Schemas.NotificationPreference do
   def categories, do: @categories
   def default_preferences, do: @default_preferences
 
+  # ------------------------------------------------------------------
+  #  Wire shape <-> stored shape
+  # ------------------------------------------------------------------
+  #
+  # The clients speak snake_case under a `categories` wrapper and treat `sound`
+  # as a boolean; storage is flat camelCase and keeps `sound` as the name of a
+  # sound (or nil for silent). The two never matched, so every settings write
+  # from a phone was rejected as "contains unsupported keys: categories" and
+  # every read fell back to defaults.
+  #
+  # Translating at the boundary rather than restyling the stored map keeps
+  # `notification_enabled?/2` — which is on the push path — reading the same
+  # keys it always has.
+
+  @wire_categories %{
+    "private_chats" => "privateChats",
+    "group_chats" => "groupChats",
+    "channels" => "channels",
+    "stories" => "stories",
+    "reactions" => "reactions"
+  }
+
+  @wire_booleans %{
+    "all_accounts" => "allAccounts",
+    "in_app_sounds" => "inAppSounds",
+    "in_app_vibrate" => "inAppVibrate",
+    "in_app_preview" => "inAppPreview",
+    "names_on_lock_screen" => "namesOnLockScreen"
+  }
+
+  @default_sound "default"
+
+  @doc """
+  Client payload -> stored shape, for a partial update.
+
+  A payload already in the stored shape passes through untouched: older clients
+  send that, and silently discarding their keys would be worse than the bug this
+  translation fixes.
+  """
+  def from_wire(updates) when is_map(updates) do
+    updates = stringify_keys(updates)
+
+    if wire_shaped?(updates) do
+      categories =
+        updates
+        |> Map.get("categories", %{})
+        |> case do
+          map when is_map(map) -> map
+          _ -> %{}
+        end
+        |> Enum.reduce(%{}, fn {wire_key, settings}, acc ->
+          case {Map.fetch(@wire_categories, wire_key), settings} do
+            {{:ok, key}, settings} when is_map(settings) ->
+              Map.put(acc, key, from_wire_category(settings))
+
+            _ ->
+              acc
+          end
+        end)
+
+      Enum.reduce(@wire_booleans, categories, fn {wire_key, key}, acc ->
+        case Map.fetch(updates, wire_key) do
+          {:ok, value} -> Map.put(acc, key, value)
+          :error -> acc
+        end
+      end)
+    else
+      updates
+    end
+  end
+
+  def from_wire(updates), do: updates
+
+  @doc "Stored shape -> client payload."
+  def to_wire(preferences) when is_map(preferences) do
+    normalized = normalize(preferences)
+
+    categories =
+      Enum.reduce(@wire_categories, %{}, fn {wire_key, key}, acc ->
+        Map.put(acc, wire_key, to_wire_category(Map.get(normalized, key, %{})))
+      end)
+
+    Enum.reduce(@wire_booleans, %{"categories" => categories}, fn {wire_key, key}, acc ->
+      Map.put(acc, wire_key, Map.get(normalized, key, true))
+    end)
+  end
+
+  # A payload is "wire" if it carries the wrapper or any snake_case top-level
+  # key. Anything else is assumed to already be stored-shape.
+  defp wire_shaped?(updates) do
+    Map.has_key?(updates, "categories") or
+      Enum.any?(Map.keys(@wire_booleans), &Map.has_key?(updates, &1))
+  end
+
+  defp from_wire_category(settings) do
+    settings
+    |> Map.take(["enabled", "preview"])
+    |> then(fn taken ->
+      case Map.fetch(settings, "sound") do
+        # The clients only know "makes a noise / doesn't", so a false has to pick
+        # a representation for silence and a true has to pick a sound back.
+        {:ok, true} -> Map.put(taken, "sound", @default_sound)
+        {:ok, false} -> Map.put(taken, "sound", nil)
+        {:ok, value} when is_binary(value) or is_nil(value) -> Map.put(taken, "sound", value)
+        _ -> taken
+      end
+    end)
+  end
+
+  defp to_wire_category(settings) do
+    %{
+      "enabled" => Map.get(settings, "enabled", true),
+      "preview" => Map.get(settings, "preview", true),
+      "sound" => Map.get(settings, "sound") not in [nil, ""]
+    }
+  end
+
   def normalize(preferences) when is_map(preferences) do
     Enum.reduce(@categories, normalize_booleans(preferences), fn category, normalized ->
       stored = Map.get(preferences, category)

@@ -3,6 +3,7 @@ defmodule VibeWeb.SettingsController do
 
   alias Vibe.Accounts
   alias Vibe.Notifications
+  alias Vibe.Schemas.NotificationPreference
 
   @privacy_keys ~w(forwarded_messages calls phone_number profile_photos bio gifts birthday saved_music)
 
@@ -11,16 +12,16 @@ defmodule VibeWeb.SettingsController do
 
     json(conn, %{
       privacy: Accounts.privacy_settings(user),
-      notifications: Notifications.get_notification_preferences(user.id)
+      notifications: wire_preferences(user.id)
     })
   end
 
   def index(conn, _params) do
-    json(conn, Notifications.get_notification_preferences(conn.assigns.current_user.id))
+    json(conn, wire_preferences(conn.assigns.current_user.id))
   end
 
   def update(conn, params) when is_map(params) do
-    case Notifications.update_notification_preferences(conn.assigns.current_user.id, params) do
+    case update_preferences(conn.assigns.current_user.id, params) do
       {:ok, preferences} -> json(conn, preferences)
       {:error, changeset} -> validation_error(conn, changeset)
     end
@@ -43,10 +44,7 @@ defmodule VibeWeb.SettingsController do
 
   def update_notifications(conn, %{"notifications" => notifications})
       when is_map(notifications) do
-    case Notifications.update_notification_preferences(
-           conn.assigns.current_user.id,
-           notifications
-         ) do
+    case update_preferences(conn.assigns.current_user.id, notifications) do
       {:ok, preferences} -> json(conn, %{notifications: preferences})
       {:error, changeset} -> validation_error(conn, changeset)
     end
@@ -54,6 +52,23 @@ defmodule VibeWeb.SettingsController do
 
   def update_notifications(conn, _params),
     do: invalid_payload(conn, "notifications must be an object")
+
+  # The clients' shape is translated here rather than inside Notifications so the
+  # push path keeps reading the stored keys directly.
+  defp update_preferences(user_id, params) do
+    user_id
+    |> Notifications.update_notification_preferences(NotificationPreference.from_wire(params))
+    |> case do
+      {:ok, preferences} -> {:ok, NotificationPreference.to_wire(preferences)}
+      other -> other
+    end
+  end
+
+  defp wire_preferences(user_id) do
+    user_id
+    |> Notifications.get_notification_preferences()
+    |> NotificationPreference.to_wire()
+  end
 
   defp invalid_payload(conn, message) do
     conn |> put_status(:unprocessable_entity) |> json(%{error: message})

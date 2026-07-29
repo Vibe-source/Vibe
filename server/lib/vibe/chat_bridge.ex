@@ -209,8 +209,7 @@ defmodule Vibe.ChatBridge do
   def bundle do
     raw =
       System.get_env("BLACKOUT_BRIDGE_BUNDLE_JSON") ||
-        System.get_env("VIBE_BRIDGE_BUNDLE_JSON") ||
-        System.get_env("EXPO_PUBLIC_BLACKOUT_BRIDGE_BUNDLE")
+        System.get_env("VIBE_BRIDGE_BUNDLE_JSON")
 
     cond do
       !is_binary(raw) or String.trim(raw) == "" ->

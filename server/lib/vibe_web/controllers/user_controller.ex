@@ -141,7 +141,6 @@ defmodule VibeWeb.UserController do
     token_map =
       %{}
       |> merge_push_token_bundle(params["pushTokens"] || params["push_tokens"])
-      |> maybe_put_token("expo", params["expoPushToken"] || params["expo_push_token"])
       |> maybe_put_token("fcm", params["fcmPushToken"] || params["fcm_push_token"])
       |> maybe_put_token("apns", params["apnsPushToken"] || params["apns_push_token"])
       |> maybe_put_token("apns_voip", params["voipPushToken"] || params["voip_push_token"])
@@ -150,9 +149,6 @@ defmodule VibeWeb.UserController do
     cond do
       map_size(token_map) > 0 ->
         Jason.encode!(token_map)
-
-      is_binary(explicit) ->
-        explicit
 
       true ->
         nil
@@ -163,7 +159,6 @@ defmodule VibeWeb.UserController do
 
   defp merge_push_token_bundle(acc, value) when is_map(value) do
     acc
-    |> maybe_put_token("expo", value["expo"] || value["expoPushToken"])
     |> maybe_put_token("fcm", value["fcm"] || value["fcmPushToken"])
     |> maybe_put_token("apns", value["apns"] || value["apnsToken"])
     |> maybe_put_token("apns_voip", value["apns_voip"] || value["voip"] || value["voipPushToken"])
@@ -199,8 +194,13 @@ defmodule VibeWeb.UserController do
       String.starts_with?(trimmed, "{") ->
         merge_push_token_bundle(acc, trimmed)
 
+      apns_device_token?(trimmed) ->
+        # Support a direct native APNs token while never persisting a legacy
+        # provider-specific bare token.
+        maybe_put_token(acc, "apns", trimmed)
+
       true ->
-        maybe_put_token(acc, "expo", trimmed)
+        acc
     end
   end
 
@@ -249,7 +249,6 @@ defmodule VibeWeb.UserController do
         case Jason.decode(trimmed) do
           {:ok, decoded} when is_map(decoded) ->
             %{}
-            |> maybe_put_token("expo", decoded["expo"] || decoded["expoPushToken"])
             |> maybe_put_token("fcm", decoded["fcm"] || decoded["fcmPushToken"])
             |> maybe_put_token("apns", decoded["apns"] || decoded["apnsToken"])
             |> maybe_put_token("apns_voip", decoded["apns_voip"] || decoded["voip"] || decoded["voipPushToken"])
@@ -259,11 +258,27 @@ defmodule VibeWeb.UserController do
         end
 
       true ->
-        %{"expo" => trimmed}
+        # Older rows may contain a bare legacy token. They are intentionally
+        # ignored so a native token bundle can safely overwrite the row.
+        %{}
     end
   end
 
   defp push_token_to_map(_), do: %{}
+
+  # APNs device tokens are hex, but NOT a fixed 32 bytes — Apple documents the
+  # length as variable and this fleet already registers 76-char tokens, so a
+  # `== 64` test would silently drop the very tokens we see in production.
+  # Bounds instead of an exact length: long enough not to swallow a stray word,
+  # loose enough to survive Apple lengthening the token again.
+  defp apns_device_token?(token) when is_binary(token) do
+    length = String.length(token)
+
+    length >= 64 and length <= 200 and rem(length, 2) == 0 and
+      String.match?(token, ~r/\A[[:xdigit:]]+\z/)
+  end
+
+  defp apns_device_token?(_), do: false
 
   defp push_token_target_summary(token) do
     token

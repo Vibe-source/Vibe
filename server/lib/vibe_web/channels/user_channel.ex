@@ -120,7 +120,21 @@ defmodule VibeWeb.UserChannel do
     # Use cached friend_ids from :after_join_complete (avoids re-running list_chats)
     cached_friend_ids = socket.assigns[:friend_ids]
 
-    # Run all terminate work asynchronously so the process exits immediately
+    # On node shutdown the Repo is stopped before the sockets are drained, so this
+    # work can only raise — one crash report per open connection, every deploy.
+    # Skipping it loses nothing: the client reconnects to the replacement node and
+    # is marked online there, which is what the offline broadcast would race with.
+    if repo_running?() do
+      spawn_offline_broadcast(user_id, cached_friend_ids)
+    end
+
+    :ok
+  end
+
+  defp repo_running?, do: is_pid(Process.whereis(Vibe.Repo))
+
+  # Runs asynchronously so the channel process exits immediately.
+  defp spawn_offline_broadcast(user_id, cached_friend_ids) do
     Task.start(fn ->
       user = Accounts.get_user(user_id)
       last_seen = DateTime.utc_now()
