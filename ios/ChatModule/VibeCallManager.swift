@@ -415,6 +415,14 @@ public final class VibeNativeCallManager: NSObject {
 
   private func normalizedString(_ value: Any?) -> String? {
     guard let value else { return nil }
+    // Cast before describing. String(describing:) on a nested Optional renders
+    // it as the literal text Optional("…"), which is how a valid APNs token
+    // became an invalid 76-character string. Casting unwraps instead.
+    if let text = value as? String {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let number = value as? NSNumber { return number.stringValue }
     let text = String(describing: value).trimmingCharacters(in: .whitespacesAndNewlines)
     return text.isEmpty ? nil : text
   }
