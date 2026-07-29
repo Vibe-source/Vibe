@@ -171,12 +171,11 @@ enum ChatAvatarImageStore {
     diskMissLock.unlock()
   }
 
+  /// Avatars live in the shared media vault, which is in Application Support. They used to sit
+  /// in `Caches`, where iOS reclaims them whenever it wants — every purge cost a re-download of
+  /// every face in the list, and the Settings cache screen could not account for them.
   private static var diskDirectory: URL = {
-    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-      ?? FileManager.default.temporaryDirectory
-    let dir = base.appendingPathComponent("vibe-avatars", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
+    VibeMediaVault.shared.directory(for: .avatar)
   }()
 
   /// Memory hit, else **synchronous** disk seed (downsampled JPEG) so cold launch
@@ -286,13 +285,26 @@ enum ChatAvatarImageStore {
     imageCache.setObject(image, forKey: key as NSString, cost: pixelW * pixelH * 4)
   }
 
-  private static func diskFileURL(for key: String) -> URL {
+  private static func diskFileName(for key: String) -> String {
     let safe = key.data(using: .utf8).map { $0.base64EncodedString() } ?? key
     let trimmed = safe
       .replacingOccurrences(of: "/", with: "_")
       .replacingOccurrences(of: "+", with: "-")
-    let name = String(trimmed.prefix(180)) + ".jpg"
-    return diskDirectory.appendingPathComponent(name)
+    return String(trimmed.prefix(180)) + ".jpg"
+  }
+
+  private static func diskFileURL(for key: String) -> URL {
+    diskDirectory.appendingPathComponent(diskFileName(for: key))
+  }
+
+  /// Where a pre-vault build wrote this avatar. Checked once on a miss and moved forward, so an
+  /// upgrade does not re-download every face the app already has.
+  private static func legacyDiskFileURL(for key: String) -> URL? {
+    guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else { return nil }
+    return caches
+      .appendingPathComponent("vibe-avatars", isDirectory: true)
+      .appendingPathComponent(diskFileName(for: key))
   }
 
   private static func loadFromDisk(key: String) -> UIImage? {
@@ -302,6 +314,14 @@ enum ChatAvatarImageStore {
     if knownMiss { return nil }
 
     let url = diskFileURL(for: key)
+    if !FileManager.default.fileExists(atPath: url.path) {
+      // Carry a pre-vault copy forward rather than call this a miss and re-fetch it.
+      if let legacy = legacyDiskFileURL(for: key),
+        FileManager.default.fileExists(atPath: legacy.path)
+      {
+        try? FileManager.default.moveItem(at: legacy, to: url)
+      }
+    }
     guard FileManager.default.fileExists(atPath: url.path) else {
       diskMissLock.lock()
       diskMissKeys.insert(key)
@@ -458,16 +478,12 @@ private actor ChatAvatarImageLoadCoordinator {
 }
 
 enum ChatAvatarFallbackStyle {
-  private static let palettes: [(lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)] = [
-    ("#5B8DEF", "#3D6BC6", "#6EA2FF", "#355EAA"),
-    ("#1FA97A", "#167A60", "#3BC99A", "#126B55"),
-    ("#D66A5A", "#AF493F", "#E98574", "#963B33"),
-    ("#A06AD8", "#7C4EB2", "#B984EA", "#6E45A0"),
-    ("#D59A2E", "#AF741D", "#E6B24A", "#966418"),
-    ("#2F9AA8", "#207585", "#4BB6C4", "#1B6575"),
-    ("#E05A8A", "#B83E6A", "#F178A4", "#9C345B"),
-    ("#6078D6", "#4659AE", "#7A91EA", "#3A4E9C"),
-  ]
+  // Owned by VibeAvatarFallback, which the notification service extension also
+  // compiles. Duplicating the table here would let a push notification colour
+  // someone differently from the chat list the moment either copy is edited.
+  private static var palettes: [(lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)] {
+    VibeAvatarFallback.palettes
+  }
 
   static func hexGradient(
     title: String?,
@@ -568,6 +584,13 @@ struct ChatHomeListRow {
   /// True when the chat's friend is an AI agent's shadow user — i.e. this is a
   /// 1:1 "talk to the agent" chat. Mirrors the server's `friendIsAgent` flag.
   let isAgentFriend: Bool
+  /// True only for rows synthesized for the Agents tab (an agent the current
+  /// user created/owns), never for a normal Home chat row — even one whose
+  /// peer happens to be an agent. Defaults false so every pre-existing
+  /// `ChatHomeListRow(...)` call site keeps its exact current swipe actions.
+  /// Adds the "Settings" leading swipe action, the only row-shape difference
+  /// the Agents tab needs from an ordinary chat row.
+  var isOwnedAgent: Bool = false
   /// The agent's id when `isAgentFriend` is true. Sent as `peerAgentId` so the
   /// engine routes the message to the agent backend instead of E2E-encrypting
   /// to a human peer. Mirrors the server's `friendAgentId`.
@@ -1366,6 +1389,23 @@ struct ChatHomeSwipeActionSpec {
 
 extension ChatHomeListRow {
   var leadingSwipeActionSpecs: [ChatHomeSwipeActionSpec] {
+    // Owned-agent rows (Agents tab) get exactly one leading action — Settings —
+    // instead of Pin/Read: an agent management row has no "unread" concept, and
+    // routing Pin through a synthetic/no-chat-yet row risks a real network call
+    // against a chatId that was never registered server-side.
+    if isOwnedAgent {
+      return [
+        ChatHomeSwipeActionSpec(
+          eventType: "swipeAgentSettings",
+          title: "Settings",
+          systemImageName: "gearshape.fill",
+          backgroundColor: ChatHomeSwipePalette.settings,
+          foregroundColor: .white,
+          style: .normal,
+          isFullSwipeTarget: true
+        )
+      ]
+    }
     let hasUnread = unreadCount > 0 || markedUnread
     return [
       ChatHomeSwipeActionSpec(
@@ -1390,7 +1430,20 @@ extension ChatHomeListRow {
   }
 
   var trailingSwipeActionSpecs: [ChatHomeSwipeActionSpec] {
-    [
+    if isOwnedAgent {
+      return [
+        ChatHomeSwipeActionSpec(
+          eventType: "swipeDelete",
+          title: "Delete",
+          systemImageName: "trash.fill",
+          backgroundColor: ChatHomeSwipePalette.delete,
+          foregroundColor: .white,
+          style: .destructive,
+          isFullSwipeTarget: true
+        )
+      ]
+    }
+    return [
       ChatHomeSwipeActionSpec(
         eventType: "swipeDelete",
         title: "Delete",
@@ -1423,6 +1476,7 @@ extension ChatHomeListRow {
 }
 
 private enum ChatHomeSwipePalette {
+  static let settings = UIColor(red: 0.42, green: 0.45, blue: 0.50, alpha: 1)
   static let pin = UIColor(red: 0.20, green: 0.47, blue: 0.90, alpha: 1)
   static let read = UIColor(red: 0.24, green: 0.61, blue: 0.86, alpha: 1)
   static let mute = UIColor(red: 0.86, green: 0.53, blue: 0.04, alpha: 1)

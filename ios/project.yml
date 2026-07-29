@@ -40,6 +40,9 @@ targets:
     sources:
       - path: App
       - path: Sources
+      # Compiled into the notification service extension too, so the avatar
+      # fallback cannot drift between a push and the chat list.
+      - path: Shared
       - path: ChatModule
         excludes:
           - ChatHomeListView.swift
@@ -104,13 +107,17 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - path: NotificationServiceExtension
+      - path: Shared
     entitlements:
       path: NotificationServiceExtension/NotificationServiceExtension.entitlements
       properties:
         aps-environment: "$(APS_ENVIRONMENT)"
-        # The extension is what donates the intent, so it needs the capability
-        # too -- granting it only to the host app is not enough.
-        com.apple.developer.usernotifications.communication: true
+        # Deliberately NOT com.apple.developer.usernotifications.communication.
+        # That is an app-level capability: Apple will not provision it for an
+        # extension App ID, and requesting it here fails the build with
+        # "Entitlement ... not found and could not be included in profile".
+        # The extension donates INSendMessageIntent under the host app's
+        # authority, so the entitlement on the app target is what counts.
     info:
       path: NotificationServiceExtension/Info.plist
       # XcodeGen owns any plist named here and rewrites it on every generate, so

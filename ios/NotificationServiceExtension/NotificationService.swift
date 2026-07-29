@@ -311,10 +311,15 @@ final class NotificationService: UNNotificationServiceExtension {
         senderImage = INImage(imageData: bundledDefault)
         log("sender image fallback loaded from bundled NotificationDefaultAvatar")
       } else if senderImage == nil,
-        let fallbackData = makeDefaultAvatarData()
+        // Same renderer the app uses, seeded on the sender's user id, so the
+        // notification shows the identical colour and initials as the chat list.
+        let fallbackData = VibeAvatarFallback.imageData(
+          displayName: payload.fromUserName.isEmpty ? senderDisplayName : payload.fromUserName,
+          userId: payload.fromUserId.isEmpty ? nil : payload.fromUserId
+        )
       {
         senderImage = INImage(imageData: fallbackData)
-        log("sender image fallback generated default avatar")
+        log("sender image fallback rendered from shared avatar style")
       }
       if senderImage == nil {
         log("sender image is still nil after all fallback attempts")
@@ -523,44 +528,6 @@ final class NotificationService: UNNotificationServiceExtension {
       }
     }
     return nil
-  }
-
-  private func makeDefaultAvatarData() -> Data? {
-    let side: CGFloat = 120
-    let size = CGSize(width: side, height: side)
-    let renderer = UIGraphicsImageRenderer(size: size)
-
-    let image = renderer.image { context in
-      let rect = CGRect(origin: .zero, size: size)
-
-      // Theme-aligned soft bubble background (matches light.bubble.them ~ #E0F2F1).
-      UIColor(red: 224.0 / 255.0, green: 242.0 / 255.0, blue: 241.0 / 255.0, alpha: 1.0).setFill()
-      context.cgContext.fillEllipse(in: rect)
-
-      let iconColor = UIColor(red: 106.0 / 255.0, green: 117.0 / 255.0, blue: 128.0 / 255.0, alpha: 1.0)
-      let symbolConfig = UIImage.SymbolConfiguration(pointSize: 58, weight: .medium)
-      if let personSymbol = UIImage(systemName: "person.fill", withConfiguration: symbolConfig)?
-        .withTintColor(iconColor, renderingMode: .alwaysOriginal)
-      {
-        let iconRect = CGRect(x: (side - 58) / 2.0, y: (side - 58) / 2.0, width: 58, height: 58)
-        personSymbol.draw(in: iconRect)
-      } else {
-        // Fallback path if SF Symbol lookup ever fails.
-        iconColor.setFill()
-        let headRect = CGRect(x: side * 0.38, y: side * 0.24, width: side * 0.24, height: side * 0.24)
-        context.cgContext.fillEllipse(in: headRect)
-        let bodyPath = UIBezierPath(
-          roundedRect: CGRect(x: side * 0.26, y: side * 0.52, width: side * 0.48, height: side * 0.24),
-          cornerRadius: side * 0.12
-        )
-        bodyPath.fill()
-      }
-    }
-
-    if let png = image.pngData() {
-      return png
-    }
-    return image.jpegData(compressionQuality: 0.92)
   }
 
   private func payloadMetadata(from userInfo: [AnyHashable: Any]) -> PayloadMetadata {
