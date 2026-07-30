@@ -2155,9 +2155,17 @@ func humanizedAgentErrorMessage(_ raw: String) -> String {
   return "Something went wrong"
 }
 
-/// Formats "Alice added Bob", "Carol left the group", "Dave joined the group".
-/// Prefers structured metadata; falls back to system-type body / plain patterns.
+/// Formats "Alice added Bob", "Carol left the group", "Dave joined the group",
+/// or a sender-declared decision notice.
+/// Prefers the structured `metadata.service` node so join/leave/decision events
+/// never depend on English body prose. Falls back to string sniffing for
+/// messages already in the database that predate the service node.
 func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
+  // Canonical path: structured service node (membership, decision, future kinds).
+  if let service = row.serviceMessage {
+    return service.displayText
+  }
+
   let type = row.messageType.lowercased()
   let isSystemType =
     type == "system"
@@ -2171,7 +2179,8 @@ func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
     return body
   }
 
-  // Heuristic for older/local payloads that used freeform text.
+  // Fallback for history that only has freeform body text (pre-service-node).
+  // Do not delete: existing rows never gained a `metadata.service` payload.
   let lower = body.lowercased()
   if lower.contains(" added ") && (lower.contains(" to the group") || lower.contains(" to group")) {
     return body
@@ -2186,6 +2195,12 @@ func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
     return body
   }
   return nil
+}
+
+/// Extra height under a centred service notice when live decision actions are present.
+func serviceDecisionActionsHeight(for row: ChatListRow) -> CGFloat {
+  guard let service = row.serviceMessage, service.hasLiveActions else { return 0 }
+  return 40.0
 }
 
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
@@ -8771,6 +8786,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let notSentIndicator = UIImageView()
   private var notSentIndicatorShown = false
   private let agentActionBarView = ChatNativeAgentActionBarView()
+  private let serviceActionBarView = ChatServiceActionBarView()
   private let dayLabel = UILabel()
   private let reactionPillView = UIView()
   private let reactionLabel = UILabel()
@@ -8784,6 +8800,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// (interrupt / compaction) reusing `dayLabel` — lets `layoutSubviews` position it with
   /// the day-pill centering path instead of the bubble path.
   private var isConfiguredAgentDivider = false
+  /// Service-notice divider that also shows live decision action chips under the pill.
+  private var isConfiguredServiceDecision = false
   /// Whether the last configure() rendered this row as a centered agent *error* notice
   /// (a failed turn) reusing the `dayLabel` pill. Drives the warning tint + makes the
   /// pill tappable to retry.
@@ -8856,6 +8874,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// Tapped the centered "Something went wrong · Try again" agent-error notice pill.
   var onAgentErrorRetryTap: ((ChatListRow) -> Void)?
   var onAgentAction: (([String: Any]) -> Void)?
+  /// Claim a sender-declared decision action (opaque token).
+  var onServiceDecisionAction: ((ChatListRow, ChatServiceAction) -> Void)?
   var onSelectionToggle: ((ChatListRow) -> Void)?
 
   override init(frame: CGRect) {
@@ -8911,6 +8931,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     metaContainerView.addSubview(statusLabel)
     metaContainerView.addSubview(pendingStatusView)
     contentView.addSubview(dayLabel)
+    contentView.addSubview(serviceActionBarView)
+    serviceActionBarView.isHidden = true
+    serviceActionBarView.onAction = { [weak self] action in
+      guard let self, let row = self.row else { return }
+      self.onServiceDecisionAction?(row, action)
+    }
     contentView.addSubview(retryButton)
     contentView.addSubview(agentRegenerateButton)
     contentView.addSubview(agentViewButton)
@@ -9449,6 +9475,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     lastConfigureStartedAt = ProcessInfo.processInfo.systemUptime
     self.agentTurnState = agentTurnState
     isConfiguredAgentDivider = false
+    isConfiguredServiceDecision = false
+    serviceActionBarView.isHidden = true
+    serviceActionBarView.configure(actions: [], appearance: appearance)
     isConfiguredAgentErrorNotice = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
     self.row = row
@@ -9648,6 +9677,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // user or assistant bubble. Bypass all the bubble machinery below.
       if let dividerText = agentSystemDividerText(for: row) {
         isConfiguredAgentDivider = true
+        let liveActions = row.serviceMessage?.hasLiveActions == true
+          ? (row.serviceMessage?.actions ?? [])
+          : []
+        isConfiguredServiceDecision = !liveActions.isEmpty
         self.isGhostHidden = false
         VoiceBubblePlaybackCoordinator.shared.unbind(cell: self)
         resetStickerAnimation()
@@ -9671,6 +9704,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         reactionPillView.isHidden = true
         retryButton.isHidden = true
         agentActionBarView.isHidden = true
+        if liveActions.isEmpty {
+          serviceActionBarView.isHidden = true
+          serviceActionBarView.configure(actions: [], appearance: appearance)
+        } else {
+          serviceActionBarView.configure(actions: liveActions, appearance: appearance)
+          serviceActionBarView.isHidden = false
+        }
         mediaProgressSpinner.stopAnimating()
         mediaProgressOverlayView.isHidden = true
         mediaProgressSizeLabel.isHidden = true
@@ -10207,16 +10247,31 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
+      let actionsHeight = isConfiguredServiceDecision ? serviceDecisionActionsHeight(for: row) : 0
       let textSize = dayLabel.sizeThatFits(CGSize(width: bounds.width - 16, height: 24))
       let width = min(bounds.width - 8, ceil(textSize.width) + (dayPillHorizontalPadding * 2.0))
       let height = ceil(textSize.height) + (dayPillVerticalPadding * 2.0)
+      let totalBlock = height + actionsHeight
+      let top = floor((bounds.height - totalBlock) * 0.5)
       dayLabel.frame = CGRect(
         x: floor((bounds.width - width) * 0.5),
-        y: floor((bounds.height - height) * 0.5),
+        y: top,
         width: width,
         height: height
       )
       dayLabel.layer.cornerRadius = height / 2.0
+      if isConfiguredServiceDecision {
+        serviceActionBarView.frame = CGRect(
+          x: 12,
+          y: dayLabel.frame.maxY + 4,
+          width: max(1, bounds.width - 24),
+          height: max(0, actionsHeight - 4)
+        )
+        serviceActionBarView.isHidden = false
+      } else {
+        serviceActionBarView.frame = .zero
+        serviceActionBarView.isHidden = true
+      }
       return
     }
 

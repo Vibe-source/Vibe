@@ -10487,6 +10487,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     cell.onAgentErrorRetryTap = { [weak self] row in
       self?.retryAgentErrorNotice(row: row)
     }
+    cell.onServiceDecisionAction = { [weak self] row, action in
+      self?.handleServiceDecisionAction(row: row, action: action)
+    }
     cell.onNotSentTap = { [weak self] row in
       self?.handleNotSentTap(row: row)
     }
@@ -12428,7 +12431,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// parse progress payloads or run an offscreen Auto Layout pass during navigation.
   private func presentationSeedMessageHeight(_ row: ChatListRow, rowWidth: CGFloat) -> CGFloat {
     if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
-      return 36.0
+      return 36.0 + serviceDecisionActionsHeight(for: row)
     }
 
     let state = agentTurnBubbleState(for: row)
@@ -12570,7 +12573,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // as a centered pill, not a bubble — give them a fixed compact height like the day
     // separator.
     if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
-      return 36.0
+      return 36.0 + serviceDecisionActionsHeight(for: row)
     }
     // Agent turns are the one row type whose measurement is genuinely expensive
     // (`VibeAgentTurnContentView.measuredHeight` parses the FULL progress payload and
@@ -13915,6 +13918,40 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// triggered it — the source text the server stamped on the error row, or, failing
   /// that, the nearest preceding user message — as a brand-new send. That re-invokes the
   /// agent exactly as if the user had asked again.
+  private func handleServiceDecisionAction(row: ChatListRow, action: ChatServiceAction) {
+    let claim: () -> Void = { [weak self] in
+      guard self != nil else { return }
+      ChatServiceDecisionClient.claim(token: action.token) { result in
+        switch result {
+        case .success:
+          // Settled state arrives via message-edited broadcast; nothing local to patch.
+          break
+        case .failure(let error):
+          let ns = error as NSError
+          // Concurrent loser: already decided — leave the row for the edit event.
+          if ns.code == 409 { return }
+          NSLog(
+            "[ServiceDecision] claim failed action=%@ code=%d desc=%@",
+            action.id, ns.code, ns.localizedDescription
+          )
+        }
+      }
+    }
+
+    if let confirm = action.confirm, !confirm.isEmpty {
+      let alert = UIAlertController(title: action.label, message: confirm, preferredStyle: .alert)
+      alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+      alert.addAction(
+        UIAlertAction(title: action.label, style: action.style == "destructive" ? .destructive : .default) { _ in
+          claim()
+        }
+      )
+      topPresentingViewController()?.present(alert, animated: true)
+    } else {
+      claim()
+    }
+  }
+
   private func retryAgentErrorNotice(row: ChatListRow) {
     let candidates: [String?] = [
       row.agentActionSourceText,

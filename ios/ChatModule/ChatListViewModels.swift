@@ -620,6 +620,10 @@ struct ChatListRow {
   // Agent response whose turn errored out — drives the side regenerate button.
   let isAgentError: Bool
 
+  /// Structured service-message node (`metadata.service`) for centred notices
+  /// (join/leave/decision). Nil for ordinary bubbles.
+  let serviceMessage: ChatServiceMessage?
+
   var isAgentMention: Bool {
     return isMe && text.lowercased().contains("@vibe")
   }
@@ -781,6 +785,7 @@ struct ChatListRow {
       hiddenFromTranscript = false
       isDeliveryFailed = false
       isAgentError = false
+      serviceMessage = nil
       return
     }
 
@@ -1185,6 +1190,9 @@ struct ChatListRow {
       (message["isError"] as? Bool)
       ?? (message["is_error"] as? Bool)
       ?? false
+    serviceMessage =
+      ChatServiceMessage.parse(metadata?["service"])
+      ?? ChatServiceMessage.parse(message["service"])
   }
 }
 
@@ -1509,6 +1517,7 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.hiddenFromTranscript == rhs.hiddenFromTranscript
     && lhs.isDeliveryFailed == rhs.isDeliveryFailed
     && lhs.isAgentError == rhs.isAgentError
+    && lhs.serviceMessage == rhs.serviceMessage
 }
 
 /// Stable (cross-launch) FNV-1a hash — used for persisted-height validation.

@@ -10070,12 +10070,28 @@ final class ChatEngine {
       // Carry the existing metadata under the edited payload's fields so an edit
       // (e.g. adding a caption to a sent image) can't wipe row-only state like the
       // sealed attachment blobs (server never echoes those back) or media size.
+      // Also accept top-level `metadata` on the wire event (decision settlement
+      // rewrites `service` there without re-wrapping ciphertext as hybrid JSON).
+      let wireMetadata = payload["metadata"] as? [String: Any]
       if let existingMetadata, !existingMetadata.isEmpty {
         var mergedMetadata = existingMetadata
         if let editedMetadata = hydratedFields["metadata"] as? [String: Any] {
           mergedMetadata.merge(editedMetadata) { _, new in new }
         }
+        if let wireMetadata {
+          mergedMetadata.merge(wireMetadata) { _, new in new }
+        }
         hydratedFields["metadata"] = mergedMetadata
+      } else if let wireMetadata, !wireMetadata.isEmpty {
+        var mergedMetadata = (hydratedFields["metadata"] as? [String: Any]) ?? [:]
+        mergedMetadata.merge(wireMetadata) { _, new in new }
+        hydratedFields["metadata"] = mergedMetadata
+      }
+      if let plain = normalizedString(payload["plainContent"] ?? payload["plaintext"]),
+        !plain.isEmpty
+      {
+        hydratedFields["text"] = plain
+        hydratedFields["plainContent"] = plain
       }
       let row = buildLiveRowPayloadLocked(
         chatId: chatId,
