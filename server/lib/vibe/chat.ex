@@ -1459,6 +1459,8 @@ defmodule Vibe.Chat do
 
   # System notice after membership change. Plaintext body in encrypted_content
   # (non-hybrid) so clients parse it as text; type "system" for centered UI.
+  # Structured `metadata.service` is the canonical renderer input; legacy
+  # systemAction/text fields stay for older clients and history.
   defp maybe_insert_group_system_notice(chat_id, actor_id, target_id, action)
        when is_binary(chat_id) and is_binary(actor_id) and is_binary(target_id) and
               is_binary(action) do
@@ -1475,6 +1477,8 @@ defmodule Vibe.Chat do
       end
 
     if is_binary(body) do
+      service = Vibe.AI.AgentDecisions.membership_service_node(action, actor_name, target_name)
+
       # Client decrypt path treats non-hybrid ciphertext as parseable payload JSON.
       payload =
         Jason.encode!(%{
@@ -1483,7 +1487,8 @@ defmodule Vibe.Chat do
           "actorId" => actor_id,
           "targetId" => target_id,
           "actorName" => actor_name,
-          "targetName" => target_name
+          "targetName" => target_name,
+          "service" => service
         })
 
       msg_id = Ecto.UUID.generate()
@@ -1502,7 +1507,8 @@ defmodule Vibe.Chat do
           "targetId" => target_id,
           "actorName" => actor_name,
           "targetName" => target_name,
-          "text" => body
+          "text" => body,
+          "service" => service
         },
         status: "sent"
       }
