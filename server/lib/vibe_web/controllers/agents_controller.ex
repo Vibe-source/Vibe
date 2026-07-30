@@ -403,6 +403,48 @@ defmodule VibeWeb.AgentsController do
     end
   end
 
+  @doc """
+  Claim a sender-declared decision action by opaque token.
+
+  Body: `%{"token" => "..."}`. Authorization is chat participation on the
+  decision's chat (not agent ownership). Concurrent single-mode claims return
+  `already_decided` for the loser, not a 5xx.
+  """
+  def respond_decision_action(conn, params) when is_map(params) do
+    user_id = conn.assigns.current_user.id
+    token = params["token"] || params["actionToken"] || params["action_token"]
+
+    case Vibe.AI.AgentDecisions.respond(user_id, token) do
+      {:ok, %{task: task, action: action, actor: actor}} ->
+        json(conn, %{
+          ok: true,
+          task: Agents.approval_task_payload(task),
+          action: %{
+            id: action.action_id,
+            label: action.label,
+            style: action.style,
+            status: action.status
+          },
+          decidedByUserId: actor && actor.id
+        })
+
+      {:error, :forbidden} ->
+        conn |> put_status(:forbidden) |> json(%{error: "forbidden"})
+
+      {:error, :invalid_token} ->
+        conn |> put_status(:not_found) |> json(%{error: "invalid_token"})
+
+      {:error, :already_decided} ->
+        conn |> put_status(:conflict) |> json(%{error: "already_decided", ok: false})
+
+      {:error, :expired} ->
+        conn |> put_status(:gone) |> json(%{error: "expired"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: to_string(reason)})
+    end
+  end
+
   def ingest_event(conn, params) when is_map(params) do
     identifier = params["identifier"] || conn.path_params["identifier"]
     secret =

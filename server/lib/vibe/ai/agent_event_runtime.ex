@@ -32,6 +32,7 @@ defmodule Vibe.AI.AgentEventRuntime do
   alias Vibe.AgentRun
   alias Vibe.AgentRunbook
   alias Vibe.Agents
+  alias Vibe.AI.AgentDecisions
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Chat.Message
@@ -753,7 +754,7 @@ defmodule Vibe.AI.AgentEventRuntime do
       normalize_string(params["source"]) || (integration && integration.source_type) || "internal"
 
     title = normalize_rich_text(params["title"])
-    text = normalize_rich_text(params["text"] || params["message"])
+    text = normalize_rich_text(params["text"] || params["message"] || params["body"])
     payload = normalize_payload(params["data"] || params["payload"])
     occurred_at = parse_datetime(params["timestamp"]) || DateTime.utc_now()
 
@@ -774,27 +775,34 @@ defmodule Vibe.AI.AgentEventRuntime do
         agent.default_destination_chat_id ||
         owner_dm_chat_id(agent)
 
-    cond do
-      is_nil(event_type) ->
-        {:error, :missing_event_type}
+    # Callback URLs on the event payload are ignored entirely (SSRF). Destination
+    # for decisions is always agents.callback_url configured by the owner.
+    _ignored_callback = params["callbackUrl"] || params["callback_url"]
 
-      is_nil(destination_chat_id) ->
-        {:error, :missing_destination_chat}
+    with {:ok, declaration} <- AgentDecisions.normalize_declaration(params) do
+      cond do
+        is_nil(event_type) ->
+          {:error, :missing_event_type}
 
-      true ->
-        {:ok,
-         %{
-           event_id: event_id,
-           event_type: event_type,
-           source: source,
-           title: title || humanize_event_type(event_type),
-           text: text,
-           payload: payload,
-           attachments: normalize_event_attachments(params),
-           occurred_at: occurred_at,
-           thread_key: thread_key,
-           destination_chat_id: destination_chat_id
-         }}
+        is_nil(destination_chat_id) ->
+          {:error, :missing_destination_chat}
+
+        true ->
+          {:ok,
+           %{
+             event_id: event_id,
+             event_type: event_type,
+             source: source,
+             title: title || humanize_event_type(event_type),
+             text: text,
+             payload: payload,
+             attachments: normalize_event_attachments(params),
+             occurred_at: occurred_at,
+             thread_key: thread_key,
+             destination_chat_id: destination_chat_id,
+             declaration: declaration
+           }}
+      end
     end
   end
 
@@ -885,6 +893,7 @@ defmodule Vibe.AI.AgentEventRuntime do
     priority = classify_priority(normalized)
     autonomy = effective_autonomy(agent, integration)
     estimated_cost_cents = estimated_cost_cents(runbook)
+    declaration = Map.get(normalized, :declaration)
 
     cond do
       not event_type_enabled?(agent, integration, normalized.event_type) ->
@@ -903,6 +912,18 @@ defmodule Vibe.AI.AgentEventRuntime do
           reason: "noise_suppressed",
           post_event_message?: false,
           estimated_cost_cents: 0
+        }
+
+      # Sender-declared decision set wins over runbook auto-act: the event author
+      # is asking a human to choose, regardless of owner automation settings.
+      match?(%{actions: [_ | _]}, declaration) ->
+        %{
+          mode: "approval_required",
+          priority: priority,
+          reason: "sender_declared_actions",
+          post_event_message?: true,
+          estimated_cost_cents: estimated_cost_cents,
+          declaration: declaration
         }
 
       budget_exceeded?(agent, integration, estimated_cost_cents) ->
@@ -1450,48 +1471,75 @@ defmodule Vibe.AI.AgentEventRuntime do
   end
 
   defp create_approval(agent, integration, thread, event, runbook, normalized, policy) do
-    requested_action =
-      case runbook_action_payload(normalized, runbook) do
-        {:ok, payload} -> payload
-        {:error, _} -> fallback_requested_action(normalized)
+    declaration = Map.get(policy, :declaration) || Map.get(normalized, :declaration)
+
+    if match?(%{actions: [_ | _]}, declaration) do
+      with {:ok, details} <-
+             AgentDecisions.create_declared_decision(
+               agent,
+               thread,
+               event,
+               normalized,
+               declaration,
+               policy
+             ) do
+        run =
+          create_run!(agent, integration, thread, event, runbook, policy, %{
+            result: %{
+              approvalTaskId: details.approval_task.id,
+              source: "declared",
+              actionMode: declaration.action_mode
+            }
+          })
+
+        {:ok, Map.put(details, :run, run)}
       end
+    else
+      requested_action =
+        case runbook_action_payload(normalized, runbook) do
+          {:ok, payload} -> payload
+          {:error, _} -> fallback_requested_action(normalized)
+        end
 
-    task =
-      %AgentApprovalTask{}
-      |> AgentApprovalTask.changeset(%{
-        agent_id: agent.id,
-        thread_id: thread.id,
-        event_id: event.id,
-        runbook_id: runbook && runbook.id,
-        chat_id: thread.chat_id,
-        requested_action: requested_action,
-        rationale: "Approval required for #{normalized.event_type}",
-        status: "pending"
-      })
-      |> Repo.insert!()
+      task =
+        %AgentApprovalTask{}
+        |> AgentApprovalTask.changeset(%{
+          agent_id: agent.id,
+          thread_id: thread.id,
+          event_id: event.id,
+          runbook_id: runbook && runbook.id,
+          chat_id: thread.chat_id,
+          requested_action: requested_action,
+          rationale: "Approval required for #{normalized.event_type}",
+          status: "pending",
+          source: "runbook",
+          action_mode: "single"
+        })
+        |> Repo.insert!()
 
-    _ =
-      post_system_followup(
-        agent,
-        thread,
-        "Approval needed for #{normalized.title || normalized.event_type}. Open the task to approve or reject.",
-        %{
-          "approvalTaskId" => task.id,
-          "eventThreadId" => thread.id,
-          "eventId" => event.id,
-          "status" => "pending_approval"
-        }
-      )
+      _ =
+        post_system_followup(
+          agent,
+          thread,
+          "Approval needed for #{normalized.title || normalized.event_type}. Open the task to approve or reject.",
+          %{
+            "approvalTaskId" => task.id,
+            "eventThreadId" => thread.id,
+            "eventId" => event.id,
+            "status" => "pending_approval"
+          }
+        )
 
-    run =
-      create_run!(agent, integration, thread, event, runbook, policy, %{
-        result: %{
-          approvalTaskId: task.id,
-          requestedAction: requested_action
-        }
-      })
+      run =
+        create_run!(agent, integration, thread, event, runbook, policy, %{
+          result: %{
+            approvalTaskId: task.id,
+            requestedAction: requested_action
+          }
+        })
 
-    {:ok, %{status: "approval_required", run: run, approval_task: task}}
+      {:ok, %{status: "approval_required", run: run, approval_task: task}}
+    end
   end
 
   defp runbook_action_payload(normalized, %AgentRunbook{} = runbook) do

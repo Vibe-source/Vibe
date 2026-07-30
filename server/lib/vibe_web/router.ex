@@ -187,6 +187,8 @@ defmodule VibeWeb.Router do
     get "/agents/:id/threads/:thread_id", AgentsController, :thread
     post "/agents/:id/approval_tasks/:task_id/approve", AgentsController, :approve_task
     post "/agents/:id/approval_tasks/:task_id/reject", AgentsController, :reject_task
+    # Opaque token claim for sender-declared decision actions (not runbook approve/reject).
+    post "/decisions/actions", AgentsController, :respond_decision_action
     delete "/agents/:id", AgentsController, :delete
 
     # Builder

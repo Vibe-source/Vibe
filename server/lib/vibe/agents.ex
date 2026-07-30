@@ -1060,7 +1060,12 @@ defmodule Vibe.Agents do
       status: task.status,
       decisionNote: task.decision_note,
       decidedAt: task.decided_at,
-      approvedByUserId: task.approved_by_user_id
+      approvedByUserId: task.approved_by_user_id,
+      actionMode: task.action_mode || "single",
+      expiresAt: task.expires_at,
+      messageId: task.message_id,
+      chosenActionId: task.chosen_action_id,
+      source: task.source || "runbook"
     }
   end
 
