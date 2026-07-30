@@ -46,6 +46,11 @@ defmodule Vibe.AI.AgentEventRuntime do
   @batch_summary_event_line_limit 12
   @stream_table :vibe_agent_event_streams
   @stream_event_type "message.stream"
+  @max_event_params_bytes 512 * 1024
+  @max_stream_params_bytes 256 * 1024
+  @max_rich_text_chars 32_000
+  @max_attachment_count 10
+  @max_attachment_url_chars 2_048
 
   def ingest(%Agent{} = agent, params, opts \\ []) when is_map(params) do
     secret = Keyword.get(opts, :secret)
@@ -107,6 +112,9 @@ defmodule Vibe.AI.AgentEventRuntime do
       normalize_string(params["destinationChatId"] || params["destination_chat_id"])
 
     cond do
+      not json_size_within?(params, @max_stream_params_bytes) ->
+        {:error, :stream_payload_too_large}
+
       is_nil(stream_id) ->
         {:error, :missing_stream_id}
 
@@ -779,7 +787,8 @@ defmodule Vibe.AI.AgentEventRuntime do
     # for decisions is always agents.callback_url configured by the owner.
     _ignored_callback = params["callbackUrl"] || params["callback_url"]
 
-    with {:ok, declaration} <- AgentDecisions.normalize_declaration(params) do
+    with :ok <- validate_event_params_size(params),
+         {:ok, declaration} <- AgentDecisions.normalize_declaration(params) do
       cond do
         is_nil(event_type) ->
           {:error, :missing_event_type}
@@ -1751,10 +1760,17 @@ defmodule Vibe.AI.AgentEventRuntime do
   @doc false
   def merged_attachment_caption(body, attachment) do
     case {normalize_string(body), attachment_own_caption(attachment)} do
-      {nil, nil} -> nil
-      {text, nil} -> text
-      {nil, caption} -> caption
-      {text, caption} -> if String.contains?(text, caption), do: text, else: "#{text}\n\n#{caption}"
+      {nil, nil} ->
+        nil
+
+      {text, nil} ->
+        text
+
+      {nil, caption} ->
+        caption
+
+      {text, caption} ->
+        if String.contains?(text, caption), do: text, else: "#{text}\n\n#{caption}"
     end
   end
 
@@ -2028,7 +2044,10 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   defp normalize_attachments(value) when is_list(value) do
     items =
-      Enum.map(value, fn item ->
+      value
+      |> Enum.take(@max_attachment_count)
+      |> Enum.filter(&is_map/1)
+      |> Enum.map(fn item ->
         %{
           "type" => normalize_string(item["type"] || item[:type]),
           "url" =>
@@ -2062,7 +2081,7 @@ defmodule Vibe.AI.AgentEventRuntime do
         |> Enum.reject(fn {_k, v} -> is_nil(v) end)
         |> Map.new()
       end)
-      |> Enum.filter(&is_binary(&1["url"]))
+      |> Enum.filter(&(is_binary(&1["url"]) and valid_attachment_url?(&1["url"])))
 
     %{"items" => items}
   end
@@ -2095,7 +2114,35 @@ defmodule Vibe.AI.AgentEventRuntime do
         |> String.replace(~r/[ \t]+\n/u, "\n")
         |> String.replace(~r/\n{3,}/u, "\n\n")
         |> String.trim()
+        |> String.slice(0, @max_rich_text_chars)
         |> normalize_string()
+    end
+  end
+
+  defp valid_attachment_url?(url) when is_binary(url) do
+    byte_size(url) <= @max_attachment_url_chars and
+      case URI.parse(url) do
+        %URI{scheme: scheme, host: host}
+        when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+          true
+
+        _ ->
+          false
+      end
+  end
+
+  defp valid_attachment_url?(_), do: false
+
+  defp validate_event_params_size(params) do
+    if json_size_within?(params, @max_event_params_bytes),
+      do: :ok,
+      else: {:error, :event_payload_too_large}
+  end
+
+  defp json_size_within?(value, max_bytes) do
+    case Jason.encode_to_iodata(value) do
+      {:ok, iodata} -> IO.iodata_length(iodata) <= max_bytes
+      {:error, _} -> false
     end
   end
 

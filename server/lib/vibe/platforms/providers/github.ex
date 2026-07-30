@@ -275,7 +275,9 @@ defmodule Vibe.Platforms.Providers.GitHub do
       "list_repos" ->
         visibility = params["visibility"] || "all"
         per_page = clamp_int(params["per_page"], 30, 1, 50)
-        path = "/user/repos?per_page=#{per_page}&sort=updated&visibility=#{URI.encode_www_form(visibility)}"
+
+        path =
+          "/user/repos?per_page=#{per_page}&sort=updated&visibility=#{URI.encode_www_form(visibility)}"
 
         with {:ok, repos} <- gh_get(access_token, path) do
           {:ok,
@@ -349,7 +351,8 @@ defmodule Vibe.Platforms.Providers.GitHub do
       "list_pr_files" ->
         with {:ok, owner, repo} <- require_owner_repo(params),
              {:ok, number} <- require_number(params),
-             {:ok, files} <- gh_get(access_token, "/repos/#{owner}/#{repo}/pulls/#{number}/files?per_page=100") do
+             {:ok, files} <-
+               gh_get(access_token, "/repos/#{owner}/#{repo}/pulls/#{number}/files?per_page=100") do
           {:ok,
            %{
              "items" =>
@@ -370,7 +373,10 @@ defmodule Vibe.Platforms.Providers.GitHub do
         with {:ok, owner, repo} <- require_owner_repo(params),
              {:ok, number} <- require_number(params),
              {:ok, comments} <-
-               gh_get(access_token, "/repos/#{owner}/#{repo}/issues/#{number}/comments?per_page=50") do
+               gh_get(
+                 access_token,
+                 "/repos/#{owner}/#{repo}/issues/#{number}/comments?per_page=50"
+               ) do
           {:ok,
            %{
              "items" =>
@@ -544,13 +550,17 @@ defmodule Vibe.Platforms.Providers.GitHub do
 
   defp require_number(params) do
     case params["number"] || params["pr"] || params["pull_number"] do
-      n when is_integer(n) and n > 0 -> {:ok, n}
+      n when is_integer(n) and n > 0 ->
+        {:ok, n}
+
       n when is_binary(n) ->
         case Integer.parse(String.trim(n)) do
           {i, _} when i > 0 -> {:ok, i}
           _ -> {:error, :invalid_number}
         end
-      _ -> {:error, :missing_number}
+
+      _ ->
+        {:error, :missing_number}
     end
   end
 
@@ -580,22 +590,28 @@ defmodule Vibe.Platforms.Providers.GitHub do
   defp clamp_int(value, default, min, max) do
     n =
       cond do
-        is_integer(value) -> value
+        is_integer(value) ->
+          value
+
         is_binary(value) ->
           case Integer.parse(String.trim(value)) do
             {i, _} -> i
             :error -> default
           end
-        true -> default
+
+        true ->
+          default
       end
 
     n |> max(min) |> min(max)
   end
 
   defp truncate(nil, _), do: nil
+
   defp truncate(value, max) when is_binary(value) and byte_size(value) > max do
     binary_part(value, 0, max) <> "…"
   end
+
   defp truncate(value, _), do: value
 
   defp summarize(body) when is_binary(body), do: String.slice(body, 0, 200)
@@ -608,22 +624,57 @@ defmodule Vibe.Platforms.Providers.GitHub do
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_), do: false
 
-  defp client_id, do: System.get_env("GITHUB_CLIENT_ID") || System.get_env("VIBE_GITHUB_CLIENT_ID")
-  defp client_secret, do: System.get_env("GITHUB_CLIENT_SECRET") || System.get_env("VIBE_GITHUB_CLIENT_SECRET")
+  defp client_id,
+    do: System.get_env("GITHUB_CLIENT_ID") || System.get_env("VIBE_GITHUB_CLIENT_ID")
+
+  defp client_secret,
+    do: System.get_env("GITHUB_CLIENT_SECRET") || System.get_env("VIBE_GITHUB_CLIENT_SECRET")
 
   defp redirect_uri do
     System.get_env("VIBE_GITHUB_REDIRECT_URI") ||
       System.get_env("GITHUB_REDIRECT_URI") ||
-      default_public_base() <> "/api/platforms/oauth/github/callback"
+      public_base_url() <> "/api/platforms/oauth/github/callback"
   end
 
-  defp default_public_base do
-    System.get_env("VIBE_PUBLIC_BASE_URL") ||
-      System.get_env("PHX_HOST")
-      |> case do
-        nil -> "https://api.vibegram.io"
-        host ->
-          if String.starts_with?(host, "http"), do: host, else: "https://" <> host
-      end
+  @doc """
+  Public HTTPS base for OAuth callbacks and absolute API links.
+
+  Env priority (first present wins):
+  1. `VIBE_PUBLIC_BASE_URL`
+  2. `PUBLIC_BASE_URL` (Railway / legacy)
+  3. `PHX_HOST` (scheme added if missing)
+  4. `https://api.vibegram.io`
+  """
+  def public_base_url do
+    base =
+      present_env("VIBE_PUBLIC_BASE_URL") ||
+        present_env("PUBLIC_BASE_URL") ||
+        case present_env("PHX_HOST") do
+          nil -> "https://api.vibegram.io"
+          host -> host
+        end
+
+    normalize_public_base(base)
+  end
+
+  defp present_env(name) do
+    case System.get_env(name) do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: nil, else: trimmed
+
+      _ ->
+        nil
+    end
+  end
+
+  defp normalize_public_base(base) do
+    trimmed = String.trim_trailing(String.trim(base), "/")
+
+    if String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://") do
+      trimmed
+    else
+      "https://" <> trimmed
+    end
   end
 end

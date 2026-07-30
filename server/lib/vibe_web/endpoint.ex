@@ -2,9 +2,9 @@ defmodule VibeWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :vibe
 
   @parser_length (case Integer.parse(System.get_env("MAX_REQUEST_BYTES") || "120000000") do
-                   {value, _} when value > 0 -> value
-                   _ -> 120_000_000
-                 end)
+                    {value, _} when value > 0 -> value
+                    _ -> 120_000_000
+                  end)
 
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
@@ -15,58 +15,65 @@ defmodule VibeWeb.Endpoint do
     signing_salt: "VA520x4+"
   ]
 
-  socket "/socket", VibeWeb.UserSocket,
+  socket("/socket", VibeWeb.UserSocket,
     websocket: [
-      # Forward HTTP headers to UserSocket.connect/3 so the mobile clients'
-      # Authorization: Bearer token is available during WebSocket upgrade.
+      # Phoenix only forwards headers whose names start with "x-". Mobile clients
+      # send `x-vibe-auth: Bearer <login_token>` (not Authorization) so the token
+      # is available here without putting it in the WebSocket URL query string.
       connect_info: [:x_headers]
     ],
     longpoll: false
+  )
 
   # Agent bridge daemon (the user's computer) connects here, authenticated by its
-  # bridge_token. Outbound-only from the daemon's perspective.
-  socket "/agent-bridge", VibeWeb.AgentBridgeSocket,
+  # bridge_token via `x-vibe-bridge-token: Bearer <bridge_token>`. Outbound-only
+  # from the daemon's perspective. Query param `token` remains a fallback.
+  socket("/agent-bridge", VibeWeb.AgentBridgeSocket,
     websocket: [connect_info: [:x_headers]],
     longpoll: false
+  )
 
-  socket "/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
+  socket("/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]])
 
   # Serve at "/" the static files from "priv/static" directory.
   #
   # You should set gzip to true if you are running phx.digest
   # when deploying your static files in production.
   if code_reloading? do
-    socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
-    plug Phoenix.LiveReloader
-    plug Phoenix.CodeReloader
-    plug Phoenix.Ecto.CheckRepoStatus, otp_app: :vibe
+    socket("/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket)
+    plug(Phoenix.LiveReloader)
+    plug(Phoenix.CodeReloader)
+    plug(Phoenix.Ecto.CheckRepoStatus, otp_app: :vibe)
   end
 
-  plug Plug.Static,
+  plug(Plug.Static,
     at: "/",
     from: if(code_reloading?, do: :vibe, else: "priv/static"),
     gzip: false,
     only: VibeWeb.static_paths()
+  )
 
   # Serve uploaded files
-  plug Plug.Static,
+  plug(Plug.Static,
     at: "/uploads",
     from: "/app/uploads",
     gzip: false
+  )
 
-  plug Plug.RequestId
-  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+  plug(Plug.RequestId)
+  plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
 
-  plug Plug.Parsers,
+  plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
     length: @parser_length,
     json_decoder: Phoenix.json_library(),
     body_reader: {VibeWeb.Plugs.RawBodyReader, :read_body, []}
+  )
 
-  plug Plug.MethodOverride
-  plug Plug.Head
-  plug Plug.Session, @session_options
+  plug(Plug.MethodOverride)
+  plug(Plug.Head)
+  plug(Plug.Session, @session_options)
 
   # CORS Plug
   cors_origins =
@@ -89,7 +96,7 @@ defmodule VibeWeb.Endpoint do
         |> Enum.reject(&(&1 == ""))
     end
 
-  plug CORSPlug,
+  plug(CORSPlug,
     origin: cors_origins,
     headers: [
       "Authorization",
@@ -103,8 +110,42 @@ defmodule VibeWeb.Endpoint do
       "Keep-Alive",
       "X-Requested-With",
       "If-Modified-Since",
-      "ngrok-skip-browser-warning"
+      "ngrok-skip-browser-warning",
+      # WebSocket / HTTP clients that prefer header auth over query tokens.
+      "x-vibe-auth",
+      "x-vibe-bridge-token"
     ]
+  )
 
-  plug VibeWeb.Router
+  plug(VibeWeb.Router)
+
+  @doc """
+  Production Ecto SSL options from env-style inputs.
+
+  - `verify_env` of `"none"` (case-insensitive) opts out → `verify_none`
+  - otherwise (including `nil` / unset) → `verify_peer` when a CA bundle path
+    is provided; falls back to `verify_none` only when no CA is available
+
+  Pure helper so unit tests can prove the prod default without booting runtime.exs.
+  """
+  def db_ssl_opts(verify_env, cacertfile) do
+    verify =
+      case verify_env do
+        nil -> nil
+        value when is_binary(value) -> String.downcase(String.trim(value))
+        _ -> nil
+      end
+
+    case verify do
+      "none" ->
+        [verify: :verify_none]
+
+      _ ->
+        if is_binary(cacertfile) and String.trim(cacertfile) != "" do
+          [verify: :verify_peer, cacertfile: cacertfile]
+        else
+          [verify: :verify_none]
+        end
+    end
+  end
 end

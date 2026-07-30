@@ -50,6 +50,16 @@ defmodule Vibe.Links do
 
   @doc """
   Base URL every share link hangs off, without a trailing slash.
+
+  Env resolution (explicit and tested):
+
+  1. `VIBE_SHARE_BASE_URL` when set and non-blank — preferred share host
+     (e.g. `https://vibegram.io` once apex forwards here).
+  2. Otherwise `@default_share_base` (`https://api.vibegram.io`) — the host
+     that currently serves these paths.
+
+  This is intentionally separate from `VIBE_PUBLIC_BASE_URL` / `PUBLIC_BASE_URL`
+  (API / OAuth base). Share marketing host and API host can diverge.
   """
   def share_base_url do
     case present(System.get_env("VIBE_SHARE_BASE_URL")) do
@@ -57,6 +67,9 @@ defmodule Vibe.Links do
       value -> normalize_base(value)
     end
   end
+
+  @doc false
+  def default_share_base, do: @default_share_base
 
   @doc """
   Public link for a person or an agent handle: `https://<base>/<handle>`.

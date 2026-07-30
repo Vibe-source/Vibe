@@ -21,8 +21,11 @@ if config_env() == :prod do
         case Regex.run(~r/https?:\/\/([^.]+)\.supabase\.co/, supabase_url) do
           [_, project_ref] ->
             region = System.get_env("SUPABASE_REGION") || "us-east-1"
+
             "postgresql://postgres.#{project_ref}:#{URI.encode_www_form(supabase_db_password)}@aws-0-#{region}.pooler.supabase.com:6543/postgres"
-          _ -> nil
+
+          _ ->
+            nil
         end
       end
     else
@@ -37,6 +40,7 @@ if config_env() == :prod do
       Application will start but Database operations will fail.
       Set DATABASE_URL or SUPABASE_* vars to fix.
       """)
+
       "postgres://user:pass@localhost:5432/db_missing"
     else
       database_url
@@ -62,7 +66,10 @@ if config_env() == :prod do
 
   maybe_ipv6 = if System.get_env("ECTO_IPV6") in ["true", "1"], do: [:inet6], else: []
 
-  db_ssl_verify = System.get_env("DB_SSL_VERIFY") || "none"
+  # DB SSL: default is peer verification when a CA bundle is available.
+  # Explicit DB_SSL_VERIFY=none still opts out. Unset is no longer treated as "none".
+  # Decision table is mirrored by VibeWeb.Endpoint.db_ssl_opts/2 (unit-tested).
+  db_ssl_verify = System.get_env("DB_SSL_VERIFY")
   db_cacertfile_env = System.get_env("DB_CACERTFILE")
 
   default_cacertfile =
@@ -76,16 +83,27 @@ if config_env() == :prod do
 
   db_cacertfile = db_cacertfile_env || default_cacertfile
 
+  db_ssl_verify_norm =
+    case db_ssl_verify do
+      nil -> nil
+      value when is_binary(value) -> String.downcase(String.trim(value))
+      _ -> nil
+    end
+
   ssl_opts =
-    case String.downcase(db_ssl_verify) do
+    case db_ssl_verify_norm do
       "none" ->
         [verify: :verify_none]
 
       _ ->
-        if is_binary(db_cacertfile) and db_cacertfile != "" do
+        if is_binary(db_cacertfile) and String.trim(db_cacertfile) != "" do
           [verify: :verify_peer, cacertfile: db_cacertfile]
         else
-          IO.warn("DB_SSL_VERIFY=peer but no CA bundle found; falling back to verify_none")
+          IO.warn(
+            "DB SSL peer verification requested (or defaulted) but no CA bundle found; " <>
+              "falling back to verify_none. Set DB_CACERTFILE or DB_SSL_VERIFY=none explicitly."
+          )
+
           [verify: :verify_none]
         end
     end

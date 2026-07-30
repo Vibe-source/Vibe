@@ -73,6 +73,15 @@ defmodule Vibe.AgentEventStreamTest do
 
       assert frame.text == ""
     end
+
+    test "rejects oversized stream frames before stream state is touched" do
+      assert {:error, :stream_payload_too_large} =
+               AgentEventRuntime.normalize_stream_params(%{
+                 "streamId" => "s",
+                 "seq" => 1,
+                 "text" => String.duplicate("x", 300_000)
+               })
+    end
   end
 
   # ── stream_frame_decision/2 ────────────────────────────────────────────────

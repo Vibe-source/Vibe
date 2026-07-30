@@ -48,4 +48,34 @@ defmodule Vibe.AgentEventAttachmentsTest do
     assert top["type"] == "image"
     assert nested["type"] == "html"
   end
+
+  test "drops malformed, unsafe, and overlong attachment URLs" do
+    long_url = "https://example.test/" <> String.duplicate("a", 2_100)
+
+    assert %{"items" => [kept]} =
+             AgentEventRuntime.normalize_event_attachments(%{
+               "attachments" => [
+                 "not-a-map",
+                 %{"url" => "file:///etc/passwd"},
+                 %{"url" => "javascript:alert(1)"},
+                 %{"url" => long_url},
+                 %{"url" => "https://example.test/safe.pdf"}
+               ]
+             })
+
+    assert kept["url"] == "https://example.test/safe.pdf"
+  end
+
+  test "caps normalized attachments to ten items" do
+    attachments =
+      for i <- 1..12 do
+        %{"url" => "https://example.test/#{i}.png"}
+      end
+
+    assert %{"items" => items} =
+             AgentEventRuntime.normalize_event_attachments(%{"attachments" => attachments})
+
+    assert length(items) == 10
+    assert List.last(items)["url"] == "https://example.test/10.png"
+  end
 end

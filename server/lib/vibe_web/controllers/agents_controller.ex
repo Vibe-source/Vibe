@@ -84,7 +84,10 @@ defmodule VibeWeb.AgentsController do
 
     case Agents.create_agent(owner_id, params) do
       {:ok, agent, secret} ->
-        json(conn, %{agent: Agents.agent_payload(agent, quota: Agents.quota_for_user(owner_id)), secret: secret})
+        json(conn, %{
+          agent: Agents.agent_payload(agent, quota: Agents.quota_for_user(owner_id)),
+          secret: secret
+        })
 
       {:error, :quota_exceeded} ->
         conn |> put_status(:forbidden) |> json(%{error: "Agent limit reached"})
@@ -125,8 +128,11 @@ defmodule VibeWeb.AgentsController do
          {:ok, updated} <- Agents.update_agent(agent, Map.delete(params, "id"), owner_id) do
       json(conn, Agents.agent_payload(updated, quota: Agents.quota_for_user(owner_id)))
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -137,13 +143,17 @@ defmodule VibeWeb.AgentsController do
          {:ok, updated} <- Agents.publish_agent(agent, owner_id) do
       json(conn, Agents.agent_payload(updated, quota: Agents.quota_for_user(owner_id)))
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
   def rotate_secret(conn, %{"id" => id} = params) do
     owner_id = conn.assigns.current_user.id
+
     # نبودِ این پارامتر یعنی ابطالِ فوری — حالتِ «کلیدم لو رفته».
     grace_hours = params["graceHours"] || params["grace_hours"]
 
@@ -185,8 +195,11 @@ defmodule VibeWeb.AgentsController do
          {:ok, _} <- Agents.archive_agent(agent, owner_id) do
       json(conn, %{success: true})
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -213,7 +226,7 @@ defmodule VibeWeb.AgentsController do
              external_user_id: params["externalUserId"] || params["external_user_id"],
              request_payload: Map.drop(params, ["identifier"]),
              response_payload: result,
-           status: "completed"
+             status: "completed"
            }) do
       Logger.info(
         "[AgentsController] invoke success " <>
@@ -250,11 +263,14 @@ defmodule VibeWeb.AgentsController do
 
         conn
         |> put_status(:unprocessable_entity)
-        |> json(%{error: "invalid_content", detail: inspect(reason)})
+        |> json(%{error: "invalid_content"})
 
       {:error, reason} ->
-        Logger.error("[AgentsController] invoke failed identifier=#{identifier} reason=#{inspect(reason)}")
-        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+        Logger.error(
+          "[AgentsController] invoke failed identifier=#{identifier} reason=#{inspect(reason)}"
+        )
+
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "request_failed"})
     end
   end
 
@@ -303,11 +319,18 @@ defmodule VibeWeb.AgentsController do
     owner_id = conn.assigns.current_user.id
 
     with %{} = agent <- Agents.get_agent(id, owner_id),
-         {:ok, integration, secret} <- Agents.create_integration(agent, Map.drop(params, ["id"]), owner_id) do
-      json(conn, %{integration: Agents.integration_payload(integration, latest_secret: secret), secret: secret})
+         {:ok, integration, secret} <-
+           Agents.create_integration(agent, Map.drop(params, ["id"]), owner_id) do
+      json(conn, %{
+        integration: Agents.integration_payload(integration, latest_secret: secret),
+        secret: secret
+      })
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -316,11 +339,19 @@ defmodule VibeWeb.AgentsController do
 
     with %{} = agent <- Agents.get_agent(id, owner_id),
          %{} = integration <- Agents.get_integration(agent, integration_id),
-         {:ok, updated} <- Agents.update_integration(integration, Map.drop(params, ["id", "integration_id"]), owner_id) do
+         {:ok, updated} <-
+           Agents.update_integration(
+             integration,
+             Map.drop(params, ["id", "integration_id"]),
+             owner_id
+           ) do
       json(conn, %{integration: Agents.integration_payload(updated)})
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Integration not found"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Integration not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -383,9 +414,14 @@ defmodule VibeWeb.AgentsController do
          {:ok, execution} <- AgentEventRuntime.execute_approved_task(agent, task) do
       json(conn, %{task: Agents.approval_task_payload(task), execution: execution})
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Task not found"})
-      {:error, :already_decided} -> conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Task not found"})
+
+      {:error, :already_decided} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -397,9 +433,14 @@ defmodule VibeWeb.AgentsController do
          {:ok, task} <- Agents.reject_task(agent, task_id, owner_id, note) do
       json(conn, %{task: Agents.approval_task_payload(task)})
     else
-      nil -> conn |> put_status(:not_found) |> json(%{error: "Task not found"})
-      {:error, :already_decided} -> conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "Task not found"})
+
+      {:error, :already_decided} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Task already decided"})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -447,9 +488,10 @@ defmodule VibeWeb.AgentsController do
 
   def ingest_event(conn, params) when is_map(params) do
     identifier = params["identifier"] || conn.path_params["identifier"]
+
     secret =
-      List.first(get_req_header(conn, "x-vibe-agent-secret"))
-      || List.first(get_req_header(conn, "x-vibe-integration-secret"))
+      List.first(get_req_header(conn, "x-vibe-agent-secret")) ||
+        List.first(get_req_header(conn, "x-vibe-integration-secret"))
 
     Logger.info(
       "[AgentsController] ingest_event start " <>
@@ -485,29 +527,57 @@ defmodule VibeWeb.AgentsController do
           conn |> put_status(:forbidden) |> json(%{error: "Agent unavailable"})
 
         {:error, :invalid_secret} ->
-          Logger.warning("[AgentsController] ingest_event invalid secret identifier=#{identifier}")
+          Logger.warning(
+            "[AgentsController] ingest_event invalid secret identifier=#{identifier}"
+          )
+
           conn |> put_status(:unauthorized) |> json(%{error: "Invalid secret"})
 
         {:error, :chat_not_attached} ->
-          Logger.warning("[AgentsController] ingest_event chat not attached identifier=#{identifier}")
+          Logger.warning(
+            "[AgentsController] ingest_event chat not attached identifier=#{identifier}"
+          )
+
           conn |> put_status(:forbidden) |> json(%{error: "Agent not attached to target chat"})
 
         # همان ردهٔ chat_not_attached است — ردِ مجوز، نه ورودیِ نامعتبر. بدون این
         # بند، اتم خام داخل بدنهٔ ۴۲۲ چاپ می‌شد.
         {:error, :event_trigger_not_enabled} ->
-          Logger.warning("[AgentsController] ingest_event trigger not enabled identifier=#{identifier}")
+          Logger.warning(
+            "[AgentsController] ingest_event trigger not enabled identifier=#{identifier}"
+          )
 
           conn
           |> put_status(:forbidden)
           |> json(%{error: "event_trigger_not_enabled"})
 
         {:error, :missing_destination_chat} ->
-          Logger.warning("[AgentsController] ingest_event missing destination chat identifier=#{identifier}")
+          Logger.warning(
+            "[AgentsController] ingest_event missing destination chat identifier=#{identifier}"
+          )
+
           conn |> put_status(:unprocessable_entity) |> json(%{error: "Missing destination chat"})
 
         {:error, :missing_event_type} ->
-          Logger.warning("[AgentsController] ingest_event missing event type identifier=#{identifier}")
+          Logger.warning(
+            "[AgentsController] ingest_event missing event type identifier=#{identifier}"
+          )
+
           conn |> put_status(:unprocessable_entity) |> json(%{error: "eventType is required"})
+
+        {:error, :event_payload_too_large} ->
+          Logger.warning(
+            "[AgentsController] ingest_event payload too large identifier=#{identifier}"
+          )
+
+          conn |> put_status(:payload_too_large) |> json(%{error: "event_payload_too_large"})
+
+        {:error, :stream_payload_too_large} ->
+          Logger.warning(
+            "[AgentsController] ingest_event stream payload too large identifier=#{identifier}"
+          )
+
+          conn |> put_status(:payload_too_large) |> json(%{error: "stream_payload_too_large"})
 
         {:error, {:invalid_content, reason}} ->
           Logger.warning(
@@ -516,11 +586,14 @@ defmodule VibeWeb.AgentsController do
 
           conn
           |> put_status(:unprocessable_entity)
-          |> json(%{error: "invalid_content", detail: inspect(reason)})
+          |> json(%{error: "invalid_content"})
 
         {:error, reason} ->
-          Logger.error("[AgentsController] ingest_event failed identifier=#{identifier} reason=#{inspect(reason)}")
-          conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+          Logger.error(
+            "[AgentsController] ingest_event failed identifier=#{identifier} reason=#{inspect(reason)}"
+          )
+
+          conn |> put_status(:unprocessable_entity) |> json(%{error: "event_ingest_failed"})
       end
     rescue
       exception ->
@@ -537,7 +610,9 @@ defmodule VibeWeb.AgentsController do
   defp bounded_integer(value, fallback, minimum, maximum) do
     parsed =
       cond do
-        is_integer(value) -> value
+        is_integer(value) ->
+          value
+
         is_binary(value) ->
           case Integer.parse(value) do
             {number, _} -> number
