@@ -17,7 +17,10 @@ defmodule Vibe.MusicUrlResolveTest do
   test "download_url_for_track_id prefers webpage_url for SoundCloud" do
     url =
       YtDlp.download_url_for_track_id("sc_12345",
-        links: %{"webpage_url" => "https://soundcloud.com/a/b", "soundcloud" => "https://soundcloud.com/a/b"},
+        links: %{
+          "webpage_url" => "https://soundcloud.com/a/b",
+          "soundcloud" => "https://soundcloud.com/a/b"
+        },
         source: "soundcloud"
       )
 
@@ -27,6 +30,15 @@ defmodule Vibe.MusicUrlResolveTest do
   test "download_url_for_track_id defaults YouTube watch URL" do
     assert YtDlp.download_url_for_track_id("dQw4w9WgXcQ") ==
              "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  end
+
+  test "safe_media_url rejects non-music and spoofed music hosts before yt-dlp runs" do
+    assert {:error, :host_not_allowed} = YtDlp.safe_media_url("https://example.com/audio")
+
+    assert {:error, :host_not_allowed} =
+             YtDlp.safe_media_url("https://soundcloud.com.evil.test/track")
+
+    assert {:error, :invalid_url} = YtDlp.safe_media_url("file:///etc/passwd")
   end
 
   test "search rejects empty params" do

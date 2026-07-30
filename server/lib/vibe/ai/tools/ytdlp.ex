@@ -12,7 +12,8 @@ defmodule Vibe.AI.Tools.YtDlp do
 
   require Logger
 
-  @timeout 30_000  # 30 seconds max per request (fast mode should be <5s)
+  # 30 seconds max per request (fast mode should be <5s)
+  @timeout 30_000
   @download_timeout 120_000
 
   @doc """
@@ -30,20 +31,26 @@ defmodule Vibe.AI.Tools.YtDlp do
     base_args = [
       "--no-download",
       "--print-json",
-      "--flat-playlist",  # Critical: only get metadata, no stream URLs
+      # Critical: only get metadata, no stream URLs
+      "--flat-playlist",
       "--no-warnings",
       "--ignore-errors",
-      "--extractor-retries", "2",
-      "--socket-timeout", "10",
-      "--user-agent", random_user_agent(),
-      "--referer", "https://www.youtube.com/"
+      "--extractor-retries",
+      "2",
+      "--socket-timeout",
+      "10",
+      "--user-agent",
+      random_user_agent(),
+      "--referer",
+      "https://www.youtube.com/"
     ]
 
     # Add cookies if available
-    args = case get_cookies_path() do
-      nil -> base_args ++ [search_query]
-      path -> base_args ++ ["--cookies", path, search_query]
-    end
+    args =
+      case get_cookies_path() do
+        nil -> base_args ++ [search_query]
+        path -> base_args ++ ["--cookies", path, search_query]
+      end
 
     case run_ytdlp(args) do
       {:ok, output} ->
@@ -66,18 +73,47 @@ defmodule Vibe.AI.Tools.YtDlp do
   def get_stream_url(video_id_or_url) do
     url = normalize_url(video_id_or_url)
 
-    base_args = [
-      "--no-download",
-      "--print-json",
-      # More flexible format: try audio formats, then any best format
-      "-f", "bestaudio/bestaudio*/best",
-      "--no-playlist",
-      "--no-warnings",
-      "--extractor-retries", "3",
-      "--user-agent", random_user_agent(),
-      "--referer", referer_for(url),
-      "--add-header", "Accept-Language:en-US,en;q=0.9"
-    ] ++ player_client_args()
+    # SECURITY (SSRF): yt-dlp will HTTP-GET whatever URL we hand it. Any external
+    # URL must be a known music host AND must not resolve to a private/link-local
+    # address, or a caller could turn this into a server-side request to internal
+    # services / cloud metadata (169.254.169.254). Bare ids / youtube-built URLs
+    # skip the check (they are not attacker-chosen hosts). See safe_media_url/1.
+    if String.starts_with?(url, "http") do
+      case safe_media_url(url) do
+        {:ok, _} ->
+          do_get_stream_url(url)
+
+        {:error, reason} ->
+          Logger.warning(
+            "[YtDlp] blocked non-music/unsafe URL host=#{inspect(safe_host(url))} reason=#{inspect(reason)}"
+          )
+
+          {:error, "unsupported_or_unsafe_url"}
+      end
+    else
+      do_get_stream_url(url)
+    end
+  end
+
+  defp do_get_stream_url(url) do
+    base_args =
+      [
+        "--no-download",
+        "--print-json",
+        # More flexible format: try audio formats, then any best format
+        "-f",
+        "bestaudio/bestaudio*/best",
+        "--no-playlist",
+        "--no-warnings",
+        "--extractor-retries",
+        "3",
+        "--user-agent",
+        random_user_agent(),
+        "--referer",
+        referer_for(url),
+        "--add-header",
+        "Accept-Language:en-US,en;q=0.9"
+      ] ++ player_client_args()
 
     args =
       case get_cookies_path() do
@@ -114,7 +150,8 @@ defmodule Vibe.AI.Tools.YtDlp do
   def music_page_url?(value) when is_binary(value) do
     trimmed = String.trim(value)
 
-    with true <- String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://"),
+    with true <-
+           String.starts_with?(trimmed, "http://") or String.starts_with?(trimmed, "https://"),
          %URI{host: host} when is_binary(host) <- URI.parse(trimmed) do
       host = String.downcase(host)
 
@@ -132,6 +169,49 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
 
   def music_page_url?(_), do: false
+
+  # Hosts yt-dlp is allowed to fetch. Kept in parity with music_page_url?/1 so no
+  # source that path recognizes is newly rejected. Suffix-matched strictly (host
+  # == domain or ends with ".<domain>") — NOT String.contains?, which would let
+  # `soundcloud.com.evil.com` through.
+  @music_hosts ~w(
+    soundcloud.com youtube.com youtu.be bandcamp.com vimeo.com mixcloud.com
+  )
+
+  @doc """
+  SSRF gate for any URL handed to yt-dlp. `{:ok, url}` only when the URL is
+  http(s), on a known music host, AND does not resolve to a private/link-local
+  address (`Vibe.Net.SafeURL`). Everything else is `{:error, reason}`.
+  """
+  def safe_media_url(url) when is_binary(url) do
+    trimmed = String.trim(url)
+
+    with %URI{scheme: scheme, host: host}
+         when scheme in ["http", "https"] and is_binary(host) and host != "" <-
+           URI.parse(trimmed),
+         true <- allowed_music_host?(host),
+         {:ok, _} <- Vibe.Net.SafeURL.validate(trimmed) do
+      {:ok, trimmed}
+    else
+      {:error, reason} -> {:error, reason}
+      false -> {:error, :host_not_allowed}
+      _ -> {:error, :invalid_url}
+    end
+  end
+
+  def safe_media_url(_), do: {:error, :invalid_url}
+
+  defp allowed_music_host?(host) do
+    h = host |> String.downcase() |> String.trim_trailing(".")
+    Enum.any?(@music_hosts, fn d -> h == d or String.ends_with?(h, "." <> d) end)
+  end
+
+  defp safe_host(url) do
+    case URI.parse(url) do
+      %URI{host: host} -> host
+      _ -> nil
+    end
+  end
 
   @doc """
   Best URL to hand yt-dlp for a cached track id (YouTube id, sc_*, or stored webpage).
@@ -178,25 +258,34 @@ defmodule Vibe.AI.Tools.YtDlp do
     # Direct search with full extraction
     search_query = "ytsearch#{limit}:#{query}"
 
-    base_args = [
-      "--no-download",
-      "--print-json",
-      # More flexible format: try audio formats, then any best format
-      "-f", "bestaudio/bestaudio*/best",
-      "--no-warnings",
-      "--ignore-errors",
-      "--extractor-retries", "3",
-      "--sleep-requests", "1",
-      "--user-agent", random_user_agent(),
-      "--referer", "https://www.youtube.com/",
-      "--add-header", "Accept-Language:en-US,en;q=0.9",
-      "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    ] ++ player_client_args()
+    base_args =
+      [
+        "--no-download",
+        "--print-json",
+        # More flexible format: try audio formats, then any best format
+        "-f",
+        "bestaudio/bestaudio*/best",
+        "--no-warnings",
+        "--ignore-errors",
+        "--extractor-retries",
+        "3",
+        "--sleep-requests",
+        "1",
+        "--user-agent",
+        random_user_agent(),
+        "--referer",
+        "https://www.youtube.com/",
+        "--add-header",
+        "Accept-Language:en-US,en;q=0.9",
+        "--add-header",
+        "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      ] ++ player_client_args()
 
-    args = case get_cookies_path() do
-      nil -> base_args ++ [search_query]
-      path -> base_args ++ ["--cookies", path, search_query]
-    end
+    args =
+      case get_cookies_path() do
+        nil -> base_args ++ [search_query]
+        path -> base_args ++ ["--cookies", path, search_query]
+      end
 
     case run_ytdlp(args) do
       {:ok, output} ->
@@ -375,10 +464,11 @@ defmodule Vibe.AI.Tools.YtDlp do
     |> Enum.map(fn line ->
       case Jason.decode(line) do
         {:ok, data} ->
-          thumbnail = case data["thumbnail"] do
-            nil -> get_best_thumbnail(data["thumbnails"])
-            url -> url
-          end
+          thumbnail =
+            case data["thumbnail"] do
+              nil -> get_best_thumbnail(data["thumbnails"])
+              url -> url
+            end
 
           %{
             video_id: data["id"],
@@ -387,8 +477,10 @@ defmodule Vibe.AI.Tools.YtDlp do
             duration: format_duration(data["duration"]),
             duration_seconds: data["duration"],
             cover: thumbnail,
-            stream_url: data["url"],  # Direct audio stream URL
-            preview_url: data["url"], # Same as stream for full audio
+            # Direct audio stream URL
+            stream_url: data["url"],
+            # Same as stream for full audio
+            preview_url: data["url"],
             links: %{
               youtube: "https://www.youtube.com/watch?v=#{data["id"]}",
               youtube_music: "https://music.youtube.com/watch?v=#{data["id"]}"
@@ -404,6 +496,7 @@ defmodule Vibe.AI.Tools.YtDlp do
 
   defp get_best_thumbnail(nil), do: nil
   defp get_best_thumbnail([]), do: nil
+
   defp get_best_thumbnail(thumbnails) do
     # Prefer medium/high quality
     Enum.find(thumbnails, fn t -> t["height"] && t["height"] >= 360 end)
@@ -415,6 +508,7 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
 
   defp extract_formats(nil), do: []
+
   defp extract_formats(formats) do
     formats
     |> Enum.filter(fn f -> f["acodec"] && f["acodec"] != "none" end)
@@ -485,14 +579,27 @@ defmodule Vibe.AI.Tools.YtDlp do
 
   defp source_from_extractor(extractor, webpage) do
     cond do
-      String.contains?(extractor, "soundcloud") -> "soundcloud"
-      String.contains?(extractor, "youtube") -> "youtube"
-      is_binary(webpage) and String.contains?(webpage, "soundcloud.com") -> "soundcloud"
-      is_binary(webpage) and (String.contains?(webpage, "youtube.com") or String.contains?(webpage, "youtu.be")) ->
+      String.contains?(extractor, "soundcloud") ->
+        "soundcloud"
+
+      String.contains?(extractor, "youtube") ->
         "youtube"
-      String.contains?(extractor, "bandcamp") -> "bandcamp"
-      String.contains?(extractor, "vimeo") -> "vimeo"
-      true -> "web"
+
+      is_binary(webpage) and String.contains?(webpage, "soundcloud.com") ->
+        "soundcloud"
+
+      is_binary(webpage) and
+          (String.contains?(webpage, "youtube.com") or String.contains?(webpage, "youtu.be")) ->
+        "youtube"
+
+      String.contains?(extractor, "bandcamp") ->
+        "bandcamp"
+
+      String.contains?(extractor, "vimeo") ->
+        "vimeo"
+
+      true ->
+        "web"
     end
   end
 
@@ -544,6 +651,7 @@ defmodule Vibe.AI.Tools.YtDlp do
   end
 
   defp format_duration(nil), do: "0:00"
+
   defp format_duration(seconds) when is_number(seconds) do
     seconds = round(seconds)
     hours = div(seconds, 3600)
@@ -556,6 +664,7 @@ defmodule Vibe.AI.Tools.YtDlp do
       "#{minutes}:#{String.pad_leading("#{secs}", 2, "0")}"
     end
   end
+
   defp format_duration(_), do: "0:00"
 
   @doc """
@@ -566,10 +675,14 @@ defmodule Vibe.AI.Tools.YtDlp do
   def hardening_args do
     base =
       [
-        "--extractor-retries", "3",
-        "--user-agent", random_user_agent(),
-        "--referer", "https://www.youtube.com/",
-        "--add-header", "Accept-Language:en-US,en;q=0.9"
+        "--extractor-retries",
+        "3",
+        "--user-agent",
+        random_user_agent(),
+        "--referer",
+        "https://www.youtube.com/",
+        "--add-header",
+        "Accept-Language:en-US,en;q=0.9"
       ] ++ player_client_args()
 
     case get_cookies_path() do
@@ -613,6 +726,7 @@ defmodule Vibe.AI.Tools.YtDlp do
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ]
+
     Enum.random(agents)
   end
 
@@ -620,7 +734,9 @@ defmodule Vibe.AI.Tools.YtDlp do
   defp get_cookies_path do
     # 1. Try to generate from content env var (most reliable)
     case System.get_env("YTDLP_COOKIES_CONTENT") do
-      nil -> check_existing_paths()
+      nil ->
+        check_existing_paths()
+
       content ->
         path = "/tmp/cookies.txt"
         File.write!(path, content)
@@ -634,6 +750,7 @@ defmodule Vibe.AI.Tools.YtDlp do
         # Check default locations
         default_path = "/app/cookies.txt"
         if File.exists?(default_path), do: default_path, else: nil
+
       path ->
         if File.exists?(path), do: path, else: nil
     end

@@ -128,7 +128,9 @@ defmodule VibeWeb.MusicController do
       {:error, "Missing SoundCloud source URL in cache"}
     else
       case YtDlp.get_stream_url(source) do
-        {:ok, %{stream_url: url}} when not is_nil(url) and url != "" -> {:ok, url}
+        {:ok, %{stream_url: url}} when not is_nil(url) and url != "" ->
+          {:ok, url}
+
         # Some extractors put the playable URL on the track map root as :stream_url only
         {:ok, track} when is_map(track) ->
           url = track[:stream_url] || track[:preview_url] || track["stream_url"] || track["url"]
@@ -265,6 +267,19 @@ defmodule VibeWeb.MusicController do
   end
 
   defp do_download_and_upload(video_id, source_url, temp_path, remote_path) do
+    # SECURITY (SSRF, defense in depth): the resolve path already gates URLs, but
+    # the cache-fill download runs yt-dlp directly, so re-check any external URL
+    # here too. A bare YouTube id / non-http source falls through untouched.
+    if is_binary(source_url) and String.starts_with?(source_url, "http") and
+         match?({:error, _}, YtDlp.safe_media_url(source_url)) do
+      Logger.warning("[MusicController] blocked unsafe download source for #{video_id}")
+      {:error, "unsupported_or_unsafe_url"}
+    else
+      do_download_and_upload_checked(video_id, source_url, temp_path, remote_path)
+    end
+  end
+
+  defp do_download_and_upload_checked(video_id, source_url, temp_path, remote_path) do
     Logger.info("[MusicController] yt-dlp download source=#{source_url}")
 
     # Use yt-dlp to download the audio file
@@ -345,31 +360,43 @@ defmodule VibeWeb.MusicController do
       nil ->
         # Create new entry
         %MusicCache{}
-        |> Ecto.Changeset.cast(%{
-          video_id: video_id,
-          title: video_id,
-          query: video_id,
-          query_hash: hash_string(video_id),
-          cached_file_path: url,
-          file_size_bytes: size,
-          cached_at: now,
-          stream_expires_at: nil
-        }, [
-          :video_id, :title, :query, :query_hash, :cached_file_path,
-          :file_size_bytes, :cached_at, :stream_expires_at
-        ])
+        |> Ecto.Changeset.cast(
+          %{
+            video_id: video_id,
+            title: video_id,
+            query: video_id,
+            query_hash: hash_string(video_id),
+            cached_file_path: url,
+            file_size_bytes: size,
+            cached_at: now,
+            stream_expires_at: nil
+          },
+          [
+            :video_id,
+            :title,
+            :query,
+            :query_hash,
+            :cached_file_path,
+            :file_size_bytes,
+            :cached_at,
+            :stream_expires_at
+          ]
+        )
         |> Repo.insert()
         |> log_result("Created")
 
       entry ->
         # Update existing
         entry
-        |> Ecto.Changeset.cast(%{
-          cached_file_path: url,
-          file_size_bytes: size,
-          cached_at: now,
-          stream_expires_at: nil
-        }, [:cached_file_path, :file_size_bytes, :cached_at, :stream_expires_at])
+        |> Ecto.Changeset.cast(
+          %{
+            cached_file_path: url,
+            file_size_bytes: size,
+            cached_at: now,
+            stream_expires_at: nil
+          },
+          [:cached_file_path, :file_size_bytes, :cached_at, :stream_expires_at]
+        )
         |> Repo.update()
         |> log_result("Updated")
     end
@@ -382,5 +409,7 @@ defmodule VibeWeb.MusicController do
   end
 
   defp log_result({:ok, _}, action), do: Logger.info("[MusicController] #{action} cache entry")
-  defp log_result({:error, changeset}, action), do: Logger.error("[MusicController] Failed to #{action}: #{inspect(changeset.errors)}")
+
+  defp log_result({:error, changeset}, action),
+    do: Logger.error("[MusicController] Failed to #{action}: #{inspect(changeset.errors)}")
 end

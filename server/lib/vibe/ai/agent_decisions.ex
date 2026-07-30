@@ -694,13 +694,26 @@ defmodule Vibe.AI.AgentDecisions do
     event = task.event_id && Repo.get(AgentEvent, task.event_id)
     thread = task.thread_id && Repo.get(AgentEventThread, task.thread_id)
 
+    # Echo the original event's payload so any integration can act without a
+    # second lookup. This is intentionally generic (not Leorre-shaped): claim
+    # ids, order refs, runbook keys all ride through as the sender declared them.
+    event_payload =
+      case event do
+        %AgentEvent{payload: payload} when is_map(payload) -> payload
+        _ -> %{}
+      end
+
     body = %{
       "type" => "decision.action",
       "taskId" => task.id,
       "eventId" => task.event_id,
+      "sourceEventId" => event && event.event_id,
       "threadId" => task.thread_id,
       "threadKey" => thread && thread.thread_key,
       "eventType" => event && event.event_type,
+      "source" => event && event.source,
+      "title" => event && event.title,
+      "data" => event_payload,
       "actionId" => action.action_id,
       "actionLabel" => action.label,
       "actionMode" => task.action_mode,

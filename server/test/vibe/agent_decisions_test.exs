@@ -160,6 +160,11 @@ defmodule Vibe.AgentDecisionsTest do
       assert delivery.target_url == ctx.agent.callback_url
       assert delivery.request_body["actionId"] == "approve"
       assert delivery.request_body["type"] == "decision.action"
+      # Original event payload is echoed so the integration can act without a re-fetch.
+      assert delivery.request_body["data"]["service"] == "api-gateway"
+      assert delivery.request_body["data"]["version"] == "v2.4.1"
+      assert delivery.request_body["sourceEventId"]
+      assert delivery.request_body["threadKey"]
     end
 
     test "one-shot race: exactly one of two concurrent claims wins", ctx do
@@ -266,6 +271,11 @@ defmodule Vibe.AgentDecisionsTest do
         "title" => "Deploy api-gateway v2.4.1?",
         "body" => "12 commits, 3 migrations.",
         "destinationChatId" => ctx.chat_id,
+        "data" => %{
+          "service" => "api-gateway",
+          "version" => "v2.4.1",
+          "request_id" => "req-#{event_id}"
+        },
         "actions" => [
           %{"id" => "approve", "label" => "Approve", "style" => "primary"},
           %{
