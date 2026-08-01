@@ -4425,7 +4425,16 @@ defmodule Vibe.AI.LocalAgentWorker do
           }
 
           VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
-          notify_chat_participants(chat_id, agent_user_id, message_id, timestamp, plain_text)
+
+          notify_chat_participants(
+            chat_id,
+            agent_user_id,
+            message_id,
+            timestamp,
+            plain_text,
+            payload
+          )
+
           {:ok, %{message_id: message_id, timestamp: timestamp}}
 
         error ->
@@ -4506,7 +4515,17 @@ defmodule Vibe.AI.LocalAgentWorker do
     _ -> :ok
   end
 
-  defp notify_chat_participants(chat_id, agent_user_id, message_id, timestamp, body) do
+  defp notify_chat_participants(
+         chat_id,
+         agent_user_id,
+         message_id,
+         timestamp,
+         body,
+         message_payload
+       ) do
+    # Built once and reused for every recipient's user-topic mirror.
+    mirrored_message = Chat.mirrored_message_payload(message_payload)
+
     Chat.get_all_participant_settings(chat_id)
     |> Enum.each(fn participant ->
       if participant.user_id != agent_user_id do
@@ -4517,7 +4536,8 @@ defmodule Vibe.AI.LocalAgentWorker do
           from_id: agent_user_id,
           message_id: message_id,
           timestamp: timestamp,
-          muted: participant.muted || false
+          muted: participant.muted || false,
+          message: mirrored_message
         })
 
         if not participant.muted do

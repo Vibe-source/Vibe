@@ -85,11 +85,21 @@ defmodule VibeWeb.ChatController do
 
     case Chat.delete_message(chat_id, message_id, user_id, for_everyone) do
       {:ok, _message} ->
-        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-deleted", %{
+        mutation_payload = %{
+          chatId: chat_id,
           messageId: message_id,
           deletedBy: user_id,
           forEveryone: for_everyone
-        })
+        }
+
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-deleted", mutation_payload)
+
+        Chat.broadcast_user_chat_event(
+          chat_id,
+          "message-deleted",
+          mutation_payload,
+          if(for_everyone, do: nil, else: [user_id])
+        )
 
         json(conn, %{success: true, messageId: message_id, forEveryone: for_everyone})
 
@@ -255,6 +265,7 @@ defmodule VibeWeb.ChatController do
 
   def delete(conn, %{"chat_id" => chat_id} = params) do
     user_id = conn.assigns.current_user.id
+
     delete_for_everyone =
       truthy?(
         params["deleteForEveryone"] || params["delete_for_everyone"] || params["forEveryone"] ||
@@ -264,13 +275,25 @@ defmodule VibeWeb.ChatController do
     if Chat.is_participant?(chat_id, user_id) do
       case Chat.delete_chat(chat_id, user_id, delete_for_everyone: delete_for_everyone) do
         {:ok, result} ->
+          Chat.broadcast_user_chat_event(
+            chat_id,
+            "chat-deleted",
+            %{
+              chatId: chat_id,
+              deletedBy: user_id,
+              forEveryone: result.for_everyone
+            },
+            result.target_user_ids
+          )
+
           json(conn, %{
             success: true,
             deleteForEveryone: result.for_everyone,
             deletedCount: result.deleted_count
           })
 
-        {:error, reason} -> conn |> put_status(400) |> json(%{error: reason})
+        {:error, reason} ->
+          conn |> put_status(400) |> json(%{error: reason})
       end
     else
       conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})

@@ -100,15 +100,21 @@ defmodule Vibe.AI.Tools.Channel do
 
         case Chat.add_message(message_attrs) do
           {:ok, _msg} ->
-            # Broadcast to channel subscribers
-            VibeWeb.Endpoint.broadcast!("chat:#{channel_id}", "message", %{
+            broadcast_payload = %{
               "id" => message_id,
               "fromId" => user_id,
+              "chatId" => channel_id,
               "encryptedContent" => content,
               "type" => type,
               "mediaUrl" => media_url,
               "timestamp" => timestamp
-            })
+            }
+
+            # Broadcast to channel subscribers
+            VibeWeb.Endpoint.broadcast!("chat:#{channel_id}", "message", broadcast_payload)
+
+            # Built once and reused for every recipient's user-topic mirror.
+            mirrored_message = Chat.mirrored_message_payload(broadcast_payload)
 
             # Notify subscribers
             Chat.get_participant_ids(channel_id)
@@ -118,7 +124,8 @@ defmodule Vibe.AI.Tools.Channel do
                   chat_id: channel_id,
                   from_id: user_id,
                   message_id: message_id,
-                  timestamp: timestamp
+                  timestamp: timestamp,
+                  message: mirrored_message
                 })
 
                 _ =
@@ -204,7 +211,7 @@ defmodule Vibe.AI.Tools.Channel do
         }
 
         VibeWeb.Endpoint.broadcast!("chat:#{channel_id}", "message", payload)
-        notify_channel_participants(channel_id, sender_id, message_id, timestamp)
+        notify_channel_participants(channel_id, sender_id, message_id, timestamp, payload)
 
         %{
           "ok" => true,
@@ -218,7 +225,10 @@ defmodule Vibe.AI.Tools.Channel do
     end
   end
 
-  defp notify_channel_participants(channel_id, sender_id, message_id, timestamp) do
+  defp notify_channel_participants(channel_id, sender_id, message_id, timestamp, message_payload) do
+    # Built once and reused for every recipient's user-topic mirror.
+    mirrored_message = Chat.mirrored_message_payload(message_payload)
+
     Chat.get_participant_ids(channel_id)
     |> Enum.each(fn participant_id ->
       if participant_id != sender_id do
@@ -226,7 +236,8 @@ defmodule Vibe.AI.Tools.Channel do
           chat_id: channel_id,
           from_id: sender_id,
           message_id: message_id,
-          timestamp: timestamp
+          timestamp: timestamp,
+          message: mirrored_message
         })
 
         _ =
@@ -488,7 +499,7 @@ defmodule Vibe.AI.Tools.Channel do
   # actually paste anywhere — always quote that one, never the relative path.
   defp room_result(room, agent, current_agent_id) do
     share_path = room[:shareLink] || room["shareLink"]
-    share_url = (room[:shareUrl] || room["shareUrl"]) || Vibe.Links.room_url(share_path)
+    share_url = room[:shareUrl] || room["shareUrl"] || Vibe.Links.room_url(share_path)
 
     %{
       "ok" => true,
@@ -504,7 +515,7 @@ defmodule Vibe.AI.Tools.Channel do
   defp canonical_tool_room(room) when is_map(room) do
     chat_id = room[:chatId] || room["chatId"]
     share_path = room[:shareLink] || room["shareLink"]
-    share_url = (room[:shareUrl] || room["shareUrl"]) || Vibe.Links.room_url(share_path)
+    share_url = room[:shareUrl] || room["shareUrl"] || Vibe.Links.room_url(share_path)
 
     %{
       "chat_id" => chat_id,
@@ -674,6 +685,7 @@ defmodule Vibe.AI.Tools.Channel do
 
   defp error_message(:slug_unavailable),
     do: "That public link is already taken. Ask the owner for a different channel link."
+
   defp error_message(:invalid_name), do: "Room name is required."
   defp error_message(:invalid_chat_id), do: "Chat id is required."
   defp error_message(:invalid_member_ids), do: "member_ids contains an unknown user."

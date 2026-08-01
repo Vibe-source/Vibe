@@ -39,6 +39,64 @@ defmodule Vibe.Chat do
   @history_default_limit 30
   @history_max_limit 100
 
+  # Sealed/base64 blob fields that exist only for the open chat surface. They are the
+  # reason a mirror of the message payload cannot simply be the payload: one of these
+  # can be hundreds of kilobytes, and the mirror is sent once per participant.
+  @mirror_dropped_keys [
+    "agentBridgeAttachmentsEnc",
+    "attachmentThumbnailsB64",
+    :agentBridgeAttachmentsEnc,
+    :attachmentThumbnailsB64
+  ]
+  # Hard ceiling on one mirrored message. The mirror is fanned out once per participant,
+  # so a single oversized payload in a large room is multiplied by the room. Anything
+  # above this is simply not mirrored and the client falls back to its list refresh —
+  # slower for that one message, but never a fan-out amplifier.
+  @mirror_max_bytes 16_384
+
+  @doc """
+  Compact copy of a chat-topic `message` payload, for the per-user `new_message` mirror.
+
+  A device joins a chat's realtime topic only while that chat is on screen, so the
+  user-topic `new_message` ping is all a backgrounded chat list ever sees. Historically
+  it carried nothing but ids, so the client could not project the new message and had to
+  re-fetch the whole chat list before Home (and therefore the first frame of the opened
+  conversation) knew about it. Carrying the message itself makes that projection real
+  and immediate.
+
+  Everything the conversation needs on its first frame is preserved — text/ciphertext,
+  type, media url, reply target, agent identity, `thumbnailBase64` micro-thumb — while
+  the heavy sealed blobs are dropped and anything still over `@mirror_max_bytes` is
+  refused. Returns `nil` for a non-map, an oversized payload, or one JSON cannot encode,
+  so callers can omit the key and clients fall back to the previous refresh path.
+
+  Call it ONCE per message, not once per recipient.
+  """
+  def mirrored_message_payload(payload) when is_map(payload) do
+    compacted =
+      payload
+      |> Map.drop(@mirror_dropped_keys)
+      |> compact_mirrored_metadata("metadata")
+      |> compact_mirrored_metadata(:metadata)
+
+    case Jason.encode(compacted) do
+      {:ok, encoded} when byte_size(encoded) <= @mirror_max_bytes -> compacted
+      _ -> nil
+    end
+  end
+
+  def mirrored_message_payload(_payload), do: nil
+
+  defp compact_mirrored_metadata(payload, key) do
+    case Map.get(payload, key) do
+      metadata when is_map(metadata) ->
+        Map.put(payload, key, Map.drop(metadata, @mirror_dropped_keys))
+
+      _ ->
+        payload
+    end
+  end
+
   def save_message(attrs) do
     if content_copy_restricted?(attrs) do
       {:error, :content_saving_restricted}
@@ -115,6 +173,58 @@ defmodule Vibe.Chat do
 
   def get_all_participant_settings(chat_id) do
     Repo.all(from(p in Participant, where: p.chat_id == ^chat_id))
+  end
+
+  @doc false
+  def broadcast_user_chat_event(chat_id, event, payload, user_ids \\ nil)
+      when is_binary(chat_id) and is_binary(event) and is_map(payload) do
+    recipients =
+      case user_ids do
+        ids when is_list(ids) -> ids
+        _ -> get_participant_ids(chat_id)
+      end
+
+    payload =
+      if Map.has_key?(payload, :chatId) or Map.has_key?(payload, "chatId") or
+           Map.has_key?(payload, :chat_id) or Map.has_key?(payload, "chat_id") do
+        payload
+      else
+        Map.put(payload, :chatId, chat_id)
+      end
+
+    recipients
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.each(fn user_id ->
+      VibeWeb.Endpoint.broadcast!("user:#{user_id}", event, payload)
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def broadcast_message_receipt(chat_id, message_id, actor_id, status)
+      when status in ["delivered", "read"] do
+    case get_message(chat_id, message_id, actor_id) do
+      %Message{from_id: sender_id}
+      when is_binary(sender_id) and sender_id != "" and sender_id != actor_id ->
+        broadcast_user_chat_event(
+          chat_id,
+          "message-#{status}",
+          %{
+            chatId: chat_id,
+            messageId: message_id,
+            readerId: actor_id,
+            status: status
+          },
+          [sender_id]
+        )
+
+      _ ->
+        :ok
+    end
   end
 
   def list_chats(user_id, opts \\ []) do
@@ -584,8 +694,10 @@ defmodule Vibe.Chat do
 
     is_forwarded =
       meta["isForwarded"] == true or meta["is_forwarded"] == true or
-        present_string(meta["forwardedFromUserId"] || meta["forwarded_from_user_id"] ||
-          meta["forwardedFromMessageId"] || meta["forwarded_from_message_id"]) != nil
+        present_string(
+          meta["forwardedFromUserId"] || meta["forwarded_from_user_id"] ||
+            meta["forwardedFromMessageId"] || meta["forwarded_from_message_id"]
+        ) != nil
 
     author_id =
       present_string(
@@ -1149,7 +1261,13 @@ defmodule Vibe.Chat do
                ) do
             {count, _} when count > 0 ->
               ChatHomeCache.invalidate_users(target_user_ids)
-              {:ok, %{deleted_count: count, for_everyone: delete_for_everyone}}
+
+              {:ok,
+               %{
+                 deleted_count: count,
+                 for_everyone: delete_for_everyone,
+                 target_user_ids: target_user_ids
+               }}
 
             {0, _} ->
               {:error, "Chat not found"}
@@ -1530,13 +1648,17 @@ defmodule Vibe.Chat do
 
           VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", broadcast_payload)
 
+          # Built once and reused for every recipient's user-topic mirror.
+          mirrored_message = mirrored_message_payload(broadcast_payload)
+
           Enum.each(group_member_ids(chat_id), fn uid ->
             VibeWeb.Endpoint.broadcast!("user:#{uid}", "new_message", %{
               chat_id: chat_id,
               from_id: actor_id,
               message_id: msg_id,
               timestamp: ts,
-              type: "system"
+              type: "system",
+              message: mirrored_message
             })
           end)
 
@@ -2453,9 +2575,14 @@ defmodule Vibe.Chat do
 
   defp room_share_url(room, share_link) do
     cond do
-      is_binary(share_link) -> Vibe.Links.room_url(share_link)
-      room.type == "channel" and is_binary(room.public_slug) -> Vibe.Links.room_url("/r/#{room.public_slug}")
-      true -> nil
+      is_binary(share_link) ->
+        Vibe.Links.room_url(share_link)
+
+      room.type == "channel" and is_binary(room.public_slug) ->
+        Vibe.Links.room_url("/r/#{room.public_slug}")
+
+      true ->
+        nil
     end
   end
 
@@ -3182,6 +3309,9 @@ defmodule Vibe.Chat do
   end
 
   defp normalize_actor_id(_), do: nil
+
+  @doc false
+  def client_message_payload(message), do: to_client_message(message)
 
   defp to_client_message(nil), do: nil
 

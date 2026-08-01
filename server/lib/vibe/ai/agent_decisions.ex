@@ -944,7 +944,8 @@ defmodule Vibe.AI.AgentDecisions do
                })
                |> Repo.update() do
             {:ok, updated} ->
-              VibeWeb.Endpoint.broadcast!("chat:#{task.chat_id}", "message-edited", %{
+              mutation_payload = %{
+                chatId: task.chat_id,
                 messageId: updated.id,
                 encryptedContent: body || "",
                 editedAt: edited_at,
@@ -952,8 +953,24 @@ defmodule Vibe.AI.AgentDecisions do
                 plainContent: body,
                 plaintext: body,
                 metadata: metadata,
-                type: updated.type
-              })
+                type: updated.type,
+                message:
+                  updated
+                  |> Chat.client_message_payload()
+                  |> Chat.mirrored_message_payload()
+              }
+
+              VibeWeb.Endpoint.broadcast!(
+                "chat:#{task.chat_id}",
+                "message-edited",
+                mutation_payload
+              )
+
+              Chat.broadcast_user_chat_event(
+                task.chat_id,
+                "message-edited",
+                mutation_payload
+              )
 
               :ok
 

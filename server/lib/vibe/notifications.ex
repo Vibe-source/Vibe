@@ -45,6 +45,35 @@ defmodule Vibe.Notifications do
     |> Map.fetch!("enabled")
   end
 
+  @doc """
+  Collapse identity for one alert push.
+
+  APNs reads `apns-collapse-id` as "this notification REPLACES any pending or already
+  displayed notification carrying the same id". Keying it on the chat meant every new
+  message erased the previous one, so a chat that emits several events/summaries could
+  only ever show its newest item. Keying it on the message keeps distinct items on the
+  lock screen while a re-delivery of the SAME logical item still replaces itself rather
+  than duplicating. Grouping is the notification extension's `threadIdentifier`
+  (`chat-<chatId>`), which stacks them per chat without discarding any.
+
+  Returns `""` when the sender supplied no message id; the caller drops empty headers,
+  which means "never collapse" — still safer than collapsing unrelated messages.
+  """
+  @apns_collapse_id_max_bytes 64
+  def push_collapse_id(data) when is_map(data) do
+    (Map.get(data, :messageId) || Map.get(data, "messageId") || Map.get(data, :message_id) ||
+       Map.get(data, "message_id"))
+    |> to_string()
+    |> String.trim()
+    |> binary_part_prefix(@apns_collapse_id_max_bytes)
+  end
+
+  def push_collapse_id(_), do: ""
+
+  defp binary_part_prefix(value, max_bytes) when is_binary(value) do
+    if byte_size(value) <= max_bytes, do: value, else: binary_part(value, 0, max_bytes)
+  end
+
   def send_incoming_call_push(to_user_id, payload)
       when is_binary(to_user_id) and is_map(payload) do
     with to_user when not is_nil(to_user) <- Accounts.get_user(to_user_id),
@@ -497,7 +526,7 @@ defmodule Vibe.Notifications do
           {"apns-priority", "10"},
           {"apns-topic", config.topic},
           {"apns-expiration", "0"},
-          {"apns-collapse-id", Map.get(data, :chatId, "") |> to_string()}
+          {"apns-collapse-id", push_collapse_id(data)}
         ]
         |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
 

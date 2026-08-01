@@ -350,9 +350,17 @@ defmodule Vibe.AI.AgentEventRuntime do
              content: content_meta,
              edited_at: edited_at
            ) do
-        {:ok, _message} ->
+        {:ok, message} ->
           stream_put(key, %{next_state | message_id: message_id})
-          broadcast_stream_edited(agent, frame.destination_chat_id, message_id, text, edited_at)
+
+          broadcast_stream_edited(
+            agent,
+            frame.destination_chat_id,
+            message_id,
+            text,
+            edited_at,
+            message
+          )
 
           result = %{
             success: true,
@@ -451,17 +459,23 @@ defmodule Vibe.AI.AgentEventRuntime do
 
   # Mirror chat_channel.ex ~555 message-edited payload, plus agent plain-text
   # fields so clients that hydrate agent rows from plainContent keep working.
-  defp broadcast_stream_edited(agent, chat_id, message_id, plain_text, edited_at) do
+  defp broadcast_stream_edited(agent, chat_id, message_id, plain_text, edited_at, message) do
     payload = %{
+      chatId: chat_id,
       messageId: message_id,
       encryptedContent: plain_text || "",
       editedAt: edited_at,
       editedBy: agent.agent_user_id,
       plainContent: plain_text,
-      plaintext: plain_text
+      plaintext: plain_text,
+      message:
+        message
+        |> Chat.client_message_payload()
+        |> Chat.mirrored_message_payload()
     }
 
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-edited", payload)
+    Chat.broadcast_user_chat_event(chat_id, "message-edited", payload)
   end
 
   defp stream_state_key(agent_id, stream_id), do: {agent_id, stream_id}
@@ -1875,6 +1889,9 @@ defmodule Vibe.AI.AgentEventRuntime do
 
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
 
+        # Built once and reused for every recipient's user-topic mirror.
+        mirrored_message = Chat.mirrored_message_payload(payload)
+
         Chat.get_all_participant_settings(chat_id)
         |> Enum.each(fn participant ->
           if participant.user_id != agent.agent_user_id do
@@ -1886,7 +1903,8 @@ defmodule Vibe.AI.AgentEventRuntime do
                 from_id: agent.agent_user_id,
                 message_id: message_id,
                 timestamp: timestamp,
-                muted: participant.muted || false
+                muted: participant.muted || false,
+                message: mirrored_message
               })
             end
 

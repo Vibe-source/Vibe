@@ -46,7 +46,11 @@ defmodule Vibe.Scheduler do
       {:error, reason} ->
         retry_count = state.load_retry_count + 1
         retry_ms = load_retry_backoff_ms(retry_count)
-        Logger.error("[Scheduler] Failed to load pending posts (attempt #{retry_count}). Retrying in #{retry_ms}ms. Reason: #{inspect(reason)}")
+
+        Logger.error(
+          "[Scheduler] Failed to load pending posts (attempt #{retry_count}). Retrying in #{retry_ms}ms. Reason: #{inspect(reason)}"
+        )
+
         Process.send_after(self(), :load_pending, retry_ms)
         {:noreply, %{state | load_retry_count: retry_count}}
     end
@@ -80,6 +84,7 @@ defmodule Vibe.Scheduler do
           nil -> :ok
           ref -> Process.cancel_timer(ref)
         end
+
         timers = Map.delete(state.timers, post_id)
         {:reply, :ok, %{state | timers: timers}}
 
@@ -98,8 +103,9 @@ defmodule Vibe.Scheduler do
     try do
       posts =
         Vibe.Repo.all(
-          from sp in ScheduledPost,
+          from(sp in ScheduledPost,
             where: sp.status == "pending"
+          )
         )
 
       timers =
@@ -124,7 +130,8 @@ defmodule Vibe.Scheduler do
       scheduled = post.scheduled_at
 
       delay_ms = DateTime.diff(scheduled, now, :millisecond)
-      delay_ms = max(delay_ms, 0)  # If past due, execute immediately
+      # If past due, execute immediately
+      delay_ms = max(delay_ms, 0)
 
       ref = Process.send_after(self(), {:execute_post, post.id}, delay_ms)
       Map.put(timers, post.id, ref)
@@ -157,15 +164,21 @@ defmodule Vibe.Scheduler do
 
         case Chat.add_message(message_attrs) do
           {:ok, _msg} ->
-            # Broadcast to channel subscribers
-            VibeWeb.Endpoint.broadcast!("chat:#{post.channel_id}", "message", %{
+            broadcast_payload = %{
               "id" => message_id,
               "fromId" => post.user_id,
+              "chatId" => post.channel_id,
               "encryptedContent" => post.content,
               "type" => post.type || "text",
               "mediaUrl" => post.media_url,
               "timestamp" => timestamp
-            })
+            }
+
+            # Broadcast to channel subscribers
+            VibeWeb.Endpoint.broadcast!("chat:#{post.channel_id}", "message", broadcast_payload)
+
+            # Built once and reused for every recipient's user-topic mirror.
+            mirrored_message = Chat.mirrored_message_payload(broadcast_payload)
 
             # Notify all subscribers via user channel
             Chat.get_participant_ids(post.channel_id)
@@ -175,7 +188,8 @@ defmodule Vibe.Scheduler do
                   chat_id: post.channel_id,
                   from_id: post.user_id,
                   message_id: message_id,
-                  timestamp: timestamp
+                  timestamp: timestamp,
+                  message: mirrored_message
                 })
 
                 _ =
@@ -189,10 +203,15 @@ defmodule Vibe.Scheduler do
 
             # Mark as posted
             Chat.mark_post_as_posted(post_id)
-            Logger.info("[Scheduler] Posted scheduled message #{post_id} to channel #{post.channel_id}")
+
+            Logger.info(
+              "[Scheduler] Posted scheduled message #{post_id} to channel #{post.channel_id}"
+            )
 
           {:error, reason} ->
-            Logger.error("[Scheduler] Failed to post scheduled message #{post_id}: #{inspect(reason)}")
+            Logger.error(
+              "[Scheduler] Failed to post scheduled message #{post_id}: #{inspect(reason)}"
+            )
         end
 
       _ ->

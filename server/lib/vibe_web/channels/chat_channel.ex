@@ -156,6 +156,9 @@ defmodule VibeWeb.ChatChannel do
           # BROADCAST IMMEDIATELY for instant message delivery
           broadcast!(socket, "message", broadcast_payload)
 
+          # Built once and reused for every recipient's user-topic mirror.
+          mirrored_message = Vibe.Chat.mirrored_message_payload(broadcast_payload)
+
           # Mirror a lightweight ping to the sender's OWN other devices. The chat-topic
           # broadcast above only reaches devices that currently have THIS chat open, so
           # a message typed on the phone never reached the same user's laptop sitting on
@@ -166,7 +169,8 @@ defmodule VibeWeb.ChatChannel do
             from_id: user_id,
             message_id: data["id"],
             timestamp: data["timestamp"],
-            self_echo: true
+            self_echo: true,
+            message: mirrored_message
           })
 
           # Check for @vibe agent mention and dispatch to group agent.
@@ -197,7 +201,8 @@ defmodule VibeWeb.ChatChannel do
                       from_id: user_id,
                       message_id: data["id"],
                       timestamp: data["timestamp"],
-                      muted: p.muted || false
+                      muted: p.muted || false,
+                      message: mirrored_message
                     })
 
                     if p.muted do
@@ -520,15 +525,19 @@ defmodule VibeWeb.ChatChannel do
 
   @impl true
   def handle_in("read-receipt", %{"messageId" => msg_id} = payload, socket) do
+    "chat:" <> chat_id = socket.topic
     Vibe.Chat.mark_read(msg_id, socket.assigns.user_id)
     broadcast_from!(socket, "message-read", payload)
+    Chat.broadcast_message_receipt(chat_id, msg_id, socket.assigns.user_id, "read")
     {:noreply, socket}
   end
 
   @impl true
   def handle_in("delivery-receipt", %{"messageId" => msg_id} = payload, socket) do
+    "chat:" <> chat_id = socket.topic
     Vibe.Chat.mark_delivered(msg_id, socket.assigns.user_id)
     broadcast_from!(socket, "message-delivered", payload)
+    Chat.broadcast_message_receipt(chat_id, msg_id, socket.assigns.user_id, "delivered")
     {:noreply, socket}
   end
 
@@ -545,11 +554,21 @@ defmodule VibeWeb.ChatChannel do
 
     case Vibe.Chat.delete_message(chat_id, msg_id, user_id, for_everyone) do
       {:ok, _message} ->
-        broadcast!(socket, "message-deleted", %{
+        mutation_payload = %{
+          chatId: chat_id,
           messageId: msg_id,
           deletedBy: user_id,
           forEveryone: for_everyone
-        })
+        }
+
+        broadcast!(socket, "message-deleted", mutation_payload)
+
+        Chat.broadcast_user_chat_event(
+          chat_id,
+          "message-deleted",
+          mutation_payload,
+          if(for_everyone, do: nil, else: [user_id])
+        )
 
         {:reply, :ok, socket}
 
@@ -578,13 +597,21 @@ defmodule VibeWeb.ChatChannel do
     edited_at = Map.get(payload, "editedAt")
 
     case Vibe.Chat.edit_message(chat_id, msg_id, user_id, encrypted_content, edited_at) do
-      {:ok, _message} ->
-        broadcast!(socket, "message-edited", %{
+      {:ok, message} ->
+        mutation_payload = %{
+          chatId: chat_id,
           messageId: msg_id,
           encryptedContent: encrypted_content,
           editedAt: edited_at || :os.system_time(:millisecond),
-          editedBy: user_id
-        })
+          editedBy: user_id,
+          message:
+            message
+            |> Chat.client_message_payload()
+            |> Chat.mirrored_message_payload()
+        }
+
+        broadcast!(socket, "message-edited", mutation_payload)
+        Chat.broadcast_user_chat_event(chat_id, "message-edited", mutation_payload)
 
         {:reply, :ok, socket}
 

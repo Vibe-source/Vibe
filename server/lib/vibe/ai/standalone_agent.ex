@@ -105,7 +105,8 @@ defmodule Vibe.AI.StandaloneAgent do
     end
   end
 
-  defp delivery_scoped_agent(agent, _response_mode, _chat_id, _requester_user_id), do: {:ok, agent}
+  defp delivery_scoped_agent(agent, _response_mode, _chat_id, _requester_user_id),
+    do: {:ok, agent}
 
   defp scoped_system_prompt(base_prompt, permissions) do
     channel_instructions =
@@ -297,18 +298,37 @@ defmodule Vibe.AI.StandaloneAgent do
       {:ok, _message} ->
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
 
+        # Built once and reused for every recipient's user-topic mirror.
+        mirrored_message = Chat.mirrored_message_payload(payload)
+
         Chat.get_all_participant_settings(chat_id)
         |> Enum.each(fn participant ->
-          if participant.user_id != agent.agent_user_id and not participant.muted do
-            _ =
-              Notifications.send_message_push(participant.user_id, %{
-                "chat_id" => chat_id,
-                "message_id" => message_id,
-                "from_id" => agent.agent_user_id,
-                "type" => message_type,
-                "body" => plain_text,
-                "media_url" => media_url
-              })
+          if participant.user_id != agent.agent_user_id do
+            # The chat topic above only reaches devices with this chat on screen. Every
+            # other agent path already mirrors a `new_message` onto the participant's
+            # user topic so their chat list updates in real time; this one did not, which
+            # is why a standalone agent's reply could raise a push notification while Home
+            # still showed the previous message until the next list fetch.
+            VibeWeb.Endpoint.broadcast!("user:#{participant.user_id}", "new_message", %{
+              chat_id: chat_id,
+              from_id: agent.agent_user_id,
+              message_id: message_id,
+              timestamp: timestamp,
+              muted: participant.muted || false,
+              message: mirrored_message
+            })
+
+            if not participant.muted do
+              _ =
+                Notifications.send_message_push(participant.user_id, %{
+                  "chat_id" => chat_id,
+                  "message_id" => message_id,
+                  "from_id" => agent.agent_user_id,
+                  "type" => message_type,
+                  "body" => plain_text,
+                  "media_url" => media_url
+                })
+            end
           end
         end)
 
@@ -817,6 +837,7 @@ defmodule Vibe.AI.StandaloneAgent do
     if is_binary(media_url) do
       duration = map_value(track, :duration)
       track_id = map_value(track, :track_id) || map_value(track, :trackId) || video_id
+
       duration_secs =
         case map_value(track, :duration_seconds) || duration_seconds(duration) do
           n when is_float(n) -> round(n)
@@ -888,11 +909,20 @@ defmodule Vibe.AI.StandaloneAgent do
   # (see VoiceBubble resolveAudioURL) and "Couldn't load" if we ship relative mediaUrl.
   defp public_api_base_url do
     cond do
-      base = present_env("PUBLIC_BASE_URL") -> normalize_api_base(base)
-      base = present_env("API_BASE_URL") -> normalize_api_base(base)
-      base = present_env("VIBE_PUBLIC_BASE_URL") -> normalize_api_base(base)
+      base = present_env("PUBLIC_BASE_URL") ->
+        normalize_api_base(base)
+
+      base = present_env("API_BASE_URL") ->
+        normalize_api_base(base)
+
+      base = present_env("VIBE_PUBLIC_BASE_URL") ->
+        normalize_api_base(base)
+
       host = present_env("PHX_HOST") ->
-        if String.starts_with?(host, "http"), do: String.trim_trailing(host, "/"), else: "https://" <> host
+        if String.starts_with?(host, "http"),
+          do: String.trim_trailing(host, "/"),
+          else: "https://" <> host
+
       true ->
         "https://api.vibegram.io"
     end
