@@ -126,3 +126,38 @@ final class VibeCoreOrderAuthorityTests: XCTestCase {
     XCTAssertFalse(flags.vibeTimelineCoreOrderAuthorityEnabled)
   }
 }
+
+/// Eligibility, verified against what a device run actually did.
+@MainActor
+final class VibeShadowProbeEligibilityTests: XCTestCase {
+
+  private func flags(_ classes: VibeTimelineChatClassEligibility) -> VibeTimelineFeatureFlags {
+    VibeTimelineFeatureFlags(
+      vibeTimelineShadowCompareEnabled: true, shadowEligibleChatClasses: classes)
+  }
+
+  func testSavedMessagesIsNotADirectMessage() {
+    // A device run caught this: `saved_messages` answers false to
+    // `isGroupOrChannel`, so it armed under a DM-only allowlist. It has its own
+    // dual-id ordering history and deserves its own soak.
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "saved_messages", isGroupOrChannel: false, flags: flags(.directMessage)))
+
+    XCTAssertNotNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "saved_messages", isGroupOrChannel: false, flags: flags(.savedMessages)))
+  }
+
+  func testAnOrdinaryDirectMessageStillArms() {
+    XCTAssertNotNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "47157fce5863", isGroupOrChannel: false, flags: flags(.directMessage)))
+  }
+
+  func testASavedMessagesAllowlistDoesNotArmOrdinaryDMs() {
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "47157fce5863", isGroupOrChannel: false, flags: flags(.savedMessages)))
+  }
+}

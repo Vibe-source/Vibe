@@ -141,8 +141,8 @@ final class VibeCoreListPreviewModel: ObservableObject {
   func start() {
     guard handle == nil else { return }
     let host = VibeTimelineHost(chatId: chatId, listHost: listHost)
-    host.onDiagnostic = { message, meta in
-      VibeLog.warning("list preview: \(message)", category: "core", metadata: meta)
+    host.onDiagnostic = { [weak self] message, meta in
+      self?.logHostEvent("list preview: \(message)", meta: meta, isFailure: true)
     }
     // The core is the only thing that can answer "what should be on screen", so
     // a resync is a fresh window request, not a replay from a local mirror.
@@ -160,21 +160,7 @@ final class VibeCoreListPreviewModel: ObservableObject {
 
     listHost.onDiagnostic = { [weak self] message, meta, isFailure in
       guard let self else { return }
-      // The measurement counters ride along on every host event, so an exported
-      // log can answer "was geometry frozen" without the screen in front of you.
-      var enriched = meta
-      if let stats = self.timelineHost?.measurementStats {
-        enriched["measured"] = String(stats.measured)
-        enriched["reused"] = String(stats.reused)
-        enriched["remeasureAll"] = String(stats.invalidations)
-      }
-      enriched["settledHeightChanges"] = String(self.listHost.settledGeometryViolations)
-      enriched["anchorDrifted"] = String(self.listHost.anchorDriftViolations)
-      if isFailure {
-        VibeLog.error("list preview host: \(message)", category: "core", metadata: enriched)
-      } else {
-        VibeLog.info("list preview host: \(message)", category: "core", metadata: enriched)
-      }
+      self.logHostEvent("list preview host: \(message)", meta: meta, isFailure: isFailure)
       self.refreshStats()
     }
 
@@ -266,6 +252,44 @@ final class VibeCoreListPreviewModel: ObservableObject {
   }
 
   // MARK: Internals
+
+  /// Routes a host event to the log, sampling the successes.
+  ///
+  /// The first version wrote one `info` line per host event and put the running
+  /// `reused` counter in its metadata. That defeats `VibeLog`'s repeat
+  /// coalescing — every line differs by one number, so nothing folds — and a
+  /// single visit to this screen produced **1,355 of the 1,500** entries in the
+  /// ring, evicting the real-chat data the export existed to carry. That is the
+  /// third time a diagnostic in this project has destroyed its own evidence.
+  ///
+  /// Failures still log every time; there are never many of them, and each one
+  /// is the point. Successes are sampled, and only the sampled line pays for the
+  /// counters.
+  private func logHostEvent(_ message: String, meta: [String: String], isFailure: Bool) {
+    if isFailure {
+      VibeLog.error(message, category: "core", metadata: enriched(meta))
+      return
+    }
+    hostEvents += 1
+    guard hostEvents % Self.hostEventLogInterval == 1 else { return }
+    VibeLog.info(message, category: "core", metadata: enriched(meta))
+  }
+
+  private func enriched(_ meta: [String: String]) -> [String: String] {
+    var enriched = meta
+    if let stats = timelineHost?.measurementStats {
+      enriched["measured"] = String(stats.measured)
+      enriched["reused"] = String(stats.reused)
+      enriched["remeasureAll"] = String(stats.invalidations)
+    }
+    enriched["settledHeightChanges"] = String(listHost.settledGeometryViolations)
+    enriched["anchorDrifted"] = String(listHost.anchorDriftViolations)
+    enriched["event"] = String(hostEvents)
+    return enriched
+  }
+
+  private var hostEvents = 0
+  private static let hostEventLogInterval = 100
 
   private func refreshStats() {
     // Both counters feed one verdict: either the list moved something the user

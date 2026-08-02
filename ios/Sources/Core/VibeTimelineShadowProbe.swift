@@ -77,6 +77,23 @@ final class VibeTimelineShadowProbe {
   ///
   /// Fails closed: unset flags, an empty allowlist, a group, a channel, or a
   /// blank chat id all return `nil`.
+  /// Saved Messages is its own chat class, and it is not a direct message.
+  ///
+  /// A device run caught the probe arming on `saved_messages`: the only
+  /// eligibility input was `isGroupOrChannel`, which Saved Messages answers
+  /// `false` to, so it slipped through a DM-only allowlist. It has its own
+  /// ordering quirks — the dual-id generations that produced duplicate cells —
+  /// which is exactly why it is a separate class with a separate soak.
+  private static func chatClass(for chatId: String, isGroupOrChannel: Bool)
+    -> VibeTimelineChatClass
+  {
+    if isGroupOrChannel { return .group }
+    if chatId == "saved_messages" || chatId.hasPrefix("saved_messages") {
+      return .savedMessages
+    }
+    return .directMessage
+  }
+
   static func makeIfEligible(
     chatId: String,
     isGroupOrChannel: Bool,
@@ -84,10 +101,11 @@ final class VibeTimelineShadowProbe {
   ) -> VibeTimelineShadowProbe? {
     guard flags.vibeTimelineShadowCompareEnabled else { return nil }
     guard !isGroupOrChannel else { return nil }
-    // The shadow allowlist, not the render one — see the note on the field.
-    guard flags.shadowEligibleChatClasses.contains(.directMessage) else { return nil }
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
+    // The shadow allowlist, not the render one — see the note on the field.
+    let chatClass = chatClass(for: trimmed, isGroupOrChannel: isGroupOrChannel)
+    guard flags.shadowEligibleChatClasses.contains(chatClass) else { return nil }
     VibeLog.notice(
       "shadow probe armed", category: "core", metadata: ["chat": String(trimmed.prefix(12))])
     return VibeTimelineShadowProbe(chatId: trimmed)
@@ -153,10 +171,17 @@ final class VibeTimelineShadowProbe {
     }
 
     guard !order.isEmpty else { return }
+    let orderChanged = order != pendingEngineOrder
     pendingEngineOrder = order
-    // Only ask for a window when something actually changed. A re-emit of an
+    // Ask the core only when something actually changed — a re-emit of an
     // identical window is not a new comparison.
-    guard newFrames > 0 else { return }
+    //
+    // "Changed" has to include a *reordering* with no new ids, not just new
+    // frames. Gating on `newFrames` alone meant the engine could re-emit the
+    // same messages in a different order and the probe would never look, which
+    // is precisely the divergence it exists to catch. A device run showed the
+    // cost of the narrow rule: one comparison per chat open and nothing after.
+    guard newFrames > 0 || orderChanged else { return }
     let now = Int64(Date().timeIntervalSince1970 * 1000)
     try? handle.flush(nowMs: now)
     try? handle.requestWindow(chatId: chatId, nowMs: now)
