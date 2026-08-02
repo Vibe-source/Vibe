@@ -1689,6 +1689,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// keeps the eligibility decision to once per chat instead of once per row batch.
   private var coreShadowProbe: VibeTimelineShadowProbe?
   private var coreShadowChecked: Bool = false
+  /// Puts `[HeightShift]` events into the exportable log, and separates the
+  /// corrections that moved the reader's screen from the ones under the fold.
+  /// See `docs/chat-list-seams-map.md` for the twelve sites that can produce them.
+  private let heightShiftLog = VibeHeightShiftLog()
   private var isGroupOrChannel: Bool = false
   /// Broadcast channel (not a group chat). History loading uses bubble skeleton only here;
   /// direct + group use a clean modern arc spinner instead.
@@ -2765,6 +2769,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Joins the core's worker thread. Leaving it running would outlive the chat
     // it was measuring and keep answering into a dead comparison.
     coreShadowProbe?.shutdown()
+    // Closing is the only moment this chat's shift numbers are final. They are
+    // the baseline the core-driven list has to beat.
+    heightShiftLog.logSummary(chatId: engineChatId, reason: "chat-closed")
     updateChatEngineChannelBinding(forceDetach: true)
     if !engineSurfaceId.isEmpty {
       let surfaceId = engineSurfaceId
@@ -6934,11 +6941,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // was mounted at `est` and is now `exact`, and everything below it moves by the
         // difference. `origin` names which sizing decision produced the wrong number and
         // `vis=ABOVE` means the reader is watching it happen.
+        let warmupVisibility = heightShiftVisibility(row.key)
         NSLog(
           "[HeightShift] warmup chat=%@ key=%@ %@ est=%.0f exact=%.0f dh=%+.0f w=%.0f vis=%@ follow=%@",
           String(engineChatId.prefix(12)), String(row.key.suffix(14)),
           seededDescriptor, estimated, exact, exact - estimated,
-          extras.measurementWidth, heightShiftVisibility(row.key), followsBottom ? "Y" : "N")
+          extras.measurementWidth, warmupVisibility, followsBottom ? "Y" : "N")
+        // Same event, in the log that leaves the device. `NSLog` only reaches a
+        // console nobody has attached while actually using their phone, which is
+        // the one situation that produces these.
+        heightShiftLog.record(
+          cause: "warmup", chatId: engineChatId, rowKey: row.key,
+          descriptor: seededDescriptor, was: estimated, now: exact,
+          visibility: warmupVisibility, trigger: "progressive-warmup")
         UIView.performWithoutAnimation {
           flowLayout.invalidateLayout()
           collectionView.layoutIfNeeded()
@@ -8074,11 +8089,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // A row that had no cached height was never sized, so nothing moved — not a shift.
       guard old >= 0.0, abs(corrected - old) > 0.5 else { continue }
       if let firstVisibleIndex, index < firstVisibleIndex { deltaAbove += corrected - old }
+      let correctDescriptor = heightShiftRowDescriptor(row)
+      let correctVisibility = heightShiftVisibility(row.key)
       NSLog(
         "[HeightShift] correct chat=%@ key=%@ %@ was=%.0f now=%.0f dh=%+.0f vis=%@ via=%@",
         String(engineChatId.prefix(12)), String(row.key.suffix(14)),
-        heightShiftRowDescriptor(row), old, corrected, corrected - old,
-        heightShiftVisibility(row.key), trigger)
+        correctDescriptor, old, corrected, corrected - old,
+        correctVisibility, trigger)
+      heightShiftLog.record(
+        cause: "correct", chatId: engineChatId, rowKey: row.key,
+        descriptor: correctDescriptor, was: old, now: corrected,
+        visibility: correctVisibility, trigger: trigger)
     }
     guard !paths.isEmpty else { return }
     // Same rule the height warmup uses: hold the bottom only when the reader actually wants
