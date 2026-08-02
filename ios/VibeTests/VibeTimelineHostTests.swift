@@ -1,0 +1,349 @@
+import CoreGraphics
+import UIKit
+import XCTest
+
+@testable import Vibe
+
+/// Tests for the P4 render path — the adapter, the measurement cache, and the
+/// `UICollectionView` host.
+///
+/// Every property asserted here was first observed on a physical device, and
+/// several of them were observed *failing*. Manual verification found them; only
+/// a test keeps them found. The frozen-geometry rule in particular is enforced by
+/// the shape of the code today, and this is what notices if that shape changes.
+@MainActor
+final class VibeTimelineHostTests: XCTestCase {
+
+  // MARK: Fixtures
+
+  private func message(
+    id: String,
+    tsMs: Int64 = 1_000,
+    text: String = "hello",
+    isMe: Bool = true,
+    contentHash: UInt64 = 1,
+    hasMedia: Bool = false,
+    hasReply: Bool = false,
+    flags: UInt32 = 0
+  ) -> VibeFfiMessage {
+    VibeFfiMessage(
+      messageId: id,
+      clientMessageId: nil,
+      tsMs: tsMs,
+      orderSeq: 0,
+      authorUserId: isMe ? "me" : "peer",
+      authorIsMe: isMe,
+      authorAgentProvider: nil,
+      kind: .text,
+      text: text,
+      caption: nil,
+      flags: flags,
+      displayStatus: .sent,
+      uploadFraction: nil,
+      deliveryFailed: false,
+      contentHash: contentHash,
+      hasMedia: hasMedia,
+      hasReply: hasReply,
+      hasAgent: false,
+      hasService: false,
+      isEdited: false
+    )
+  }
+
+  private func makeCache(width: CGFloat = 390) -> VibeRowMeasurementCache {
+    let cache = VibeRowMeasurementCache()
+    cache.setEnvironment(width: width, contentSizeCategory: .large, themeEpoch: 0)
+    return cache
+  }
+
+  // MARK: Frozen geometry
+
+  func testASettledRowIsMeasuredExactlyOnce() {
+    let cache = makeCache()
+    let m = message(id: "m1", text: "a body long enough to wrap onto more than one line, easily")
+
+    let first = cache.settledGeometry(for: m)
+    for _ in 0..<50 { _ = cache.settledGeometry(for: m) }
+
+    XCTAssertEqual(cache.measurements, 1)
+    XCTAssertEqual(cache.reuses, 50)
+    XCTAssertEqual(cache.settledGeometry(for: m).size, first.size)
+  }
+
+  func testAContentOnlyUpdateReusesTheFrozenSize() {
+    // The month-long bug in one assertion: a receipt, a delivery status, an
+    // upload tick — none of them may move a bubble that is already on screen.
+    let cache = makeCache()
+    let factory = VibeRenderItemFactory(cache: cache)
+    let settled = factory.settledItem(message(id: "m1", text: "original body text here"))
+
+    // Same id, different content hash and a *much* longer body. If the content
+    // path measured at all, this would be taller.
+    let updated = factory.contentUpdatedItem(
+      message(
+        id: "m1",
+        text: String(repeating: "considerably more text than before. ", count: 20),
+        contentHash: 99))
+
+    XCTAssertEqual(updated.size, settled.size, "a content-only op re-measured the row")
+    XCTAssertEqual(updated.geometryRevision, settled.geometryRevision)
+    XCTAssertNotEqual(updated.contentRevision, settled.contentRevision)
+    XCTAssertEqual(cache.measurements, 1)
+  }
+
+  func testAGeometryUpdateIsAllowedToChangeHeightAndBumpsTheRevision() {
+    let cache = makeCache()
+    let factory = VibeRenderItemFactory(cache: cache)
+    let settled = factory.settledItem(message(id: "m1", text: "short"))
+
+    let (grown, delta) = factory.geometryUpdatedItem(
+      message(id: "m1", text: String(repeating: "much longer body. ", count: 30)))
+
+    XCTAssertGreaterThan(grown.size.height, settled.size.height)
+    XCTAssertGreaterThan(delta, 0)
+    XCTAssertEqual(grown.geometryRevision, settled.geometryRevision + 1)
+  }
+
+  func testAWidthChangeInvalidatesEveryMeasurement() {
+    let cache = makeCache(width: 390)
+    let m = message(id: "m1", text: String(repeating: "wrapping body ", count: 10))
+    let narrow = cache.settledGeometry(for: m)
+
+    XCTAssertTrue(cache.setEnvironment(width: 600, contentSizeCategory: .large, themeEpoch: 0))
+    let wide = cache.settledGeometry(for: m)
+
+    XCTAssertLessThan(wide.size.height, narrow.size.height, "wider should wrap less")
+    XCTAssertEqual(cache.invalidations, 2, "construction plus the width change")
+  }
+
+  func testAnUnchangedEnvironmentDoesNotInvalidate() {
+    let cache = makeCache(width: 390)
+    XCTAssertFalse(cache.setEnvironment(width: 390, contentSizeCategory: .large, themeEpoch: 0))
+  }
+
+  func testMediaWithoutANaturalSizeReservesAStableBoxRatherThanGuessingSquare() {
+    // Guess-square-then-correct is the media list-shift bug. A reservation that
+    // is merely wrong never moves; a guess that gets corrected moves everything
+    // below it.
+    let cache = makeCache(width: 390)
+    let m = message(id: "m1", text: "", hasMedia: true)
+    let first = cache.settledGeometry(for: m)
+    let second = cache.settledGeometry(for: m)
+    XCTAssertEqual(first.size, second.size)
+    XCTAssertNotEqual(first.layout.mediaBoxFrame.height, first.layout.mediaBoxFrame.width)
+  }
+
+  // MARK: Order keys
+
+  func testOrderKeysSortByTimestampThenMessageId() {
+    let a = VibeTimelineOrderKeyFactory.key(tsMs: 1_000, messageId: "b")
+    let b = VibeTimelineOrderKeyFactory.key(tsMs: 2_000, messageId: "a")
+    XCTAssertLessThan(a, b, "timestamp must dominate the id")
+
+    let sameTsEarlier = VibeTimelineOrderKeyFactory.key(tsMs: 1_000, messageId: "aaa")
+    let sameTsLater = VibeTimelineOrderKeyFactory.key(tsMs: 1_000, messageId: "aab")
+    XCTAssertLessThan(sameTsEarlier, sameTsLater, "same ms must fall back to id ASC")
+  }
+
+  func testOrderKeysHandleNegativeTimestampsWithoutWrapping() {
+    // `UInt64(bitPattern:)` alone would sort every pre-1970 timestamp above
+    // everything else. The sign-bit flip is what stops that.
+    let past = VibeTimelineOrderKeyFactory.key(tsMs: -5_000, messageId: "a")
+    let epoch = VibeTimelineOrderKeyFactory.key(tsMs: 0, messageId: "a")
+    let future = VibeTimelineOrderKeyFactory.key(tsMs: 5_000, messageId: "a")
+    XCTAssertLessThan(past, epoch)
+    XCTAssertLessThan(epoch, future)
+  }
+
+  func testShortMessageIdsAreZeroPaddedSoPrefixesOrderCorrectly() {
+    let short = VibeTimelineOrderKeyFactory.key(tsMs: 1_000, messageId: "p1")
+    let longer = VibeTimelineOrderKeyFactory.key(tsMs: 1_000, messageId: "p10")
+    XCTAssertLessThan(short, longer)
+  }
+
+  // MARK: List host — generation fencing
+
+  private func makeHost(width: CGFloat = 390, height: CGFloat = 600)
+    -> VibeCollectionMessageListHost
+  {
+    let host = VibeCollectionMessageListHost()
+    host.view.frame = CGRect(x: 0, y: 0, width: width, height: height)
+    host.view.layoutIfNeeded()
+    return host
+  }
+
+  private func snapshot(generation: UInt64, items: [VibeRenderItem]) -> VibeRenderSnapshot {
+    VibeRenderSnapshot(
+      chatId: "c1",
+      generation: generation,
+      window: VibeTimelineWindowV1(
+        chatId: "c1",
+        messageIds: items.map(\.identity.messageId),
+        anchors: items.map(\.identity)),
+      items: items,
+      contentHeight: items.reduce(0) { $0 + $1.size.height }
+    )
+  }
+
+  private func item(_ id: String, rank: UInt64, height: CGFloat = 50) -> VibeRenderItem {
+    VibeRenderItem(
+      identity: VibeTimelineAnchor(messageId: id),
+      orderKey: VibeOrderKey(rank: rank),
+      size: CGSize(width: 300, height: height),
+      flags: .settled
+    )
+  }
+
+  func testATransactionAgainstTheWrongGenerationIsRejected() {
+    let host = makeHost()
+    host.apply(snapshot: snapshot(generation: 10, items: [item("a", rank: 1)]), reason: .debug)
+
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 7, nextGeneration: 11, ops: [.insert(items: [item("b", rank: 2)], at: 1)]))
+
+    XCTAssertEqual(host.rejectedTransactions, 1)
+    XCTAssertEqual(host.debugGeometryMap().count, 1, "the stale op must not have landed")
+  }
+
+  func testDetachFromEngineClearsTheFenceSoAFreshEngineIsNotRejected() {
+    // Observed on device: after Reset, a new core starts at generation 0 while
+    // the long-lived host still held 8610, and every transaction from the
+    // replacement was fenced off as stale.
+    let host = makeHost()
+    host.apply(snapshot: snapshot(generation: 8_610, items: [item("a", rank: 1)]), reason: .debug)
+
+    host.detachFromEngine()
+    XCTAssertEqual(host.debugGeometryMap().count, 0)
+
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 0, nextGeneration: 1, ops: [.insert(items: [item("z", rank: 1)], at: 0)]))
+
+    XCTAssertEqual(host.rejectedTransactions, 0, "a fresh engine was fenced against a dead one")
+    XCTAssertEqual(host.debugGeometryMap().count, 1)
+  }
+
+  func testDetachDoesNotResetTheViolationCounters() {
+    // These are session-long qualification measurements. Zeroing them on a chat
+    // switch would let a real regression hide behind ordinary navigation.
+    let host = makeHost()
+    host.apply(snapshot: snapshot(generation: 5, items: [item("a", rank: 1)]), reason: .debug)
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 99, nextGeneration: 100, ops: [.remove(ids: ["a"])]))
+    XCTAssertEqual(host.rejectedTransactions, 1)
+
+    host.detachFromEngine()
+    XCTAssertEqual(host.rejectedTransactions, 1)
+  }
+
+  // MARK: List host — settled geometry and anchors
+
+  func testAContentOpThatChangesHeightIsCountedAsAViolation() {
+    let host = makeHost()
+    host.apply(snapshot: snapshot(generation: 1, items: [item("a", rank: 1, height: 50)]),
+               reason: .debug)
+
+    // Deliberately malformed: a content op carrying a different height. The
+    // adapter cannot produce this, and this is what notices if it starts to.
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 1, nextGeneration: 2,
+        ops: [.updateContent(id: "a", item: item("a", rank: 1, height: 80))]))
+
+    XCTAssertEqual(host.settledGeometryViolations, 1)
+  }
+
+  func testInsertingAboveTheViewportDoesNotMoveWhatTheUserIsLookingAt() {
+    // §5.4 "insert above viewport": the content on screen must not shift.
+    let host = makeHost(height: 300)
+    let initial = (0..<40).map { item("m\($0)", rank: UInt64($0 + 1), height: 50) }
+    host.apply(snapshot: snapshot(generation: 1, items: initial), reason: .debug)
+
+    // Park in the middle, well away from the bottom pin.
+    let scrollView = host.view as! UIScrollView
+    scrollView.contentOffset.y = 800
+    host.view.layoutIfNeeded()
+    let anchors = host.visibleAnchors()
+    XCTAssertFalse(anchors.isEmpty, "nothing visible — the test cannot measure a shift")
+
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 1, nextGeneration: 2,
+        ops: [.insert(items: [item("older", rank: 0, height: 120)], at: 0)],
+        preserve: .pinToBottom))
+
+    XCTAssertEqual(host.anchorDriftViolations, 0, "the viewport moved on a history insert")
+    XCTAssertEqual(
+      scrollView.contentOffset.y, 920, accuracy: 0.5,
+      "offset must absorb the inserted height exactly")
+  }
+
+  func testWindowTrimAboveTheViewportAlsoPreservesTheAnchor() {
+    // Head eviction removes rows *above* the viewport. Not compensating scrolls
+    // the user's content out from under them.
+    let host = makeHost(height: 300)
+    let initial = (0..<40).map { item("m\($0)", rank: UInt64($0 + 1), height: 50) }
+    host.apply(snapshot: snapshot(generation: 1, items: initial), reason: .debug)
+
+    let scrollView = host.view as! UIScrollView
+    scrollView.contentOffset.y = 800
+    host.view.layoutIfNeeded()
+
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 1, nextGeneration: 2,
+        ops: [.remove(ids: ["m0", "m1", "m2"])],
+        preserve: .pinToBottom))
+
+    XCTAssertEqual(host.anchorDriftViolations, 0)
+    XCTAssertEqual(scrollView.contentOffset.y, 650, accuracy: 0.5, "3 × 50 pt removed above")
+  }
+
+  func testAViewerAtTheBottomFollowsNewTraffic() {
+    let host = makeHost(height: 300)
+    let initial = (0..<10).map { item("m\($0)", rank: UInt64($0 + 1), height: 50) }
+    host.apply(snapshot: snapshot(generation: 1, items: initial), reason: .debug)
+    let scrollView = host.view as! UIScrollView
+    let bottomBefore = scrollView.contentOffset.y
+
+    host.apply(
+      transaction: VibeListTransaction(
+        baseGeneration: 1, nextGeneration: 2,
+        ops: [.insert(items: [item("new", rank: 99, height: 50)], at: 10)],
+        preserve: .pinToBottom))
+
+    XCTAssertEqual(scrollView.contentOffset.y, bottomBefore + 50, accuracy: 0.5)
+    XCTAssertEqual(host.anchorDriftViolations, 0, "following live traffic is not a jump")
+  }
+
+  // MARK: Shadow probe eligibility
+
+  func testTheShadowProbeFailsClosed() {
+    let off = VibeTimelineFeatureFlags()
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: false, flags: off),
+      "default flags must not arm the probe")
+
+    let noAllowlist = VibeTimelineFeatureFlags(vibeTimelineShadowCompareEnabled: true)
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "c1", isGroupOrChannel: false, flags: noAllowlist),
+      "an empty class allowlist must not arm the probe")
+  }
+
+  func testTheShadowProbeIsDirectMessageOnly() {
+    let on = VibeTimelineFeatureFlags(
+      vibeTimelineShadowCompareEnabled: true, eligibleChatClasses: .directMessage)
+
+    XCTAssertNotNil(
+      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: false, flags: on))
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: true, flags: on),
+      "P4 is 1:1 DM only; groups get their own gated rollout")
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(chatId: "   ", isGroupOrChannel: false, flags: on),
+      "a blank chat id must not arm the probe")
+  }
+}
