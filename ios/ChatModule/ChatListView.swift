@@ -1689,6 +1689,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// keeps the eligibility decision to once per chat instead of once per row batch.
   private var coreShadowProbe: VibeTimelineShadowProbe?
   private var coreShadowChecked: Bool = false
+  /// Whether the core may order this chat's tail. Resolved once, next to the
+  /// probe, because a flag that changes mid-chat would reorder a list the reader
+  /// is already looking at.
+  private var coreOrderAuthorityEnabled: Bool = false
   /// Puts `[HeightShift]` events into the exportable log, and separates the
   /// corrections that moved the reader's screen from the ones under the fold.
   /// See `docs/chat-list-seams-map.md` for the twelve sites that can produce them.
@@ -8680,8 +8684,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       coreShadowChecked = true
       coreShadowProbe = VibeTimelineShadowProbe.makeIfEligible(
         chatId: engineChatId, isGroupOrChannel: isGroupOrChannel)
+      coreOrderAuthorityEnabled =
+        coreShadowProbe != nil
+        && VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineCoreOrderAuthorityEnabled
     }
     coreShadowProbe?.observe(rows: nextRows)
+
+    // P5 — the first thing the core is allowed to decide for the real list.
+    //
+    // Deliberately the smallest possible step: it permutes rows this list has
+    // already built, using an ordering the shadow probe above proves agreement
+    // on, and touches nothing else. Cells, heights, seeding and scroll stay
+    // exactly where they are. `authoritativeOrder` returns nil unless the core
+    // and the engine cover the same ids, so anything the core has evicted or
+    // never saw keeps the engine's order and its position.
+    //
+    // When the two already agree — which is the expected case, and what the
+    // shadow data has to show before this flag is worth turning on — this is a
+    // comparison and nothing more.
+    var nextRows = nextRows
+    if coreOrderAuthorityEnabled, let reordered = coreShadowProbe?.authoritativeOrder(for: nextRows)
+    {
+      VibeLog.warning(
+        "core reordered the list", category: "core",
+        metadata: ["chat": String(engineChatId.prefix(12)), "rows": String(reordered.count)])
+      nextRows = reordered
+    }
 
     VibeDebugLog.log(
       "[ChatListView] setRows called — count: %d, isApplying: %@", nextRows.count,

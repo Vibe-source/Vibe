@@ -19,6 +19,8 @@ struct DiagnosticsView: View {
   @State private var coreBridgeEnabled: Bool = VibeCoreBridge.isEnabled
   @State private var coreShadowEnabled: Bool =
     VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineShadowCompareEnabled
+  @State private var coreOrderAuthorityEnabled: Bool =
+    VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineCoreOrderAuthorityEnabled
 
   private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -87,21 +89,33 @@ struct DiagnosticsView: View {
         // nothing, so the worst case is a log line.
         Toggle("Shadow-compare real DMs", isOn: $coreShadowEnabled)
           .onChange(of: coreShadowEnabled) { _, on in
-            let defaults = UserDefaults.standard
-            defaults.set(on, forKey: VibeTimelineUserDefaultsFeatureFlags.shadowCompareKey)
-            // 1:1 DM only. P5 widens this per class, each with its own soak.
-            defaults.set(
-              on ? Int(VibeTimelineChatClassEligibility.directMessage.rawValue) : 0,
-              forKey: VibeTimelineUserDefaultsFeatureFlags.eligibleChatClassesKey)
+            // Only the shadow key. This used to also write the RENDER allowlist,
+            // which is now a different list on purpose — writing it here would
+            // mean arming a diagnostic silently widened what the render gate
+            // covers the moment anyone enabled it. The shadow allowlist follows
+            // this flag inside the provider.
+            UserDefaults.standard.set(
+              on, forKey: VibeTimelineUserDefaultsFeatureFlags.shadowCompareKey)
             VibeLog.notice(
               "shadow compare \(on ? "enabled" : "disabled") (reopen a chat to arm)",
               category: "core")
           }
+
+        // P5. The first thing the core is allowed to decide for the real list.
+        Toggle("Core orders the list", isOn: $coreOrderAuthorityEnabled)
+          .onChange(of: coreOrderAuthorityEnabled) { _, on in
+            UserDefaults.standard.set(
+              on, forKey: VibeTimelineUserDefaultsFeatureFlags.coreOrderAuthorityKey)
+            VibeLog.notice(
+              "core order authority \(on ? "ENABLED" : "disabled") (reopen a chat)",
+              category: "core")
+          }
+          .disabled(!coreShadowEnabled)
       } header: {
         Text("Rust core")
       } footer: {
         Text(
-          "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it."
+          "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it.\n\n\"Core orders the list\" is the first setting here that changes what you see: the core reorders the newest messages in a 1:1 DM, and nothing else. Turn it on only after shadow-compare has reported CLEAN — and if the order ever looks wrong, turn it off and reopen the chat."
         )
       }
 

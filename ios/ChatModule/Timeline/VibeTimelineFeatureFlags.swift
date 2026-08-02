@@ -51,6 +51,16 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
   var vibeAsyncTimelineV1Enabled: Bool
   /// Dual-apply shadow comparison (ids/metrics only). Independent of async host.
   var vibeTimelineShadowCompareEnabled: Bool
+  /// The core orders the production list's tail; `ChatListView` keeps its own
+  /// cells, heights and everything else.
+  ///
+  /// A third gate rather than a mode of `vibeAsyncTimelineV1Enabled`, because it
+  /// is a genuinely different risk. Order authority permutes rows the engine
+  /// already built and the shadow probe already proves agreement on; the async
+  /// host replaces the entire render path. Folding a small reversible step into
+  /// the flag that governs the large irreversible one would mean the only way to
+  /// try the first is to accept the second.
+  var vibeTimelineCoreOrderAuthorityEnabled: Bool
   /// Explicit per-class rollout allowlist **for the render path**. Empty by
   /// default, including when the umbrella flag is accidentally enabled.
   var eligibleChatClasses: VibeTimelineChatClassEligibility
@@ -68,12 +78,14 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
   init(
     vibeAsyncTimelineV1Enabled: Bool = false,
     vibeTimelineShadowCompareEnabled: Bool = false,
+    vibeTimelineCoreOrderAuthorityEnabled: Bool = false,
     eligibleChatClasses: VibeTimelineChatClassEligibility = [],
     shadowEligibleChatClasses: VibeTimelineChatClassEligibility = [],
     activeWindowOverride: Int? = nil
   ) {
     self.vibeAsyncTimelineV1Enabled = vibeAsyncTimelineV1Enabled
     self.vibeTimelineShadowCompareEnabled = vibeTimelineShadowCompareEnabled
+    self.vibeTimelineCoreOrderAuthorityEnabled = vibeTimelineCoreOrderAuthorityEnabled
     self.eligibleChatClasses = eligibleChatClasses
     self.shadowEligibleChatClasses = shadowEligibleChatClasses
     self.activeWindowOverride = activeWindowOverride
@@ -123,6 +135,7 @@ struct VibeTimelineFixedFeatureFlags: VibeTimelineFeatureFlagProviding {
 struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
   static let asyncTimelineKey = "vibeAsyncTimelineV1Enabled"
   static let shadowCompareKey = "vibeTimelineShadowCompareEnabled"
+  static let coreOrderAuthorityKey = "vibeTimelineCoreOrderAuthorityEnabled"
   static let activeWindowKey = "vibeTimelineActiveWindowCount"
   static let eligibleChatClassesKey = "vibeTimelineEligibleChatClassesMask"
 
@@ -171,6 +184,10 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     #endif
     let shadowEnabled = defaults.object(forKey: shadowKey) as? Bool ?? shadowDefault
 
+    // Default-off everywhere, debug included: this one reaches the screen.
+    let orderAuthority =
+      defaults.object(forKey: Self.coreOrderAuthorityKey) as? Bool ?? false
+
     let eligibilityRaw: UInt32
     if let value = defaults.object(forKey: eligibilityKey) as? Int {
       eligibilityRaw = value >= 0 && UInt64(value) <= UInt64(UInt32.max) ? UInt32(value) : 0
@@ -193,6 +210,7 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     return VibeTimelineFeatureFlags(
       vibeAsyncTimelineV1Enabled: asyncEnabled,
       vibeTimelineShadowCompareEnabled: shadowEnabled,
+      vibeTimelineCoreOrderAuthorityEnabled: orderAuthority,
       eligibleChatClasses: VibeTimelineChatClassEligibility(rawValue: eligibilityRaw),
       shadowEligibleChatClasses: shadowClasses,
       activeWindowOverride: windowOverride

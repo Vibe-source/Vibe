@@ -46,6 +46,11 @@ final class VibeTimelineShadowProbe {
   /// Engine order as of the last observation, awaiting the core's answer.
   private var pendingEngineOrder: [String] = []
 
+  /// The core's most recent window, newest last. This is the only thing the core
+  /// can hold an authoritative opinion about: it caps at 200 rows and evicts from
+  /// the head, so it has nothing to say about anything older than its own window.
+  private var latestCoreOrder: [String] = []
+
   var comparisons: Int { box.comparisons }
   var mismatches: Int { box.mismatches }
 
@@ -159,7 +164,77 @@ final class VibeTimelineShadowProbe {
 
   // MARK: Comparison
 
+  /// Reorders the tail of `rows` to match the core, or returns `nil`.
+  ///
+  /// **This is the read-authority seam.** Everything above it in this type is a
+  /// diagnostic; this is the one method whose result can reach the screen.
+  ///
+  /// It answers `nil` far more often than it answers rows, and every one of those
+  /// refusals is deliberate:
+  ///
+  /// - the core has produced no window yet,
+  /// - the core's window and the engine's rows do not cover the same ids, so
+  ///   reordering would mean inventing a position for something the core has
+  ///   never seen,
+  /// - the two already agree, so there is nothing to do and the caller should
+  ///   keep its own array rather than pay for a rebuild.
+  ///
+  /// Only the overlapping **tail** is ever touched. The core evicts from the head
+  /// at 200 rows, so it has no opinion about older history and must not be asked
+  /// to reorder it. Anything the core does not know keeps the engine's order and
+  /// its position.
+  func authoritativeOrder(for rows: [[String: Any]]) -> [[String: Any]]? {
+    Self.reorder(rows: rows, toMatch: latestCoreOrder)
+  }
+
+  /// The reorder decision, as a pure function.
+  ///
+  /// Separated from the live probe on purpose: this is the only logic in this
+  /// file whose output can reach a user's screen, and it should be provable
+  /// without a Rust worker thread, a chat, or a device. Every `nil` below is a
+  /// case worth a test.
+  nonisolated static func reorder(rows: [[String: Any]], toMatch coreOrder: [String])
+    -> [[String: Any]]?
+  {
+    guard !coreOrder.isEmpty, !rows.isEmpty else { return nil }
+
+    // Index the engine's rows by id. Every row must have one, and no id may
+    // repeat: `firstGoverned` below is an index into this array and is used to
+    // slice `rows`, so the two must line up exactly. A duplicate makes them
+    // diverge silently and the reorder would drop or misplace a real message.
+    // Duplicates are an engine bug, not something to paper over here.
+    var rowById: [String: [String: Any]] = [:]
+    var idsInEngineOrder: [String] = []
+    idsInEngineOrder.reserveCapacity(rows.count)
+    for row in rows {
+      guard let id = messageId(from: row) else { return nil }
+      guard rowById.updateValue(row, forKey: id) == nil else { return nil }
+      idsInEngineOrder.append(id)
+    }
+
+    // The core may only speak about ids it holds AND the engine still has.
+    let coreKnown = coreOrder.filter { rowById[$0] != nil }
+    guard coreKnown.count >= 2 else { return nil }
+
+    // The core's opinion covers a suffix of the engine's rows. Find where that
+    // suffix starts; everything before it is history the core has evicted.
+    let coreSet = Set(coreKnown)
+    guard let firstGoverned = idsInEngineOrder.firstIndex(where: { coreSet.contains($0) })
+    else { return nil }
+
+    // Every engine row from that point on must be one the core knows, or the two
+    // are describing different transcripts and reordering would interleave them.
+    let governed = Array(idsInEngineOrder[firstGoverned...])
+    guard governed.count == coreKnown.count, Set(governed) == coreSet else { return nil }
+    guard governed != coreKnown else { return nil }
+
+    var reordered = Array(rows.prefix(firstGoverned))
+    reordered.append(contentsOf: coreKnown.compactMap { rowById[$0] })
+    return reordered
+  }
+
   private func compare(coreOrder: [String]) {
+    latestCoreOrder = coreOrder
     let engineOrder = pendingEngineOrder
     guard !engineOrder.isEmpty, !coreOrder.isEmpty else { return }
     let comparisons = box.countComparison()
@@ -289,7 +364,7 @@ private final class CoreHandleBox: @unchecked Sendable {
 
   // MARK: Row parsing
 
-  private static func messageId(from row: [String: Any]) -> String? {
+  nonisolated private static func messageId(from row: [String: Any]) -> String? {
     for key in ["messageId", "id", "key"] {
       if let value = row[key] as? String, !value.isEmpty { return value }
     }
