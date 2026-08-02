@@ -46,8 +46,17 @@ final class VibeTimelineShadowProbe {
   /// Engine order as of the last observation, awaiting the core's answer.
   private var pendingEngineOrder: [String] = []
 
-  private(set) var comparisons = 0
-  private(set) var mismatches = 0
+  var comparisons: Int { box.comparisons }
+  var mismatches: Int { box.mismatches }
+
+  /// One clean comparison in `cleanLogInterval` is logged.
+  ///
+  /// Logging every clean comparison floods the ring and buries the rare line that
+  /// matters — a mistake this project has already shipped once, where the fix for
+  /// a noisy export was itself the thing that filled it. Logging *none* is the
+  /// opposite failure: a silent probe and a probe that never ran produce byte-for-byte
+  /// identical exports, so "no divergence" would be unfalsifiable.
+  private static let cleanLogInterval = 25
 
   init(chatId: String) {
     self.chatId = chatId
@@ -78,10 +87,28 @@ final class VibeTimelineShadowProbe {
     return VibeTimelineShadowProbe(chatId: trimmed)
   }
 
-  /// Joins the core's worker thread. Safe to call from any thread, including a
-  /// `deinit`, and safe to call more than once.
+  /// Joins the core's worker thread and reports the verdict for this chat.
+  ///
+  /// Safe to call from any thread, including a `deinit`, and safe to call more
+  /// than once. The tally lives in the lock-guarded box precisely so this line
+  /// can be written from a `deinit`, which is not actor-isolated — leaving a chat
+  /// is the moment the numbers are final and the only moment anyone would look
+  /// for them.
   nonisolated func shutdown() {
-    box.take()?.shutdown()
+    let handle = box.take()
+    guard handle != nil else { return }
+    handle?.shutdown()
+    let (compared, diverged) = box.tally()
+    guard compared > 0 else { return }
+    var meta: [String: String] = [:]
+    meta["chat"] = String(chatId.prefix(12))
+    meta["comparisons"] = String(compared)
+    meta["divergences"] = String(diverged)
+    if diverged == 0 {
+      VibeLog.notice("shadow probe closed CLEAN", category: "core", metadata: meta)
+    } else {
+      VibeLog.error("shadow probe closed WITH DIVERGENCE", category: "core", metadata: meta)
+    }
   }
 
   /// Feeds one engine window to the core and schedules a comparison.
@@ -134,7 +161,7 @@ final class VibeTimelineShadowProbe {
   private func compare(coreOrder: [String]) {
     let engineOrder = pendingEngineOrder
     guard !engineOrder.isEmpty, !coreOrder.isEmpty else { return }
-    comparisons += 1
+    let comparisons = box.countComparison()
 
     // The core caps its window at 200 and evicts from the head, so compare the
     // overlapping tail rather than the whole array. Length disagreement caused by
@@ -143,9 +170,20 @@ final class VibeTimelineShadowProbe {
     let n = min(engineOrder.count, coreOrder.count)
     let engineTail = Array(engineOrder.suffix(n))
     let coreTail = Array(coreOrder.suffix(n))
-    guard engineTail != coreTail else { return }
+    guard engineTail != coreTail else {
+      if comparisons % Self.cleanLogInterval == 1 {
+        VibeLog.info(
+          "shadow agrees", category: "core",
+          metadata: [
+            "chat": String(chatId.prefix(12)),
+            "rows": String(n),
+            "comparison": String(comparisons),
+          ])
+      }
+      return
+    }
 
-    mismatches += 1
+    let mismatches = box.countMismatch()
     let diffs = VibeTimelineShadowComparator.compareOrder(
       leftIds: engineTail, rightIds: coreTail)
     let firstIndex = diffs.first(where: { $0.kind == .orderMismatch })?.metricA ?? -1
@@ -190,11 +228,46 @@ final class VibeTimelineShadowProbe {
 private final class CoreHandleBox: @unchecked Sendable {
   private let lock = NSLock()
   private var handle: VibeCoreHandle?
+  private var comparisonCount = 0
+  private var mismatchCount = 0
 
   var current: VibeCoreHandle? {
     lock.lock()
     defer { lock.unlock() }
     return handle
+  }
+
+  var comparisons: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return comparisonCount
+  }
+
+  var mismatches: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return mismatchCount
+  }
+
+  /// Returns the new total so callers can sample without a second lock round-trip.
+  func countComparison() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    comparisonCount += 1
+    return comparisonCount
+  }
+
+  func countMismatch() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    mismatchCount += 1
+    return mismatchCount
+  }
+
+  func tally() -> (comparisons: Int, mismatches: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (comparisonCount, mismatchCount)
   }
 
   func set(_ newHandle: VibeCoreHandle?) {

@@ -161,9 +161,9 @@ enum VibeCoreBridge {
   /// anything predictable would be worse than not sealing, because the column is
   /// named `sealed_body` and every reader downstream would trust it.
   ///
-  /// **Nothing calls this in the write path yet.** `ChatMessageStore` still owns
-  /// persistence and still writes plaintext; this is the capability, wired and
-  /// exercised, ahead of the migration that uses it.
+  /// `ChatMessageStore` calls this once at open and seals every message body it
+  /// writes. A `nil` here is the documented plaintext fallback, not a silent one:
+  /// the store logs it and `ChatMessageStore.sealSummary` reports it.
   static func makeSealer() -> VibeStoreSealerHandle? {
     guard let key = VibeCoreStoreKey.loadOrCreate() else {
       VibeLog.error("[VibeCore] no store key available — sealing unavailable")

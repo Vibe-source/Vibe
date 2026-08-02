@@ -272,17 +272,46 @@ struct DiagnosticsView: View {
     return f.string(from: date)
   }
 
+  /// Provenance for an exported log: which build, which device, which settings.
+  ///
+  /// When two exports disagree, this is what says whether the code changed
+  /// underneath them. The Dynamic Type category and layout direction are here
+  /// because they are inputs to row geometry — a height report is unreadable
+  /// without knowing which text size produced it.
+  ///
+  /// `@MainActor` because the trait and layout-direction lookups are; both call
+  /// sites (the on-screen row and the export buttons) already run there.
+  @MainActor
   static func deviceContext() -> [String: String] {
-    let d = UIDevice.current
+    let device = UIDevice.current
     let info = Bundle.main.infoDictionary
     let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
     let build = (info?["CFBundleVersion"] as? String) ?? "?"
+    let isRTL = UIApplication.shared.userInterfaceLayoutDirection == .rightToLeft
     return [
       "app": "\(version) (\(build))",
-      "os": "\(d.systemName) \(d.systemVersion)",
+      "bundle": Bundle.main.bundleIdentifier ?? "?",
+      "os": "\(device.systemName) \(device.systemVersion)",
       "device": deviceModelIdentifier(),
-      "model": d.model,
+      "model": device.model,
+      "locale": "\(Locale.current.identifier)\(isRTL ? " RTL" : "")",
+      "textSize": UIApplication.shared.preferredContentSizeCategory.rawValue
+        .replacingOccurrences(of: "UICTContentSizeCategory", with: ""),
+      "freeDiskMB": freeDiskSpaceMB(),
     ]
+  }
+
+  /// Free space in MB, or `"?"`. `volumeAvailableCapacityForImportantUsage` is
+  /// the number that matters — the raw free-space figure counts purgeable space
+  /// the system will not actually hand over.
+  private static func freeDiskSpaceMB() -> String {
+    let home = URL(fileURLWithPath: NSHomeDirectory())
+    guard
+      let values = try? home.resourceValues(
+        forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+      let capacity = values.volumeAvailableCapacityForImportantUsage
+    else { return "?" }
+    return String(capacity / (1024 * 1024))
   }
 
   private static func deviceModelIdentifier() -> String {
@@ -290,7 +319,8 @@ struct DiagnosticsView: View {
     uname(&sysinfo)
     let mirror = Mirror(reflecting: sysinfo.machine)
     let id = mirror.children.compactMap { ($0.value as? Int8).flatMap { $0 == 0 ? nil : Character(UnicodeScalar(UInt8($0))) } }
-    return String(id)
+    let str = String(id)
+    return str.isEmpty ? "?" : str
   }
 }
 

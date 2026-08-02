@@ -38,13 +38,28 @@ enum VibeCoreStoreKey {
   /// silently seal under something predictable.
   static func loadOrCreate() -> Data? {
     queue.sync {
-      if let existing = loadLocked() {
+      let existing = loadLocked()
+      if let key = existing.key {
         // A key of the wrong width means a corrupt or partially-written item.
         // Replacing it is safe: the sealed store is derived data and is rebuilt
         // by the backfill.
-        if existing.count == lengthBytes { return existing }
+        if key.count == lengthBytes { return key }
         VibeLog.error("[VibeCore] store key wrong width — regenerating")
         deleteLocked()
+        return createLocked()
+      }
+      // "Absent" and "temporarily unreadable" are NOT the same thing, and only
+      // the first may mint a new key. The item is
+      // `kSecAttrAccessibleAfterFirstUnlock`, so a background launch before the
+      // first unlock after a reboot returns `errSecInteractionNotAllowed` — and
+      // minting there would delete the key that every already-sealed row on disk
+      // depends on, turning the user's whole local history into unreadable
+      // bytes. Fail closed: the caller falls back to plaintext for this launch,
+      // which is recoverable; losing the key is not.
+      guard existing.status == errSecItemNotFound else {
+        VibeLog.error(
+          "[VibeCore] store key unavailable (status=\(existing.status)) — NOT regenerating")
+        return nil
       }
       return createLocked()
     }
@@ -59,12 +74,14 @@ enum VibeCoreStoreKey {
   }
 
   static var exists: Bool {
-    queue.sync { loadLocked() != nil }
+    queue.sync { loadLocked().key != nil }
   }
 
   // MARK: - Keychain
 
-  private static func loadLocked() -> Data? {
+  /// Returns the key *and* the raw status, because the caller's decision depends
+  /// on which kind of "no key" this is — see ``loadOrCreate``.
+  private static func loadLocked() -> (key: Data?, status: OSStatus) {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -74,8 +91,8 @@ enum VibeCoreStoreKey {
     ]
     var result: AnyObject?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess, let data = result as? Data else { return nil }
-    return data
+    guard status == errSecSuccess, let data = result as? Data else { return (nil, status) }
+    return (data, status)
   }
 
   private static func createLocked() -> Data? {
