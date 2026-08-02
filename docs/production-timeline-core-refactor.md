@@ -2,13 +2,22 @@
 
 **Status:** P1 green. **P2 complete and verified on a physical device** — the
 Rust core is cross-compiled, packaged as an XCFramework, linked into the app,
-and builds clean for the iPhone 16 Pro Max at **+1.91 MB**. It is *linked but
-dark*: nothing in the UI consumes it. P3 **partially landed** (store sealing +
-`core_messages_v1`). **P4 render path landed, read authority not taken** — the
-adapter, the `UICollectionView` host, and the gated `ChatListView` branch all
-exist and build; the branch runs the core in **shadow only** (order comparison,
-renders nothing) and every gate defaults off. Group E2E is **specified and
-implemented in the core, not enabled and not wired to any platform**.
+and builds clean for the iPhone 16 Pro Max at **+1.91 MB**. **P3 complete** —
+`ChatMessageStore` seals every message body at rest through the core's sealer;
+the store is no longer plaintext and the core is no longer dark. **P4 render
+path landed, read authority not taken** — the adapter, the `UICollectionView`
+host, and the gated `ChatListView` branch all exist and build; the branch runs
+the core in **shadow only** (order comparison, renders nothing). Shadow
+comparison arms itself in debug builds so divergence data accumulates from real
+DMs; the render-path flag stays default-off in every configuration. Group E2E is
+**specified and implemented in the core, not enabled and not wired to any
+platform**.
+
+**What the core is NOT doing yet, stated plainly:** it does not order the
+production list, does not size a single row on screen, and is not fed by the
+real ingest pipeline — the shadow probe re-ingests rows the engine already
+built. Every row the user sees is still ordered, parsed, measured and rendered
+by `ChatListView`.
 
 **On-device evidence (2026-08-02, iPhone 16 Pro Max):** the core's reducer was
 exercised through the preview surface across **503 windows / 372 messages** with
