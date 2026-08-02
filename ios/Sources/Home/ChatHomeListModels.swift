@@ -394,10 +394,30 @@ enum ChatAvatarImageStore {
           if let status = (response as? HTTPURLResponse)?.statusCode,
             !(200...299).contains(status)
           {
+            // 404 is common for users without avatars (negative-cached above).
+            // Only durable-log unexpected statuses to keep the ring useful.
+            if status != 404 {
+              VibeLog.warning(
+                "avatar fetch bad status",
+                category: "network",
+                metadata: [
+                  "status": String(status),
+                  "host": url.host ?? "?",
+                ]
+              )
+            }
             return nil
           }
           return UIImage(data: data)
         } catch {
+          VibeLog.warning(
+            "avatar fetch failed",
+            category: "network",
+            metadata: [
+              "host": url.host ?? "?",
+              "error": error.localizedDescription,
+            ]
+          )
           return nil
         }
       }
@@ -729,6 +749,46 @@ struct ChatHomeListRow {
     peerTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
   }
 
+  /// Delivery state for the newest Home preview when that message was sent by us.
+  ///
+  /// Home rows are projected from ChatEngine whenever a receipt changes, so rendering
+  /// must only inspect the row it already owns. Calling the engine synchronously here
+  /// blocks the main thread behind launch/history work once per visible/signature row.
+  var latestOutgoingDisplayStatus: String? {
+    guard !isSavedMessages, !isArchiveEntry, !isGroup, !isChannel else { return nil }
+    let tail = initialMessages.isEmpty ? previewRows : initialMessages
+    guard let rawRow = tail.last else { return nil }
+    let message = (rawRow["message"] as? [String: Any]) ?? rawRow
+
+    let messageID = Self.normalizedString(
+      message["id"] ?? message["messageId"] ?? message["message_id"]
+        ?? rawRow["id"] ?? rawRow["messageId"] ?? rawRow["message_id"] ?? rawRow["key"])
+    guard let messageID else { return nil }
+
+    let explicitIsMe = Self.parseBool(
+      message["isMe"] ?? message["is_me"] ?? rawRow["isMe"] ?? rawRow["is_me"])
+    let config = ChatEngineStore.shared.getConfig()
+    let myUserID = Self.normalizedString(config["myUserId"] ?? config["userId"])
+    let fromUserID = Self.normalizedString(
+      message["fromId"] ?? message["from_id"] ?? message["senderId"] ?? message["sender_id"])
+    let isMe = explicitIsMe
+      ?? {
+        guard let myUserID, let fromUserID else { return false }
+        return myUserID.caseInsensitiveCompare(fromUserID) == .orderedSame
+      }()
+    guard isMe else { return nil }
+
+    let rawStatus = Self.normalizedString(
+      message["status"] ?? message["deliveryStatus"] ?? message["delivery_status"])?
+      .lowercased()
+    switch rawStatus {
+    case "pending", "sending", "sent", "delivered", "read":
+      return rawStatus
+    default:
+      return nil
+    }
+  }
+
   static func isBuiltInAgentChatId(_ rawChatId: String) -> Bool {
     switch rawChatId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "vibe", "vibe_agent", "vibeagent", "vibe-ai", "vibe_ai":
@@ -838,6 +898,57 @@ struct ChatHomeListRow {
       timeLabel: timeLabel,
       unreadCount: unreadCount,
       markedUnread: markedUnread,
+      muted: muted,
+      pinned: pinned,
+      archived: archived,
+      isTyping: isTyping,
+      isOnline: isOnline,
+      peerUserId: peerUserId,
+      avatarUri: avatarUri,
+      avatarFallback: avatarFallback,
+      avatarGradientStartLight: avatarGradientStartLight,
+      avatarGradientEndLight: avatarGradientEndLight,
+      avatarGradientStartDark: avatarGradientStartDark,
+      avatarGradientEndDark: avatarGradientEndDark,
+      isSavedMessages: isSavedMessages,
+      isArchiveEntry: isArchiveEntry,
+      type: type,
+      isGroup: isGroup,
+      myRole: myRole,
+      isAgentFriend: isAgentFriend,
+      peerAgentId: peerAgentId,
+      agentEventInboxMode: agentEventInboxMode,
+      peerTier: peerTier,
+      previewRows: previewRows,
+      initialMessages: initialMessages,
+      members: members,
+      lastMessageAt: lastMessageAt,
+      createdAt: createdAt,
+      roomDescription: roomDescription,
+      accessType: accessType,
+      publicSlug: publicSlug,
+      shareLink: shareLink,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent,
+      memberCount: memberCount,
+      subscriberCount: subscriberCount
+    )
+  }
+
+  /// Local-only unread state, applied before (and independently of) the server call.
+  ///
+  /// Marking a chat unread is a projection of THIS user's chat list. It deliberately
+  /// touches nothing that the peer can observe: no read receipt is retracted, no message
+  /// status is rewritten, and the peer's own ticks are unaffected — the server endpoint
+  /// behind it only flips this participant's `marked_unread` flag.
+  func withLocalUnread(_ unread: Bool) -> ChatHomeListRow {
+    ChatHomeListRow(
+      chatId: chatId,
+      title: title,
+      preview: preview,
+      timeLabel: timeLabel,
+      unreadCount: unread ? max(1, unreadCount) : 0,
+      markedUnread: unread,
       muted: muted,
       pinned: pinned,
       archived: archived,
@@ -1220,11 +1331,23 @@ struct ChatHomeListRow {
       : millis
     let date = Date(timeIntervalSince1970: seconds)
     let calendar = Calendar.current
+    let now = Date()
     if calendar.isDateInToday(date) {
       return HomeTimeFormatters.time.string(from: date)
     }
-    if calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
+    if calendar.isDateInYesterday(date) {
+      return NSLocalizedString("Yesterday", comment: "Home list date for the previous day")
+    }
+    let daysAgo = calendar.dateComponents(
+      [.day],
+      from: calendar.startOfDay(for: date),
+      to: calendar.startOfDay(for: now)
+    ).day
+    if let daysAgo, (2..<7).contains(daysAgo) {
       return HomeTimeFormatters.day.string(from: date)
+    }
+    if calendar.isDate(date, equalTo: now, toGranularity: .year) {
+      return HomeTimeFormatters.dayMonth.string(from: date)
     }
     return HomeTimeFormatters.shortDate.string(from: date)
   }
@@ -1360,7 +1483,13 @@ private enum HomeTimeFormatters {
 
   static let day: DateFormatter = {
     let formatter = DateFormatter()
-    formatter.setLocalizedDateFormatFromTemplate("EEE")
+    formatter.setLocalizedDateFormatFromTemplate("EEEE")
+    return formatter
+  }()
+
+  static let dayMonth: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("MMM d")
     return formatter
   }()
 

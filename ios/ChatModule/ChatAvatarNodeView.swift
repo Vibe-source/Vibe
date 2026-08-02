@@ -89,17 +89,7 @@ final class ChatAvatarNodeView: UIView {
     }
     
     static func fallbackInitials(from name: String) -> String {
-        let parts = name.split(whereSeparator: { $0.isWhitespace || $0.isPunctuation })
-        if parts.isEmpty { return "" }
-        if parts.count == 1 {
-            return String(parts[0].prefix(2)).uppercased()
-        }
-        let first = parts.first!
-        let last = parts.last!
-        if let f = first.first, let l = last.first {
-            return (String(f) + String(l)).uppercased()
-        }
-        return ""
+        VibeAvatarFallback.initials(from: name)
     }
 
     /// Telegram-style room fallbacks use one clear glyph. Direct-person avatars retain

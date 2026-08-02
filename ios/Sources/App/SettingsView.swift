@@ -16,6 +16,7 @@ private enum SettingsRoute: String, Identifiable {
   case appearance
   case mediaCache
   case connectedApps
+  case diagnostics
 
   var id: String { rawValue }
 }
@@ -250,9 +251,20 @@ struct SettingsView: View {
             toggleValue: false,
             kind: .link,
             iconColor: UIColor(red: 90 / 255, green: 200 / 255, blue: 250 / 255, alpha: 1),
+            divider: true,
+            destructive: false
+          ),
+          SettingsNativeRow(
+            id: "diagnostics",
+            icon: "stethoscope",
+            label: "Diagnostics & Logs",
+            detailText: "View",
+            toggleValue: false,
+            kind: .link,
+            iconColor: UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 1),
             divider: false,
             destructive: false
-          )
+          ),
         ]
       ),
     ]
@@ -387,6 +399,8 @@ struct SettingsView: View {
         MediaCacheSettingsDetailView()
       case .connectedApps:
         PlatformConnectorsView()
+      case .diagnostics:
+        DiagnosticsView()
       }
     }
   }
@@ -445,6 +459,8 @@ struct SettingsView: View {
       activeRoute = .appearance
     case "media-cache":
       activeRoute = .mediaCache
+    case "diagnostics":
+      activeRoute = .diagnostics
     default:
       break
     }
@@ -1114,19 +1130,24 @@ private struct NotificationSettingsDetailView: View {
   let systemAuthorized: Bool
   let onAuthorizationRefresh: () -> Void
 
+  @AppStorage("vibe.settings.notificationsEnabled") private var notificationsEnabled = true
   @State private var saveError: String?
+  @State private var showPermissionNotice = false
+  @State private var hasPresentedPermissionNotice = false
+  @State private var isUpdatingMasterSwitch = false
+  @State private var awaitingSystemSettingsReturn = false
 
   var body: some View {
     List {
-      if !systemAuthorized {
-        Section {
-          Button("Enable Notifications in iOS Settings") {
-            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-            UIApplication.shared.open(url)
-          }
-        } footer: {
-          Text("Vibe cannot deliver alerts until notifications are allowed in iOS Settings.")
-        }
+      Section {
+        Toggle(
+          "Notifications",
+          isOn: Binding(
+            get: { notificationsEnabled && systemAuthorized },
+            set: setMasterEnabled
+          )
+        )
+        .disabled(isUpdatingMasterSwitch)
       }
 
       Section("MESSAGE NOTIFICATIONS") {
@@ -1154,7 +1175,143 @@ private struct NotificationSettingsDetailView: View {
     .listStyle(.insetGrouped)
     .navigationTitle("Notifications")
     .navigationBarTitleDisplayMode(.inline)
-    .onAppear(perform: onAuthorizationRefresh)
+    .onAppear {
+      refreshPermissionState(promptIfUndetermined: true)
+    }
+    .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+      refreshPermissionState(
+        promptIfUndetermined: false,
+        enableAfterSettingsReturn: awaitingSystemSettingsReturn
+      )
+      awaitingSystemSettingsReturn = false
+    }
+    .alert("Notifications Are Off", isPresented: $showPermissionNotice) {
+      Button("Open Settings") {
+        awaitingSystemSettingsReturn = true
+        openSystemSettings()
+      }
+      Button("Not Now", role: .cancel) {}
+    } message: {
+      Text("Allow notifications in iOS Settings to receive alerts from Vibe.")
+    }
+  }
+
+  private func openSystemSettings() {
+    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+    UIApplication.shared.open(url)
+  }
+
+  private func setMasterEnabled(_ enabled: Bool) {
+    guard !isUpdatingMasterSwitch else { return }
+    if enabled {
+      enableNotifications()
+    } else {
+      updateMasterPreference(false)
+    }
+  }
+
+  private func enableNotifications() {
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      DispatchQueue.main.async {
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+          updateMasterPreference(true)
+          VibeNativeCallManager.shared.refreshNotificationRegistration(
+            reason: "settings-master-enable"
+          )
+        case .notDetermined:
+          requestNativePermission()
+        case .denied:
+          notificationsEnabled = false
+          presentPermissionNotice(force: true)
+          onAuthorizationRefresh()
+        @unknown default:
+          notificationsEnabled = false
+          presentPermissionNotice(force: true)
+          onAuthorizationRefresh()
+        }
+      }
+    }
+  }
+
+  private func requestNativePermission() {
+    VibeNativeCallManager.shared.refreshNotificationRegistration(
+      reason: "settings-native-permission"
+    ) { granted in
+      onAuthorizationRefresh()
+      if granted {
+        updateMasterPreference(true)
+      } else {
+        notificationsEnabled = false
+      }
+    }
+  }
+
+  private func refreshPermissionState(
+    promptIfUndetermined: Bool,
+    enableAfterSettingsReturn: Bool = false
+  ) {
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      DispatchQueue.main.async {
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+          hasPresentedPermissionNotice = false
+          if enableAfterSettingsReturn {
+            updateMasterPreference(true)
+          } else if notificationsEnabled {
+            VibeNativeCallManager.shared.refreshNotificationRegistration(
+              reason: "settings-notifications-appear"
+            )
+          }
+          onAuthorizationRefresh()
+        case .notDetermined:
+          if promptIfUndetermined {
+            requestNativePermission()
+          } else {
+            onAuthorizationRefresh()
+          }
+        case .denied:
+          notificationsEnabled = false
+          presentPermissionNotice()
+          onAuthorizationRefresh()
+        @unknown default:
+          notificationsEnabled = false
+          presentPermissionNotice()
+          onAuthorizationRefresh()
+        }
+      }
+    }
+  }
+
+  private func presentPermissionNotice(force: Bool = false) {
+    guard force || !hasPresentedPermissionNotice else { return }
+    hasPresentedPermissionNotice = true
+    showPermissionNotice = true
+  }
+
+  private func updateMasterPreference(_ enabled: Bool) {
+    guard !isUpdatingMasterSwitch else { return }
+    let previous = notificationsEnabled
+    notificationsEnabled = enabled
+    isUpdatingMasterSwitch = true
+    saveError = nil
+
+    Task { @MainActor in
+      var next = store.notifications
+      next.privateChats.enabled = enabled
+      next.groupChats.enabled = enabled
+      next.channels.enabled = enabled
+      next.stories.enabled = enabled
+      next.reactions.enabled = enabled
+
+      do {
+        try await store.updateNotifications(next)
+      } catch {
+        notificationsEnabled = previous
+        saveError = error.localizedDescription
+      }
+      isUpdatingMasterSwitch = false
+    }
   }
 
   private func categoryRow(
@@ -2740,29 +2897,34 @@ private struct AppMediaCacheStats {
   var totalFiles: Int { categories.reduce(0) { $0 + $1.fileCount } }
 }
 
-/// App-wide DOWNLOAD cache accounting + clearing. Every directory listed here holds media
-/// that was downloaded from the server and can always be re-fetched, so clearing is safe.
-/// Upload/own-recording staging dirs (`chat-local-attachments`, `voice-local-imports`,
-/// `video-notes`) are deliberately NOT listed — clearing them would lose media that can't
-/// be re-downloaded (the user asked to clear downloads only, never their pending uploads).
+/// App-wide DOWNLOAD cache accounting + clearing, reported straight out of `VibeMediaVault`.
+///
+/// It used to keep its own list of directory NAMES under `Library/Caches` — which meant that the
+/// moment chat photos, voice notes and documents moved to durable storage, this screen reported
+/// zero bytes for them and its Clear button silently did nothing. The vault is now the single
+/// source of truth for where downloaded media lives, so the accounting cannot drift from it
+/// again.
+///
+/// The user's own uploads and recordings (`chat-local-attachments`, `voice-local-imports`,
+/// `video-notes`) are not in the vault and are deliberately unreachable from here: clearing them
+/// would lose media that cannot be re-downloaded.
 private enum AppMediaCacheController {
-  static let categories:
-    [(id: String, title: String, systemImage: String, directories: [String])] = [
-      (
-        "audio", "Voice & Music", "music.note",
-        ["voice-cache", "native-music-player-cache", "music_cache"]
-      ),
-      ("photos", "Photos", "photo", ["chat-media-images", "vibe-avatars"]),
-      ("videos", "Video Previews", "film", ["chat-media-video-preview"]),
-    ]
+  static let categories: [(id: String, title: String, systemImage: String, kinds: [VibeMediaKind])] = [
+    ("audio", "Voice & Music", "music.note", [.audio]),
+    ("photos", "Photos", "photo", [.image, .avatar]),
+    ("videos", "Video Previews", "film", [.videoPreview]),
+    ("documents", "Documents", "doc.text", [.document, .documentPage]),
+  ]
 
   static func cacheStats() -> AppMediaCacheStats {
+    let vault = VibeMediaVault.shared
     let categoryStats = categories.map { category -> AppCacheCategoryStat in
       var bytes: Int64 = 0
       var count = 0
-      for fileURL in fileURLs(in: category.directories) {
-        count += 1
-        bytes += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+      for kind in category.kinds {
+        let usage = vault.usage(for: kind)
+        bytes += usage.byteSize
+        count += usage.fileCount
       }
       return AppCacheCategoryStat(
         id: category.id,
@@ -2775,50 +2937,23 @@ private enum AppMediaCacheController {
     return AppMediaCacheStats(categories: categoryStats)
   }
 
+  /// Explicit, user-pressed. Nothing in the app sweeps on a timer: a file the user waited for
+  /// stays until they ask for the space back.
   static func clearExpired(olderThanDays days: Int) {
     let threshold = Date().addingTimeInterval(-Double(max(days, 1)) * 86_400.0)
-    let removableDirectories = categories.flatMap(\.directories)
-    for fileURL in fileURLs(in: removableDirectories) {
-      let contentDate =
-        (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-        ?? .distantPast
-      if contentDate < threshold {
-        try? FileManager.default.removeItem(at: fileURL)
-      }
-    }
+    VibeMediaVault.shared.clearEntries(olderThan: threshold, kinds: allKinds)
   }
 
   static func clearAll() {
-    removeFiles(in: categories.flatMap(\.directories))
+    VibeMediaVault.shared.clear(kinds: allKinds)
   }
 
   static func clearCategory(id: String) {
     guard let category = categories.first(where: { $0.id == id }) else { return }
-    removeFiles(in: category.directories)
+    VibeMediaVault.shared.clear(kinds: category.kinds)
   }
 
-  private static func removeFiles(in directories: [String]) {
-    for fileURL in fileURLs(in: directories) {
-      try? FileManager.default.removeItem(at: fileURL)
-    }
-  }
-
-  private static func fileURLs(in directories: [String]) -> [URL] {
-    let baseDirectory =
-      FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-      ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-
-    return directories.flatMap { directoryName -> [URL] in
-      let directoryURL = baseDirectory.appendingPathComponent(directoryName, isDirectory: true)
-      let contents =
-        (try? FileManager.default.contentsOfDirectory(
-          at: directoryURL,
-          includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey],
-          options: [.skipsHiddenFiles]
-        )) ?? []
-      return contents.filter { !$0.hasDirectoryPath }
-    }
-  }
+  private static var allKinds: [VibeMediaKind] { categories.flatMap(\.kinds) }
 }
 
 private struct AppBlockedUser: Identifiable {

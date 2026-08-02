@@ -239,6 +239,26 @@ final class ChatMessageStore {
     return sqlite3_step(statement) == SQLITE_ROW
   }
 
+  /// Every stored (message_id, ts) pair for one chat — the raw material for reconciling
+  /// the store against a server-canonical transcript (ghost rows under retired ids are
+  /// invisible to upserts and can only be found by enumerating what disk actually holds).
+  func messageIdsWithTimestamps(userId: String, chatId: String) -> [(messageId: String, ts: Int64)] {
+    guard db != nil, !userId.isEmpty, !chatId.isEmpty else { return [] }
+    guard
+      let statement = prepare(
+        "SELECT message_id, ts FROM messages WHERE user_id=? AND chat_id=?")
+    else { return [] }
+    defer { sqlite3_finalize(statement) }
+    bindText(statement, 1, userId)
+    bindText(statement, 2, chatId)
+    var results: [(messageId: String, ts: Int64)] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+      guard let idBytes = sqlite3_column_text(statement, 0) else { continue }
+      results.append((String(cString: idBytes), sqlite3_column_int64(statement, 1)))
+    }
+    return results
+  }
+
   func deleteChat(userId: String, chatId: String) {
     guard db != nil, !userId.isEmpty, !chatId.isEmpty else { return }
     guard let statement = prepare("DELETE FROM messages WHERE user_id=? AND chat_id=?") else {

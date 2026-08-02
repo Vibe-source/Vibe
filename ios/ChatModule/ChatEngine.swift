@@ -414,7 +414,9 @@ final class ChatEngine {
   /// keyed by push ref. Lets us log the true send→server-ack (checkmark) latency.
   private var nativeMessagePushSentAtMs: [String: Int] = [:]
   private var nativePendingEditPushRefs: [String: (chatId: String, messageId: String)] = [:]
-  private var nativePendingDeletePushRefs: [String: (chatId: String, messageId: String)] = [:]
+  private var nativePendingDeletePushRefs: [
+    String: (chatId: String, messageId: String, forEveryone: Bool)
+  ] = [:]
   private var nativePendingCallSignals: [PendingCallSignal] = []
   private var nativePendingCallPushRefs: [String: String] = [:]
   private var nativeUserChannelDemandUntilMs = 0
@@ -433,6 +435,11 @@ final class ChatEngine {
   private var lastNetworkPathSatisfied = true
   private var pendingOutboundDraftsByMessageId: [String: [String: Any]] = [:]
   private var pendingOutboundQueueByChat: [String: [String]] = [:]
+  /// Retryable Phoenix push errors replay the same message id. One work item
+  /// per message prevents socket-open/chat-join/error triggers from creating
+  /// parallel retry loops.
+  private var outboundReplayWorkItemsByMessageId: [String: DispatchWorkItem] = [:]
+  private var outboundReplayAttemptsByMessageId: [String: Int] = [:]
   private var packetRuntimeStartInFlight = false
   private var activeMediaUploadTasksByMessageId: [String: URLSessionTask] = [:]
   private var canceledOutboundMessageIds = Set<String>()
@@ -652,6 +659,7 @@ final class ChatEngine {
   private static let fallbackApiBaseURL = "https://api.vibegram.io"
   private let nativeConnectStaleTimeoutMs = 5_000
   private let queuedOutboundVisibleErrorDelayMs = 20_000
+  private let outboundReplayDelays: [TimeInterval] = [0.45, 0.9, 1.8, 3.5, 6.0, 10.0]
   /// Oldest a queued bridge-agent draft may be and still auto-send on reconnect.
   /// Past this, replay marks it failed instead — a prompt from minutes ago must
   /// not silently dispatch an agent run the user is no longer watching for.
@@ -1044,7 +1052,10 @@ final class ChatEngine {
     if transportMode == "bridge_text" {
       return bridgeBaseURLLocked(config: config) != nil && userId != nil && token != nil
     }
-    return socketUrl != nil && userId != nil && token != nil
+    // A UUID is an identity, not a login token. Older bootstrap code stored userId as
+    // the token fallback; that makes the WebSocket upgrade fail while HTTP/LAN still
+    // work, creating an endless false "Connecting" loop. Force a keychain repair.
+    return socketUrl != nil && userId != nil && token != nil && token != userId
   }
 
   @discardableResult
@@ -1077,10 +1088,17 @@ final class ChatEngine {
       normalizedString(existing["socketUrl"] ?? existing["url"] ?? nativeCallConfig["socketUrl"])
       ?? (apiBase.replacingOccurrences(of: "^http", with: "ws", options: .regularExpression)
         + "/socket")
-    let token =
-      normalizedString(existing["authToken"] ?? existing["token"] ?? nativeCallConfig["authToken"])
-      ?? normalizedString(session?["loginToken"])
-      ?? userId
+    let token = [
+      normalizedString(session?["loginToken"]),
+      normalizedString(nativeCallConfig["authToken"]),
+      normalizedString(existing["authToken"] ?? existing["token"]),
+    ].compactMap { $0 }.first { $0 != userId && $0.lowercased() != "undefined" }
+    guard let token else {
+      appendJournalLocked(
+        event: "native-config-bootstrap-skip",
+        payload: ["trigger": trigger, "reason": "missing_login_token"])
+      return false
+    }
 
     var merged = existing
     merged["apiBaseUrl"] = apiBase
@@ -1417,6 +1435,9 @@ final class ChatEngine {
     let now = nowMs()
     let snapshot = syncOnQueue {
       if configuredUserId != nil, configuredUserId != nextUserId {
+        outboundReplayWorkItemsByMessageId.values.forEach { $0.cancel() }
+        outboundReplayWorkItemsByMessageId.removeAll()
+        outboundReplayAttemptsByMessageId.removeAll()
         pendingOutboundDraftsByMessageId.removeAll()
         pendingOutboundQueueByChat.removeAll()
         store.clearOutboundState()
@@ -1521,6 +1542,9 @@ final class ChatEngine {
       nativePendingCallSignals.removeAll()
       nativePendingCallPushRefs.removeAll()
       nativeUserChannelDemandUntilMs = 0
+      outboundReplayWorkItemsByMessageId.values.forEach { $0.cancel() }
+      outboundReplayWorkItemsByMessageId.removeAll()
+      outboundReplayAttemptsByMessageId.removeAll()
       pendingOutboundDraftsByMessageId.removeAll()
       pendingOutboundQueueByChat.removeAll()
       onlineUsers.removeAll()
@@ -1783,7 +1807,14 @@ final class ChatEngine {
       _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
       guard !messages.isEmpty, !self.historyFullyLoadedChats.contains(chatId) else { return }
 
-      let sortedMessages = messages.sorted { lhs, rhs in
+      // Saved-messages dicts must go through their normalizer first: it re-keys each row
+      // to `original_message_id` (the id every other saved path uses — seeding raw server
+      // dicts here persisted a second id-generation of the same transcript, i.e. the
+      // duplicated cells) and parses the plaintext `extra` blob the generic builder
+      // doesn't know about.
+      let sourceMessages =
+        chatId == "saved_messages" ? self.normalizeSavedMessagesLocked(messages) : messages
+      let sortedMessages = sourceMessages.sorted { lhs, rhs in
         let lt =
           self.parseLongValue(lhs["timestamp"] ?? lhs["timestampMs"] ?? lhs["timestamp_ms"]) ?? 0
         let rt =
@@ -1823,7 +1854,12 @@ final class ChatEngine {
         _ = restoreCachedHistoryRowsLocked(chatId: chatId)
         // We only seed if the full history hasn't already been loaded.
         if !historyFullyLoadedChats.contains(chatId) {
-          let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
+          // Same rule as seedRecentChatHistory: saved-messages dicts re-key through their
+          // normalizer so this path can never mint a second id-generation of a message.
+          let sourceMessages =
+            chatId == "saved_messages"
+            ? normalizeSavedMessagesLocked(messagesArray) : messagesArray
+          let rows = buildHistoryRowsLocked(chatId: chatId, rawMessages: sourceMessages)
           // A home payload that carries no messages for this chat must not install an
           // empty transcript, and a 5-row preview must not replace a longer slice some
           // other seed already put there. The in-memory entry is nil (unknown) or real.
@@ -4169,9 +4205,23 @@ final class ChatEngine {
                 messageId: messageId,
                 progress: scaledProgress
               ) {
+                // A progress tick is NOT a message change. Posting it as one made every
+                // observer that treats "chatMessageChanged" as "something happened in this
+                // chat" do its full-refresh work several times a second for the whole
+                // upload: Home refetched /api/chats (measured ~30 back-to-back 800ms
+                // fetches during one 25s upload, each stealing bandwidth from the very
+                // upload being reported) and the open conversation re-read + re-applied
+                // its entire 60-row transcript per tick. The bar itself rides the
+                // chatDelta above (source=upload), which reconfigures exactly the one
+                // cell. This reason exists so a surface can opt IN to ticks; nothing
+                // treats it as a content change.
                 self.postChangeLocked(
-                  reason: "chatMessageChanged",
-                  userInfo: ["chatId": chatId, "messageId": messageId, "action": "updated"]
+                  reason: "mediaUploadProgress",
+                  userInfo: [
+                    "chatId": chatId,
+                    "messageId": messageId,
+                    "progress": scaledProgress,
+                  ]
                 )
               }
             }
@@ -4660,11 +4710,12 @@ final class ChatEngine {
                 return
               }
               if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
-                self.queueOutboundDraftLocked(
+                self.scheduleRetryableOutboundReplayLocked(
                   chatId: pending.chatId,
                   messageId: pending.messageId,
-                  payload: draft,
-                  reason: "send_timeout"
+                  draft: draft,
+                  reason: "send_timeout",
+                  recycleTransport: true
                 )
               }
               self.appendJournalLocked(
@@ -4674,17 +4725,6 @@ final class ChatEngine {
                   "messageId": pending.messageId,
                   "ref": timeoutRef,
                 ])
-              self.upsertLocalStatusLocked(
-                chatId: pending.chatId, messageId: pending.messageId, status: "error")
-              self.postChangeLocked(
-                reason: "messageStatusChanged",
-                userInfo: [
-                  "chatId": pending.chatId, "messageId": pending.messageId, "status": "error",
-                ])
-              self.scheduleReconnectLocked(reason: "send_timeout")
-              DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.ensureNativeTransport(trigger: "send_timeout")
-              }
             }
           }
 
@@ -4715,6 +4755,13 @@ final class ChatEngine {
       normalizedString(payload["messageId"]) ?? normalizedString(payload["message_id"])
     guard let chatId, let messageId else {
       return ["accepted": false, "reason": "invalid_payload"]
+    }
+    // Saved Messages is an HTTP-backed personal collection, intentionally never
+    // joined as a Phoenix chat topic. Routing it through the live-chat delete
+    // event always returned `chat_not_joined`, which the UI then mislabeled as a
+    // connection problem.
+    if chatId == "saved_messages" {
+      return sendDeleteSavedMessage(messageId: messageId)
     }
     if syncOnQueue({ isBridgeTextModeLocked() }) {
       return ["accepted": false, "reason": "delete_disabled_in_blackout"]
@@ -4748,7 +4795,37 @@ final class ChatEngine {
           "messageId": messageId,
           "forEveryone": forEveryone,
         ])
-      nativePendingDeletePushRefs[ref] = (chatId: chatId, messageId: messageId)
+      nativePendingDeletePushRefs[ref] = (
+        chatId: chatId, messageId: messageId, forEveryone: forEveryone)
+      NSLog(
+        "[DeleteTrace] accepted chatId=%@ messageId=%@ forEveryone=%@ ref=%@",
+        chatId, messageId, forEveryone ? "true" : "false", ref)
+      removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
+      markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+      applyPinnedUpdateLocked(
+        chatId: chatId,
+        messageId: messageId,
+        pinned: false,
+        payload: [:],
+        trigger: "delete_optimistic",
+        refreshRemote: false
+      )
+      let snapshot = statusSnapshotLocked()
+      postChangeLocked(
+        reason: "chatMessageDeleted",
+        userInfo: [
+          "chatId": chatId,
+          "messageId": messageId,
+          "action": "deleted",
+          "state": snapshot,
+        ]
+      )
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [], deleted: [messageId],
+        source: "deleteOptimistic")
+      NSLog(
+        "[DeleteTrace] optimistic removal chatId=%@ messageId=%@ forEveryone=%@",
+        chatId, messageId, forEveryone ? "true" : "false")
       appendJournalLocked(
         event: "native-send-delete-message",
         payload: [
@@ -4757,8 +4834,151 @@ final class ChatEngine {
           "forEveryone": forEveryone,
           "ref": ref,
         ])
-      return ["accepted": true, "transport": "native", "ref": ref]
+      return [
+        "accepted": true,
+        "transport": "native",
+        "ref": ref,
+        "chatId": chatId,
+        "messageId": messageId,
+        "forEveryone": forEveryone,
+      ]
     }
+  }
+
+  private func sendDeleteSavedMessage(messageId: String) -> [String: Any] {
+    let requestContext: (apiBase: URL, token: String, userId: String)? = syncOnQueue {
+      guard let apiBase = apiBaseURLLocked(),
+        let userId = normalizedString(
+          getConfigValueLocked("userId") ?? getConfigValueLocked("myUserId"))
+      else {
+        return nil
+      }
+      let token = authHeaderTokenLocked() ?? ""
+      let chatId = "saved_messages"
+
+      cachedSavedMessagesResponse?.removeAll { row in
+        normalizedString(
+          row["id"] ?? row["messageId"] ?? row["message_id"]
+            ?? row["original_message_id"] ?? row["originalMessageId"]) == messageId
+      }
+      removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
+      markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+      let snapshot = statusSnapshotLocked()
+      postChangeLocked(
+        reason: "chatMessageDeleted",
+        userInfo: [
+          "chatId": chatId,
+          "messageId": messageId,
+          "action": "deleted",
+          "state": snapshot,
+        ])
+      postChatDeltaLocked(
+        chatId: chatId,
+        inserted: [],
+        updated: [],
+        deleted: [messageId],
+        source: "savedDeleteOptimistic"
+      )
+      appendJournalLocked(
+        event: "saved-message-delete-optimistic",
+        payload: ["chatId": chatId, "messageId": messageId])
+      NSLog("[DeleteTrace] saved accepted messageId=%@ transport=http", messageId)
+      return (apiBase, token, userId)
+    }
+
+    guard let requestContext else {
+      return ["accepted": false, "reason": "saved_messages_not_ready"]
+    }
+    performSavedMessageDeleteRequest(
+      apiBase: requestContext.apiBase,
+      token: requestContext.token,
+      userId: requestContext.userId,
+      messageId: messageId,
+      attempt: 1
+    )
+    return [
+      "accepted": true,
+      "transport": "http",
+      "chatId": "saved_messages",
+      "messageId": messageId,
+      "forEveryone": false,
+    ]
+  }
+
+  private func performSavedMessageDeleteRequest(
+    apiBase: URL,
+    token: String,
+    userId: String,
+    messageId: String,
+    attempt: Int
+  ) {
+    let url =
+      apiBase
+      .appendingPathComponent("api")
+      .appendingPathComponent("saved_messages")
+      .appendingPathComponent(userId)
+      .appendingPathComponent(messageId)
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      guard let self else { return }
+      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      let success = error == nil && (200...299).contains(status)
+      let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+      NSLog(
+        "[DeleteTrace] saved reply messageId=%@ attempt=%d status=%d success=%@ error=%@ body=%@",
+        messageId,
+        attempt,
+        status,
+        success ? "Y" : "N",
+        error?.localizedDescription ?? "-",
+        body.isEmpty ? "-" : body
+      )
+      if success {
+        self.queue.async {
+          self.appendJournalLocked(
+            event: "saved-message-delete-reply",
+            payload: [
+              "messageId": messageId,
+              "attempt": attempt,
+              "status": status,
+            ])
+        }
+        return
+      }
+
+      guard attempt < 3 else {
+        self.queue.async {
+          self.appendJournalLocked(
+            event: "saved-message-delete-failed",
+            payload: [
+              "messageId": messageId,
+              "attempts": attempt,
+              "status": status,
+              "error": error?.localizedDescription ?? "",
+            ])
+        }
+        return
+      }
+      let retryDelay: TimeInterval = attempt == 1 ? 1.5 : 5.0
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + retryDelay) {
+        [weak self] in
+        self?.performSavedMessageDeleteRequest(
+          apiBase: apiBase,
+          token: token,
+          userId: userId,
+          messageId: messageId,
+          attempt: attempt + 1
+        )
+      }
+    }.resume()
   }
 
   func editMessage(_ payload: [String: Any]) -> [String: Any] {
@@ -4929,52 +5149,7 @@ final class ChatEngine {
     requestContext = syncOnQueue {
       let apiBase = apiBaseURLLocked()
       let token = authHeaderTokenLocked() ?? ""
-
-      historyRowsByChat.removeValue(forKey: chatId)
-      historyFullyLoadedChats.remove(chatId)
-      historyRowsRestoredFromCacheChats.remove(chatId)
-      historyOlderExhaustedChats.remove(chatId)
-      historyLoadingOlderChats.remove(chatId)
-      historyHasMoreByChat.removeValue(forKey: chatId)
-      historyNextCursorByChat.removeValue(forKey: chatId)
-      historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
-      clearCachedHistoryRowsLocked(chatId: chatId)
-      if chatId == "saved_messages" {
-        self.cachedSavedMessagesResponse = nil
-      }
-      historyLoadingChats.remove(chatId)
-      liveMessageRowsByChat.removeValue(forKey: chatId)
-      deletedMessageIdsByChat.removeValue(forKey: chatId)
-      receiptIndex.removeValue(forKey: chatId)
-      localStatusIndex.removeValue(forKey: chatId)
-      pendingOutboundQueueByChat.removeValue(forKey: chatId)
-      nativeTypingStateByChatId.removeValue(forKey: chatId)
-      peerTypingUserIdsByChatId.removeValue(forKey: chatId)
-      agentProgressByChatId.removeValue(forKey: chatId)
-      nativeRecordingStateByChatId.removeValue(forKey: chatId)
-      pinnedMessagesByChatId.removeValue(forKey: chatId)
-      pinnedFetchInFlightChatIds.remove(chatId)
-      chatPeerUserIdsByChatId.removeValue(forKey: chatId)
-      openChatChannels.removeValue(forKey: chatId)
-
-      let draftIdsToRemove = pendingOutboundDraftsByMessageId.compactMap {
-        (messageId, draft) -> String? in
-        let draftChatId = normalizedString(draft["chatId"] ?? draft["chat_id"])
-        return draftChatId == chatId ? messageId : nil
-      }
-      draftIdsToRemove.forEach { pendingOutboundDraftsByMessageId.removeValue(forKey: $0) }
-
-      if nativeJoinedChatIds.contains(chatId) {
-        nativeJoinedChatIds.remove(chatId)
-        if let client = phoenixClient {
-          client.leave(topic: chatTopic(for: chatId))
-        }
-      }
-
-      appendJournalLocked(event: "native-chat-clear-local", payload: ["chatId": chatId])
-      state["updatedAt"] = nowMs()
-      postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
-      postChangeLocked(reason: "chatCleared", userInfo: ["chatId": chatId])
+      clearChatStateLocked(chatId: chatId, journalEvent: "native-chat-clear-local")
       return (apiBase, token)
     }
 
@@ -5022,6 +5197,56 @@ final class ChatEngine {
     }.resume()
 
     return ["accepted": true, "queued": true, "chatId": chatId]
+  }
+
+  /// Remove every local projection of a chat. This is shared by the optimistic local
+  /// delete path and by the `chat-deleted` event mirrored onto the user's own topic, so
+  /// deleting a DM from another device (or for both participants) cannot leave Home,
+  /// SQLite, the warm transcript, or receipt state pointing at a chat the server removed.
+  /// Must be called on `queue`.
+  private func clearChatStateLocked(chatId: String, journalEvent: String) {
+    historyRowsByChat.removeValue(forKey: chatId)
+    historyFullyLoadedChats.remove(chatId)
+    historyRowsRestoredFromCacheChats.remove(chatId)
+    historyOlderExhaustedChats.remove(chatId)
+    historyLoadingOlderChats.remove(chatId)
+    historyHasMoreByChat.removeValue(forKey: chatId)
+    historyNextCursorByChat.removeValue(forKey: chatId)
+    historyNextCursorBoundaryByChat.removeValue(forKey: chatId)
+    clearCachedHistoryRowsLocked(chatId: chatId)
+    if chatId == "saved_messages" {
+      cachedSavedMessagesResponse = nil
+    }
+    historyLoadingChats.remove(chatId)
+    liveMessageRowsByChat.removeValue(forKey: chatId)
+    deletedMessageIdsByChat.removeValue(forKey: chatId)
+    receiptIndex.removeValue(forKey: chatId)
+    localStatusIndex.removeValue(forKey: chatId)
+    pendingOutboundQueueByChat.removeValue(forKey: chatId)
+    nativeTypingStateByChatId.removeValue(forKey: chatId)
+    peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+    agentProgressByChatId.removeValue(forKey: chatId)
+    nativeRecordingStateByChatId.removeValue(forKey: chatId)
+    pinnedMessagesByChatId.removeValue(forKey: chatId)
+    pinnedFetchInFlightChatIds.remove(chatId)
+    chatPeerUserIdsByChatId.removeValue(forKey: chatId)
+    openChatChannels.removeValue(forKey: chatId)
+
+    let draftIdsToRemove = pendingOutboundDraftsByMessageId.compactMap {
+      (messageId, draft) -> String? in
+      let draftChatId = normalizedString(draft["chatId"] ?? draft["chat_id"])
+      return draftChatId == chatId ? messageId : nil
+    }
+    draftIdsToRemove.forEach { pendingOutboundDraftsByMessageId.removeValue(forKey: $0) }
+
+    if nativeJoinedChatIds.remove(chatId) != nil, let client = phoenixClient {
+      client.leave(topic: chatTopic(for: chatId))
+    }
+
+    appendJournalLocked(event: journalEvent, payload: ["chatId": chatId])
+    state["updatedAt"] = nowMs()
+    postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
+    postChangeLocked(reason: "chatCleared", userInfo: ["chatId": chatId])
   }
 
   func blockUser(_ payload: [String: Any]) -> [String: Any] {
@@ -7282,7 +7507,8 @@ final class ChatEngine {
         // confusing "your device is not up — send again"; that manual resend re-pushed the
         // SAME id and relied on the SAME dedup, so auto-replay is no less safe.)
         self.upsertLocalStatusLocked(
-          chatId: pending.chatId, messageId: pending.messageId, status: "pending")
+          chatId: pending.chatId, messageId: pending.messageId, status: "pending",
+          allowDowngrade: true)
         if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
           self.queueOutboundDraftLocked(
             chatId: pending.chatId, messageId: pending.messageId, payload: draft,
@@ -7336,7 +7562,8 @@ final class ChatEngine {
           // "pending" (waiting), never a dead-end error, and queue for auto-replay. Safe
           // for agent chats via the bridge's message-id taskId dedup (see socket_closed).
           self.upsertLocalStatusLocked(
-            chatId: pending.chatId, messageId: pending.messageId, status: "pending")
+            chatId: pending.chatId, messageId: pending.messageId, status: "pending",
+            allowDowngrade: true)
           if let draft = self.pendingOutboundDraftsByMessageId[pending.messageId] {
             self.queueOutboundDraftLocked(
               chatId: pending.chatId, messageId: pending.messageId, payload: draft,
@@ -7463,6 +7690,17 @@ final class ChatEngine {
     // work on the serial engine queue when diagnosing send→ack latency.
     let frameArrivalMs = nowMs()
     queue.async {
+      if frame.event == "phx_error",
+        frame.topic.hasPrefix("chat:")
+      {
+        let chatId = String(frame.topic.dropFirst("chat:".count))
+        self.recoverStaleNativeChatTopicLocked(
+          chatId: chatId,
+          reason: "channel_phx_error"
+        )
+        return
+      }
+
       if frame.event == "phx_reply",
         frame.topic == self.nativeUserTopic,
         let ref = frame.ref,
@@ -7519,7 +7757,30 @@ final class ChatEngine {
 
         if let pending = self.nativePendingMessagePushRefs.removeValue(forKey: ref) {
           let status = (frame.payload["status"] as? String)?.lowercased() ?? ""
-          let nextStatus = status == "ok" ? "sent" : "error"
+          let failureReason =
+            status == "ok" ? "ok" : self.messagePushFailureReasonLocked(frame.payload)
+          let bridgeProvider = self.bridgeProviderForChatLocked(chatId: pending.chatId)
+          let replayDraft = self.pendingOutboundDraftsByMessageId[pending.messageId]
+          let permanentFailure =
+            status != "ok" && self.isPermanentMessagePushFailureLocked(frame.payload)
+          let retryable =
+            status != "ok"
+            && bridgeProvider == nil
+            && !permanentFailure
+            && replayDraft != nil
+          let staleTopic =
+            status != "ok"
+            && failureReason.contains("unmatched topic")
+          let nextStatus = status == "ok" ? "sent" : (retryable ? "pending" : "error")
+          if status != "ok" {
+            let payloadKeys = frame.payload.keys.sorted().joined(separator: ",")
+            NSLog(
+              "[OutboundRetry] push reply chatId=%@ messageId=%@ status=%@ reason=%@ keys=%@ draft=%@ permanent=%@ retryable=%@",
+              pending.chatId, pending.messageId, status, failureReason, payloadKeys,
+              replayDraft == nil ? "N" : "Y",
+              permanentFailure ? "Y" : "N",
+              retryable ? "Y" : "N")
+          }
           if let sentAtMs = self.nativeMessagePushSentAtMs.removeValue(forKey: ref) {
             let wireRTT = frameArrivalMs - sentAtMs
             let queueWait = self.nowMs() - frameArrivalMs
@@ -7529,9 +7790,11 @@ final class ChatEngine {
               pending.chatId, pending.messageId)
           }
           if status == "ok" {
+            self.cancelScheduledOutboundReplayLocked(
+              messageId: pending.messageId, resetAttempt: true)
             self.removeQueuedOutboundDraftLocked(
               chatId: pending.chatId, messageId: pending.messageId, dropDraft: true)
-          } else if let provider = self.bridgeProviderForChatLocked(chatId: pending.chatId) {
+          } else if let provider = bridgeProvider {
             // Server rejected the push — keep the user's text visible with an error
             // badge (tap-to-retry) instead of deleting the bubble.
             self.markVolatileBridgeSendErrorLocked(
@@ -7541,7 +7804,42 @@ final class ChatEngine {
               provider: provider
             )
             return
+          } else if retryable,
+            let draft = replayDraft
+          {
+            if staleTopic {
+              // Phoenix returns this when the chat Channel process died while
+              // the websocket itself stayed healthy. Do not tear down the
+              // socket: invalidate only this topic and join it again now. The
+              // join reply replays the queued draft, normally within one RTT.
+              self.recoverStaleNativeChatTopicLocked(
+                chatId: pending.chatId,
+                reason: "push_unmatched_topic"
+              )
+            }
+            self.appendJournalLocked(
+              event: "native-message-push-reply",
+              payload: [
+                "chatId": pending.chatId,
+                "messageId": pending.messageId,
+                "ref": ref,
+                "status": status,
+                "reason": failureReason,
+                "retryable": true,
+              ])
+            self.scheduleRetryableOutboundReplayLocked(
+              chatId: pending.chatId,
+              messageId: pending.messageId,
+              draft: draft,
+              reason: failureReason,
+              recycleTransport: !staleTopic
+            )
+            return
           }
+          self.cancelScheduledOutboundReplayLocked(
+            messageId: pending.messageId, resetAttempt: true)
+          self.removeQueuedOutboundDraftLocked(
+            chatId: pending.chatId, messageId: pending.messageId, dropDraft: false)
           self.upsertLocalStatusLocked(
             chatId: pending.chatId, messageId: pending.messageId, status: nextStatus)
           self.appendJournalLocked(
@@ -7551,6 +7849,8 @@ final class ChatEngine {
               "messageId": pending.messageId,
               "ref": ref,
               "status": status,
+              "reason": failureReason,
+              "retryable": false,
             ])
           let snapshot = self.statusSnapshotLocked()
           self.postChangeLocked(
@@ -7590,9 +7890,19 @@ final class ChatEngine {
 
         if let pending = self.nativePendingDeletePushRefs.removeValue(forKey: ref) {
           let status = (frame.payload["status"] as? String)?.lowercased() ?? ""
-          if status == "ok" {
-            self.removeMessageIndicesLocked(chatId: pending.chatId, messageId: pending.messageId)
-          }
+          let replyError =
+            frame.payload["response"] ?? frame.payload["reason"] ?? frame.payload["error"]
+          NSLog(
+            "[DeleteTrace] reply chatId=%@ messageId=%@ forEveryone=%@ status=%@ error=%@",
+            pending.chatId,
+            pending.messageId,
+            pending.forEveryone ? "true" : "false",
+            status.isEmpty ? "missing" : status,
+            replyError.map { String(describing: $0) } ?? "-")
+          // Optimistic deletion is intentionally stable even when the server rejects the
+          // push. Reassert the tombstone idempotently; never restore the row and flicker.
+          self.removeMessageIndicesLocked(chatId: pending.chatId, messageId: pending.messageId)
+          self.markLiveMessageDeletedLocked(chatId: pending.chatId, messageId: pending.messageId)
           self.appendJournalLocked(
             event: "native-delete-message-push-reply",
             payload: [
@@ -7600,6 +7910,7 @@ final class ChatEngine {
               "messageId": pending.messageId,
               "ref": ref,
               "status": status,
+              "forEveryone": pending.forEveryone,
             ])
           let snapshot = self.statusSnapshotLocked()
           self.postChangeLocked(
@@ -8041,23 +8352,130 @@ final class ChatEngine {
         }
         return
       }
-      if frame.event == "new_message" {
-        // A new message landed in one of this user's chats (from a peer, or mirrored
-        // from the user's OWN other device). Devices only join a chat's realtime
-        // topic while that chat screen is open, so this user-topic ping is how the
-        // chat LIST and any other-device surface learn to refresh without waiting for
-        // a re-open/pull. Content for an open chat still arrives over the chat topic;
-        // this just nudges observers (home list debounces a refresh; the agent view
-        // re-reads its provider).
-        let signalChatId = self.normalizedString(
-          frame.payload["chatId"] ?? frame.payload["chat_id"])
+      if frame.event == "chat-deleted" {
+        guard
+          let chatId = self.normalizedString(
+            frame.payload["chatId"] ?? frame.payload["chat_id"]),
+          !chatId.isEmpty
+        else { return }
+        self.clearChatStateLocked(chatId: chatId, journalEvent: "native-chat-clear-remote")
+        return
+      }
+      if frame.event == "message-edited" || frame.event == "message-deleted" {
+        guard
+          let chatId = self.normalizedString(
+            frame.payload["chatId"] ?? frame.payload["chat_id"]),
+          !chatId.isEmpty
+        else { return }
+        // A mounted chat receives the authoritative event on `chat:<id>`. Ignoring its
+        // user-topic mirror avoids a second delete/edit delta while still giving Home,
+        // another chat, and this user's other devices the same realtime mutation.
+        guard !self.nativeJoinedChatIds.contains(chatId) else { return }
+        guard
+          let mutationUpdate = self.applyNativeChatMutationEventLocked(
+            chatId: chatId, event: frame.event, payload: frame.payload)
+        else {
+          // Compatibility/oversize fallback: older servers and deliberately omitted
+          // mirrors cannot hydrate a never-opened row. Tell Home to reconcile without
+          // blocking the navigation transition or clearing its populated cached tail.
+          self.postChangeLocked(
+            reason: "remoteChatMutationMiss",
+            userInfo: [
+              "chatId": chatId,
+              "messageId": self.normalizedString(
+                frame.payload["messageId"] ?? frame.payload["message_id"]) as Any,
+              "chatIsOnScreen": false,
+              "state": self.statusSnapshotLocked(),
+            ]
+          )
+          return
+        }
+        let reason =
+          mutationUpdate.action == "edited" ? "chatMessageEdited" : "chatMessageDeleted"
         self.postChangeLocked(
-          reason: "remoteNewMessage",
+          reason: reason,
           userInfo: [
-            "chatId": signalChatId ?? "",
+            "chatId": chatId,
+            "messageId": mutationUpdate.messageId,
+            "action": mutationUpdate.action,
+            "chatIsOnScreen": false,
             "state": self.statusSnapshotLocked(),
           ]
         )
+        if mutationUpdate.action == "edited" {
+          self.postChatDeltaLocked(
+            chatId: chatId, inserted: [], updated: [mutationUpdate.messageId], deleted: [],
+            source: "userTopicEdit")
+        } else {
+          self.postChatDeltaLocked(
+            chatId: chatId, inserted: [], updated: [], deleted: [mutationUpdate.messageId],
+            source: "userTopicDelete")
+        }
+        return
+      }
+      if frame.event == "message-delivered" || frame.event == "message-read" {
+        guard
+          let chatId = self.normalizedString(
+            frame.payload["chatId"] ?? frame.payload["chat_id"]),
+          !chatId.isEmpty
+        else { return }
+        // As above, an open affected chat already receives the chat-topic receipt.
+        guard !self.nativeJoinedChatIds.contains(chatId) else { return }
+        guard
+          let receiptUpdate = self.applyNativeChatEventLocked(
+            chatId: chatId, event: frame.event, payload: frame.payload)
+        else { return }
+        self.postChangeLocked(
+          reason: "messageStatusChanged",
+          userInfo: [
+            "chatId": chatId,
+            "messageId": receiptUpdate.messageId,
+            "status": receiptUpdate.status,
+            "chatIsOnScreen": false,
+            "state": self.statusSnapshotLocked(),
+          ]
+        )
+        return
+      }
+      if frame.event == "new_message" {
+        // A new message landed in one of this user's chats (from a peer, an agent, or
+        // mirrored from the user's OWN other device). Devices only join a chat's
+        // realtime topic while that chat screen is open, so this user-topic ping is how
+        // the chat LIST and any other-device surface learn about it.
+        //
+        // The server now mirrors the message itself under `message` (see
+        // `Vibe.Chat.mirrored_message_payload/1`). Ingesting it here is what makes the
+        // chat list real-time: without it the ping carried only ids, so Home could
+        // project nothing, had to wait for a debounced `/api/chats` round trip, and a
+        // row tapped inside that window opened on a transcript that did not contain the
+        // message its own notification had just announced.
+        let signalChatId = self.normalizedString(
+          frame.payload["chatId"] ?? frame.payload["chat_id"])
+        var ingested: (messageId: String, inserted: Bool)?
+        if let chatId = signalChatId, !chatId.isEmpty,
+          let mirrored = frame.payload["message"] as? [String: Any],
+          !mirrored.isEmpty
+        {
+          ingested = self.ingestMirroredUserTopicMessageLocked(
+            chatId: chatId, payload: mirrored)
+        }
+        var userInfo: [String: Any] = [
+          "chatId": signalChatId ?? "",
+          "state": self.statusSnapshotLocked(),
+          // Free here (we already hold the queue) and it saves the chat list a
+          // synchronous hop back into this queue just to ask whether the conversation
+          // it is about to badge is the one on screen.
+          "chatIsOnScreen": signalChatId.map { self.nativeJoinedChatIds.contains($0) } ?? false,
+        ]
+        // Additive: lets Home account for exactly this message (unread, projection)
+        // instead of inferring it from whatever happens to be newest. `inserted` is what
+        // makes a redelivery idempotent — an upsert that only updated an existing row
+        // must not raise the badge a second time.
+        if let ingested {
+          userInfo["messageId"] = ingested.messageId
+          userInfo["inserted"] = ingested.inserted
+        }
+        self.postChangeLocked(reason: "remoteNewMessage", userInfo: userInfo)
         return
       }
       if self.handleUserCallEventLocked(event: frame.event, payload: frame.payload) {
@@ -9622,7 +10040,59 @@ final class ChatEngine {
     var deleted = deletedMessageIdsByChat[chatId] ?? Set<String>()
     deleted.insert(messageId)
     deletedMessageIdsByChat[chatId] = deleted
+    deleteCachedHistoryMessageLocked(chatId: chatId, messageId: messageId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+  }
+
+  /// Delete persistence must not depend on there being another row to write.
+  /// `storeMergedChatHistoryIfLoadedLocked` intentionally skips an empty transcript,
+  /// so without this direct removal the final message remains in SQLite (or the
+  /// pre-SQLite UserDefaults blob) and resurrects after the next process launch.
+  private func deleteCachedHistoryMessageLocked(chatId: String, messageId: String) {
+    if var historyRows = historyRowsByChat[chatId] {
+      historyRows.removeAll { self.messageId(fromRow: $0) == messageId }
+      historyRowsByChat[chatId] = historyRows
+    }
+
+    var sqliteBefore = -1
+    var sqliteAfter = -1
+    if let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable {
+      sqliteBefore = messageStore.messageCount(userId: userId, chatId: chatId)
+      messageStore.deleteMessages(
+        userId: userId,
+        chatId: chatId,
+        messageIds: [messageId]
+      )
+      sqliteAfter = messageStore.messageCount(userId: userId, chatId: chatId)
+    }
+
+    var legacyRemoved = false
+    if let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId),
+      let data = UserDefaults.standard.data(forKey: cacheKey),
+      let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+      let legacyRows = object as? [[String: Any]]
+    {
+      let retained = legacyRows.filter { self.messageId(fromRow: $0) != messageId }
+      if retained.count != legacyRows.count {
+        legacyRemoved = true
+        if retained.isEmpty {
+          UserDefaults.standard.removeObject(forKey: cacheKey)
+        } else if JSONSerialization.isValidJSONObject(retained),
+          let nextData = try? JSONSerialization.data(withJSONObject: retained)
+        {
+          UserDefaults.standard.set(nextData, forKey: cacheKey)
+        }
+      }
+    }
+
+    NSLog(
+      "[HistoryStore] DELETE chat=%@ id=%@ sqlite=%d→%d legacy=%@",
+      String(chatId.prefix(12)),
+      String(messageId.suffix(12)),
+      sqliteBefore,
+      sqliteAfter,
+      legacyRemoved ? "Y" : "N"
+    )
   }
 
   private func findMessagePayloadLocked(chatId: String, messageId: String) -> [String: Any]? {
@@ -9715,6 +10185,23 @@ final class ChatEngine {
     if let emoji = normalizedString(decryptedFields["emoji"]) {
       metadata["emoji"] = emoji
     }
+    // Music card identity. The send path seals `cover`/`artist`/`source` at the TOP level
+    // of the encrypted payload, and the row model reads them back from `metadata` — this
+    // fold is the only bridge between the two. Without it every history rebuild (network
+    // reload, logout/login) produced a music row with no artwork, and the store upsert
+    // then overwrote the rich row on disk, so the loss looked permanent.
+    if metadata["cover"] == nil,
+      let cover = normalizedString(
+        decryptedFields["cover"] ?? decryptedFields["coverUrl"] ?? decryptedFields["artworkUrl"])
+    {
+      metadata["cover"] = cover
+    }
+    if metadata["artist"] == nil, let artist = normalizedString(decryptedFields["artist"]) {
+      metadata["artist"] = artist
+    }
+    if metadata["source"] == nil, let source = normalizedString(decryptedFields["source"]) {
+      metadata["source"] = source
+    }
 
     var message: [String: Any] = [
       "id": messageId,
@@ -9757,6 +10244,43 @@ final class ChatEngine {
   }
 
   private static let agentUserId = "00000000-0000-0000-0000-000000000001"
+
+  /// Ingest the message mirrored onto this user's own topic for a chat whose realtime
+  /// topic this device is NOT joined to (i.e. the chat is not on screen).
+  ///
+  /// Deliberately narrow:
+  /// - a joined chat is left entirely to the chat-topic path, which additionally emits
+  ///   the delivery receipt, clears typing, and retires the agent's streaming row;
+  /// - a message the user already deleted locally is never re-inserted, because
+  ///   `upsertLiveMessageRowLocked` lifts the tombstone and a late mirror (or a
+  ///   reconnect-era duplicate) would otherwise resurrect deleted content.
+  ///
+  /// Everything else is the same upsert the chat topic performs, so redelivery of the
+  /// same id updates in place rather than duplicating.
+  private func ingestMirroredUserTopicMessageLocked(
+    chatId: String, payload: [String: Any]
+  ) -> (messageId: String, inserted: Bool)? {
+    guard !nativeJoinedChatIds.contains(chatId) else { return nil }
+    guard let messageId = normalizedString(payload["id"] ?? payload["message_id"]) else {
+      return nil
+    }
+    guard deletedMessageIdsByChat[chatId]?.contains(messageId) != true else {
+      NSLog(
+        "[ChatEngine] user-topic mirror ignored for locally deleted message chatId=%@ messageId=%@",
+        String(chatId.prefix(12)),
+        String(messageId.prefix(12))
+      )
+      return nil
+    }
+    let wasPresent =
+      liveMessageRowsByChat[chatId]?[messageId] != nil
+      || (historyRowsByChat[chatId] ?? []).contains { self.messageId(fromRow: $0) == messageId }
+    guard
+      let insertedMessageId = applyNativeIncomingMessageEventLocked(
+        chatId: chatId, payload: payload, postDelta: true)
+    else { return nil }
+    return (insertedMessageId, !wasPresent)
+  }
 
   private func applyNativeIncomingMessageEventLocked(
     chatId: String, payload: [String: Any], postDelta: Bool = true
@@ -10019,16 +10543,43 @@ final class ChatEngine {
     }
     switch event {
     case "message-edited":
+      // Deletion wins every race. `upsertLiveMessageRowLocked` intentionally lifts a
+      // tombstone for legitimate re-inserts, so an older edit must be rejected before
+      // hydrating its canonical message or it could resurrect deleted content.
+      guard deletedMessageIdsByChat[chatId]?.contains(messageId) != true else { return nil }
       let editedAtValue = payload["editedAt"] ?? payload["edited_at"]
       let encryptedContent = normalizedString(
         payload["encryptedContent"] ?? payload["encrypted_content"])
-      let existingRow = liveMessageRowsByChat[chatId]?[messageId]
-      let existingMessage = existingRow?["message"] as? [String: Any]
-      let existingMetadata = existingMessage?["metadata"] as? [String: Any]
-      let fromId = normalizedString(existingMessage?["fromId"])
-      let type = normalizedString(existingMessage?["type"]) ?? "text"
+
+      // A user-topic mutation can arrive for a chat this process has never opened. The
+      // compact canonical row included by the server supplies the identity/type/metadata
+      // needed to build a real bubble without waiting for a history fetch (and therefore
+      // keeps the first pushed frame populated). Older servers omit it; in that case we
+      // preserve the current snapshot and let Home's reconcile fetch fill the gap.
+      if findMessagePayloadLocked(chatId: chatId, messageId: messageId) == nil,
+        let mirroredMessage = payload["message"] as? [String: Any],
+        normalizedString(mirroredMessage["id"] ?? mirroredMessage["message_id"]) == messageId
+      {
+        _ = applyNativeIncomingMessageEventLocked(
+          chatId: chatId, payload: mirroredMessage, postDelta: false)
+      }
+      guard let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId)
+      else { return nil }
+
+      // Receipts and mutations are allowed to be duplicated and reordered by reconnects.
+      // Never let an older edit overwrite a newer local/server edit.
+      if let incomingEditedAt = parseLongValue(editedAtValue),
+        let currentEditedAt = parseLongValue(
+          existingMessage["editedAt"] ?? existingMessage["edited_at"]),
+        incomingEditedAt < currentEditedAt
+      {
+        return nil
+      }
+      let existingMetadata = existingMessage["metadata"] as? [String: Any]
+      let fromId = normalizedString(existingMessage["fromId"] ?? existingMessage["from_id"])
+      let type = normalizedString(existingMessage["type"]) ?? "text"
       let timestampMs =
-        parseLongValue(existingMessage?["timestampMs"] ?? existingMessage?["timestamp"])
+        parseLongValue(existingMessage["timestampMs"] ?? existingMessage["timestamp"])
         ?? Int64(nowMs())
       let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
       let decryptedFields: [String: Any] = {
@@ -10049,22 +10600,22 @@ final class ChatEngine {
       var hydratedFields = decryptedFields
       if normalizedString(hydratedFields["mediaUrl"]) == nil {
         hydratedFields["mediaUrl"] =
-          existingMessage?["mediaUrl"] ?? existingMessage?["media_url"]
+          existingMessage["mediaUrl"] ?? existingMessage["media_url"]
           ?? existingMetadata?["mediaUrl"] ?? existingMetadata?["media_url"]
       }
       if normalizedString(hydratedFields["fileName"]) == nil {
         hydratedFields["fileName"] =
-          existingMessage?["fileName"] ?? existingMessage?["file_name"]
+          existingMessage["fileName"] ?? existingMessage["file_name"]
           ?? existingMetadata?["fileName"] ?? existingMetadata?["file_name"]
       }
       if normalizedString(hydratedFields["mediaKey"]) == nil {
         hydratedFields["mediaKey"] =
-          existingMessage?["mediaKey"] ?? existingMessage?["media_key"]
+          existingMessage["mediaKey"] ?? existingMessage["media_key"]
           ?? existingMetadata?["mediaKey"] ?? existingMetadata?["media_key"]
       }
       if hydratedFields["thumbnailBase64"] == nil {
         hydratedFields["thumbnailBase64"] =
-          existingMessage?["thumbnailBase64"] ?? existingMessage?["thumbnail_base64"]
+          existingMessage["thumbnailBase64"] ?? existingMessage["thumbnail_base64"]
           ?? existingMetadata?["thumbnailBase64"] ?? existingMetadata?["thumbnail_base64"]
       }
       // Carry the existing metadata under the edited payload's fields so an edit
@@ -10100,7 +10651,8 @@ final class ChatEngine {
         type: type,
         timestampMs: timestampMs,
         encryptedContent: encryptedContent
-          ?? normalizedString(existingMessage?["encryptedContent"]),
+          ?? normalizedString(
+            existingMessage["encryptedContent"] ?? existingMessage["encrypted_content"]),
         decryptedFields: hydratedFields,
         forceEdited: true,
         forceEditedAt: editedAtValue
@@ -10150,6 +10702,11 @@ final class ChatEngine {
       guard let messageId = normalizedString(payload["messageId"] ?? payload["message_id"]) else {
         return nil
       }
+      // A receipt can legally arrive after the message was deleted (peer's client had it
+      // in flight, or a reconnect replayed it). Recording it would re-seed the receipt
+      // indices for a row that no longer exists and leave stale state behind a later
+      // re-use of the same id.
+      guard deletedMessageIdsByChat[chatId]?.contains(messageId) != true else { return nil }
       upsertReceiptLocked(chatId: chatId, messageId: messageId, status: "delivered")
       upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "delivered")
       appendJournalLocked(
@@ -10163,6 +10720,7 @@ final class ChatEngine {
       guard let messageId = normalizedString(payload["messageId"] ?? payload["message_id"]) else {
         return nil
       }
+      guard deletedMessageIdsByChat[chatId]?.contains(messageId) != true else { return nil }
       upsertReceiptLocked(chatId: chatId, messageId: messageId, status: "read")
       upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "read")
       appendJournalLocked(
@@ -10494,6 +11052,64 @@ final class ChatEngine {
     appendJournalLocked(event: "native-chat-join-start", payload: ["chatId": chatId, "ref": ref])
   }
 
+  /// A Phoenix channel is a process independent from the websocket. If that
+  /// process exits, the socket may remain open and `connected` stays true, but
+  /// pushes to the old topic receive `unmatched topic`. Recover the individual
+  /// topic immediately and keep every unacknowledged bubble queued.
+  private func recoverStaleNativeChatTopicLocked(chatId: String, reason: String) {
+    guard !chatId.isEmpty else { return }
+
+    let inFlight = nativePendingMessagePushRefs.filter { _, pending in
+      pending.chatId == chatId
+    }
+    for (ref, pending) in inFlight {
+      nativePendingMessagePushRefs.removeValue(forKey: ref)
+      nativeMessagePushSentAtMs.removeValue(forKey: ref)
+      upsertLocalStatusLocked(
+        chatId: pending.chatId,
+        messageId: pending.messageId,
+        status: "pending",
+        allowDowngrade: true
+      )
+      if let draft = pendingOutboundDraftsByMessageId[pending.messageId] {
+        queueOutboundDraftLocked(
+          chatId: pending.chatId,
+          messageId: pending.messageId,
+          payload: draft,
+          reason: reason
+        )
+      }
+    }
+
+    nativeJoinedChatIds.remove(chatId)
+    nativeChatJoinRefsByRef = nativeChatJoinRefsByRef.filter { _, joinedChatId in
+      joinedChatId != chatId
+    }
+    appendJournalLocked(
+      event: "native-chat-topic-recover",
+      payload: [
+        "chatId": chatId,
+        "reason": reason,
+        "requeued": inFlight.count,
+      ])
+    NSLog(
+      "[OutboundRetry] rejoin stale topic chatId=%@ reason=%@ requeued=%d",
+      chatId, reason, inFlight.count)
+
+    let hasDemand =
+      openChatChannels[chatId] != nil
+      || !(pendingOutboundQueueByChat[chatId]?.isEmpty ?? true)
+      || !inFlight.isEmpty
+    if hasDemand {
+      joinNativeChatTopicIfNeededLocked(chatId: chatId)
+    }
+    state["updatedAt"] = nowMs()
+    postChangeLocked(
+      reason: "chatChannelStateChanged",
+      userInfo: ["chatId": chatId, "recovery": reason]
+    )
+  }
+
   private func queueOutboundDraftLocked(
     chatId: String, messageId: String, payload: [String: Any], reason: String
   ) {
@@ -10549,6 +11165,11 @@ final class ChatEngine {
         "messageId": messageId,
         "reason": reason,
       ])
+    // Ordinary messages remain queued and self-heal through reconnect/replay.
+    // A slow or absent network is not a terminal send failure. Bridge prompts
+    // retain their separate expiry because replaying an old agent run has
+    // different side-effect semantics.
+    guard isBridgeDraft else { return }
     queue.asyncAfter(deadline: .now() + .milliseconds(queuedOutboundVisibleErrorDelayMs)) { [weak self] in
       guard let self else { return }
       let stillQueued = self.pendingOutboundQueueByChat[chatId]?.contains(messageId) == true
@@ -10580,6 +11201,139 @@ final class ChatEngine {
     }
   }
 
+  private func messagePushFailureReasonLocked(_ payload: [String: Any]) -> String {
+    var maps: [[String: Any]] = [payload]
+    for key in ["response", "error", "details"] {
+      if let nested = payload[key] as? [String: Any] {
+        maps.append(nested)
+      }
+    }
+    for map in maps {
+      for key in ["reason", "error", "message", "code"] {
+        if let value = normalizedString(map[key])?.lowercased(), !value.isEmpty {
+          return value
+        }
+      }
+    }
+    return "push_error"
+  }
+
+  /// Only explicit policy/validation failures stop replay. A bare Phoenix
+  /// `status=error` commonly means a stale socket/topic and is recoverable.
+  private func isPermanentMessagePushFailureLocked(_ payload: [String: Any]) -> Bool {
+    let reason = messagePushFailureReasonLocked(payload)
+    let permanentMarkers = [
+      "unauthorized", "forbidden", "not_member", "not a member", "blocked",
+      "invalid_payload", "invalid message", "invalid_message", "message_too_large",
+      "unsupported_type", "chat_disabled", "account_disabled", "permission_denied",
+    ]
+    return permanentMarkers.contains { reason.contains($0) }
+  }
+
+  private func cancelScheduledOutboundReplayLocked(
+    messageId: String,
+    resetAttempt: Bool
+  ) {
+    outboundReplayWorkItemsByMessageId.removeValue(forKey: messageId)?.cancel()
+    if resetAttempt {
+      outboundReplayAttemptsByMessageId.removeValue(forKey: messageId)
+    }
+  }
+
+  private func scheduleRetryableOutboundReplayLocked(
+    chatId: String,
+    messageId: String,
+    draft: [String: Any],
+    reason: String,
+    recycleTransport: Bool
+  ) {
+    upsertLocalStatusLocked(
+      chatId: chatId,
+      messageId: messageId,
+      status: "pending",
+      allowDowngrade: true
+    )
+    queueOutboundDraftLocked(
+      chatId: chatId,
+      messageId: messageId,
+      payload: draft,
+      reason: "retryable_\(reason)"
+    )
+
+    let attempt = (outboundReplayAttemptsByMessageId[messageId] ?? 0) + 1
+    outboundReplayAttemptsByMessageId[messageId] = attempt
+    let delay = outboundReplayDelays[
+      min(max(0, attempt - 1), outboundReplayDelays.count - 1)]
+    cancelScheduledOutboundReplayLocked(messageId: messageId, resetAttempt: false)
+
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.outboundReplayWorkItemsByMessageId.removeValue(forKey: messageId)
+      guard
+        self.pendingOutboundQueueByChat[chatId]?.contains(messageId) == true,
+        self.pendingOutboundDraftsByMessageId[messageId] != nil
+      else { return }
+      self.appendJournalLocked(
+        event: "native-outgoing-auto-retry",
+        payload: [
+          "chatId": chatId,
+          "messageId": messageId,
+          "attempt": attempt,
+          "reason": reason,
+        ])
+      self.scheduleReplayQueuedOutboundLocked(
+        chatId: chatId, trigger: "push_error_backoff")
+      self.ensureNativeTransportIfDemandedLocked(trigger: "push_error_backoff")
+    }
+    outboundReplayWorkItemsByMessageId[messageId] = workItem
+    queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+
+    appendJournalLocked(
+      event: "native-outgoing-retry-scheduled",
+      payload: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "attempt": attempt,
+        "delayMs": Int(delay * 1000),
+        "reason": reason,
+        "recycleTransport": recycleTransport,
+      ])
+    NSLog(
+      "[ChatEngine] send queued for auto-retry chatId=%@ messageId=%@ reason=%@ attempt=%d delayMs=%d recycle=%@",
+      chatId, messageId, reason, attempt, Int(delay * 1000),
+      recycleTransport ? "Y" : "N")
+    postChangeLocked(
+      reason: "messageStatusChanged",
+      userInfo: [
+        "chatId": chatId,
+        "messageId": messageId,
+        "status": "pending",
+      ])
+
+    if recycleTransport, let client = phoenixClient {
+      appendJournalLocked(
+        event: "native-outgoing-recycle-socket",
+        payload: [
+          "chatId": chatId,
+          "messageId": messageId,
+          "reason": reason,
+        ])
+      // ChatPhoenixClient.disconnect() is deliberately silent for user-driven
+      // shutdowns: it sets `isClosing`, so its delegate never calls onClose.
+      // A retry recycle is different. Publish the close into the engine before
+      // disconnecting so `connected`, joined topics, and other in-flight pushes
+      // are reset/requeued instead of leaving a zombie "open" client whose
+      // sendFrame silently returns because its URLSession task is nil.
+      handleNativeSocketClosed(
+        code: 4001,
+        reason: "outbound_recycle:\(reason)"
+      )
+      DispatchQueue.global(qos: .utility).async {
+        client.disconnect()
+      }
+    }
+  }
+
   private func removeQueuedOutboundDraftLocked(chatId: String, messageId: String, dropDraft: Bool) {
     if var ids = pendingOutboundQueueByChat[chatId] {
       ids.removeAll { $0 == messageId }
@@ -10590,6 +11344,7 @@ final class ChatEngine {
       }
     }
     if dropDraft {
+      cancelScheduledOutboundReplayLocked(messageId: messageId, resetAttempt: true)
       pendingOutboundDraftsByMessageId.removeValue(forKey: messageId)
     }
     persistOutboundStateLocked()
@@ -10892,19 +11647,42 @@ final class ChatEngine {
     var responseData = Data()
     private var lastEmitTime: TimeInterval = 0
     private var lastEmittedProgress: Float = 0
+    private let activityLock = NSLock()
+    private var lastActivityTime: TimeInterval = CACurrentMediaTime()
+
+    /// When bytes last moved, read from the waiting thread to tell a slow upload
+    /// (still sending — keep waiting) apart from a dead one (nothing for seconds).
+    var lastActivityAt: TimeInterval {
+      activityLock.lock()
+      defer { activityLock.unlock() }
+      return lastActivityTime
+    }
+
+    private func markActivity() {
+      activityLock.lock()
+      lastActivityTime = CACurrentMediaTime()
+      activityLock.unlock()
+    }
 
     func urlSession(
       _ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
       totalBytesSent: Int64, totalBytesExpectedToSend: Int64
     ) {
+      markActivity()
       guard totalBytesExpectedToSend > 0 else { return }
       let progress = Float(totalBytesSent) / Float(totalBytesExpectedToSend)
       let now = CACurrentMediaTime()
+      // Ticks are not free: each one wakes the engine queue, writes the row and
+      // repaints the cell. The old rule emitted on a 30 Hz timer REGARDLESS of
+      // whether the fraction had moved, so a fast upload could fire dozens of
+      // identical repaints. Emit on real movement (2%), on a 200ms floor when the
+      // bar is still creeping, and always on completion.
+      let advanced = progress > lastEmittedProgress
       let shouldEmit =
         progress >= 0.999
         || progress <= 0.0
-        || (progress - lastEmittedProgress) >= 0.01
-        || (now - lastEmitTime) >= (1.0 / 30.0)
+        || (progress - lastEmittedProgress) >= 0.02
+        || (advanced && (now - lastEmitTime) >= 0.2)
       if shouldEmit {
         lastEmitTime = now
         lastEmittedProgress = progress
@@ -10913,6 +11691,7 @@ final class ChatEngine {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+      markActivity()
       responseData.append(data)
     }
 
@@ -11023,8 +11802,39 @@ final class ChatEngine {
         activeMediaUploadTasksByMessageId[messageId] = task
       }
     }
+    let wireStartedAt = ProcessInfo.processInfo.systemUptime
     task.resume()
-    let waitResult = semaphore.wait(timeout: .now() + 40.0)
+    // Wait for as long as bytes keep moving. The old fixed 40s wall-clock cap was a
+    // hard ceiling on FILE SIZE, not on failure: this 5.9 MB audio took 25s on a
+    // contended link, so anything appreciably larger (any video) was cancelled as
+    // "upload_timeout" while it was still uploading fine. Bail only when the
+    // transfer has genuinely stalled — no body bytes and no response bytes for
+    // `uploadStallTimeout` — which is the condition that actually means dead.
+    let uploadStallTimeout: TimeInterval = 30
+    var waitResult: DispatchTimeoutResult = .timedOut
+    while true {
+      if semaphore.wait(timeout: .now() + 2.0) == .success {
+        waitResult = .success
+        break
+      }
+      if CACurrentMediaTime() - delegate.lastActivityAt >= uploadStallTimeout {
+        NSLog(
+          "[MediaUpload] STALLED %@ bytes=%d elapsed=%.1fs idle>=%.0fs — cancelling",
+          messageType, body.count,
+          ProcessInfo.processInfo.systemUptime - wireStartedAt, uploadStallTimeout)
+        break
+      }
+    }
+    // The one number that says whether a slow upload is the link or the app.
+    // Compare it against what the same device gets on a speed test: if they match,
+    // the wire is the limit; if the app is far below, something on device is
+    // stealing the pipe (that is exactly how the Home-refetch storm was found).
+    let wireSeconds = max(0.001, ProcessInfo.processInfo.systemUptime - wireStartedAt)
+    NSLog(
+      "[MediaUpload] %@ bytes=%d wire=%.2fs throughput=%.0fKB/s result=%@",
+      messageType, body.count, wireSeconds,
+      Double(body.count) / 1024.0 / wireSeconds,
+      waitResult == .timedOut ? "timeout" : "done")
     if waitResult == .timedOut {
       task.cancel()
       if let messageId, !messageId.isEmpty {
@@ -11310,21 +12120,90 @@ final class ChatEngine {
       return false
     }
 
-    historyRowsByChat[chatId] = rows
+    // Self-heal twin generations already on disk: the same logical message persisted
+    // under two different ids (the saved-messages `id` vs `original_message_id`
+    // re-keying) restores as an adjacent DUPLICATE pair. Content-identical at the same
+    // millisecond is not something two real messages can be — collapse to the richer
+    // row and delete the twin from SQLite so this heals once, not per launch.
+    let dedup = dedupContentIdenticalRestoredRows(rows)
+    let restoredRows = dedup.rows
+    if !dedup.droppedIds.isEmpty {
+      if let userId = chatHistoryCacheUserIdLocked() {
+        messageStore.deleteMessages(
+          userId: userId, chatId: chatId, messageIds: dedup.droppedIds)
+      }
+      flagTranscriptHealedForRasterInvalidation(chatId: chatId)
+      NSLog(
+        "[HistoryStore] restore DEDUP chat=%@ dropped=%d twin rows (same content+ms, different id)",
+        String(chatId.prefix(12)), dedup.droppedIds.count)
+    }
+    historyRowsByChat[chatId] = restoredRows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.insert(chatId)
     NSLog(
       "[HistoryStore] restore HIT chat=%@ rows=%d (painted from local store, no network)",
-      String(chatId.prefix(12)), rows.count)
+      String(chatId.prefix(12)), restoredRows.count)
     appendJournalLocked(
       event: "native-chat-history-cache-restore",
-      payload: ["chatId": chatId, "rows": rows.count])
+      payload: ["chatId": chatId, "rows": restoredRows.count])
     VibeDebugLog.log(
       "[ChatEngine] restored cached chat history chatId=%@ rows=%d",
       String(chatId.prefix(12)),
-      rows.count
+      restoredRows.count
     )
     return true
+  }
+
+  /// Collapses rows that are the SAME logical message under two ids: identical sender,
+  /// type, text, media, and millisecond timestamp. Keeps the richer payload (more message
+  /// fields — the normalized generation carries decrypted extras the bare seed lacks) and
+  /// reports the loser ids so the caller can delete them from the durable store. Rows
+  /// without an id, without a timestamp, or from agents are never touched.
+  private func dedupContentIdenticalRestoredRows(
+    _ rows: [[String: Any]]
+  ) -> (rows: [[String: Any]], droppedIds: [String]) {
+    guard rows.count > 1 else { return (rows, []) }
+    var bestIndexBySignature: [String: Int] = [:]
+    var droppedIndices: Set<Int> = []
+    var droppedIds: [String] = []
+    for (index, row) in rows.enumerated() {
+      guard let id = messageId(fromRow: row),
+        let message = row["message"] as? [String: Any],
+        (message["isAgentMessage"] as? Bool) != true
+      else { continue }
+      let ts = messageTimestampMs(fromRow: row)
+      guard ts > 0 else { continue }
+      let signature = [
+        String(ts),
+        normalizedString(message["type"]) ?? "text",
+        normalizedUpper(message["fromId"]) ?? "",
+        (message["isMe"] as? Bool) == true ? "me" : "peer",
+        normalizedString(message["text"]) ?? "",
+        normalizedString(message["mediaUrl"]) ?? "",
+        normalizedString(message["fileName"]) ?? "",
+      ].joined(separator: "|")
+      guard let keptIndex = bestIndexBySignature[signature] else {
+        bestIndexBySignature[signature] = index
+        continue
+      }
+      let keptMessage = rows[keptIndex]["message"] as? [String: Any] ?? [:]
+      let keptId = messageId(fromRow: rows[keptIndex]) ?? ""
+      // Richer row wins; identical richness falls back to the larger id so the choice
+      // is deterministic across launches.
+      let currentWins =
+        message.count != keptMessage.count ? message.count > keptMessage.count : id > keptId
+      if currentWins {
+        droppedIndices.insert(keptIndex)
+        droppedIds.append(keptId)
+        bestIndexBySignature[signature] = index
+      } else {
+        droppedIndices.insert(index)
+        droppedIds.append(id)
+      }
+    }
+    guard !droppedIndices.isEmpty else { return (rows, []) }
+    let kept = rows.enumerated().compactMap { droppedIndices.contains($0.offset) ? nil : $0.element }
+    return (kept, droppedIds)
   }
 
   private func storeCachedHistoryRowsLocked(chatId: String, rows: [[String: Any]]) {
@@ -11382,6 +12261,52 @@ final class ChatEngine {
       messageStore.pruneChat(userId: userId, chatId: chatId)
     }
     return entries.count
+  }
+
+  /// Deletes store rows the server-canonical transcript no longer lists. Upserts alone can
+  /// never remove a ghost: a row persisted under a retired id (a re-keying, a delete on
+  /// another device) sits in SQLite forever and resurrects as a DUPLICATE or a zombie on
+  /// every cold-open restore — network reconcile fixed the screen, relaunch brought it
+  /// back. Only call this with a COMPLETE canonical set for the chat (saved_messages
+  /// returns its full list); a paginated window would mass-delete rows beyond the page.
+  private func reconcileStoreAgainstCanonicalLocked(chatId: String, canonicalIds: Set<String>) {
+    guard !canonicalIds.isEmpty, let userId = chatHistoryCacheUserIdLocked(),
+      messageStore.isAvailable
+    else { return }
+    let stored = messageStore.messageIdsWithTimestamps(userId: userId, chatId: chatId)
+    guard !stored.isEmpty else { return }
+    let liveIds = Set(liveMessageRowsByChat[chatId]?.keys.map { $0 } ?? [])
+    let pendingIds = Set(pendingOutboundDraftsByMessageId.keys)
+    // A send still in flight may predate the GET this canonical set came from — never
+    // treat anything live, pending, or seconds old as a ghost.
+    let recencyFloorTs = Int64(nowMs()) - Int64(5 * 60 * 1000)
+    let ghostIds = stored.filter { entry in
+      !canonicalIds.contains(entry.messageId)
+        && !liveIds.contains(entry.messageId)
+        && !pendingIds.contains(entry.messageId)
+        && entry.ts < recencyFloorTs
+    }.map(\.messageId)
+    guard !ghostIds.isEmpty else { return }
+    messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: ghostIds)
+    flagTranscriptHealedForRasterInvalidation(chatId: chatId)
+    NSLog(
+      "[HistoryStore] reconcile chat=%@ purged=%d of %d stored (ids absent from the canonical transcript)",
+      String(chatId.prefix(12)), ghostIds.count, stored.count)
+  }
+
+  /// A structural heal (twin dedup, ghost reconcile) changed this chat's durable
+  /// transcript — any reopen raster captured before it photographs a world that no
+  /// longer exists, and covering the next open with it means a visible content jump when
+  /// the healed rows mount underneath. The view layer owns the raster lifecycle, so the
+  /// fact travels via UserDefaults: thread-safe, immune to the launch ordering race with
+  /// the raster prewarm, and it survives a relaunch if the process dies in between.
+  private func flagTranscriptHealedForRasterInvalidation(chatId: String) {
+    let key = "VibeReopenRasterHealedChats"
+    let defaults = UserDefaults.standard
+    var ids = defaults.stringArray(forKey: key) ?? []
+    guard !ids.contains(chatId) else { return }
+    ids.append(chatId)
+    defaults.set(ids, forKey: key)
   }
 
   private func clearCachedHistoryRowsLocked(chatId: String) {
@@ -11676,8 +12601,15 @@ final class ChatEngine {
       }
     }
     liveMessageRowsByChat = nextLive
+    // A deleted chat's final live row makes `liveMessageRowsByChat[chatId]` nil.
+    // Dropping its tombstone on the next socket reset exposed the unchanged
+    // in-memory history row again, which is the delete → flicker → resurrection
+    // sequence seen in the UI. Keep tombstones for every loaded transcript; a
+    // legitimate later upsert already removes its own id from this set.
     deletedMessageIdsByChat = deletedMessageIdsByChat.filter { chatId, _ in
-      isVolatileBridgeAgentChatLocked(chatId: chatId) || liveMessageRowsByChat[chatId] != nil
+      isVolatileBridgeAgentChatLocked(chatId: chatId)
+        || liveMessageRowsByChat[chatId] != nil
+        || historyRowsByChat[chatId] != nil
     }
     for (chatId, perChat) in previousLive {
       let remainingIds = Set(nextLive[chatId]?.keys ?? Dictionary<String, [String: Any]>().keys)
@@ -12532,6 +13464,12 @@ final class ChatEngine {
     historyRowsRestoredFromCacheChats.remove(chatId)
     markHistoryNetworkSyncedLocked(chatId: chatId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    // list_saved_messages returns the COMPLETE set, so this response is authoritative:
+    // anything on disk it doesn't list is a ghost (a re-keyed twin, an unsave from
+    // another device) and must go now, or the next cold-open restore repaints it.
+    reconcileStoreAgainstCanonicalLocked(
+      chatId: chatId,
+      canonicalIds: Set(rows.compactMap { messageId(fromRow: $0) }))
     state["updatedAt"] = nowMs()
     appendJournalLocked(
       event: "native-chat-history-load-ok",
@@ -12574,7 +13512,17 @@ final class ChatEngine {
       return lt < rt
     }
     let rows: [[String: Any]] = sortedMessages.compactMap { (raw: [String: Any]) -> [String: Any]? in
-      guard let messageId = normalizedString(raw["id"] ?? raw["message_id"]) else { return nil }
+      // Saved messages carry TWO ids: the server row's UUID (`id`) and the client's
+      // `original_message_id`. Every other saved-messages path (normalize, the send echo)
+      // keys rows by the ORIGINAL id — preferring `id` here re-keyed the same transcript
+      // under a second generation whenever Home's seed passed raw server dicts through
+      // this builder. The append-only SQLite store then held BOTH generations and every
+      // cold-open restore painted each message twice (the duplicated-cells screenshot).
+      let preferredId =
+        chatId == "saved_messages"
+        ? raw["original_message_id"] ?? raw["originalMessageId"] ?? raw["id"] ?? raw["message_id"]
+        : raw["id"] ?? raw["message_id"]
+      guard let messageId = normalizedString(preferredId) else { return nil }
       let fromId = normalizedString(raw["fromId"] ?? raw["from_id"])
       let type = normalizedString(raw["type"]) ?? "text"
       let timestampMs =
@@ -13156,6 +14104,31 @@ final class ChatEngine {
       if let emoji = normalizedString(decryptedFields["emoji"]) {
         normalized["emoji"] = emoji
       }
+      // Metadata is where the forward chrome (`forwardedFrom*`, `isForwarded`) and a music
+      // card's cover/artist/title live. This normalizer rebuilds the row from an allow-list of
+      // top-level fields, and `metadata` was never on the list — so a forwarded or music
+      // message painted correctly when it arrived (the live socket path DOES merge it) and then
+      // came back bare on the next launch, because the row written to disk had no metadata to
+      // read. The regular-chat history path already does exactly this merge.
+      var mergedMetadata = (decryptedFields["metadata"] as? [String: Any]) ?? [:]
+      if let serverMetadata = raw["metadata"] as? [String: Any] {
+        for (key, value) in serverMetadata where mergedMetadata[key] == nil {
+          mergedMetadata[key] = value
+        }
+      }
+      // The send path seals these at the TOP level of the encrypted payload, not under
+      // `metadata` — fold them in here so the row builder (which reads them back out of
+      // metadata) still finds them even when its own decrypt pass is skipped or fails.
+      // Missing `cover`/`artist`/`source` was the music card losing its artwork on every
+      // saved-messages reload; `thumbnailBase64`/`caption` are the same class for images.
+      for key in ["cover", "artist", "source", "thumbnailBase64", "caption"] {
+        if mergedMetadata[key] == nil, let value = decryptedFields[key] {
+          mergedMetadata[key] = value
+        }
+      }
+      if !mergedMetadata.isEmpty {
+        normalized["metadata"] = mergedMetadata
+      }
       return normalized
     }
   }
@@ -13195,6 +14168,19 @@ final class ChatEngine {
       let latitude = self.parseDoubleValue(metadata["latitude"] ?? payload["latitude"])
       let longitude = self.parseDoubleValue(metadata["longitude"] ?? payload["longitude"])
       let duration = self.parseDoubleValue(metadata["duration"] ?? payload["duration"])
+      // Saved Messages used to seal a SHORTER payload than a DM: no cover art, no caption,
+      // no waveform, no music identity. The optimistic row carried them, so a just-sent track
+      // looked right and lost its artwork the moment the row was rebuilt from the server —
+      // i.e. on the next open. What is not in this envelope does not exist anywhere else.
+      let thumbnailBase64 = self.normalizedString(
+        metadata["thumbnailBase64"] ?? metadata["thumbnail_base64"] ?? payload["thumbnailBase64"])
+      let caption = self.normalizedString(metadata["caption"] ?? payload["caption"])
+      let waveform = metadata["waveform"] ?? payload["waveform"]
+      let musicCover = self.normalizedString(
+        metadata["cover"] ?? metadata["coverUrl"] ?? metadata["cover_url"] ?? payload["cover"])
+      let musicArtist = self.normalizedString(metadata["artist"] ?? payload["artist"])
+      let musicSource = self.normalizedString(
+        metadata["source"] ?? metadata["platform"] ?? payload["source"])
       let width = self.parseLongValue(metadata["width"] ?? payload["width"])
       let height = self.parseLongValue(metadata["height"] ?? payload["height"])
       var mediaKey = self.normalizedString(metadata["mediaKey"] ?? metadata["media_key"] ?? payload["mediaKey"])
@@ -13286,6 +14272,12 @@ final class ChatEngine {
           encryptedPayload["stickerBundleFileName"] = stickerBundleFileName
         }
         if let stickerEmoji { encryptedPayload["emoji"] = stickerEmoji }
+        if let thumbnailBase64 { encryptedPayload["thumbnailBase64"] = thumbnailBase64 }
+        if let caption { encryptedPayload["caption"] = caption }
+        if let waveform { encryptedPayload["waveform"] = waveform }
+        if let musicCover { encryptedPayload["cover"] = musicCover }
+        if let musicArtist { encryptedPayload["artist"] = musicArtist }
+        if let musicSource { encryptedPayload["source"] = musicSource }
         if let payloadString = try? JSONSerialization.data(
           withJSONObject: self.makeJSONSafeMap(encryptedPayload), options: []),
           let messageString = String(data: payloadString, encoding: .utf8),

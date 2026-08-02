@@ -116,27 +116,14 @@ struct ChatProfileAppearancePalette: Identifiable, Equatable {
   static let defaultAvatarID = "warm-gold"
   static let defaultPosterID = "poster-soft-neutral"
 
-  static let all: [ChatProfileAppearancePalette] = [
-    // Soft, closely related color pairs keep fallback avatars luminous instead of
-    // producing a hard two-tone split. Existing IDs stay stable for saved selections.
-    ChatProfileAppearancePalette(id: "warm-gold", topHex: "#FFD77A", bottomHex: "#F4A65E"),
-    ChatProfileAppearancePalette(id: "aurora", topHex: "#B68AF4", bottomHex: "#7D91EA"),
-    ChatProfileAppearancePalette(id: "lime", topHex: "#C4DC78", bottomHex: "#70BE7D"),
-    ChatProfileAppearancePalette(id: "ocean", topHex: "#70D8CD", bottomHex: "#4CA7D8"),
-    ChatProfileAppearancePalette(id: "ember", topHex: "#86C5A5", bottomHex: "#EE7C62"),
-    ChatProfileAppearancePalette(id: "rose", topHex: "#F6A67F", bottomHex: "#D975C9"),
-    ChatProfileAppearancePalette(id: "midnight", topHex: "#78A5F5", bottomHex: "#5E72DC"),
-    ChatProfileAppearancePalette(id: "earth", topHex: "#C9A58A", bottomHex: "#9C7464"),
-    ChatProfileAppearancePalette(id: "graphite", topHex: "#A0A8B2", bottomHex: "#6D7886"),
-    ChatProfileAppearancePalette(id: "ruby", topHex: "#ED8491", bottomHex: "#C9586D"),
-    ChatProfileAppearancePalette(id: "teal", topHex: "#6BCDC9", bottomHex: "#41A9B7"),
-    ChatProfileAppearancePalette(id: "mint", topHex: "#79DCB3", bottomHex: "#3DB98A"),
-    ChatProfileAppearancePalette(id: "coral", topHex: "#FF8B6B", bottomHex: "#FF5E79"),
-    ChatProfileAppearancePalette(id: "marigold", topHex: "#FFE17E", bottomHex: "#F5B15C"),
-    ChatProfileAppearancePalette(id: "steel", topHex: "#A4B7CF", bottomHex: "#758EAF"),
-    ChatProfileAppearancePalette(id: "poster-soft-neutral", topHex: "#DCD7CF", bottomHex: "#A9876F"),
-    ChatProfileAppearancePalette(id: "poster-black", topHex: "#050507", bottomHex: "#000000"),
-  ]
+  static let all: [ChatProfileAppearancePalette] =
+    VibeAvatarFallback.paletteDefinitions.map {
+      ChatProfileAppearancePalette(id: $0.id, topHex: $0.start, bottomHex: $0.end)
+    } + [
+      ChatProfileAppearancePalette(
+        id: "poster-soft-neutral", topHex: "#DCD7CF", bottomHex: "#A9876F"),
+      ChatProfileAppearancePalette(id: "poster-black", topHex: "#050507", bottomHex: "#000000"),
+    ]
 
   static let defaultAvatarPalettes: [ChatProfileAppearancePalette] = all.filter {
     $0.id != defaultPosterID && $0.id != "poster-black"
@@ -325,12 +312,7 @@ enum ChatProfileAppearanceStore {
   }
 
   private static func defaultAvatarPaletteID(seed: String) -> String {
-    let palettes = ChatProfileAppearancePalette.defaultAvatarPalettes
-    guard !palettes.isEmpty else { return ChatProfileAppearancePalette.defaultAvatarID }
-    let safeSeed = seed.isEmpty ? "user" : seed
-    let hash = safeSeed.unicodeScalars.reduce(UInt(0)) { ($0 &* 31) &+ UInt($1.value) }
-    let index = Int(hash % UInt(palettes.count))
-    return palettes[index].id
+    VibeAvatarFallback.paletteID(for: seed)
   }
 }
 

@@ -50,11 +50,14 @@ enum AppUITrace {
   static func error(_ message: String) {
     logger.error("\(message, privacy: .public)")
     NSLog("[VibeUITrace][error] %@", message)
+    // Persist to the durable diagnostics store so shipped-build errors leave a record.
+    VibeLog.error(message, category: "ui")
   }
 
   static func fault(_ message: String) {
     logger.fault("\(message, privacy: .public)")
     NSLog("[VibeUITrace][fault] %@", message)
+    VibeLog.fault(message, category: "ui")
   }
 }
 
@@ -1304,17 +1307,15 @@ final class AppShellCoordinator: ObservableObject {
         nav.popViewController(animated: true)
       }
     )
-    // Commit-first push: load the view (route apply + engine bind + seed stash,
-    // ~15-40ms) but never force a layout here. Forcing it materialized every visible
-    // transcript cell synchronously before the slide's first frame — 114-547ms of
-    // dead screen between tap and slide, the exact felt delay — and measured bubbles
-    // at detached-view width (no safe area → w[365→385] height-cache misses).
-    // ChatListView stashes the seed and mounts it one tick after the transition
-    // commits, so the slide starts immediately and content joins it mid-flight.
+    // Stage a bounded REAL transcript behind the still-visible Home page at the exact
+    // destination bounds. The previous commit-first path mounted cells after UIKit had
+    // attached the destination: that could paint a full-screen chat before the starting
+    // transform, then replace/re-pin rows during the slide. Prestaging keeps frame one
+    // populated without exposing collection work or geometry changes mid-transition.
     let prePushStartedAt = ProcessInfo.processInfo.systemUptime
-    controller.loadViewIfNeeded()
+    controller.prepareForNavigationPush(in: nav)
     NSLog(
-      "[ChatOpen] host-stage pre-push loadView %dms chatId=%@",
+      "[ChatOpen] host-stage pre-push prestage %dms chatId=%@",
       Int((ProcessInfo.processInfo.systemUptime - prePushStartedAt) * 1000),
       String(route.chatId.prefix(12)))
     // The conversation is full-screen above the tab bar controller, so it
@@ -1342,6 +1343,11 @@ final class AppShellCoordinator: ObservableObject {
         nav.popViewController(animated: true)
       }
     )
+    let prePushStartedAt = ProcessInfo.processInfo.systemUptime
+    controller.prepareForNavigationPush(in: nav)
+    NSLog(
+      "[AgentOpen] host-stage pre-push prestage %dms",
+      Int((ProcessInfo.processInfo.systemUptime - prePushStartedAt) * 1000))
     nav.pushViewController(controller, animated: true)
   }
 
@@ -1480,6 +1486,35 @@ final class VibeRoomLinkRouter {
     config: AppSessionConfig,
     coordinator: AppShellCoordinator?
   ) async throws {
+    // Instant path — the same one `openChat(for:)` already has, and the reason tapping a
+    // username (in a forwarded header, a mention, a deep link) felt slow while tapping the
+    // same person in the chat list was immediate: this path always awaited TWO sequential
+    // round-trips first (contact search for the public key, then create-or-reuse the DM)
+    // before it pushed anything. When the DM is already on the home list there is nothing to
+    // resolve — push it now and let the peer fetch refresh the key behind the open.
+    let peerKey = userId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if !peerKey.isEmpty,
+      let existing = ChatHomeService.cachedRows(config: config)
+        .first(where: {
+          ($0.peerUserId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == peerKey && !$0.isGroup
+        })
+    {
+      coordinator?.openChat(ChatRoute(row: existing))
+      Task.detached {
+        guard
+          let user = try? await ContactSearchService.search(config: config, query: userId).first,
+          let publicKey = user.publicKey, !publicKey.isEmpty
+        else { return }
+        _ = ChatEngine.shared.cachePeerPublicKey([
+          "chatId": existing.chatId,
+          "peerUserId": user.userID,
+          "publicKey": publicKey,
+        ])
+      }
+      return
+    }
+
     guard let user = try await ContactSearchService.search(config: config, query: userId).first
     else {
       AppToastController.shared.show("That Vibe user could not be found.")
@@ -1802,7 +1837,9 @@ private final class ChatsViewModel: ObservableObject {
   @Published var archivedRows: [ChatHomeListRow] = []
   @Published var isLoading = false
   @Published var isLoadingArchived = false
-  /// True while ChatEngine is not connected (socket bootstrap / reconnect / offline).
+  /// Kept for compatibility with the existing view state, but it represents an HTTP
+  /// reachability failure now. A realtime-socket reconnect must not label usable cached
+  /// chats as generally offline when `/api/chats` is succeeding.
   @Published var isConnecting = false
   /// True while a home-list fetch is in flight *and* we are already connected.
   @Published var isListUpdating = false
@@ -1812,9 +1849,9 @@ private final class ChatsViewModel: ObservableObject {
   @Published var hasLoadedArchived = false
 
   /// Hard-refreshed principal header: Connecting → Updating → Chats.
-  /// Connecting only for real offline / blocked-to-server — not bootstrap noise.
+  /// Connecting only for a proved list-network failure — not socket bootstrap noise.
   var headerState: AppHomeHeaderState {
-    if isWaitingForNetwork || isConnecting { return .connecting }
+    if isWaitingForNetwork { return .connecting }
     if isListUpdating || isLoading { return .updating }
     return .ready
   }
@@ -1825,12 +1862,30 @@ private final class ChatsViewModel: ObservableObject {
   private var agentConversationObserver: NSObjectProtocol?
   private var realtimeMessageObserver: NSObjectProtocol?
   private var bridgeStatusObserver: NSObjectProtocol?
+  private var foregroundObserver: NSObjectProtocol?
+  /// The launch activation is already followed by `loadIfNeeded`'s cached-start refresh.
+  /// Treating that same activation as a resume queued a second `/api/chats` trip and a
+  /// duplicate history/prewarm pass while the user had begun scrolling.
+  private var hasObservedInitialForegroundActivation = false
   private var realtimeRefreshTask: Task<Void, Never>?
+  /// Edge detector for the socket coming back up, so one reconnect reconciles once.
+  private var wasEngineConnected = false
+  /// Wall clock of the last completed `/api/chats` round trip, so realtime traffic
+  /// can never chain fetches back to back (see `scheduleRealtimeRefresh`).
+  private var lastListFetchFinishedAt: TimeInterval = 0
+  private static let realtimeRefreshMinInterval: TimeInterval = 1.5
   private var locallyRemovedChatIDs = Set<String>()
   private var projectedMessageIDsByChat = [String: String]()
+  /// Message tombstones projected into Home immediately. A list request already in
+  /// flight can legally return the pre-delete preview; filtering it here prevents that
+  /// stale response from resurrecting the message after the user navigates back.
+  private var locallyDeletedMessageIDsByChat = [String: Set<String>]()
   private var warmingFirstPaintTailChatIDs = Set<String>()
 
   init() {
+    // If this model is created after UIKit already delivered launch activation, the
+    // next didBecomeActive is a genuine resume and must not be discarded.
+    hasObservedInitialForegroundActivation = UIApplication.shared.applicationState == .active
     refreshConnectionState()
 
     agentConversationObserver = NotificationCenter.default.addObserver(
@@ -1863,10 +1918,21 @@ private final class ChatsViewModel: ObservableObject {
           || reason == "engineError"
         {
           self.refreshConnectionState()
+          // The socket coming back up is the moment to reconcile whatever it could not
+          // deliver while it was down — a background trip, a network change, a server
+          // restart. The user topic replays nothing on rejoin, so without this Home can
+          // sit on pre-drop state indefinitely even though a push already announced the
+          // message.
+          let connected = Self.isEngineConnected()
+          if connected, !self.wasEngineConnected {
+            self.refreshAfterConnectivityGap(trigger: "reconnect")
+          }
+          self.wasEngineConnected = connected
         }
         switch reason {
         case "chatCleared":
           if let chatID {
+            ChatListView.clearWarmTranscriptSnapshot(chatId: chatID)
             self.removeLocalChat(chatID: chatID, persist: true)
           }
         case "remoteNewMessage":
@@ -1874,13 +1940,65 @@ private final class ChatsViewModel: ObservableObject {
             // The user topic also receives mirrors of messages sent from this
             // device/another device. Project the actual latest row before changing
             // the badge so a self-send never creates a fake "1" on an agent DM.
-            self.applyEngineProjection(chatID: chatID, reason: "remoteNewMessage")
+            // The engine now ingests the mirrored message before posting this, so the
+            // projection reads the REAL new row instead of the previous newest one.
+            self.applyEngineProjection(
+              chatID: chatID,
+              reason: "remoteNewMessage",
+              changedMessageID: Self.normalizedString(note.userInfo?["messageId"]),
+              changedMessageWasInserted: note.userInfo?["inserted"] as? Bool,
+              chatIsOnScreen: (note.userInfo?["chatIsOnScreen"] as? Bool) ?? false
+            )
           }
           self.scheduleRealtimeRefresh()
-        case "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted", "chatMessageChanged":
+        case "chatMessageDeleted":
           if let chatID {
-            self.applyEngineProjection(chatID: chatID, reason: reason ?? "")
+            self.applyEngineProjection(
+              chatID: chatID,
+              reason: reason ?? "",
+              changedMessageID: Self.normalizedString(
+                note.userInfo?["messageId"] ?? note.userInfo?["message_id"]),
+              chatIsOnScreen: (note.userInfo?["chatIsOnScreen"] as? Bool) ?? true
+            )
           }
+          // The engine projection is already authoritative and instant. Do not start a
+          // list fetch whose response may have been generated before the delete commit.
+        case "chatMessageInserted", "chatMessageEdited", "chatMessageChanged", "messageStatusChanged":
+          if let chatID {
+            // Mutations can arrive from a mounted chat topic or from the user topic
+            // while the conversation is closed. Only insert/new-message reasons can
+            // change unread counts; status/edit projection is content-only.
+            self.applyEngineProjection(
+              chatID: chatID,
+              reason: reason ?? "",
+              changedMessageID: Self.normalizedString(note.userInfo?["messageId"]),
+              chatIsOnScreen: (note.userInfo?["chatIsOnScreen"] as? Bool) ?? true
+            )
+          }
+          // Receipts already updated the engine row/status indices. Repaint Home from
+          // that local projection immediately; a list fetch would add latency and can
+          // race the newer receipt with an older HTTP snapshot.
+          if reason != "messageStatusChanged" {
+            self.scheduleRealtimeRefresh()
+          }
+        case "chatDelta", "chatRowsReloaded":
+          if let chatID {
+            // History/event ingestion already mutated the engine before either signal is
+            // posted. Project that local authority into Home in this same main-loop beat
+            // and grow its first-frame warm snapshot as well. Previously Home ignored
+            // these signals: the log showed 51→55 rows at 21:25:23, but a tap 21 seconds
+            // later still carried 16 and only became 59 after viewDidAppear.
+            self.applyEngineProjection(
+              chatID: chatID,
+              reason: reason ?? "",
+              changedMessageID: nil,
+              chatIsOnScreen: false
+            )
+          }
+        case "remoteChatMutationMiss":
+          // The compact canonical edit row is intentionally bounded. If it was absent
+          // (old server or oversized metadata), keep the current non-empty first-paint
+          // tail and reconcile Home in the background.
           self.scheduleRealtimeRefresh()
         case "agentProgress":
           // Render active bridge work from the local engine immediately. Fetching Home
@@ -1893,6 +2011,27 @@ private final class ChatsViewModel: ObservableObject {
         default:
           break
         }
+      }
+    }
+
+    // A push can land while the app is suspended, and the socket that would have carried
+    // the same signal is down for the whole trip. Nothing replays it on the way back, so
+    // returning to the foreground has to reconcile the list itself — otherwise Home shows
+    // the state it had before the trip while a notification for a newer message is
+    // sitting on the lock screen.
+    foregroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        if !self.hasObservedInitialForegroundActivation {
+          self.hasObservedInitialForegroundActivation = true
+          AppUITrace.notice("ChatsViewModel resume-refresh skipped initial activation")
+          return
+        }
+        self.refreshAfterConnectivityGap(trigger: "didBecomeActive")
       }
     }
 
@@ -1938,6 +2077,9 @@ private final class ChatsViewModel: ObservableObject {
     if let bridgeStatusObserver {
       NotificationCenter.default.removeObserver(bridgeStatusObserver)
     }
+    if let foregroundObserver {
+      NotificationCenter.default.removeObserver(foregroundObserver)
+    }
   }
 
   /// True only when the socket is known-up (not mid-bootstrap).
@@ -1980,7 +2122,10 @@ private final class ChatsViewModel: ObservableObject {
   }
 
   private func refreshConnectionState() {
-    let next = Self.isOfflineOrBlockedToServer()
+    // Socket health and HTTP reachability are separate. Cached chats remain fully usable
+    // while Phoenix reconnects; only an actual failed list request may put Home into the
+    // Connecting state. The engine still reconnects independently on foreground/path.
+    let next = isWaitingForNetwork && Self.isOfflineOrBlockedToServer()
     if isConnecting != next {
       isConnecting = next
     }
@@ -1993,11 +2138,28 @@ private final class ChatsViewModel: ObservableObject {
   /// Debounce a light, row-preserving refresh so bursts of incoming messages (group
   /// traffic) coalesce into one fetch instead of a storm. No spinner — the list just
   /// updates its previews/unread in place.
+  /// Reconcile after a window in which realtime delivery could not reach this device
+  /// (backgrounded, socket down). Rides the same debounce/rate limit as ordinary
+  /// realtime traffic, so a reconnect storm still costs one list fetch.
+  private func refreshAfterConnectivityGap(trigger: String) {
+    guard hasLoaded else { return }
+    AppUITrace.notice("ChatsViewModel resume-refresh trigger=\(trigger)")
+    scheduleRealtimeRefresh()
+  }
+
   private func scheduleRealtimeRefresh() {
     guard hasLoaded else { return }
     realtimeRefreshTask?.cancel()
+    // Debounce (bursts coalesce) AND rate-limit (consecutive bursts can't chain
+    // fetches). Without the floor, any signal arriving faster than one fetch takes
+    // keeps `trailingRefreshRequested` set and Home refetches the whole list
+    // continuously — one 25s media upload produced ~30 back-to-back `/api/chats`
+    // round trips, each one competing with the upload for the same link.
+    let sinceLastFetch = ProcessInfo.processInfo.systemUptime - lastListFetchFinishedAt
+    let cooldown = max(0, Self.realtimeRefreshMinInterval - sinceLastFetch)
+    let delay = max(0.18, cooldown)
     realtimeRefreshTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(nanoseconds: 180_000_000)
+      try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
       guard !Task.isCancelled, let self else { return }
       await self.refresh(preserveRows: true)
     }
@@ -2008,6 +2170,7 @@ private final class ChatsViewModel: ObservableObject {
     guard !normalizedChatID.isEmpty else { return }
     locallyRemovedChatIDs.insert(normalizedChatID)
     projectedMessageIDsByChat.removeValue(forKey: normalizedChatID)
+    locallyDeletedMessageIDsByChat.removeValue(forKey: normalizedChatID)
 
     let previousRows = rows.count
     let previousArchivedRows = archivedRows.count
@@ -2026,6 +2189,7 @@ private final class ChatsViewModel: ObservableObject {
   func restoreLocalRow(_ row: ChatHomeListRow) {
     locallyRemovedChatIDs.remove(row.chatId)
     projectedMessageIDsByChat.removeValue(forKey: row.chatId)
+    locallyDeletedMessageIDsByChat.removeValue(forKey: row.chatId)
     rows = Self.upserting(row, into: rows)
     if let config = AppSessionConfig.current {
       ChatHomeService.upsertCachedRow(row, config: config)
@@ -2077,32 +2241,129 @@ private final class ChatsViewModel: ObservableObject {
     }
   }
 
-  private func applyEngineProjection(chatID: String, reason: String) {
+  /// Project Mark as unread / Mark as read into Home immediately.
+  ///
+  /// This is purely this user's own list state: the endpoint behind it flips only this
+  /// participant's `marked_unread` flag, so nothing here retracts a read receipt already
+  /// sent to the peer or rewrites any message's delivery status. Returns the previous
+  /// unread state so a failed round trip can be reverted exactly.
+  @discardableResult
+  func applyLocalUnread(chatID: String, unread: Bool) -> (unreadCount: Int, markedUnread: Bool)? {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty,
+      let current = rows.first(where: { $0.chatId == normalizedChatID })
+        ?? archivedRows.first(where: { $0.chatId == normalizedChatID })
+    else { return nil }
+    let previous = (unreadCount: current.unreadCount, markedUnread: current.markedUnread)
+    if mutateRow(chatID: normalizedChatID, transform: { $0.withLocalUnread(unread) }) {
+      persistHomeRows()
+    }
+    return previous
+  }
+
+  func restoreLocalUnread(chatID: String, unreadCount: Int, markedUnread: Bool) {
+    let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatID.isEmpty else { return }
+    let changed = mutateRow(chatID: normalizedChatID) { row in
+      row.withHomeState(unreadCount: unreadCount, markedUnread: markedUnread)
+    }
+    if changed {
+      persistHomeRows()
+    }
+  }
+
+  private func applyEngineProjection(
+    chatID: String,
+    reason: String,
+    changedMessageID: String? = nil,
+    changedMessageWasInserted: Bool? = nil,
+    chatIsOnScreen: Bool = false
+  ) {
     let normalizedChatID = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalizedChatID.isEmpty, !locallyRemovedChatIDs.contains(normalizedChatID) else {
       return
     }
+    let projectionHomeRow =
+      rows.first(where: { $0.chatId == normalizedChatID })
+      ?? archivedRows.first(where: { $0.chatId == normalizedChatID })
 
+    if reason == "chatMessageDeleted", let changedMessageID {
+      locallyDeletedMessageIDsByChat[normalizedChatID, default: []].insert(changedMessageID)
+      if projectedMessageIDsByChat[normalizedChatID] == changedMessageID {
+        projectedMessageIDsByChat.removeValue(forKey: normalizedChatID)
+      }
+    }
+
+    let deletedMessageIDs = locallyDeletedMessageIDsByChat[normalizedChatID] ?? []
     let engineRows = ChatEngine.shared.getChatRows(["chatId": normalizedChatID])
+      .filter { row in
+        let payload = Self.messagePayload(from: row)
+        guard let messageID = Self.messageID(from: payload) ?? Self.messageID(from: row) else {
+          return true
+        }
+        return !deletedMessageIDs.contains(messageID)
+      }
+    if let changedMessageID,
+      reason == "chatMessageEdited" || reason == "chatMessageDeleted"
+    {
+      ChatListView.applyWarmTranscriptMutation(
+        chatId: normalizedChatID,
+        messageId: changedMessageID,
+        action: reason == "chatMessageEdited" ? "edited" : "deleted",
+        sourceRows: engineRows,
+        peerDisplayName: projectionHomeRow?.title ?? ""
+      )
+    }
     guard let latestRow = engineRows.last else {
       if reason == "chatMessageDeleted" || reason == "chatRowsReloaded" {
         let changed = mutateRow(chatID: normalizedChatID) { row in
-          row.withHomeState(previewRows: [], initialMessages: [])
+          row.withHomeState(
+            preview: "",
+            timeLabel: "",
+            previewRows: [],
+            initialMessages: []
+          )
         }
         if changed {
           persistHomeRows()
         }
+        NSLog(
+          "[HomeProjection] delete-empty chat=%@ mid=%@ cachedPreviewCleared=%@",
+          String(normalizedChatID.prefix(12)),
+          changedMessageID.map { String($0.prefix(12)) } ?? "-",
+          changed ? "Y" : "N"
+        )
       }
       return
     }
 
     let message = Self.messagePayload(from: latestRow)
     let messageID = Self.messageID(from: message) ?? Self.messageID(from: latestRow)
-    let isIncoming = (Self.boolValue(message["isMe"]) == false)
-    let didAlreadyProject = messageID.flatMap { projectedMessageIDsByChat[normalizedChatID] == $0 } ?? false
+
+    // Unread is decided by the message the event actually names, not by whatever happens
+    // to be newest: an out-of-order arrival must still count, and a redelivery of a
+    // message already on this device must not count twice.
+    let changedRow: [String: Any]? = changedMessageID.flatMap { identifier in
+      engineRows.last { row in
+        let payload = Self.messagePayload(from: row)
+        return (Self.messageID(from: payload) ?? Self.messageID(from: row)) == identifier
+      }
+    }
+    let unreadCandidate = Self.messagePayload(from: changedRow ?? latestRow)
+    let unreadCandidateID = changedMessageID ?? messageID
+    let isIncoming = (Self.boolValue(unreadCandidate["isMe"]) == false)
+    let didAlreadyProject =
+      unreadCandidateID.flatMap { projectedMessageIDsByChat[normalizedChatID] == $0 } ?? false
+    // The engine reports whether its upsert actually inserted; fall back to the
+    // last-projected memo when the signal carries no such flag (older server payloads).
+    let isNewOnThisDevice = changedMessageWasInserted ?? !didAlreadyProject
     let shouldIncrementUnread = (reason == "chatMessageInserted" || reason == "remoteNewMessage")
       && isIncoming
-      && !didAlreadyProject
+      && isNewOnThisDevice
+      // A message arriving in the conversation the user is currently reading is not
+      // unread. Home used to raise a badge behind the open chat and only lose it on the
+      // next list fetch.
+      && !chatIsOnScreen
     let preview = ChatHomeListRow.homePreviewText(from: message)
     let timeLabel = ChatHomeListRow.homeTimeLabel(from: message)
     let messageAt =
@@ -2111,15 +2372,31 @@ private final class ChatsViewModel: ObservableObject {
       ?? (message["timestamp_ms"] as? NSNumber)?.doubleValue
       ?? Date().timeIntervalSince1970 * 1000
 
-    let firstPaintTail = Array(engineRows.suffix(Self.chatFirstPaintTailLimit))
+    var keptFirstPaintTail = false
     let changed = mutateRow(chatID: normalizedChatID) { row in
       // Bridge/built-in agent surfaces keep their existing volatility/session behavior.
       // Normal chats only need a bounded latest tail in Home; the complete engine
       // snapshot stays engine-side for asynchronous attachment after the push begins.
-      let projectedRows =
-        row.isBuiltInAgentSurface || row.isBridgeAgentSurface
-        ? engineRows
-        : firstPaintTail
+      let projectedRows: [[String: Any]]
+      if row.isBuiltInAgentSurface || row.isBridgeAgentSurface {
+        projectedRows = engineRows
+      } else {
+        // MERGE, never replace. The engine holds only what this device has ingested; a
+        // chat that has never been opened this run can hold exactly the one message that
+        // just arrived, and overwriting Home's cached tail with it would make the tap
+        // mount a single-row transcript — the opposite of the populated-frame-one
+        // contract. Growth is also what lets the tap use real rows immediately.
+        let existingTail = Self.filteringDeletedRows(
+          row.initialMessages.isEmpty ? row.previewRows : row.initialMessages,
+          deletedMessageIDs: deletedMessageIDs
+        )
+        projectedRows = Self.mergedFirstPaintTail(
+          existing: existingTail,
+          engineRows: engineRows,
+          limit: Self.chatFirstPaintTailLimit
+        )
+        keptFirstPaintTail = projectedRows.count >= existingTail.count
+      }
       return row.withHomeState(
         preview: preview,
         timeLabel: timeLabel.isEmpty ? row.timeLabel : timeLabel,
@@ -2130,12 +2407,136 @@ private final class ChatsViewModel: ObservableObject {
         lastMessageAt: max(row.lastMessageAt, messageAt)
       )
     }
-    if let messageID {
+    if let unreadCandidateID {
+      projectedMessageIDsByChat[normalizedChatID] = unreadCandidateID
+    } else if let messageID {
       projectedMessageIDsByChat[normalizedChatID] = messageID
     }
     if changed {
       persistHomeRows()
+      // Home's row is only half of the first pushed frame: a chat that has already been
+      // warmed mounts its cached parsed snapshot, which was captured before this message
+      // existed. Grow it in the same beat so both surfaces agree. (The helper re-checks
+      // growth itself and is a no-op for anything else.)
+      if keptFirstPaintTail, !chatIsOnScreen,
+        let row = rows.first(where: { $0.chatId == normalizedChatID })
+          ?? archivedRows.first(where: { $0.chatId == normalizedChatID }),
+        !row.isBuiltInAgentSurface, !row.isBridgeAgentSurface
+      {
+        ChatListView.growWarmTranscriptSnapshot(
+          chatId: normalizedChatID,
+          sourceRows: engineRows,
+          peerDisplayName: row.title
+        )
+      }
     }
+  }
+
+  /// Drop rows the user already deleted on this device from a cached tail.
+  private static func filteringDeletedRows(
+    _ rows: [[String: Any]],
+    deletedMessageIDs: Set<String>
+  ) -> [[String: Any]] {
+    guard !deletedMessageIDs.isEmpty else { return rows }
+    return rows.filter { row in
+      let payload = messagePayload(from: row)
+      guard let messageID = messageID(from: payload) ?? messageID(from: row) else { return true }
+      return !deletedMessageIDs.contains(messageID)
+    }
+  }
+
+  /// Combine Home's cached first-paint tail with what the engine holds.
+  ///
+  /// The engine is the authority for any message it knows about, so a shared id always
+  /// takes the engine's copy (edits, receipts, media promotion). Ids the cached tail has
+  /// never seen are newer traffic and are appended in engine order. When the engine
+  /// already covers the whole cached tail it simply wins outright, which keeps its
+  /// ordering — including the settle-slot ordering agent replies depend on — intact.
+  private static func mergedFirstPaintTail(
+    existing: [[String: Any]],
+    engineRows: [[String: Any]],
+    limit: Int
+  ) -> [[String: Any]] {
+    guard !engineRows.isEmpty else { return existing }
+    guard !existing.isEmpty else { return Array(engineRows.suffix(limit)) }
+
+    var engineRowsByID: [String: [String: Any]] = [:]
+    var engineOrder: [String] = []
+    for row in engineRows {
+      let payload = messagePayload(from: row)
+      guard let identifier = messageID(from: payload) ?? messageID(from: row) else { continue }
+      if engineRowsByID[identifier] == nil { engineOrder.append(identifier) }
+      engineRowsByID[identifier] = row
+    }
+    guard !engineRowsByID.isEmpty else { return existing }
+
+    var existingIDs = Set<String>()
+    var merged: [[String: Any]] = []
+    merged.reserveCapacity(existing.count + engineOrder.count)
+    for row in existing {
+      let payload = messagePayload(from: row)
+      guard let identifier = messageID(from: payload) ?? messageID(from: row) else {
+        merged.append(row)
+        continue
+      }
+      existingIDs.insert(identifier)
+      merged.append(engineRowsByID[identifier] ?? row)
+    }
+    if existingIDs.isSubset(of: Set(engineOrder)) {
+      return Array(engineRows.suffix(limit))
+    }
+    for identifier in engineOrder where !existingIDs.contains(identifier) {
+      if let row = engineRowsByID[identifier] { merged.append(row) }
+    }
+    return Array(merged.suffix(limit))
+  }
+
+  /// Remove locally deleted ids from a server/cached Home row before it is allowed to
+  /// replace the immediate engine projection. This is the race fence for Back: the row
+  /// can repaint at once while deletion continues in the background.
+  private func filteringLocallyDeletedMessages(from row: ChatHomeListRow) -> ChatHomeListRow {
+    guard let deletedMessageIDs = locallyDeletedMessageIDsByChat[row.chatId],
+      !deletedMessageIDs.isEmpty
+    else {
+      return row
+    }
+    let sourceRows = row.initialMessages.isEmpty ? row.previewRows : row.initialMessages
+    guard !sourceRows.isEmpty else {
+      // A payload-less stale response cannot prove that its preview survived the local
+      // deletion. Keep Home's already-cleared projection until a concrete row arrives.
+      if let existing = rows.first(where: { $0.chatId == row.chatId }),
+        existing.previewRows.isEmpty,
+        existing.initialMessages.isEmpty,
+        existing.preview.isEmpty
+      {
+        return row.withHomeState(preview: "", timeLabel: "")
+      }
+      return row
+    }
+
+    let filteredRows = sourceRows.filter { rawRow in
+      let payload = Self.messagePayload(from: rawRow)
+      guard let messageID = Self.messageID(from: payload) ?? Self.messageID(from: rawRow) else {
+        return true
+      }
+      return !deletedMessageIDs.contains(messageID)
+    }
+    guard filteredRows.count != sourceRows.count else { return row }
+    guard let latestRow = filteredRows.last else {
+      return row.withHomeState(
+        preview: "",
+        timeLabel: "",
+        previewRows: [],
+        initialMessages: []
+      )
+    }
+    let latestMessage = Self.messagePayload(from: latestRow)
+    return row.withHomeState(
+      preview: ChatHomeListRow.homePreviewText(from: latestMessage),
+      timeLabel: ChatHomeListRow.homeTimeLabel(from: latestMessage),
+      previewRows: filteredRows,
+      initialMessages: filteredRows
+    )
   }
 
   /// Projects a live bridge status into Home without exposing a raw command/path.
@@ -2269,6 +2670,15 @@ private final class ChatsViewModel: ObservableObject {
       await self.performRefresh(preserveRows: preserveRows)
       while self.trailingRefreshRequested {
         self.trailingRefreshRequested = false
+        // A request that landed mid-fetch is real, but it must not turn into an
+        // immediate second round trip — that is how a steady signal (upload ticks,
+        // a chatty group) turned this into a permanent refetch loop. Let the link
+        // breathe for the same floor the debounce uses.
+        let sinceLastFetch = ProcessInfo.processInfo.systemUptime - self.lastListFetchFinishedAt
+        let cooldown = Self.realtimeRefreshMinInterval - sinceLastFetch
+        if cooldown > 0 {
+          try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
+        }
         await self.performRefresh(preserveRows: true)
       }
       self.inflightRefreshTask = nil
@@ -2295,14 +2705,16 @@ private final class ChatsViewModel: ObservableObject {
 
     refreshConnectionState()
     isLoading = rows.isEmpty && !preserveRows
-    // "Updating" only while connected and a list fetch is running. Offline/connecting
-    // stays on Connecting — never both at once.
-    isListUpdating = !isConnecting
+    // Background reconciliation is invisible: cached/projected rows remain usable and
+    // the principal header stays "Chats". Only a user-visible foreground refresh with
+    // existing rows may advertise Updating; initial empty loading still uses isLoading.
+    isListUpdating = !preserveRows && !isWaitingForNetwork && !rows.isEmpty
     isWaitingForNetwork = false
     errorMessage = nil
     defer {
       isLoading = false
       isListUpdating = false
+      lastListFetchFinishedAt = ProcessInfo.processInfo.systemUptime
     }
 
     do {
@@ -2329,7 +2741,8 @@ private final class ChatsViewModel: ObservableObject {
       )
       let nextRows = fetchedRows
         .filter { !locallyRemovedChatIDs.contains($0.chatId) }
-        .map { fetchedRow in
+        .map { rawFetchedRow in
+          let fetchedRow = filteringLocallyDeletedMessages(from: rawFetchedRow)
           guard !fetchedRow.isBuiltInAgentSurface, !fetchedRow.isBridgeAgentSurface,
             let existingRow = existingRowsByChatID[fetchedRow.chatId]
           else { return fetchedRow }
@@ -2461,18 +2874,24 @@ private final class ChatsViewModel: ObservableObject {
     // bounded raw tail off-main while Home is visible, then persist it back into the
     // Home row. The first chat route can now paint eight rows before its first layout
     // pass without ever blocking navigation on ChatEngine's serial queue.
-    warmFirstPaintTailsFromEngineCache(visibleRows)
+    // ALL rows, not the visible 8: the reported 177ms-empty first open was a chat below
+    // the fold — outside this loop it had no tail, no snapshot, and nothing mountable at
+    // push time. The loop itself bounds the fan-out.
+    warmFirstPaintTailsFromEngineCache(rows)
 
-    // Reopen-raster prewarm for EVERY chat, not just the 3 full-prewarm winners inside
-    // the prefix(8): it is one tiny off-main JPEG decode per chat (self-deduping via
-    // the overlay cache), and a chat whose raster is not in memory at tap time races
-    // the disk decode and shows a blank shell for its first ~170ms. Agent rows crowded
-    // the visible prefix, so the most-opened real DM never got warmed.
-    for row in rows where !row.isBuiltInAgentSurface {
-      let chatID = row.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !chatID.isEmpty else { continue }
-      ChatListView.prewarmReopenSnapshotRaster(chatId: chatID)
-    }
+    // Reopen-raster prewarm, beyond the 3 full-prewarm winners inside the prefix(8): a
+    // chat whose raster is not in memory at tap time races the disk decode and commits a
+    // blank shell until it lands. Agent rows crowded the visible prefix, so the filter
+    // keeps them from spending the budget — but the list is NOT unbounded any more: each
+    // raster is a full-screen bitmap and the overlay cache holds 8, so warming all ten
+    // chats newest-first made the oldest ones evict the newest, i.e. the chats actually
+    // being opened. Bounded, newest-first, and remembered for the foreground re-warm.
+    ChatListView.prewarmReopenSnapshotRasters(
+      chatIds: rows
+        .filter { !$0.isBuiltInAgentSurface }
+        .map { $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    )
 
     guard shouldFetchHistory else { return }
     // Was `prefix(2)`: only the top TWO chats ever had their history fetched, and a chat
@@ -2494,21 +2913,40 @@ private final class ChatsViewModel: ObservableObject {
 
   private func warmFirstPaintTailsFromEngineCache(_ rows: [ChatHomeListRow]) {
     let tailLimit = Self.chatFirstPaintTailLimit
-    // The most recent chats also get a complete parsed warm snapshot so their first
-    // open after relaunch mounts the whole transcript during the push (paired with
-    // disk-persisted heights) instead of a 16-row tail plus a late ~100-row insert.
-    var fullPrewarmBudget = 3
-    for row in rows where !row.isBuiltInAgentSurface && !row.isBridgeAgentSurface {
+    // Every cached chat gets a complete parsed warm snapshot below. Only reopen-raster
+    // decoding is budgeted: those are full-screen bitmaps, unlike the parsed row data.
+    var rasterPrewarmBudget = 3
+    // Spend the budget recently-OPENED first, Home's order second — the raster prewarm's
+    // rule, adopted here for the same measured reason: Home ranks by last message with
+    // pins first, so the chat the user had JUST been chatting in sat below the budget
+    // line, got no parsed snapshot, and its cold first open mounted nothing until the
+    // async engine snapshot (~180ms of bare wallpaper).
+    let mruRank = Dictionary(
+      ChatListView.recentlyOpenedChatIds.enumerated().map { ($1, $0) },
+      uniquingKeysWith: { first, _ in first })
+    let orderedRows = rows.enumerated().sorted { lhs, rhs in
+      let lhsRank =
+        mruRank[lhs.element.chatId.trimmingCharacters(in: .whitespacesAndNewlines)] ?? Int.max
+      let rhsRank =
+        mruRank[rhs.element.chatId.trimmingCharacters(in: .whitespacesAndNewlines)] ?? Int.max
+      return lhsRank == rhsRank ? lhs.offset < rhs.offset : lhsRank < rhsRank
+    }.map(\.element)
+    // Bound the fan-out (callers now pass every home row, not just the visible 8), but
+    // NEVER to fewer chats than the user can actually tap on one screen.
+    var remainingWarms = 16
+    for row in orderedRows where !row.isBuiltInAgentSurface && !row.isBridgeAgentSurface {
+      guard remainingWarms > 0 else { break }
       let chatID = row.chatId.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !chatID.isEmpty, !warmingFirstPaintTailChatIDs.contains(chatID) else { continue }
+      remainingWarms -= 1
       warmingFirstPaintTailChatIDs.insert(chatID)
-      let allowFullPrewarm = fullPrewarmBudget > 0
+      let allowRasterPrewarm = rasterPrewarmBudget > 0
       let peerDisplayName = row.title
-      if allowFullPrewarm { fullPrewarmBudget -= 1 }
+      if allowRasterPrewarm { rasterPrewarmBudget -= 1 }
 
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
         let engineRows = ChatEngine.shared.getChatRows(["chatId": chatID])
-        if allowFullPrewarm {
+        if allowRasterPrewarm {
           ChatListView.prewarmWarmTranscriptSnapshot(
             chatId: chatID,
             sourceRows: engineRows,
@@ -2518,6 +2956,19 @@ private final class ChatsViewModel: ObservableObject {
           // so the first open's shell commit already has content on its first frame
           // instead of racing the disk decode (the cold-open spinner window).
           ChatListView.prewarmReopenSnapshotRaster(chatId: chatID)
+        } else if !engineRows.isEmpty {
+          // Parsed transcript snapshots are data, not full-screen bitmaps. Keeping only
+          // a 16-row tail here meant a chat whose 55 rows were ALREADY restored locally
+          // still mounted 16 during the slide, then replaced them with all 55 at
+          // viewDidAppear. That late authoritative insert changed content height/offset
+          // and was the reported mid-push layout shift. Keep the complete bounded engine
+          // snapshot for every tappable Home row; the expensive raster budget above
+          // remains limited independently.
+          ChatListView.prewarmWarmTranscriptSnapshot(
+            chatId: chatID,
+            sourceRows: engineRows,
+            peerDisplayName: peerDisplayName
+          )
         }
         let tail = Array(engineRows.suffix(tailLimit))
         DispatchQueue.main.async { [weak self] in
@@ -2643,6 +3094,7 @@ private final class ChatsViewModel: ObservableObject {
         row.avatarUri ?? "",
         row.peerTier ?? "",
         "\(row.lastMessageAt)",
+        row.latestOutgoingDisplayStatus ?? "",
       ].joined(separator: "\u{1F}")
     }.joined(separator: "\u{1E}")
   }
@@ -2689,7 +3141,20 @@ private extension ChatHomeListRow {
       previewRows: previewRows ?? self.previewRows,
       initialMessages: initialMessages ?? self.initialMessages,
       members: members,
-      lastMessageAt: lastMessageAt ?? self.lastMessageAt
+      lastMessageAt: lastMessageAt ?? self.lastMessageAt,
+      // Everything below defaults in the initializer, so omitting it silently reset the
+      // row: a single realtime projection used to strip a channel's description, access
+      // type, public slug, share link, join/save policy and member counts — and
+      // `ChatRoute(row:)` reads exactly those when the row is tapped.
+      createdAt: createdAt,
+      roomDescription: roomDescription,
+      accessType: accessType,
+      publicSlug: publicSlug,
+      shareLink: shareLink,
+      joinApprovalRequired: joinApprovalRequired,
+      restrictSavingContent: restrictSavingContent,
+      memberCount: memberCount,
+      subscriberCount: subscriberCount
     )
   }
 }
@@ -3351,7 +3816,7 @@ private struct ChatHomeScreen: View {
         icon: """
         <?xml version="1.0" encoding="utf-8"?><svg fill="none" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="cp-800-600"><rect height="600" width="800" y="0" x="0" /></clipPath><g id="comp_0"><g opacity="0" id="planete Outlines - Group 5"><animate repeatCount="indefinite" attributeName="opacity" dur="3s" begin="0s" calcMode="spline" values="0; 1; 1; 0" keyTimes="0; 0.3; 0.68; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="translate(327.38,267.583)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="327.38 267.583; 482.38 267.583" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-171.76,-193.166)"><g id="Group 5" transform="matrix(1,0,0,1,171.76,193.166)"><path fill="#d0d2d3" fill-opacity="1" d="M59.669,-8.242C53.143,-8.242,47.22,-5.677,42.84,-1.506C42.047,-23.225,24.2,-40.592,2.287,-40.592C-17.519,-40.592,-34.001,-26.403,-37.576,-7.638C-39.31,-8.029,-41.111,-8.242,-42.962,-8.242C-56.447,-8.242,-67.378,2.69,-67.378,16.174C-67.378,16.467,-67.367,16.758,-67.356,17.049C-68.756,16.49,-70.279,16.174,-71.878,16.174C-78.62,16.174,-84.086,21.64,-84.086,28.383C-84.086,35.125,-78.62,40.591,-71.878,40.591L59.669,40.591C73.154,40.591,84.086,29.659,84.086,16.174C84.086,2.69,73.154,-8.242,59.669,-8.242Z" /></g></g></g></g><g id="Merged Shape Layer"><g transform="translate(390.319,298.2)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="390.319 298.2; 390.319 282.7; 390.319 319.25; 390.319 298.2" keyTimes="0; 0.293; 0.733; 1" keySplines="0.333 0 0.667 1; 0.333 0 0.667 1; 0.333 0 0.667 1" fill="freeze" /><g transform="rotate(0)"><animateTransform repeatCount="indefinite" type="rotate" attributeName="transform" dur="3s" begin="0s" calcMode="spline" values="0; 35; 0" keyTimes="0; 0.513; 1" keySplines="0.547 0 0.667 1; 0.333 0 0.845 1" fill="freeze" /><g transform="scale(1,1) translate(-664.319,-256.2)"><g id="planete Outlines - Group 3" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 3" transform="matrix(1,0,0,1,297.638,254.4)"><path fill="#5d68f9" fill-opacity="1" d="M-133.812,-42.171L133.812,-75.141L5.765,75.141L-61.708,18.402L124.227,-71.307L-87.011,-1.534L-133.812,-42.171Z" /></g></g><g id="planete Outlines - Group 2" transform="matrix(0.5,0,0,0.5,515.5,129)"><g id="Group 2" transform="matrix(1,0,0,1,316.247,247.882)"><path fill="#474bd8" fill-opacity="1" d="M-98.335,64.79L-105.619,4.984L105.619,-64.79L-80.316,24.919L-98.335,64.79Z" /></g></g><g id="planete Outlines - Group 1" transform="matrix(0.5,0,0,0.5,515.5,129.001)"><g id="Group 1" transform="matrix(1,0,0,1,236.879,292.737)"><path fill="#3931ac" fill-opacity="1" d="M18.967,-3.189L-18.967,19.935L-0.949,-19.935L18.967,-3.189Z" /></g></g></g></g></g></g><g opacity="0" id="planete Outlines - Group 4"><animate repeatCount="indefinite" attributeName="opacity" dur="2.4s" begin="0s" calcMode="spline" values="0; 0.5; 0.5; 0" keyTimes="0; 0.317; 0.733; 1" keySplines="0 0 1 1; 0 0 1 1; 0 0 1 1" fill="freeze" /><g transform="translate(468.336,323.378)"><animateTransform repeatCount="indefinite" type="translate" attributeName="transform" dur="2.04s" begin="0s" calcMode="spline" values="468.336 323.378; 294.336 323.378" keyTimes="0; 1" keySplines="0 0 1 1" fill="freeze" /><g transform="scale(0.5,0.5) translate(-453.672,-304.756)"><g id="Group 4" transform="matrix(1,0,0,1,453.672,304.756)"><path fill="#d0d2d3" fill-opacity="1" d="M75.134,16.175C74.353,16.175,73.591,16.256,72.85,16.396C72.851,16.322,72.856,16.249,72.856,16.175C72.856,2.691,61.924,-8.241,48.44,-8.241C46.662,-8.241,44.931,-8.046,43.262,-7.685C39.668,-26.427,23.196,-40.591,3.406,-40.591C-16.624,-40.591,-33.254,-26.077,-36.571,-6.995C-38.992,-7.799,-41.578,-8.241,-44.269,-8.241C-57.754,-8.241,-68.685,2.691,-68.685,16.175C-68.685,16.817,-68.652,17.45,-68.604,18.079C-70.494,16.88,-72.728,16.175,-75.133,16.175C-81.875,16.175,-87.341,21.641,-87.341,28.383C-87.341,35.126,-81.875,40.592,-75.133,40.592L75.134,40.592C81.876,40.592,87.342,35.126,87.342,28.383C87.342,21.641,81.876,16.175,75.134,16.175Z" /></g></g></g></g></g></defs><g transform="matrix(1.79,0,0,1.79,-310,-231)" id="Pre-comp 1"><use clip-path="url(#cp-800-600)" height="600" width="800" y="0" x="0" xlink:href="#comp_0" href="#comp_0" /></g></svg>
         """,
-        title: (model.isConnecting || model.isWaitingForNetwork) ? "Connecting" : "No Messages Yet",
+        title: model.isWaitingForNetwork ? "Connecting" : "No Messages Yet",
         message: errorMessage ?? model.errorMessage
           ?? (model.isWaitingForNetwork
             ? "Your chats will stay here when the connection returns."
@@ -3544,13 +4009,31 @@ private struct ChatHomeScreen: View {
       return
     }
 
+    // Mark as unread / read is a local list projection first. It used to change nothing
+    // until a POST and a full list reload had both finished, so the badge the user just
+    // asked for appeared a round trip late.
+    var revertUnread: (unreadCount: Int, markedUnread: Bool)?
+    if case .markUnread(let unread) = action {
+      revertUnread = model.applyLocalUnread(chatID: row.chatId, unread: unread)
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
     Task { @MainActor in
       do {
         try await ChatHomeEditService.apply(action: action, chatID: row.chatId, config: config)
         selectedChatIDs.remove(row.chatId)
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if revertUnread == nil {
+          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
         await model.refreshAll()
       } catch {
+        if let revertUnread {
+          model.restoreLocalUnread(
+            chatID: row.chatId,
+            unreadCount: revertUnread.unreadCount,
+            markedUnread: revertUnread.markedUnread
+          )
+        }
         AppUITrace.error(
           "ChatHomeScreen rowAction error chatId=\(String(row.chatId.prefix(12))) error=\(error.localizedDescription)"
         )
@@ -4100,7 +4583,7 @@ private struct SettingsRootView: View {
 }
 
 
-private enum ChatHomeRowAction: Equatable {
+enum ChatHomeRowAction: Equatable {
   case markUnread(Bool)
   case pin(Bool)
   case mute(Bool)
@@ -4906,13 +5389,11 @@ final class HomeSearchCapsuleView: UIView {
   }
 
   func applyPalette(isDark: Bool) {
-    fillView.backgroundColor =
-      isDark ? UIColor(white: 0.18, alpha: 1.0) : UIColor.tertiarySystemFill
-    let secondary =
-      isDark ? UIColor.white.withAlphaComponent(0.45) : UIColor.secondaryLabel
-    iconView.tintColor = secondary
-    placeholderLabel.textColor = secondary
-    textField.textColor = isDark ? .white : .label
+    let palette = AppThemePalette.resolve(for: isDark ? .dark : .light)
+    fillView.backgroundColor = palette.inputUIColor
+    iconView.tintColor = palette.secondaryTextUIColor
+    placeholderLabel.textColor = palette.secondaryTextUIColor
+    textField.textColor = palette.textUIColor
   }
 
   func syncText(_ text: String) {
@@ -5071,11 +5552,10 @@ private final class HomeSearchGhostInputView: UIView {
     // Must match HomeSearchCapsuleView's secondary EXACTLY (0.45, not 0.55): the
     // ghost crossfades into the solid capsule on dismiss, and any delta made the
     // "Search" label + magnifier visibly shift tone (brighter→dimmer) at handoff.
-    let secondary =
-      isDark ? UIColor.white.withAlphaComponent(0.45) : UIColor.secondaryLabel
-    iconView.tintColor = secondary
-    placeholderLabel.textColor = secondary
-    textField.textColor = isDark ? .white : .label
+    let palette = AppThemePalette.resolve(for: isDark ? .dark : .light)
+    iconView.tintColor = palette.secondaryTextUIColor
+    placeholderLabel.textColor = palette.secondaryTextUIColor
+    textField.textColor = palette.textUIColor
   }
 
   private var lastIsDark = false
@@ -5084,7 +5564,7 @@ private final class HomeSearchGhostInputView: UIView {
   /// HomeSearchCapsuleView.applyPalette so the takeoff/landing handoff to the
   /// real in-list capsule is seamless.
   private var solidFillColor: UIColor {
-    lastIsDark ? UIColor(white: 0.18, alpha: 1.0) : .tertiarySystemFill
+    AppThemePalette.resolve(for: lastIsDark ? .dark : .light).inputUIColor
   }
 
   /// Switch the field's material. Callers WRAP this in `UIView.animate { }` so
@@ -5193,6 +5673,18 @@ private final class ChatHomeInListSearchHeader: UIView {
     _ = animated
     capsuleView.applyPalette(isDark: isDark)
     capsuleView.syncText(text)
+  }
+
+  /// Reuses Home's exact resting capsule as a normal in-place search field for
+  /// list surfaces that do not mount Home's separate focused-results overlay.
+  /// Home leaves this disabled and keeps its full flight choreography.
+  func setInlineEditing(
+    _ enabled: Bool,
+    onTextChanged: ((String) -> Void)?
+  ) {
+    hitButton.isHidden = enabled
+    capsuleView.textField.isUserInteractionEnabled = enabled
+    capsuleView.onTextChanged = enabled ? onTextChanged : nil
   }
 
   @objc private func handleTap() {
@@ -5687,7 +6179,7 @@ private struct ShareChatSelectionView: View {
   }
 }
 
-private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
+struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let rows: [ChatHomeListRow]
   let isDark: Bool
   let isEditing: Bool
@@ -5697,6 +6189,9 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   var compactForwardStyle: Bool = false
   var searchText: Binding<String>? = nil
   var isSearchFocused: Binding<Bool>? = nil
+  /// Uses Home's solid in-list capsule as an editable field without invoking
+  /// the full Home search flight/results overlay.
+  var inlineSearchInteraction: Bool = false
   /// Instant (unanimated) overlay visibility — sheet gate bookkeeping.
   var isSearchOverlayVisible: Bool = false
   /// Close phase 1 — triggers the native retract (xmark out, capsule re-widen).
@@ -5711,6 +6206,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   let onSelect: (ChatHomeListRow) -> Void
   let onToggleSelection: (String) -> Void
   let onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void
+  var onSettingsAction: ((ChatHomeListRow) -> Void)? = nil
   var onSelectPerson: ((ContactSearchUser) -> Void)? = nil
   let onRefresh: () async -> Void
   let onUnavailableAction: (String) -> Void
@@ -5720,11 +6216,13 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     controller.onSelect = onSelect
     controller.onToggleSelection = onToggleSelection
     controller.onAction = onAction
+    controller.onSettingsAction = onSettingsAction
     controller.onRefresh = onRefresh
     controller.onUnavailableAction = onUnavailableAction
     controller.onSelectPerson = onSelectPerson
     controller.searchTextBinding = searchText
     controller.isSearchFocusedBinding = isSearchFocused
+    controller.inlineSearchInteraction = inlineSearchInteraction
     controller.searchOverlayVisibleFlag = isSearchOverlayVisible
     controller.searchRetractingFlag = isSearchRetracting
     controller.searchDissolveBackground = searchDissolveBackground
@@ -5747,11 +6245,13 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
     uiViewController.onSelect = onSelect
     uiViewController.onToggleSelection = onToggleSelection
     uiViewController.onAction = onAction
+    uiViewController.onSettingsAction = onSettingsAction
     uiViewController.onRefresh = onRefresh
     uiViewController.onUnavailableAction = onUnavailableAction
     uiViewController.onSelectPerson = onSelectPerson
     uiViewController.searchTextBinding = searchText
     uiViewController.isSearchFocusedBinding = isSearchFocused
+    uiViewController.inlineSearchInteraction = inlineSearchInteraction
     uiViewController.searchOverlayVisibleFlag = isSearchOverlayVisible
     uiViewController.searchRetractingFlag = isSearchRetracting
     uiViewController.searchDissolveBackground = searchDissolveBackground
@@ -5770,7 +6270,7 @@ private struct ChatHomeNativeListRepresentable: UIViewControllerRepresentable {
   }
 }
 
-private final class ChatHomeNativeListController: UIViewController, UITableViewDataSource,
+final class ChatHomeNativeListController: UIViewController, UITableViewDataSource,
   UITableViewDelegate, UIGestureRecognizerDelegate, ChatHomeCardCellSwipeDelegate
 {
   private let tableView = UITableView(frame: .zero, style: .plain)
@@ -5795,11 +6295,17 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   fileprivate var onSelect: (ChatHomeListRow) -> Void = { _ in }
   fileprivate var onToggleSelection: (String) -> Void = { _ in }
   fileprivate var onAction: (ChatHomeRowAction, ChatHomeListRow) -> Void = { _, _ in }
+  /// Fires for the Agents-tab-only "Settings" leading swipe action
+  /// (`isOwnedAgent` rows). Kept separate from `onAction`/`ChatHomeRowAction`
+  /// so ordinary Home chat rows and their exhaustive action switch are
+  /// completely untouched by this addition.
+  fileprivate var onSettingsAction: ((ChatHomeListRow) -> Void)?
   fileprivate var onRefresh: (() async -> Void)?
   fileprivate var onUnavailableAction: (String) -> Void = { _ in }
   fileprivate var onSelectPerson: ((ContactSearchUser) -> Void)?
   fileprivate var searchTextBinding: Binding<String>?
   fileprivate var isSearchFocusedBinding: Binding<Bool>?
+  fileprivate var inlineSearchInteraction = false
   fileprivate var searchOverlayVisibleFlag = false
   fileprivate var searchRetractingFlag = false
   fileprivate var searchDissolveBackground: UIColor?
@@ -5868,10 +6374,18 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   private var bridgeStatusPollTask: Task<Void, Never>?
   /// Last status signature painted by the poll, so an unchanged tick repaints nothing.
   private var lastBridgeStatusPollSignature: String?
+  /// A newly-created Home table must begin at its true rest position
+  /// (`-adjustedContentInset.top`). UIKit initializes `contentOffset.y` to zero;
+  /// after we add the nav + pinned-search inset, zero already represents a list
+  /// scrolled partway down. Apply this exactly once per controller lifetime so
+  /// later chat returns and realtime updates preserve the user's scroll position.
+  private var hasAppliedInitialTopOffset = false
+  private var hasUserDrivenHomeScroll = false
 
   override func viewSafeAreaInsetsDidChange() {
     super.viewSafeAreaInsetsDidChange()
     updateTopContentInset()
+    applyInitialTopOffsetIfNeeded()
     // The pinned bar's top tracks the safe area (nav height). Skipped mid-morph
     // (the nav fade shrinks the safe area then — the bar must stay frozen).
     layoutSearchBar()
@@ -5951,6 +6465,33 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
   }
 
+  private func applyInitialTopOffsetIfNeeded() {
+    guard !hasAppliedInitialTopOffset, isViewLoaded, !isSearchMorphActive else { return }
+    guard tableView.bounds.width > 0, tableView.bounds.height > 0 else { return }
+    // Home's pinned search band and navigation safe area must both exist before
+    // committing the one-shot offset. Marking it while safeAreaInsets is transiently
+    // zero would recreate the exact midpoint bug on the next layout pass.
+    if showsInListSearch {
+      guard searchHeader != nil, view.safeAreaInsets.top > 1 else { return }
+    }
+
+    // contentInsetAdjustmentBehavior is `.never`, so the value just committed by
+    // updateTopContentInset is the source of truth even before UIKit refreshes its
+    // derived `adjustedContentInset` on the following layout pass.
+    let topY = -tableView.contentInset.top
+    UIView.performWithoutAnimation {
+      tableView.setContentOffset(
+        CGPoint(x: tableView.contentOffset.x, y: topY),
+        animated: false
+      )
+    }
+    hasAppliedInitialTopOffset = true
+    layoutSearchBar(force: true)
+    AppUITrace.notice(
+      "ChatHomeNativeListController initial-top offsetY=\(Int(topY)) insetTop=\(Int(tableView.adjustedContentInset.top)) rows=\(rows.count)"
+    )
+  }
+
   private func updateInListSearchHeader(animated: Bool) {
     // Permanent opaque backing (identical to the SwiftUI background behind
     // it) — refreshed every apply so palette flips track it.
@@ -5979,6 +6520,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: ChatHomeInListSearchHeader.bandHeight))
       header.onFocusChange = { [weak self] focused in
         guard let self else { return }
+        guard !self.inlineSearchInteraction else { return }
         if focused {
           // UIKit-first: motion starts in this event turn, SwiftUI follows.
           self.beginSearchOpenFromTap()
@@ -5987,6 +6529,12 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         }
       }
       searchHeader = header
+      // The controller can receive its first safe-area pass before SwiftUI's configured
+      // search header exists. If no finger has owned the list yet, re-arm the one-shot
+      // top landing now that the complete nav + search inset can be computed.
+      if !hasUserDrivenHomeScroll {
+        hasAppliedInitialTopOffset = false
+      }
     }
     // Sibling ABOVE the table so the collapsing bar clips over the rows (their
     // tops kiss the bar's bottom edge but never overlap).
@@ -6002,11 +6550,32 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
       recentRows: recentRows,
       animated: animated
     )
+    header.setInlineEditing(inlineSearchInteraction) { [weak self] text in
+      guard let self, self.searchTextBinding?.wrappedValue != text else { return }
+      self.searchTextBinding?.wrappedValue = text
+    }
     // External query changes (sheet "Clear", close-time reset) reach the
     // ghost AND its solid twin; while the user types this is an equal-text
     // no-op.
     searchGhost?.syncText(searchTextBinding?.wrappedValue ?? "")
     searchSolidTwin?.syncText(searchTextBinding?.wrappedValue ?? "")
+    // SwiftUI can configure/create this header after the controller's only initial
+    // layout pass. Commit the complete inset and top landing here as well; otherwise
+    // UIKit keeps its default offset 0 while insetTop is 172, so Home opens one band
+    // down the list until the user scrolls (the captured "mid page" launch).
+    if !hasUserDrivenHomeScroll {
+      updateTopContentInset()
+      applyInitialTopOffsetIfNeeded()
+      // SwiftUI may create/configure the pinned header during the same layout turn in
+      // which the table still reports 0x0 bounds. The synchronous attempt correctly
+      // refuses to consume the one-shot in that state; retry once after Auto Layout has
+      // committed real bounds so offset 0 cannot survive under a 172pt top inset.
+      DispatchQueue.main.async { [weak self] in
+        guard let self, !self.hasUserDrivenHomeScroll else { return }
+        self.updateTopContentInset()
+        self.applyInitialTopOffsetIfNeeded()
+      }
+    }
     // Position + collapse the pinned bar for the current scroll offset.
     layoutSearchBar()
   }
@@ -6841,6 +7410,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
     updateTopContentInset()
+    applyInitialTopOffsetIfNeeded()
     // Re-position/re-collapse the pinned search bar for the current width and
     // scroll offset (rotation, first layout). Not a tableHeaderView anymore —
     // layoutSearchBar owns its geometry (top pinned under nav, height driven by
@@ -6861,6 +7431,11 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+    ChatListView.prewarmWallpaperSnapshots(
+      rawAppearance: ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark),
+      size: view.bounds.size,
+      scale: view.window?.screen.scale ?? UIScreen.main.scale
+    )
     AppUITrace.notice(
       "ChatHomeNativeListController viewDidAppear rows=\(rows.count) contentSize=\(Int(tableView.contentSize.height)) offsetY=\(Int(tableView.contentOffset.y))"
     )
@@ -7248,6 +7823,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         row.avatarUri ?? "",
         row.peerTier ?? "",
         "\(row.lastMessageAt)",
+        row.latestOutgoingDisplayStatus ?? "",
         firstPaintTailFingerprint(for: row),
       ].joined(separator: "\u{1F}")
     }
@@ -7282,7 +7858,10 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
         ?? newestMessage["editedAt"] ?? newestMessage["edited_at"]
         ?? newestMessage["timestampMs"] ?? newestMessage["timestamp_ms"]
         ?? newestMessage["timestamp"])
-    return "tail:\(tail.count):\(firstID):\(newestID):\(revision)"
+    let status = token(
+      newestMessage["status"] ?? newestMessage["deliveryStatus"]
+        ?? newestMessage["delivery_status"])
+    return "tail:\(tail.count):\(firstID):\(newestID):\(revision):\(status)"
   }
 
   private func previewDebugLog(_ message: String) {
@@ -7798,6 +8377,7 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
   }
 
   func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+    hasUserDrivenHomeScroll = true
     AppUITrace.notice(
       "ChatHomeNativeListController scrollBegin rows=\(rows.count) offsetY=\(Int(scrollView.contentOffset.y))"
     )
@@ -7895,6 +8475,8 @@ private final class ChatHomeNativeListController: UIViewController, UITableViewD
     }
 
     switch eventType {
+    case "swipeAgentSettings":
+      onSettingsAction?(row)
     case "swipePin":
       onAction(.pin(!row.pinned), row)
     case "swipeMarkRead":
@@ -9930,6 +10512,37 @@ final class ChatConversationController: UIViewController {
     fatalError("init(coder:) has not been implemented")
   }
 
+  /// Mount and settle the destination invisibly behind the current navigation page so
+  /// the native push begins with a populated, final-width transcript. Keeping the work
+  /// window-attached is important: collection cells do not materialize correctly in a
+  /// detached 0x0 hierarchy, while index 0 remains fully covered by Home.
+  func prepareForNavigationPush(in navigationController: UINavigationController) {
+    loadViewIfNeeded()
+
+    let destinationSafeBottom = max(
+      navigationController.view.safeAreaInsets.bottom,
+      navigationController.view.window?.safeAreaInsets.bottom ?? 0
+    )
+    mainView.setNavigationPrestageSafeAreaBottom(destinationSafeBottom)
+    mainView.beginNavigationPushPrestaging()
+    view.frame = navigationController.view.bounds
+    view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    view.isHidden = true
+    navigationController.view.insertSubview(view, at: 0)
+    UIView.performWithoutAnimation {
+      view.setNeedsLayout()
+      view.layoutIfNeeded()
+      mainView.layoutIfNeeded()
+    }
+
+    mainView.finishNavigationPushPrestaging()
+    view.isHidden = false
+    UIView.performWithoutAnimation {
+      view.layoutIfNeeded()
+      mainView.layoutIfNeeded()
+    }
+  }
+
   override var preferredStatusBarStyle: UIStatusBarStyle {
     return isDark ? .lightContent : .darkContent
   }
@@ -9995,6 +10608,11 @@ final class ChatConversationController: UIViewController {
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
+    // This screen draws its own native chat header. Agent Settings temporarily
+    // unhides AppRootNavigationController's system bar; reclaim the hidden-bar
+    // contract on every return (including an interactive pop that completes).
+    navigationController?.setNavigationBarHidden(true, animated: false)
+    mainView.setEngineStateUpdatesSuspended(false)
     logLifecycle("viewWillAppear")
     logVisualState("viewWillAppear", force: true)
     // If this DM's Default view is Agent, mount the isolated agent surface NOW so it rides this
@@ -10078,6 +10696,11 @@ final class ChatConversationController: UIViewController {
 
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
+    // A pushed Agent Settings page owns the system navigation header. Freeze
+    // engine-driven presence/pin/header work in the covered chat so a Phoenix
+    // reconnect cannot rebuild iOS 26 glass effects inside the outgoing view.
+    // viewWillAppear resumes with one forced catch-up snapshot.
+    mainView.setEngineStateUpdatesSuspended(true)
     // Capture while the transcript is still on screen (drawHierarchy needs live
     // content) — this bitmap becomes the next open's first frame.
     mainView.captureReopenSnapshot()
@@ -10229,6 +10852,17 @@ final class ChatConversationController: UIViewController {
         routeMemberCount,
         resolvedRouteMembers.count
       )
+    }
+    // Reply palettes are identity-owned. Bind the cached engine identity BEFORE chat id:
+    // setEngineChatId can restore and parse a warm seed immediately, and delaying "me"
+    // until the post-push engine attach made reply-to-You banners change color on arrival.
+    let engineConfig = ChatEngineStore.shared.getConfig()
+    if let currentUserId =
+      Self.normalizedString(engineConfig["myUserId"])
+        ?? Self.normalizedString(engineConfig["userId"])
+    {
+      engineBindingUserId = currentUserId
+      mainView.setEngineMyUserId(currentUserId)
     }
     // Seed route identity before any header/avatar paint. The chat header fallback
     // color is keyed by peer/chat identity, and waiting for the deferred engine
@@ -10792,7 +11426,10 @@ final class ChatConversationController: UIViewController {
     }
   }
 
-  private func refreshRows(preferInitialRows: Bool = false) {
+  private func refreshRows(
+    preferInitialRows: Bool = false,
+    allowAuthoritativeEmpty: Bool = false
+  ) {
     rowsRefreshGeneration &+= 1
     let generation = rowsRefreshGeneration
     let chatId = route.chatId
@@ -10840,8 +11477,29 @@ final class ChatConversationController: UIViewController {
     // allowing collection measurement to steal animation frames.
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let nativeRows = ChatEngine.shared.getChatRows(["chatId": chatId])
+      // Read this beside the rows, off-main, so "0 rows" has an authority bit attached
+      // to the same engine snapshot. Empty while a fetch is still in flight is merely a
+      // loading state; empty after a successful history resolution is the transcript.
+      // Without this distinction a stale reopen raster can sit over a genuinely empty
+      // chat forever, looking like a real but untouchable message.
+      let historyIsResolved = ChatEngine.shared.isChatHistoryLoaded(chatId: chatId)
       DispatchQueue.main.async { [weak self] in
         guard let self, self.route.chatId == chatId, self.rowsRefreshGeneration == generation else {
+          return
+        }
+        if nativeRows.isEmpty, allowAuthoritativeEmpty || historyIsResolved {
+          self.pendingRowsForAttachment = nil
+          self.pendingRowsForAttachmentChatId = nil
+          self.pendingRowsForAttachmentSource = nil
+          self.latestProfileRows = []
+          self.lastAppliedRowsToSurfaceCount = 0
+          self.mainView.clearRows()
+          self.profileView?.setRows([])
+          NSLog(
+            "[ChatOpen] controller authoritative-empty chat=%@ source=%@ historyResolved=%@ — cleared rows and stale raster",
+            String(chatId.prefix(12)),
+            allowAuthoritativeEmpty ? "explicit-delete" : "history",
+            historyIsResolved ? "Y" : "N")
           return
         }
         // Never wipe a visible transcript with a transient empty engine read.
@@ -12059,11 +12717,23 @@ final class ChatConversationController: UIViewController {
   }
 
   private func performClearChat(deleteForEveryone: Bool) {
+    // Exit selection chrome before transforming the visible transcript. The
+    // destructive mutation starts once exact bubble fragments cover the cells.
+    mainView.clearMessageSelection(animated: true)
+    mainView.animateClearChatDisintegration { [weak self] in
+      self?.commitClearChat(deleteForEveryone: deleteForEveryone)
+    }
+  }
+
+  private func commitClearChat(deleteForEveryone: Bool) {
     if let config = AppSessionConfig.current {
       ChatHomeService.removeCachedChat(chatID: route.chatId, config: config)
     }
-    // Exit selection chrome first so header restores while the list empties.
-    mainView.clearMessageSelection(animated: true)
+    NSLog(
+      "[DeleteTrace] clear commit chat=%@ scope=%@",
+      route.chatId,
+      deleteForEveryone ? "everyone" : "me"
+    )
     if deleteForEveryone {
       _ = ChatEngine.shared.clearChat([
         "chatId": route.chatId,
@@ -12151,7 +12821,7 @@ final class ChatConversationController: UIViewController {
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
       "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
       "chatMuteChanged":
-      refreshRows()
+      refreshRows(allowAuthoritativeEmpty: changeReason == "chatMessageDeleted")
     default:
       break
     }
@@ -15040,17 +15710,32 @@ private struct AppAnimatedSVGView: UIViewRepresentable {
 
 // MARK: - Native UIKit shell
 
+/// Scene-level, non-key overlay used only for transient global toasts.
+/// Returning nil keeps every touch routed to the real application window.
+private final class AppToastOverlayWindow: UIWindow {
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    nil
+  }
+}
+
 /// Root navigation controller that wraps the whole `AppRootTabBarController`.
 /// Pushing a `ChatConversationController` here slides it in z-above all four
 /// tabs (Calls / Contacts / Home / Settings) — a chat can be opened from any
 /// tab and is never nested inside the Chats tab. Its own nav bar stays hidden;
 /// each pushed surface draws its own header.
 final class AppRootNavigationController: UINavigationController, UIGestureRecognizerDelegate {
+  private var toastOverlayWindow: AppToastOverlayWindow?
+
   override func viewDidLoad() {
     super.viewDidLoad()
     setNavigationBarHidden(true, animated: false)
     interactivePopGestureRecognizer?.delegate = self
     NativeMusicPlayerRootOverlay.shared.install(on: view)
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    installToastOverlayWindowIfNeeded()
   }
 
   override func viewDidLayoutSubviews() {
@@ -15062,6 +15747,8 @@ final class AppRootNavigationController: UINavigationController, UIGestureRecogn
   override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
     super.traitCollectionDidChange(previousTraitCollection)
     NativeMusicPlayerRootOverlay.shared.updateLayout()
+    toastOverlayWindow?.overrideUserInterfaceStyle =
+      view.window?.overrideUserInterfaceStyle ?? traitCollection.userInterfaceStyle
   }
 
   // Keep edge-swipe-back working while the system nav bar is hidden, but only
@@ -15072,6 +15759,35 @@ final class AppRootNavigationController: UINavigationController, UIGestureRecogn
 
   override var childForStatusBarStyle: UIViewController? {
     return topViewController
+  }
+
+  deinit {
+    toastOverlayWindow?.isHidden = true
+    toastOverlayWindow?.rootViewController = nil
+  }
+
+  // A UINavigationController is a closed container: adding an unrelated
+  // UIHostingController via addChild corrupts its child/appearance bookkeeping,
+  // especially when Agent Settings toggles the system navigation bar. Put the
+  // non-interactive global toast in its own scene-bound overlay window instead.
+  private func installToastOverlayWindowIfNeeded() {
+    guard toastOverlayWindow == nil, let windowScene = view.window?.windowScene else {
+      return
+    }
+    let host = UIHostingController(rootView: AppToastHostView())
+    host.view.backgroundColor = .clear
+    host.view.isUserInteractionEnabled = false
+
+    let overlayWindow = AppToastOverlayWindow(windowScene: windowScene)
+    overlayWindow.frame = windowScene.coordinateSpace.bounds
+    overlayWindow.backgroundColor = .clear
+    overlayWindow.windowLevel = UIWindow.Level(
+      rawValue: UIWindow.Level.alert.rawValue - 1.0)
+    overlayWindow.overrideUserInterfaceStyle =
+      view.window?.overrideUserInterfaceStyle ?? traitCollection.userInterfaceStyle
+    overlayWindow.rootViewController = host
+    overlayWindow.isHidden = false
+    toastOverlayWindow = overlayWindow
   }
 }
 
@@ -15090,7 +15806,6 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
   static let orderedTabs: [AppShellTab] = [.calls, .contacts, .chats, .agents, .settings]
   static func tabIndex(for tab: AppShellTab) -> Int? { orderedTabs.firstIndex(of: tab) }
 
-  private var toastHost: UIHostingController<AppToastHostView>?
   private var settingsAvatarTask: Task<Void, Never>?
   private var profileCancellable: AnyCancellable?
 
@@ -15135,7 +15850,6 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     configureGlobalSearchBarAppearance()
     applyTabBarAppearance()
     AppAppearanceController.applyStoredPreference()
-    installToastHost()
 
     VibeNativeCallOverlayPresenter.shared.startObserving()
     VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
@@ -15171,11 +15885,13 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
 
   // MARK: Agents tab
 
-  /// The Agents tab root: the same native agents-management screen already used for the
-  /// presented control panel (`ChatNativeAgentView.presentAgentControlPanel(from:)`),
-  /// wrapped as a tab instead of a modal. No session yet (should not happen — this
-  /// controller is only ever constructed post-auth) falls back to an empty placeholder
-  /// rather than crashing.
+  /// The Agents tab root: `ChatAgentsMainViewController`, a real list PAGE (Home-style
+  /// pinned search + filters, cached instant render, Home's own row/swipe/hold-preview
+  /// engine). It replaced a controller originally written as a presented sheet — the
+  /// sheet-as-page mismatch was the source of the broken layout and empty list. Agent
+  /// configuration now lives only behind it, in `ChatNativeAgentConfigPanelController`.
+  /// No session yet (should not happen — this controller is only ever constructed
+  /// post-auth) falls back to an empty placeholder rather than crashing.
   private func makeAgentsTabRoot() -> UIViewController {
     guard let config = AppSessionConfig.current else {
       return UINavigationController(rootViewController: UIViewController())
@@ -15184,7 +15900,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       apiBaseURL: config.apiBaseURL,
       token: config.authToken
     )
-    let controller = ChatNativeAgentsControlController(
+    let controller = ChatAgentsMainViewController(
       apiContext: apiContext,
       appearance: .fallback,
       showsCloseButton: false
@@ -15207,15 +15923,73 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     return UINavigationController(rootViewController: controller)
   }
 
-  /// Opens (creating if needed) the DM with a real agent's shadow user, reusing the same
-  /// resolve→start-chat→push pipeline as tapping a `vibe://chat?friendId=` link — which is
-  /// exactly what `AgentCard.agentDMURL` already encodes for this agent.
+  /// Opens (creating if needed) the DM with a real agent's shadow user — built directly
+  /// from the `AgentCard` fields we already have, rather than the generic share-link
+  /// pipeline (resolve-by-id via contact search, THEN start chat). That extra search-by-id
+  /// round trip was an unnecessary dependency for a chat we can already fully describe,
+  /// and is the prime suspect for the reported "tapping a row does nothing" routing bug.
   private func openAgentChatFromAgentsTab(_ card: ChatListRow.AgentCard) {
     guard let agentUserId = card.agentUserId, !agentUserId.isEmpty else {
       AppToastController.shared.show("Agent chat is not available yet")
       return
     }
-    VibeRoomLinkRouter.shared.handle(target: .user(agentUserId))
+
+    // If the owner already has the 1:1 DM with this agent, its chatId is already
+    // in `attachedChats` — push instantly, exactly like tapping a Home row, instead
+    // of always waiting on a `startChat` round trip first. That network call is
+    // now only a first-ever-open fallback, which is what was making every tap on
+    // an already-existing agent chat feel delayed.
+    if let knownChatId = card.attachedChats.first(where: { ($0.type ?? "dm").lowercased() == "dm" })?.chatId {
+      coordinator.openChat(
+        ChatRoute(
+          chatId: knownChatId,
+          title: card.displayName,
+          peerUserId: agentUserId,
+          peerAgentId: card.agentId,
+          isAgent: true,
+          avatarURI: ChatAvatarURLResolver.resolve(
+            rawAvatar: card.avatarUrl,
+            peerUserId: agentUserId,
+            chatId: knownChatId,
+            preferPushAvatar: false
+          ),
+          isGroup: false,
+          initialRows: []
+        )
+      )
+      return
+    }
+
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("The current session is unavailable.")
+      return
+    }
+    Task { @MainActor [weak self] in
+      do {
+        let result = try await ChatDirectMessageService.startChat(
+          config: config, friendID: agentUserId, allowPacketFallback: false
+        )
+        self?.coordinator.openChat(
+          ChatRoute(
+            chatId: result.chatID,
+            title: card.displayName,
+            peerUserId: agentUserId,
+            peerAgentId: card.agentId,
+            isAgent: true,
+            avatarURI: ChatAvatarURLResolver.resolve(
+              rawAvatar: card.avatarUrl,
+              peerUserId: agentUserId,
+              chatId: result.chatID,
+              preferPushAvatar: false
+            ),
+            isGroup: false,
+            initialRows: result.messages
+          )
+        )
+      } catch {
+        AppToastController.shared.show("Could not open chat: \(error.localizedDescription)")
+      }
+    }
   }
 
   private func deleteAgentFromAgentsTab(
@@ -15253,7 +16027,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     }.resume()
   }
 
-  /// Mirrors `ChatNativeAgentsControlController.agentsURL()`'s base-URL normalization
+  /// Mirrors `ChatAgentsMainViewController.agentsURL()`'s base-URL normalization
   /// (the configured API base may or may not already end in `/api`) so this hits the
   /// same `DELETE /api/agents/:id` route the list screen's own GET uses.
   private static func agentDeleteURL(apiBaseURL: URL, agentId: String) -> URL? {
@@ -15499,29 +16273,12 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     }
     return image.withRenderingMode(.alwaysOriginal)
   }
-
-  // MARK: Toast host
-
-  private func installToastHost() {
-    let host = UIHostingController(rootView: AppToastHostView())
-    host.view.backgroundColor = .clear
-    host.view.isUserInteractionEnabled = false
-    addChild(host)
-    host.view.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(host.view)
-    NSLayoutConstraint.activate([
-      host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      host.view.topAnchor.constraint(equalTo: view.topAnchor),
-      host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-    ])
-    host.didMove(toParent: self)
-    toastHost = host
-  }
 }
 
-/// Floating toast overlay hosted above the whole tab shell (including a pushed
-/// conversation) so it stays visible while a chat is open. Non-interactive.
+/// Floating toast overlay hosted on `AppRootNavigationController` — one level above
+/// the tab shell — so it stays visible above ANY pushed screen (a chat, an agent's
+/// settings, ...), not just while the tab bar itself is on screen. A push replaces
+/// the tab bar controller's whole view, which used to hide a toast hosted there.
 private struct AppToastHostView: View {
   @ObservedObject private var toast = AppToastController.shared
   @Environment(\.colorScheme) private var colorScheme
@@ -15534,7 +16291,7 @@ private struct AppToastHostView: View {
       if let message = toast.message {
         AppToastBanner(message: message, palette: palette)
           .padding(.horizontal, 20)
-          .padding(.bottom, 100)
+          .padding(.bottom, 20)
           .transition(.move(edge: .bottom).combined(with: .opacity))
       }
     }
@@ -15561,6 +16318,7 @@ final class ChatAgentConversationController: UIViewController {
   private let agentView = ChatNativeAgentView(frame: .zero, transportOnly: true)
   private let isDark: Bool
   private var onClose: (() -> Void)?
+  private var didStageInitialRows = false
   /// Anchors the `[AgentOpen]` stage timings — both stored properties above are
   /// constructed before this runs, so `viewDidLoad`'s `sinceInitMs` is the push cost.
   private let createdAt = ProcessInfo.processInfo.systemUptime
@@ -15623,6 +16381,7 @@ final class ChatAgentConversationController: UIViewController {
     }
     mainView.setExternalNavigationHeaderEnabled(false)
     mainView.surfaceId = "native_agent_chat"
+    mainView.setDefersTranscriptUpdatesForPresentation(true)
     mainView.setDefersEngineStateRefreshes(true)
     mainView.setEngineChannelBindingEnabled(false)
     mainView.setStatusAuthorityEnabled(false)
@@ -15635,13 +16394,12 @@ final class ChatAgentConversationController: UIViewController {
     // applyRoute (where other chats get their engine chat id), so without this the music
     // cells have no chat id and never register into the player-sheet list. Channel binding
     // stays disabled above — this is identity only, so it never rebinds the transcript.
-    mainView.setEngineChatId("saved_messages")
+    mainView.setEngineChatId("vibe_agent")
     mainView.setInputPlaceholder("Message Vibe AI")
     mainView.setInputBarEnabled(true)
     // Route sends to us (the agent transport) instead of the chat engine.
     mainView.setNativeSendEnabled(false)
     mainView.setPage(ChatConversationPage.chat.rawValue, animated: false)
-    agentView.synchronizeHostState()
     NSLog(
       "[AgentOpen] viewDidLoad bodyMs=%d sinceInitMs=%d",
       Int((ProcessInfo.processInfo.systemUptime - viewDidLoadStartedAt) * 1000),
@@ -15651,6 +16409,74 @@ final class ChatAgentConversationController: UIViewController {
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
     navigationController?.setNavigationBarHidden(true, animated: false)
+  }
+
+  /// Stage the local persisted agent transcript at the real destination bounds before
+  /// UIKit starts the push. The previous controller emitted 140 rows from viewDidLoad
+  /// while both collection bounds and content size were 0x0, after first restoring 21
+  /// unrelated Saved Messages rows; the next layout therefore rebuilt the entire page
+  /// during the transition. This follows the normal chat's populated-frame-one contract.
+  func prepareForNavigationPush(in navigationController: UINavigationController) {
+    loadViewIfNeeded()
+    let destinationSafeBottom = max(
+      navigationController.view.safeAreaInsets.bottom,
+      navigationController.view.window?.safeAreaInsets.bottom ?? 0
+    )
+    mainView.setNavigationPrestageSafeAreaBottom(destinationSafeBottom)
+    mainView.beginNavigationPushPrestaging()
+    view.frame = navigationController.view.bounds
+    view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    view.isHidden = true
+    navigationController.view.insertSubview(view, at: 0)
+    UIView.performWithoutAnimation {
+      view.setNeedsLayout()
+      view.layoutIfNeeded()
+      mainView.layoutIfNeeded()
+    }
+    stageInitialRowsIfPossible(reason: "pre-push")
+    mainView.finishNavigationPushPrestaging()
+    view.isHidden = false
+    UIView.performWithoutAnimation {
+      view.layoutIfNeeded()
+      mainView.layoutIfNeeded()
+    }
+  }
+
+  private func stageInitialRowsIfPossible(reason: String) {
+    guard !didStageInitialRows, mainView.bounds.width > 1, mainView.bounds.height > 1 else {
+      return
+    }
+    didStageInitialRows = true
+    let startedAt = ProcessInfo.processInfo.systemUptime
+    let rows = agentView.currentHostRows()
+    mainView.setAuthoritativeRows(rows)
+    agentView.synchronizeHostState(emitRows: false)
+    NSLog(
+      "[AgentOpen] initial-stage reason=%@ rows=%d bounds=%.0fx%.0f ms=%d",
+      reason, rows.count, mainView.bounds.width, mainView.bounds.height,
+      Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    // Non-Home entry points may push this controller directly. They still seed on the
+    // first usable bounds instead of from viewDidLoad's detached 0x0 hierarchy.
+    stageInitialRowsIfPossible(reason: "first-layout")
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    mainView.completeTranscriptPresentation()
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    mainView.captureReopenSnapshot()
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    mainView.persistViewportState()
   }
 
   private func handleMainEvent(_ payload: [String: Any]) {

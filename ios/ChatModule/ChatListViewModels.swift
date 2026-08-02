@@ -1572,7 +1572,19 @@ func chatListRowSignatureFields(_ row: ChatListRow) -> [(name: String, value: St
     ("duration", String(describing: row.duration)), ("isVideoNote", String(row.isVideoNote)),
     ("waveform", String(describing: row.waveform)),
     ("uploadProgress", String(describing: row.uploadProgress)),
-    ("fileSize", String(describing: row.fileSize)), ("shape", String(describing: row.shape)),
+    ("fileSize", String(describing: row.fileSize)),
+    // Neutral, same reasoning as `replyPreviewUserId`: nothing in BubbleShape can change a
+    // row's HEIGHT. The tail is drawn outside the bubble's bounds (see `applyShapePath`'s
+    // paintRect overhang) and the four radii are cosmetic; `isMe`, the one shape field that
+    // does move layout, is already its own component above. Meanwhile the value is
+    // session-unstable: `rowsByApplyingNativeOutgoingSequenceShape` patches the corner radii
+    // and tail of messages you sent in THIS session, so the height is persisted with merged
+    // radii and re-read on the next launch with plain 18s — the row then fails its audit and
+    // re-measures on screen for a difference that cannot move it (observed as
+    // `height-audit stale=1 … sig=1 flipped=[shape=1]`, shifted=0). Keep the slot rather than
+    // dropping the tuple: `chatListRowSignatureFlippedFieldNames` diffs positionally against
+    // already-persisted `f` arrays, and removing an entry would misname every field after it.
+    ("shape", "-"),
     ("stickerId", String(describing: row.stickerId)),
     ("stickerPackId", String(describing: row.stickerPackId)),
     ("stickerBundleFileName", String(describing: row.stickerBundleFileName)),

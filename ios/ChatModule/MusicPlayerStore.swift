@@ -342,7 +342,13 @@ final class NativeMusicPlayerStore {
   private let cacheDirectoryName = "native-music-player-cache"
   private let defaults = UserDefaults.standard
 
-  private var tracks: [String: NativeMusicPlayerTrack] = [:]
+  /// Bumped on every mutation of `tracks`, so callers can memoise derived lists
+  /// instead of re-running `tracks(forChatId:)` — a filter plus a locale-aware sort
+  /// over the whole library — on every playback tick.
+  private(set) var revision: Int = 0
+  private var tracks: [String: NativeMusicPlayerTrack] = [:] {
+    didSet { revision &+= 1 }
+  }
   private var downloadingTracks: [String: Double] = [:]
 
   private init() {
@@ -435,10 +441,16 @@ final class NativeMusicPlayerStore {
     persistTracks()
   }
 
+  /// The file to play instead of the network, if this device has one. Shares the full
+  /// resolution with `hasLocalPlaybackFile` — the two disagreeing is what let the engine
+  /// download a track the library already counted as cached. A hit found somewhere other
+  /// than the recorded path heals the record, so the next lookup is a single hit.
   func resolvedCachedFileURL(for track: NativeMusicPlayerTrack) -> URL? {
-    guard let localURI = track.localURI else { return nil }
-    guard let url = resolvedLocalURL(from: localURI) else { return nil }
-    return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    guard let url = resolvedPlayableLocalURL(for: track) else { return nil }
+    if track.localURI != url.absoluteString {
+      updateLocalURI(trackId: track.trackId, localURI: url.absoluteString)
+    }
+    return url
   }
 
   func cacheDestinationURL(for track: NativeMusicPlayerTrack, remoteURL: URL?) -> URL {
@@ -547,14 +559,60 @@ final class NativeMusicPlayerStore {
       }
   }
 
+  /// Every place this track's bytes could legitimately be, in order of authority. The store used
+  /// to consult `localURI` alone, which fails two ordinary ways — the container UUID changes on
+  /// reinstall, and this store's own cache directory lived in `Caches`, which iOS purges — and
+  /// each failure was read as "not downloaded", so the player re-fetched a track the device
+  /// already had. The last stop is the media vault: a track SENT from this device is copied
+  /// there at upload time keyed by its remote URL, and that copy is durable.
   private func resolvedPlayableLocalURL(for track: NativeMusicPlayerTrack) -> URL? {
+    let fm = FileManager.default
     if let localURI = track.localURI,
       let url = resolvedLocalURL(from: localURI),
-      FileManager.default.fileExists(atPath: url.path)
+      fm.fileExists(atPath: url.path)
     {
       return url
     }
+    // The cache slot name is a pure function of trackId, so a stale/lost `localURI` never
+    // hides a file this store itself wrote — including one left in the legacy Caches folder.
+    for directory in [resolvedCacheDirectory()] + Self.legacyCacheDirectories() {
+      guard
+        let items = try? fm.contentsOfDirectory(
+          at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+      else { continue }
+      let slot = Self.cacheSlotName(for: track.trackId)
+      if let hit = items.first(where: { $0.deletingPathExtension().lastPathComponent == slot }) {
+        return hit
+      }
+    }
+    for raw in [track.streamURL, track.previewURL] {
+      guard
+        let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+        let remoteURL = URL(string: raw), let scheme = remoteURL.scheme?.lowercased(),
+        scheme == "http" || scheme == "https"
+      else { continue }
+      if let hit = VibeMediaVault.shared.cachedURL(
+        for: VibeMediaVault.identity(remoteURL: remoteURL), kind: .audio)
+      {
+        return hit
+      }
+    }
     return nil
+  }
+
+  /// Deterministic slot name for a track's own cached file (no extension).
+  private static func cacheSlotName(for trackId: String) -> String {
+    SHA256.hash(data: Data(trackId.utf8))
+      .compactMap { String(format: "%02x", $0) }
+      .joined()
+  }
+
+  /// Where this store used to write before the cache moved out of `Caches`. Read-only: a file
+  /// still sitting here is played from here rather than re-downloaded.
+  private static func legacyCacheDirectories() -> [URL] {
+    guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else { return [] }
+    return [caches.appendingPathComponent("native-music-player-cache", isDirectory: true)]
   }
 
   private func deleteFileIfNeeded(localURI: String) {
@@ -562,11 +620,13 @@ final class NativeMusicPlayerStore {
     try? FileManager.default.removeItem(at: url)
   }
 
+  /// Application Support, not `Caches`. A track the user waited for is not scratch space, and
+  /// iOS reclaims `Caches` whenever it wants — on this device the whole
+  /// `Caches/native-music-player-cache` folder had already been reclaimed, which is why every
+  /// track in the library reported itself as needing a download again.
   private func resolvedCacheDirectory() -> URL {
-    let baseDirectory =
-      FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-      ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-    let directory = baseDirectory.appendingPathComponent(cacheDirectoryName, isDirectory: true)
+    let directory = vibeDurableMediaCacheRoot()
+      .appendingPathComponent(cacheDirectoryName, isDirectory: true)
     if !FileManager.default.fileExists(atPath: directory.path) {
       try? FileManager.default.createDirectory(
         at: directory,
@@ -576,15 +636,22 @@ final class NativeMusicPlayerStore {
     return directory
   }
 
+  /// An absolute path persisted in a previous run is a hint, not a location. iOS mints a new
+  /// data-container UUID whenever the app is reinstalled — the contents are carried over, the
+  /// path is not — so every `localURI` this store saved reads as "missing" after a rebuild and
+  /// the track is downloaded again while its bytes sit on the device. Rebuild the path against
+  /// the CURRENT container before concluding the file is gone.
   private func resolvedLocalURL(from value: String) -> URL? {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
+    let parsed: URL
     if let url = URL(string: trimmed), url.isFileURL {
-      return url
+      parsed = url
+    } else if trimmed.hasPrefix("/") {
+      parsed = URL(fileURLWithPath: trimmed)
+    } else {
+      return nil
     }
-    if trimmed.hasPrefix("/") {
-      return URL(fileURLWithPath: trimmed)
-    }
-    return nil
+    return ChatListView.relocatedToCurrentContainer(parsed)
   }
 }

@@ -12,17 +12,22 @@ struct MetalKeyMaskView: UIViewRepresentable {
   func makeUIView(context: Context) -> SecureParticleMaskView {
     let view = SecureParticleMaskView(frame: .zero, device: context.coordinator.device)
     view.delegate = context.coordinator
-    view.alpha = isRevealed ? 0 : 1
+    view.setSurfaceColor(palette.cardUIColor)
+    context.coordinator.setConcealed(!isRevealed, animated: false)
     return view
   }
 
   func updateUIView(_ uiView: SecureParticleMaskView, context: Context) {
-    UIView.animate(withDuration: 0.35) {
-      uiView.alpha = isRevealed ? 0 : 1
-    }
+    uiView.setSurfaceColor(palette.cardUIColor)
+    context.coordinator.setConcealed(!isRevealed, animated: true)
   }
 
   final class Coordinator: NSObject, MTKViewDelegate {
+    enum Appearance {
+      case standard
+      case softSpoiler
+    }
+
     let device: MTLDevice?
 
     private let commandQueue: MTLCommandQueue?
@@ -30,9 +35,15 @@ struct MetalKeyMaskView: UIViewRepresentable {
     private let quadBuffer: MTLBuffer?
     private let particleBuffer: MTLBuffer?
     private let particleCount: Int
+    private let baseRadius: Float
     private var startTime = CACurrentMediaTime()
+    private var revealProgress: Float = 0
+    private var revealTarget: Float = 0
+    private var revealStartProgress: Float = 0
+    private var revealStartTime = CACurrentMediaTime()
+    private var revealDuration: CFTimeInterval = 0
 
-    override init() {
+    init(appearance: Appearance = .standard) {
       device = MTLCreateSystemDefaultDevice()
       commandQueue = device?.makeCommandQueue()
       let quadVertices: [SIMD2<Float>] = [
@@ -41,8 +52,9 @@ struct MetalKeyMaskView: UIViewRepresentable {
         SIMD2(-1, 1),
         SIMD2(1, 1),
       ]
-      let particles = Self.makeParticles()
+      let particles = Self.makeParticles(appearance: appearance)
       particleCount = particles.count
+      baseRadius = appearance == .softSpoiler ? 0.58 : 1.2
       quadBuffer = device?.makeBuffer(
         bytes: quadVertices,
         length: MemoryLayout<SIMD2<Float>>.stride * quadVertices.count
@@ -75,6 +87,7 @@ struct MetalKeyMaskView: UIViewRepresentable {
           float2 viewportSize;
           float time;
           float baseRadius;
+          float revealProgress;
       };
 
       struct VertexOut {
@@ -106,9 +119,24 @@ struct MetalKeyMaskView: UIViewRepresentable {
           }
           wrappedX -= halfWidth;
 
+          // Reveal particles independently instead of translating the rectangular
+          // drawable. Each particle gets a small stagger, then accelerates out to
+          // the right with a little vertical lift, like Telegram's spoiler dissolve.
+          float randomA = fract(particle.timeOffset * 0.017);
+          float randomB = fract(particle.timeOffset * 0.131);
+          float stagger = randomA * 0.28;
+          float flight = clamp((uniforms.revealProgress - stagger) / (1.0 - stagger), 0.0, 1.0);
+          float acceleration = flight * flight;
+          float flyX = (flight * 0.12 + acceleration * 0.88) * width * (0.72 + randomA * 0.58);
+          float fanDirection = randomB * 2.0 - 1.0;
+          float flyY = acceleration * fanDirection * height * (0.12 + randomA * 0.18);
+
           float waveY = sin((uniforms.time * 2.0) + particle.timeOffset) * particle.wobble;
-          float2 center = float2(wrappedX, particle.basePosition.y + waveY);
-          float radius = uniforms.baseRadius * particle.size;
+          float2 center = float2(
+              wrappedX + flyX,
+              particle.basePosition.y + waveY + flyY
+          );
+          float radius = uniforms.baseRadius * particle.size * (1.0 + flight * 0.32);
           float2 point = center + quad * radius;
 
           float2 ndc = float2(point.x / halfWidth, point.y / halfHeight);
@@ -118,8 +146,10 @@ struct MetalKeyMaskView: UIViewRepresentable {
           out.localPoint = quad;
           out.color = particle.color;
 
-          float edgeDist = abs(wrappedX) / halfWidth;
-          out.alpha = 1.0 - smoothstep(0.8, 1.0, edgeDist);
+          float edgeDist = abs(center.x) / halfWidth;
+          float edgeAlpha = 1.0 - smoothstep(0.96, 1.16, edgeDist);
+          float flightAlpha = 1.0 - smoothstep(0.68, 0.98, flight);
+          out.alpha = edgeAlpha * flightAlpha;
           return out;
       }
 
@@ -153,6 +183,12 @@ struct MetalKeyMaskView: UIViewRepresentable {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+      let now = CACurrentMediaTime()
+      let resolvedRevealProgress = currentRevealProgress(at: now)
+      if let maskView = view as? SecureParticleMaskView {
+        maskView.setRevealProgress(CGFloat(resolvedRevealProgress))
+      }
+
       guard
         let drawable = view.currentDrawable,
         let descriptor = view.currentRenderPassDescriptor,
@@ -166,8 +202,9 @@ struct MetalKeyMaskView: UIViewRepresentable {
 
       var uniforms = Uniforms(
         viewportSize: SIMD2(Float(view.bounds.width), Float(view.bounds.height)),
-        time: Float(CACurrentMediaTime() - startTime),
-        baseRadius: 1.2
+        time: Float(now - startTime),
+        baseRadius: baseRadius,
+        revealProgress: resolvedRevealProgress
       )
 
       let commandBuffer = commandQueue.makeCommandBuffer()
@@ -183,21 +220,60 @@ struct MetalKeyMaskView: UIViewRepresentable {
       commandBuffer?.commit()
     }
 
-    private static func makeParticles() -> [Particle] {
-      (0..<800).map { _ in
+    func setConcealed(_ concealed: Bool, animated: Bool) {
+      let target: Float = concealed ? 0 : 1
+      guard abs(target - revealTarget) > 0.001 else { return }
+
+      let now = CACurrentMediaTime()
+      revealProgress = currentRevealProgress(at: now)
+      revealStartProgress = revealProgress
+      revealTarget = target
+      revealStartTime = now
+      revealDuration = animated ? (concealed ? 0.30 : 0.90) : 0
+
+      if !animated {
+        revealProgress = target
+      }
+    }
+
+    private func currentRevealProgress(at now: CFTimeInterval) -> Float {
+      guard revealDuration > 0 else { return revealProgress }
+
+      let linear = Float(min(max((now - revealStartTime) / revealDuration, 0), 1))
+      // Reveal stays close to linear through the middle so the particle flight is
+      // readable. Re-conceal remains a quicker ease-out.
+      let eased =
+        revealTarget > revealStartProgress
+        ? linear * linear * (3 - 2 * linear)
+        : 1 - pow(1 - linear, 3)
+      revealProgress = revealStartProgress + (revealTarget - revealStartProgress) * eased
+      if linear >= 1 {
+        revealProgress = revealTarget
+        revealDuration = 0
+      }
+      return revealProgress
+    }
+
+    private static func makeParticles(appearance: Appearance) -> [Particle] {
+      let isSoft = appearance == .softSpoiler
+      return (0..<(isSoft ? 1_250 : 800)).map { _ in
         let rand = Float.random(in: 0...1)
         let yBase = Float.random(in: -1...1)
         let yCluster = (yBase >= 0 ? 1 : -1) * pow(abs(yBase), 2) * 16.0
-        let lightness: Float = rand > 0.6 ? 1.0 : Float.random(in: 0.3...0.6)
-        let size: Float = rand > 0.8 ? Float.random(in: 1.2...1.8) : Float.random(in: 0.4...0.9)
+        let lightness: Float =
+          isSoft ? Float.random(in: 0.54...0.78)
+          : (rand > 0.6 ? 1.0 : Float.random(in: 0.3...0.6))
+        let size: Float =
+          isSoft ? Float.random(in: 0.35...0.9)
+          : (rand > 0.8 ? Float.random(in: 1.2...1.8) : Float.random(in: 0.4...0.9))
 
         return Particle(
           basePosition: SIMD2(Float.random(in: -300...300), yCluster),
-          speed: Float.random(in: 5...15),
-          wobble: Float.random(in: 0.5...3.0),
+          speed: Float.random(in: isSoft ? 12...26 : 5...15),
+          wobble: Float.random(in: isSoft ? 1.0...4.0 : 0.5...3.0),
           size: size,
           timeOffset: Float.random(in: 0...1000),
-          color: SIMD4(lightness, lightness, lightness, 0.9)
+          color: SIMD4(lightness, lightness, lightness, isSoft ? 0.32 : 0.9)
         )
       }
     }
@@ -217,10 +293,13 @@ private struct Uniforms {
   let viewportSize: SIMD2<Float>
   let time: Float
   let baseRadius: Float
+  let revealProgress: Float
 }
 
 final class SecureParticleMaskView: MTKView {
   private let highlightLayer = CAGradientLayer()
+  private var surfaceComponents = SIMD4<Double>(0, 0, 0, 0)
+  private var revealProgress: CGFloat = 0
 
   override init(frame: CGRect, device: MTLDevice?) {
     super.init(frame: frame, device: device)
@@ -258,5 +337,33 @@ final class SecureParticleMaskView: MTKView {
   override func layoutSubviews() {
     super.layoutSubviews()
     highlightLayer.frame = bounds
+  }
+
+  func setSurfaceColor(_ color: UIColor) {
+    backgroundColor = .clear
+    var red: CGFloat = 0
+    var green: CGFloat = 0
+    var blue: CGFloat = 0
+    var alpha: CGFloat = 0
+    guard color.getRed(&red, green: &green, blue: &blue, alpha: &alpha) else { return }
+    surfaceComponents = SIMD4(Double(red), Double(green), Double(blue), Double(alpha))
+    applySurfaceOpacity()
+  }
+
+  func setRevealProgress(_ progress: CGFloat) {
+    revealProgress = min(max(progress, 0), 1)
+    applySurfaceOpacity()
+  }
+
+  private func applySurfaceOpacity() {
+    let surfaceAlpha = 1 - revealProgress * revealProgress * (3 - 2 * revealProgress)
+    clearColor = MTLClearColor(
+      red: surfaceComponents.x,
+      green: surfaceComponents.y,
+      blue: surfaceComponents.z,
+      alpha: surfaceComponents.w * Double(surfaceAlpha)
+    )
+    highlightLayer.opacity = Float(surfaceAlpha)
+    layer.borderColor = UIColor.white.withAlphaComponent(0.08 * surfaceAlpha).cgColor
   }
 }

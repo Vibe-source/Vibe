@@ -2,6 +2,11 @@ import UIKit
 import SwiftUI
 import PhotosUI
 
+// Agent configuration and profile surfaces, plus the shared presentation
+// primitives consumed by the Agents list page.
+
+// MARK: - Shared agent configuration contracts
+
 private func chatNativeAgentBuilderThemeColor(_ hex: String) -> UIColor {
   let sanitized =
     hex.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(
@@ -157,6 +162,48 @@ struct ChatNativeAgentConfigAPIContext {
   let token: String
 }
 
+/// Instant, cached list of the user's own agents — mirrors `ChatHomeRowsCache`'s
+/// pattern (Sources/Home/ChatHomeService.swift) so the Agents tab shows what it
+/// showed last time immediately on every open, with no spinner/skeleton, then
+/// refreshes silently underneath instead of reloading from a blank screen.
+enum ChatNativeAgentListCache {
+  private static let keyPrefix = "vibe.ios.agentsList.cards.v1"
+
+  static func cards(userID: String) -> [ChatListRow.AgentCard] {
+    guard let data = UserDefaults.standard.data(forKey: cacheKey(userID: userID)),
+      let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+    else { return [] }
+    return array.compactMap(ChatListRow.AgentCard.parse)
+  }
+
+  static func store(_ cards: [ChatListRow.AgentCard], userID: String) {
+    // The list endpoint never sends a plaintext secret, but defend anyway: this
+    // cache is a plain UserDefaults plist, not Keychain, so nothing that could
+    // ever be a live invoke secret should end up sitting on disk here.
+    let payload = cards.map { card -> [String: Any] in
+      var raw = card.rawValue
+      raw.removeValue(forKey: "latest_secret")
+      return raw
+    }
+    guard JSONSerialization.isValidJSONObject(payload),
+      let data = try? JSONSerialization.data(withJSONObject: payload, options: [])
+    else { return }
+    UserDefaults.standard.set(data, forKey: cacheKey(userID: userID))
+  }
+
+  private static func cacheKey(userID: String) -> String {
+    let safe =
+      userID
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .unicodeScalars
+      .map { scalar -> Character in
+        CharacterSet.alphanumerics.contains(scalar) ? Character(scalar) : "_"
+      }
+    let suffix = String(safe).isEmpty ? "default" : String(safe)
+    return "\(keyPrefix).\(suffix)"
+  }
+}
+
 /// Process-wide cache for the tool catalog (see `loadToolRegistry`).
 private enum ChatAgentToolRegistryCache {
   static var tools: [ChatAgentToolInfo]?
@@ -206,10 +253,8 @@ func chatNativeWarmOwnedAgentIds(config: AppSessionConfig) {
 }
 
 /// Shared normalization from a raw `/api/agents` (or `/api/agents/:id`) JSON
-/// payload into the client-side `ChatListRow.AgentCard` model. Pulled out of
-/// `ChatNativeAgentsControlController` so a single agent fetched from OUTSIDE
-/// the Agents tab (e.g. opening its config from within its chat) can reuse the
-/// exact same parsing instead of duplicating it.
+/// payload into the client-side `ChatListRow.AgentCard` model. The Agents list
+/// page and config routes use the same parsing so cards stay consistent.
 func chatNativeAgentParseControlCard(
   raw: [String: Any], apiContext: ChatNativeAgentConfigAPIContext
 ) -> ChatListRow.AgentCard? {
@@ -275,6 +320,29 @@ func chatNativeAgentPushConfig(
   from navigationController: UINavigationController,
   onToast: ((String) -> Void)?
 ) {
+  func push(_ card: ChatListRow.AgentCard) {
+    let controller = ChatNativeAgentConfigPanelController(
+      card: card, appearance: appearance, apiContext: apiContext
+    )
+    controller.onToast = onToast
+    controller.onOpenAgentChat = { [weak navigationController] _ in
+      navigationController?.popViewController(animated: true)
+    }
+    navigationController.pushViewController(controller, animated: true)
+  }
+
+  // Header taps must feel like navigation, not a network operation. The Agents
+  // page has already cached the canonical card, including identifiers and attached
+  // chats, so use it immediately and let each settings action perform its own API call.
+  if let userID = AppSessionConfig.current?.userID,
+    let cached = ChatNativeAgentListCache.cards(userID: userID).first(where: {
+      $0.agentId == agentId
+    })
+  {
+    push(cached)
+    return
+  }
+
   var base = apiContext.apiBaseURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
   while base.hasSuffix("/") { base.removeLast() }
   let suffix = base.lowercased().hasSuffix("/api") ? "" : "/api"
@@ -297,11 +365,7 @@ func chatNativeAgentPushConfig(
         onToast?("Could not open agent settings")
         return
       }
-      let controller = ChatNativeAgentConfigPanelController(
-        card: card, appearance: appearance, apiContext: apiContext
-      )
-      controller.onToast = onToast
-      navigationController.pushViewController(controller, animated: true)
+      push(card)
     }
   }.resume()
 }
@@ -397,7 +461,7 @@ private struct ChatNativeAgentStatusStyle {
   }
 }
 
-private func chatNativeAgentIsPublished(_ status: String) -> Bool {
+func chatNativeAgentIsPublished(_ status: String) -> Bool {
   status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "published"
 }
 
@@ -880,6 +944,78 @@ private final class ChatNativeAgentHeroHeaderView: UIView {
   }
 }
 
+/// A row of pill-shaped filter chips (All / Active / Disabled) — the rounded,
+/// Telegram-folder-tab look, in place of a boxed `UISegmentedControl`.
+final class ChatNativeAgentPillFilterView: UIView {
+  private var buttons: [UIButton] = []
+  private var theme: ChatNativeAgentConfigTheme
+  private(set) var selectedIndex: Int = 0
+  var onChange: ((Int) -> Void)?
+
+  init(titles: [String], theme: ChatNativeAgentConfigTheme) {
+    self.theme = theme
+    super.init(frame: .zero)
+    translatesAutoresizingMaskIntoConstraints = false
+
+    let stack = UIStackView()
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    stack.axis = .horizontal
+    stack.spacing = 8.0
+    stack.alignment = .center
+    addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+      stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+      stack.topAnchor.constraint(equalTo: topAnchor),
+      stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+
+    for (index, title) in titles.enumerated() {
+      let button = UIButton(type: .system)
+      button.translatesAutoresizingMaskIntoConstraints = false
+      var configuration = UIButton.Configuration.filled()
+      configuration.title = title
+      configuration.cornerStyle = .capsule
+      configuration.contentInsets = NSDirectionalEdgeInsets(
+        top: 8.0, leading: 16.0, bottom: 8.0, trailing: 16.0
+      )
+      button.configuration = configuration
+      button.tag = index
+      button.titleLabel?.font = .systemFont(ofSize: 13.5, weight: .semibold)
+      button.addTarget(self, action: #selector(handleTap(_:)), for: .touchUpInside)
+      buttons.append(button)
+      stack.addArrangedSubview(button)
+    }
+    updateAppearance()
+  }
+
+  required init?(coder: NSCoder) {
+    return nil
+  }
+
+  func applyTheme(_ theme: ChatNativeAgentConfigTheme) {
+    self.theme = theme
+    updateAppearance()
+  }
+
+  @objc private func handleTap(_ sender: UIButton) {
+    guard sender.tag != selectedIndex else { return }
+    selectedIndex = sender.tag
+    updateAppearance()
+    onChange?(selectedIndex)
+  }
+
+  private func updateAppearance() {
+    for button in buttons {
+      let selected = button.tag == selectedIndex
+      var configuration = button.configuration
+      configuration?.baseBackgroundColor = selected ? theme.accentColor : theme.inputColor
+      configuration?.baseForegroundColor = selected ? .white : theme.secondaryTextColor
+      button.configuration = configuration
+    }
+  }
+}
+
 private final class ChatNativeAgentActionButton: UIButton {
   init(title: String, fillColor: UIColor, foregroundColor: UIColor = .white) {
     super.init(frame: .zero)
@@ -905,9 +1041,9 @@ private final class ChatNativeAgentActionButton: UIButton {
   }
 }
 
-/// Invoke-secret card. Instead of a broken blur "shader" sitting over a label,
-/// the field simply shows masked dots until the user taps the eye to reveal —
-/// a clear, honest masking model. Copy and Rotate sit below as paired actions.
+/// Invoke-secret card. A realistic-looking token sits under an animated frosted
+/// blur that lifts on reveal — Telegram-style, not a row of masked dots. Copy
+/// and Rotate sit below as paired actions.
 // Internal (not file-private) so `ChatNativeAgentSecretCardRepresentable` — the
 // SwiftUI bridge that hosts this card inside the settings Form — can name it in a
 // non-private signature (`makeUIView(context:) -> ChatNativeAgentSecretCardView`).
@@ -917,10 +1053,15 @@ final class ChatNativeAgentSecretCardView: UIView {
   private let headerLabel = UILabel()
   private let tokenSurfaceView = UIView()
   private let tokenLabel = UILabel()
-  /// Smooth frosted-glass cover over the token, animated on/off with reveal —
-  /// replaces the old flat row of "•" dots, which read as a crude placeholder
-  /// rather than something genuinely hidden.
-  private let tokenBlurOverlay = UIVisualEffectView(effect: nil)
+  /// Uses the same Metal particle renderer as Settings' secret-key cover. Keeping
+  /// one renderer gives both secret surfaces the same Telegram-style spoiler motion.
+  private let tokenCoverRenderer = MetalKeyMaskView.Coordinator()
+  private lazy var tokenCoverView: SecureParticleMaskView = {
+    let view = SecureParticleMaskView(frame: .zero, device: tokenCoverRenderer.device)
+    view.delegate = tokenCoverRenderer
+    view.layer.cornerRadius = 7.0
+    return view
+  }()
   private let tokenSpinner = UIActivityIndicatorView(style: .medium)
   private let revealButton = UIButton(type: .system)
   private let buttonsStack = UIStackView()
@@ -972,12 +1113,9 @@ final class ChatNativeAgentSecretCardView: UIView {
     tokenLabel.numberOfLines = 1
     tokenSurfaceView.addSubview(tokenLabel)
 
-    tokenBlurOverlay.translatesAutoresizingMaskIntoConstraints = false
-    tokenBlurOverlay.isUserInteractionEnabled = false
-    tokenBlurOverlay.layer.cornerRadius = 7.0
-    tokenBlurOverlay.layer.cornerCurve = .continuous
-    tokenBlurOverlay.clipsToBounds = true
-    tokenSurfaceView.addSubview(tokenBlurOverlay)
+    tokenCoverView.translatesAutoresizingMaskIntoConstraints = false
+    tokenCoverView.isUserInteractionEnabled = false
+    tokenSurfaceView.addSubview(tokenCoverView)
 
     tokenSpinner.translatesAutoresizingMaskIntoConstraints = false
     tokenSpinner.hidesWhenStopped = true
@@ -1027,10 +1165,10 @@ final class ChatNativeAgentSecretCardView: UIView {
       tokenLabel.trailingAnchor.constraint(equalTo: revealButton.leadingAnchor, constant: -8.0),
       tokenLabel.centerYAnchor.constraint(equalTo: tokenSurfaceView.centerYAnchor),
 
-      tokenBlurOverlay.leadingAnchor.constraint(equalTo: tokenLabel.leadingAnchor, constant: -4.0),
-      tokenBlurOverlay.trailingAnchor.constraint(equalTo: tokenLabel.trailingAnchor, constant: 4.0),
-      tokenBlurOverlay.topAnchor.constraint(equalTo: tokenSurfaceView.topAnchor, constant: 6.0),
-      tokenBlurOverlay.bottomAnchor.constraint(equalTo: tokenSurfaceView.bottomAnchor, constant: -6.0),
+      tokenCoverView.leadingAnchor.constraint(equalTo: tokenLabel.leadingAnchor, constant: -4.0),
+      tokenCoverView.trailingAnchor.constraint(equalTo: tokenLabel.trailingAnchor, constant: 4.0),
+      tokenCoverView.topAnchor.constraint(equalTo: tokenSurfaceView.topAnchor, constant: 6.0),
+      tokenCoverView.bottomAnchor.constraint(equalTo: tokenSurfaceView.bottomAnchor, constant: -6.0),
 
       tokenSpinner.centerYAnchor.constraint(equalTo: tokenSurfaceView.centerYAnchor),
       tokenSpinner.leadingAnchor.constraint(equalTo: tokenSurfaceView.leadingAnchor, constant: 14.0),
@@ -1092,22 +1230,22 @@ final class ChatNativeAgentSecretCardView: UIView {
     let revealed = isRevealed && (secret != nil)
     if isLoading {
       tokenLabel.isHidden = true
-      tokenBlurOverlay.isHidden = true
+      tokenCoverView.isHidden = true
       tokenSpinner.startAnimating()
     } else {
       tokenSpinner.stopAnimating()
       tokenLabel.isHidden = false
-      tokenBlurOverlay.isHidden = false
       // The label underneath always carries real-looking token text (the actual
-      // secret when known, a realistic placeholder otherwise) — the blur is what
-      // hides it, not the text content itself, so revealing is a smooth
-      // frost-lift instead of a content swap.
+      // secret when known, a realistic placeholder otherwise) — the shimmer cover
+      // is what hides it, not the text content itself, so revealing is a smooth
+      // wipe instead of a content swap.
       tokenLabel.text = secret ?? chatNativeAgentMaskedSecret(hint)
-      let blurStyle: UIBlurEffect.Style = theme?.isDark == true ? .systemThickMaterialDark : .systemThickMaterialLight
-      let animator = UIViewPropertyAnimator(duration: 0.35, curve: .easeInOut) { [tokenBlurOverlay] in
-        tokenBlurOverlay.effect = revealed ? nil : UIBlurEffect(style: blurStyle)
+      tokenCoverView.isHidden = false
+      UIView.animate(withDuration: 0.3) { [tokenCoverView] in
+        tokenCoverView.alpha = revealed ? 0.0 : 1.0
+      } completion: { [tokenCoverView] _ in
+        tokenCoverView.isHidden = revealed
       }
-      animator.startAnimation()
     }
 
     let eyeSymbol = revealed ? "eye.slash.fill" : "eye.fill"
@@ -1181,7 +1319,10 @@ struct ChatNativeAgentSecretCardRepresentable: UIViewRepresentable {
   func sizeThatFits(
     _ proposal: ProposedViewSize, uiView: ChatNativeAgentSecretCardView, context: Context
   ) -> CGSize? {
-    let width = proposal.width ?? UIScreen.main.bounds.width
+    // A Form may make an initial measurement pass without proposing a width.
+    // Returning the full screen width during that pass made the representable keep
+    // that width, so the equal Copy/Rotate buttons overflowed the actual row.
+    guard let width = proposal.width, width > 0 else { return nil }
     let fitting = uiView.systemLayoutSizeFitting(
       CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
       withHorizontalFittingPriority: .required,
@@ -2027,7 +2168,7 @@ private final class ChatNativeAgentInboxSettingsViewController: UIViewController
 }
 
 /// A UIControl that dims slightly while pressed — shared by tappable cards.
-private final class ChatNativeAgentHighlightControl: UIControl {
+final class ChatNativeAgentHighlightControl: UIControl {
   override var isHighlighted: Bool {
     didSet {
       UIView.animate(withDuration: 0.12) {
@@ -2037,149 +2178,11 @@ private final class ChatNativeAgentHighlightControl: UIControl {
   }
 }
 
-/// Deliberately mirrors ChatHomeCardCell's row grammar (60pt ChatAvatarNodeView, 16pt
-/// leading inset, 14pt gap to the text stack, flush/flat row with a hairline divider) so
-/// the Agents list reads as the same list language as the Chats home list, not a
-/// second, differently-styled UI. Uses the same global avatar component — real photo,
-/// real per-identity gradient fallback, real caching — instead of a one-off initial.
-private final class ChatNativeAgentListCell: UITableViewCell {
-  static let reuseIdentifier = "ChatNativeAgentListCell"
-
-  private let avatarNode = ChatAvatarNodeView()
-  private let nameLabel = UILabel()
-  private let handleLabel = UILabel()
-  private let statusDot = UIView()
-  private let statusLabel = UILabel()
-  private let statusStack = UIStackView()
-  private let chevronView = UIImageView(
-    image: UIImage(
-      systemName: "chevron.right",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .semibold)
-    )
-  )
-  private let dividerView = UIView()
-
-  override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
-    super.init(style: style, reuseIdentifier: reuseIdentifier)
-    backgroundColor = .clear
-    contentView.backgroundColor = .clear
-    selectionStyle = .none
-
-    avatarNode.translatesAutoresizingMaskIntoConstraints = false
-    contentView.addSubview(avatarNode)
-
-    nameLabel.translatesAutoresizingMaskIntoConstraints = false
-    nameLabel.font = .systemFont(ofSize: 17.0, weight: .medium)
-    nameLabel.lineBreakMode = .byTruncatingTail
-    contentView.addSubview(nameLabel)
-
-    handleLabel.translatesAutoresizingMaskIntoConstraints = false
-    handleLabel.font = .systemFont(ofSize: 14.0, weight: .regular)
-    handleLabel.lineBreakMode = .byTruncatingTail
-    contentView.addSubview(handleLabel)
-
-    statusStack.translatesAutoresizingMaskIntoConstraints = false
-    statusStack.axis = .horizontal
-    statusStack.alignment = .center
-    statusStack.spacing = 5.0
-    statusStack.isLayoutMarginsRelativeArrangement = true
-    statusStack.layoutMargins = UIEdgeInsets(top: 4, left: 9, bottom: 4, right: 10)
-    statusStack.layer.cornerRadius = 11.0
-    statusStack.layer.cornerCurve = .continuous
-    contentView.addSubview(statusStack)
-
-    statusDot.translatesAutoresizingMaskIntoConstraints = false
-    statusDot.layer.cornerRadius = 3.0
-    statusStack.addArrangedSubview(statusDot)
-
-    statusLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
-    statusStack.addArrangedSubview(statusLabel)
-
-    chevronView.translatesAutoresizingMaskIntoConstraints = false
-    chevronView.contentMode = .scaleAspectFit
-    contentView.addSubview(chevronView)
-
-    dividerView.translatesAutoresizingMaskIntoConstraints = false
-    dividerView.backgroundColor = .separator
-    contentView.addSubview(dividerView)
-
-    NSLayoutConstraint.activate([
-      avatarNode.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16.0),
-      avatarNode.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-      avatarNode.widthAnchor.constraint(equalToConstant: 60.0),
-      avatarNode.heightAnchor.constraint(equalToConstant: 60.0),
-      avatarNode.topAnchor.constraint(greaterThanOrEqualTo: contentView.topAnchor, constant: 8.0),
-      avatarNode.bottomAnchor.constraint(
-        lessThanOrEqualTo: contentView.bottomAnchor, constant: -8.0),
-
-      chevronView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16.0),
-      chevronView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-      chevronView.widthAnchor.constraint(equalToConstant: 12.0),
-
-      statusDot.widthAnchor.constraint(equalToConstant: 6.0),
-      statusDot.heightAnchor.constraint(equalToConstant: 6.0),
-      statusStack.trailingAnchor.constraint(equalTo: chevronView.leadingAnchor, constant: -12.0),
-      statusStack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-      statusStack.heightAnchor.constraint(equalToConstant: 22.0),
-
-      nameLabel.leadingAnchor.constraint(equalTo: avatarNode.trailingAnchor, constant: 14.0),
-      nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusStack.leadingAnchor, constant: -10.0),
-      nameLabel.bottomAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1.0),
-
-      handleLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-      handleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusStack.leadingAnchor, constant: -10.0),
-      handleLabel.topAnchor.constraint(equalTo: contentView.centerYAnchor, constant: 2.0),
-
-      dividerView.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-      dividerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-      dividerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-      dividerView.heightAnchor.constraint(equalToConstant: 1.0 / UIScreen.main.scale),
-    ])
-  }
-
-  required init?(coder: NSCoder) {
-    return nil
-  }
-
-  override func prepareForReuse() {
-    super.prepareForReuse()
-    avatarNode.prepareForReuse()
-  }
-
-  func configure(card: ChatListRow.AgentCard, theme: ChatNativeAgentConfigTheme) {
-    avatarNode.configure(
-      with: ChatAvatarDescriptor(
-        title: card.displayName,
-        rawAvatarURI: card.avatarUrl,
-        peerUserId: card.agentUserId,
-        chatId: nil,
-        kind: .standard,
-        isGroup: false,
-        members: [],
-        preferPushAvatar: false,
-        gradientColors: nil
-      ),
-      isDark: theme.isDark,
-      renderingSide: 60.0
-    )
-    nameLabel.text = card.displayName
-    nameLabel.textColor = theme.textColor
-    handleLabel.text = card.username.map { "@\($0)" } ?? "Private agent"
-    handleLabel.textColor = theme.secondaryTextColor
-
-    let style = ChatNativeAgentStatusStyle(status: card.status, theme: theme)
-    statusDot.backgroundColor = style.color
-    statusLabel.text = style.title
-    statusLabel.textColor = style.color
-    statusStack.backgroundColor = style.color.withAlphaComponent(theme.isDark ? 0.15 : 0.12)
-    chevronView.tintColor = theme.secondaryTextColor.withAlphaComponent(0.5)
-  }
-}
 
 /// A loading placeholder that sweeps a soft highlight across card-shaped rows.
 /// The previous version just pulsed opacity on flat blocks, which read as
 /// broken; a travelling shimmer reads as "loading" and feels premium.
-private final class ChatNativeAgentShimmerView: UIView {
+final class ChatNativeAgentShimmerView: UIView {
   private let gradientLayer = CAGradientLayer()
   private let baseColor: UIColor
   private let highlightColor: UIColor
@@ -2209,13 +2212,37 @@ private final class ChatNativeAgentShimmerView: UIView {
     return nil
   }
 
+  private var animatedWidth: CGFloat = 0
+
   override func layoutSubviews() {
     super.layoutSubviews()
     // Extend beyond bounds so the sweep enters/exits cleanly.
     gradientLayer.frame = CGRect(x: -bounds.width, y: 0, width: bounds.width * 3.0, height: bounds.height)
+    // A CABasicAnimation bakes its toValue in at add-time. Hosted inside a SwiftUI
+    // representable (e.g. the secret card, sized via a custom `sizeThatFits`), this
+    // view can enter the window and fire `didMoveToWindow` BEFORE SwiftUI resolves
+    // its real row width — so the very first `startAnimating()` call adds an
+    // animation from 0 to 0 and nothing is ever visibly restarted once the real
+    // width lands. Restart whenever the resolved width actually changes instead.
+    if bounds.width > 0, abs(bounds.width - animatedWidth) > 0.5 {
+      startAnimating()
+    }
+  }
+
+  // Self-starting: callers that just add this to a hierarchy (e.g. the secret
+  // card's cover, which isn't itself a container that already knows to kick
+  // off animation the way the skeleton loader's parent does) get the sweep
+  // for free once real bounds exist, with no separate wiring required.
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    guard window != nil else { return }
+    layoutIfNeeded()
+    startAnimating()
   }
 
   func startAnimating() {
+    guard bounds.width > 0 else { return }
+    animatedWidth = bounds.width
     let animation = CABasicAnimation(keyPath: "transform.translation.x")
     animation.fromValue = 0
     animation.toValue = bounds.width
@@ -2224,9 +2251,16 @@ private final class ChatNativeAgentShimmerView: UIView {
     animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
     gradientLayer.add(animation, forKey: "shimmer")
   }
+
+  /// Re-tints an already-built shimmer (e.g. on theme change) without tearing
+  /// down the running sweep animation.
+  func updateColors(base: UIColor, highlight: UIColor) {
+    backgroundColor = base
+    gradientLayer.colors = [base.cgColor, highlight.cgColor, base.cgColor]
+  }
 }
 
-private final class ChatNativeAgentSkeletonView: UIView {
+final class ChatNativeAgentSkeletonView: UIView {
   private var shimmers: [ChatNativeAgentShimmerView] = []
 
   init(theme: ChatNativeAgentConfigTheme) {
@@ -2300,7 +2334,7 @@ private final class ChatNativeAgentSkeletonView: UIView {
 }
 
 
-private final class ChatNativeAgentEmptyStateView: UIView {
+final class ChatNativeAgentEmptyStateView: UIView {
   init(theme: ChatNativeAgentConfigTheme) {
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
@@ -2351,386 +2385,21 @@ private final class ChatNativeAgentEmptyStateView: UIView {
   }
 }
 
-final class ChatNativeAgentsControlController: UIViewController,
-  UITableViewDataSource, UITableViewDelegate
-{
-  private let apiContext: ChatNativeAgentConfigAPIContext
-  private let appearance: ChatListAppearance
-  private let theme: ChatNativeAgentConfigTheme
-  /// False when this controller is a tab root rather than a presented sheet — a
-  /// persistent tab has nothing to "close", so the leading X is omitted there.
-  private let showsCloseButton: Bool
-  private let tableView = UITableView(frame: .zero, style: .insetGrouped)
-  private let skeletonView: ChatNativeAgentSkeletonView
-  private let emptyStateView: ChatNativeAgentEmptyStateView
-  private let searchCapsule = HomeSearchCapsuleView()
-  private let filterControl = UISegmentedControl(items: ["All", "Active", "Disabled"])
-  /// Source of truth from the server; `cards` (below) is the filtered view of it.
-  private var allCards: [ChatListRow.AgentCard] = []
-  private var cards: [ChatListRow.AgentCard] = []
-  private var searchQuery: String = ""
-  private var activeTask: URLSessionDataTask?
-
-  private lazy var listHeaderView: UIView = {
-    let container = UIView()
-    container.backgroundColor = .clear
-
-    searchCapsule.translatesAutoresizingMaskIntoConstraints = false
-    searchCapsule.applyPalette(isDark: theme.isDark)
-    // No flying-overlay morph here (that's Home-specific chrome) — this is the
-    // same capsule, interactive in place, filtering the list as you type.
-    searchCapsule.textField.isUserInteractionEnabled = true
-    searchCapsule.setLabelPose(centered: false)
-    searchCapsule.onTextChanged = { [weak self] text in
-      self?.searchQuery = text
-      self?.applyFilter()
-    }
-    container.addSubview(searchCapsule)
-
-    filterControl.translatesAutoresizingMaskIntoConstraints = false
-    filterControl.selectedSegmentIndex = 0
-    filterControl.addTarget(self, action: #selector(filterChanged), for: .valueChanged)
-    container.addSubview(filterControl)
-
-    NSLayoutConstraint.activate([
-      searchCapsule.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-      searchCapsule.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-      searchCapsule.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-      searchCapsule.heightAnchor.constraint(equalToConstant: HomeSearchCapsuleView.fieldHeight),
-
-      filterControl.topAnchor.constraint(equalTo: searchCapsule.bottomAnchor, constant: 12),
-      filterControl.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-      filterControl.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-      filterControl.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
-    ])
-    return container
-  }()
-
-  var onToast: ((String) -> Void)?
-  var onCreateAgent: (() -> Void)?
-  var onOpenAgentChat: ((ChatListRow.AgentCard) -> Void)?
-  var onDeleteAgent: ((ChatListRow.AgentCard, @escaping () -> Void) -> Void)?
-
-  init(
-    apiContext: ChatNativeAgentConfigAPIContext,
-    appearance: ChatListAppearance,
-    showsCloseButton: Bool = true
-  ) {
-    self.apiContext = apiContext
-    self.appearance = appearance
-    self.showsCloseButton = showsCloseButton
-    self.theme = ChatNativeAgentConfigTheme(appearance: appearance)
-    self.skeletonView = ChatNativeAgentSkeletonView(
-      theme: ChatNativeAgentConfigTheme(appearance: appearance)
-    )
-    self.emptyStateView = ChatNativeAgentEmptyStateView(
-      theme: ChatNativeAgentConfigTheme(appearance: appearance)
-    )
-    super.init(nibName: nil, bundle: nil)
-  }
-
-  required init?(coder: NSCoder) {
-    return nil
-  }
-
-  deinit {
-    activeTask?.cancel()
-  }
-
-  override func viewDidLoad() {
-    super.viewDidLoad()
-    view.backgroundColor = theme.backgroundColor
-    title = "Agents"
-    configureNavigation()
-    configureTable()
-    configureSkeleton()
-    loadAgents()
-  }
-
-  override func viewWillAppear(_ animated: Bool) {
-    super.viewWillAppear(animated)
-    // Re-applied on every appearance (not just once in viewDidLoad): the tab bar's
-    // first-ever switch onto this root can render one frame of UIKit's default bar
-    // appearance before this runs, showing a stray hairline edge against Home that
-    // then vanished once a push/pop forced a fresh viewWillAppear — matching exactly
-    // what was reported. Scoping the appearance to navigationItem (not just the
-    // shared navigationBar) keeps it tied to this VC's own appearance lifecycle.
-    applyNavigationAppearance()
-  }
-
-  private func applyNavigationAppearance() {
-    let appearance = UINavigationBarAppearance()
-    appearance.configureWithOpaqueBackground()
-    appearance.backgroundColor = theme.backgroundColor
-    appearance.shadowColor = .clear
-    appearance.titleTextAttributes = [.foregroundColor: theme.textColor]
-    navigationController?.navigationBar.standardAppearance = appearance
-    navigationController?.navigationBar.scrollEdgeAppearance = appearance
-    navigationController?.navigationBar.compactAppearance = appearance
-    navigationController?.navigationBar.tintColor = theme.accentColor
-    // Per-item scoped appearance wins over the shared bar's if UIKit hasn't
-    // finished syncing the two yet on the very first tab appearance.
-    navigationItem.standardAppearance = appearance
-    navigationItem.scrollEdgeAppearance = appearance
-    navigationItem.compactAppearance = appearance
-  }
-
-  private func configureNavigation() {
-    if showsCloseButton {
-      navigationItem.leftBarButtonItem = UIBarButtonItem(
-        barButtonSystemItem: .close,
-        target: self,
-        action: #selector(handleClose)
-      )
-    }
-    navigationItem.rightBarButtonItem = UIBarButtonItem(
-      barButtonSystemItem: .add,
-      target: self,
-      action: #selector(handleCreate)
-    )
-    navigationItem.rightBarButtonItem?.accessibilityLabel = "Create agent"
-  }
-
-  private func configureTable() {
-    tableView.translatesAutoresizingMaskIntoConstraints = false
-    tableView.backgroundColor = .clear
-    tableView.separatorStyle = .none
-    tableView.rowHeight = 76.0
-    tableView.contentInset = UIEdgeInsets(top: 8.0, left: 0.0, bottom: 24.0, right: 0.0)
-    tableView.dataSource = self
-    tableView.delegate = self
-    tableView.register(
-      ChatNativeAgentListCell.self,
-      forCellReuseIdentifier: ChatNativeAgentListCell.reuseIdentifier
-    )
-    tableView.tableHeaderView = listHeaderView
-    view.addSubview(tableView)
-
-    emptyStateView.isHidden = true
-    view.addSubview(emptyStateView)
-
-    NSLayoutConstraint.activate([
-      tableView.topAnchor.constraint(equalTo: view.topAnchor),
-      tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-
-      emptyStateView.topAnchor.constraint(equalTo: view.topAnchor),
-      emptyStateView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      emptyStateView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      emptyStateView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-    ])
-  }
-
-  override func viewDidLayoutSubviews() {
-    super.viewDidLayoutSubviews()
-    let width = tableView.bounds.width
-    guard width > 0, let header = tableView.tableHeaderView else { return }
-    let height = header.systemLayoutSizeFitting(
-      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
-      withHorizontalFittingPriority: .required,
-      verticalFittingPriority: .fittingSizeLevel
-    ).height
-    if abs(header.frame.height - height) > 0.5 || header.frame.width != width {
-      header.frame = CGRect(x: 0, y: 0, width: width, height: height)
-      tableView.tableHeaderView = header
-    }
-  }
-
-  @objc private func filterChanged() {
-    applyFilter()
-  }
-
-  private func removeCard(agentId: String) {
-    allCards.removeAll { $0.agentId == agentId }
-    ChatOwnedAgentIdsCache.agentIds.remove(agentId)
-    applyFilter()
-    emptyStateView.isHidden = !allCards.isEmpty
-  }
-
-  private func applyFilter() {
-    let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    let segment = filterControl.selectedSegmentIndex
-    cards = allCards.filter { card in
-      if !query.isEmpty {
-        let haystack = "\(card.displayName) \(card.username ?? "")".lowercased()
-        guard haystack.contains(query) else { return false }
-      }
-      switch segment {
-      case 1: return chatNativeAgentIsPublished(card.status)
-      case 2: return !chatNativeAgentIsPublished(card.status)
-      default: return true
-      }
-    }
-    tableView.reloadData()
-  }
-
-  private func configureSkeleton() {
-    view.addSubview(skeletonView)
-    NSLayoutConstraint.activate([
-      skeletonView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-      skeletonView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      skeletonView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-    ])
-  }
-
-  private func loadAgents() {
-    skeletonView.isHidden = false
-    tableView.isHidden = true
-    emptyStateView.isHidden = true
-
-    guard let url = agentsURL() else {
-      finishLoading(cards: [])
-      onToast?("Could not load agents")
-      return
-    }
-
-    var request = URLRequest(url: url)
-    request.setValue("Bearer \(apiContext.token)", forHTTPHeaderField: "Authorization")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-    activeTask?.cancel()
-    activeTask = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
-      [weak self] data, response, error in
-      DispatchQueue.main.async {
-        guard let self else { return }
-        guard
-          error == nil,
-          let http = response as? HTTPURLResponse,
-          (200..<300).contains(http.statusCode),
-          let data,
-          let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else {
-          self.finishLoading(cards: [])
-          self.onToast?("Could not load agents")
-          return
-        }
-
-        let rawItems = (payload["items"] as? [[String: Any]]) ?? []
-        self.finishLoading(cards: rawItems.compactMap(self.controlCard(from:)))
-      }
-    }
-    activeTask?.resume()
-  }
-
-  private func finishLoading(cards: [ChatListRow.AgentCard]) {
-    self.allCards = cards
-    ChatOwnedAgentIdsCache.agentIds = Set(cards.map { $0.agentId })
-    let hasCards = !cards.isEmpty
-
-    UIView.transition(with: view, duration: 0.3, options: .transitionCrossDissolve, animations: {
-      self.skeletonView.isHidden = true
-      self.tableView.isHidden = !hasCards
-      self.emptyStateView.isHidden = hasCards
-    }, completion: { _ in
-      self.applyFilter()
-    })
-  }
-
-  private func agentsURL() -> URL? {
-    var base = apiContext.apiBaseURL.absoluteString
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    while base.hasSuffix("/") { base.removeLast() }
-    let suffix = base.lowercased().hasSuffix("/api") ? "/agents" : "/api/agents"
-    return URL(string: base + suffix)
-  }
-
-  private func controlCard(from raw: [String: Any]) -> ChatListRow.AgentCard? {
-    chatNativeAgentParseControlCard(raw: raw, apiContext: apiContext)
-  }
-
-  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    cards.count
-  }
-
-  func tableView(
-    _ tableView: UITableView,
-    cellForRowAt indexPath: IndexPath
-  ) -> UITableViewCell {
-    let cell =
-      tableView.dequeueReusableCell(
-        withIdentifier: ChatNativeAgentListCell.reuseIdentifier,
-        for: indexPath
-      ) as? ChatNativeAgentListCell
-      ?? ChatNativeAgentListCell(
-        style: .default,
-        reuseIdentifier: ChatNativeAgentListCell.reuseIdentifier
-      )
-    cell.configure(card: cards[indexPath.row], theme: theme)
-    return cell
-  }
-
-  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    tableView.deselectRow(at: indexPath, animated: true)
-    // Tapping a row talks to the agent — same as tapping any other contact in
-    // Home. Settings lives one tap deeper, from the chat's own header (Telegram's
-    // "contact → chat, chat header → profile" pattern), plus the swipe action
-    // below for a direct shortcut without leaving the list.
-    onOpenAgentChat?(cards[indexPath.row])
-  }
-
-  func tableView(
-    _ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath
-  ) -> UISwipeActionsConfiguration? {
-    let card = cards[indexPath.row]
-    let delete = UIContextualAction(style: .destructive, title: "Delete") {
-      [weak self] _, _, completion in
-      guard let self else {
-        completion(false)
-        return
-      }
-      self.onDeleteAgent?(card) { [weak self] in
-        self?.removeCard(agentId: card.agentId)
-      }
-      completion(true)
-    }
-    return UISwipeActionsConfiguration(actions: [delete])
-  }
-
-  func tableView(
-    _ tableView: UITableView, leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath
-  ) -> UISwipeActionsConfiguration? {
-    let card = cards[indexPath.row]
-    let settings = UIContextualAction(style: .normal, title: "Settings") {
-      [weak self] _, _, completion in
-      guard let self else {
-        completion(false)
-        return
-      }
-      let controller = ChatNativeAgentConfigPanelController(
-        card: card, appearance: self.appearance, apiContext: self.apiContext
-      )
-      controller.onToast = self.onToast
-      controller.onOpenAgentChat = self.onOpenAgentChat
-      controller.onDeleteAgent = { [weak self] card, completion in
-        guard let self else { return }
-        self.onDeleteAgent?(card) { [weak self] in
-          self?.removeCard(agentId: card.agentId)
-          completion()
-        }
-      }
-      self.navigationController?.pushViewController(controller, animated: true)
-      completion(true)
-    }
-    settings.backgroundColor = theme.accentColor
-    settings.image = UIImage(systemName: "gearshape.fill")
-    return UISwipeActionsConfiguration(actions: [settings])
-  }
-
-  @objc private func handleClose() {
-    dismiss(animated: true)
-  }
-
-  @objc private func handleCreate() {
-    dismiss(animated: true) { [weak self] in
-      self?.onCreateAgent?()
-    }
-  }
-}
+// MARK: - Agent configuration profile
 
 final class ChatNativeAgentConfigPanelController: UIViewController {
   private var card: ChatListRow.AgentCard
-  private let apiContext: ChatNativeAgentConfigAPIContext?
+  private let injectedApiContext: ChatNativeAgentConfigAPIContext?
+  // Falls back to the live session if a caller was ever constructed without a
+  // valid context (e.g. resolved from a headless chat transport's own, separately
+  // sourced config) — every network action on this screen (Rotate included) was
+  // failing with "Missing API session" in exactly that situation, even though the
+  // user WAS actually logged in the whole time.
+  private var apiContext: ChatNativeAgentConfigAPIContext? {
+    if let injectedApiContext { return injectedApiContext }
+    guard let config = AppSessionConfig.current else { return nil }
+    return ChatNativeAgentConfigAPIContext(apiBaseURL: config.apiBaseURL, token: config.authToken)
+  }
   private let theme: ChatNativeAgentConfigTheme
   private var viewModel: ChatAgentConfigViewModel!
   private var activeSecretRequest: URLSessionDataTask?
@@ -2745,7 +2414,7 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     apiContext: ChatNativeAgentConfigAPIContext? = nil
   ) {
     self.card = card
-    self.apiContext = apiContext
+    self.injectedApiContext = apiContext
     self.theme = ChatNativeAgentConfigTheme(appearance: appearance)
     super.init(nibName: nil, bundle: nil)
   }
@@ -2783,6 +2452,15 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     ])
     
     hostingController.didMove(toParent: self)
+  }
+
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    // Chat surfaces live inside AppRootNavigationController with its system bar
+    // hidden. A title alone cannot make that bar reappear, so every config entry
+    // path must explicitly restore it before the push transition is rendered.
+    navigationController?.setNavigationBarHidden(false, animated: false)
+    configureNavigation()
   }
 
   private func setupViewModelCallbacks() {
@@ -2845,16 +2523,20 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
   }
 
   private func configureNavigation() {
-    title = ""
+    navigationItem.title = "Agent Settings"
+    navigationItem.largeTitleDisplayMode = .never
     let appearance = UINavigationBarAppearance()
-    appearance.configureWithTransparentBackground()
-    appearance.backgroundColor = .clear
+    appearance.configureWithOpaqueBackground()
+    appearance.backgroundColor = theme.backgroundColor
     appearance.shadowColor = .clear
     appearance.titleTextAttributes = [.foregroundColor: theme.textColor]
     navigationController?.navigationBar.standardAppearance = appearance
     navigationController?.navigationBar.scrollEdgeAppearance = appearance
     navigationController?.navigationBar.compactAppearance = appearance
     navigationController?.navigationBar.tintColor = theme.accentColor
+    navigationItem.standardAppearance = appearance
+    navigationItem.scrollEdgeAppearance = appearance
+    navigationItem.compactAppearance = appearance
 
     if navigationController?.viewControllers.first === self {
       navigationItem.leftBarButtonItem = UIBarButtonItem(
@@ -3853,7 +3535,7 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
   /// The old secret is hashed at rest and cannot be recovered — this is the ONLY moment
   /// a fresh one is ever visible, so the caller must show it before the user navigates away.
   private func rotateInvokeSecret(completion: @escaping (Bool, String?, String?) -> Void) {
-    guard let url = apiRequestURL(path: "/api/agents/{agent_id}/rotate_secret") else {
+    guard let url = apiRequestURL(path: "/api/agents/{agent_id}/secret/rotate") else {
       onToast?("Missing API session")
       completion(false, nil, nil)
       return
@@ -3863,6 +3545,7 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
     request.httpMethod = "POST"
     apiHeaders(&request)
 
+    activeSecretRequest?.cancel()
     let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
       [weak self] data, response, error in
       DispatchQueue.main.async {
@@ -3885,7 +3568,11 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
           let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
           let secret = chatNativeAgentNormalizedString(payload["secret"])
         else {
-          self.onToast?("Could not rotate secret")
+          let serverMessage = data.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0) as? [String: Any])
+              .flatMap { chatNativeAgentNormalizedString($0["error"]) }
+          }
+          self.onToast?(serverMessage ?? "Could not rotate secret")
           completion(false, nil, nil)
           return
         }
@@ -3901,6 +3588,7 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
         completion(true, secret, hint)
       }
     }
+    activeSecretRequest = task
     task.resume()
   }
 

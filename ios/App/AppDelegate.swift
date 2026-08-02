@@ -21,18 +21,38 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
     appDelegateUITrace("AppDelegate didFinishLaunching")
+    // Bring up persistent diagnostics FIRST so any error during launch is captured
+    // and a crash from the previous session is surfaced. See Shared/VibeLog.swift.
+    let info = Bundle.main.infoDictionary
+    let appVersion = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+    let appBuild = (info?["CFBundleVersion"] as? String) ?? "?"
+    VibeLog.shared.bootstrap(appContext: [
+      "launchOptions": launchOptions == nil ? "none" : String(launchOptions!.count),
+      "app": "\(appVersion) (\(appBuild))",
+      "os": "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+    ])
     // Giphy SDK key for native GIF panel (Info.plist / env GIPHY_API_KEY).
     ChatGifPanelConfig.shared.reloadFromEnvironment()
     // Packet mesh is now opt-in (default direct). Downgrade any legacy
     // packet_mesh session to direct before the UI binds to the config so large
     // media sends (music/video/files) no longer fail immediately on mesh.
     ChatEngineStore.shared.migrateLegacyPacketMeshToDirectIfNeeded()
+    // Remembered media pixel sizes — read off-main before any chat can open, because the
+    // first lookup lands inside a sizing pass and a media row with no known aspect ratio is
+    // mounted as a square and then corrected (a visible list shift).
+    ChatMediaNaturalSizeStore.shared.prewarm()
     let window = UIWindow(frame: UIScreen.main.bounds)
     window.rootViewController = AppRootControllerFactory.makeInitialController()
     AppAppearanceController.applyStoredPreference(to: window)
     window.makeKeyAndVisible()
 
     self.window = window
+    // Where a chat open's cost actually goes: cell construction, not sizing. Runs once,
+    // well after launch, so it never rides the first paint. Remove once the lazy
+    // conversion it informs has shipped.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+      ChatListCell.logConstructionCostCensus()
+    }
     configureCallNotifications()
     VibeNativeCallManager.shared.start()
     NotificationCenter.default.addObserver(
@@ -65,6 +85,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   func applicationWillEnterForeground(_ application: UIApplication) {
     appDelegateUITrace("AppDelegate willEnterForeground")
+    // The reopen-raster overlay cache is memory-only and iOS empties it while the app is
+    // suspended, so the first chat opened after a return raced a ~75ms disk decode and
+    // committed a bare-wallpaper shell until it landed. Rebuild it here, before the tap.
+    ChatListView.rewarmReopenSnapshotRasters()
   }
 
   func applicationWillTerminate(_ application: UIApplication) {
@@ -103,6 +127,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   @objc private func handleDidReceiveMemoryWarning() {
     appDelegateUITrace("AppDelegate didReceiveMemoryWarning")
+    VibeLog.warning("memory warning", category: "lifecycle")
     ChatWallpaperMaskStore.purge()
     ChatAvatarImageStore.purge()
     chatMediaImageCachePurgeForMemoryWarning()
@@ -190,11 +215,21 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     defer { completionHandler() }
-    guard response.notification.request.content.categoryIdentifier == VibeNativeCallManager.foregroundCallCategoryIdentifier else {
-      return
-    }
     let payload = response.notification.request.content.userInfo.reduce(into: [String: Any]()) {
       $0[String(describing: $1.key)] = $1.value
+    }
+    guard response.notification.request.content.categoryIdentifier == VibeNativeCallManager.foregroundCallCategoryIdentifier else {
+      // Message / agent-event notifications: open the chat the payload names. Each one
+      // now carries its own identity (the push collapse id is the message, not the chat),
+      // so tapping a specific item has to land on that item's conversation.
+      if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+        let chatId = Self.notificationChatId(from: payload)
+      {
+        Task { @MainActor in
+          VibeRoomLinkRouter.shared.handle(target: .chat(chatId))
+        }
+      }
+      return
     }
     switch response.actionIdentifier {
     case VibeNativeCallManager.foregroundCallAcceptAction:
@@ -204,5 +239,30 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     default:
       _ = VibeNativeCallEngine.shared.handleSignal(payload)
     }
+  }
+
+  /// The chat a message/agent-event push belongs to. The server sends `chatId` at the
+  /// payload root; the nested shapes are the same fallbacks the notification service
+  /// extension reads, so both stay in agreement about which chat a notification names.
+  private static func notificationChatId(from payload: [String: Any]) -> String? {
+    func nested(_ value: Any?) -> [String: Any]? {
+      if let dictionary = value as? [String: Any] { return dictionary }
+      if let dictionary = value as? [AnyHashable: Any] {
+        return dictionary.reduce(into: [String: Any]()) { $0[String(describing: $1.key)] = $1.value }
+      }
+      return nil
+    }
+    let candidates: [Any?] = [
+      payload["chatId"],
+      payload["chat_id"],
+      nested(payload["data"])?["chatId"],
+      nested(payload["data"])?["chat_id"],
+    ]
+    for candidate in candidates {
+      guard let value = candidate as? String else { continue }
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty { return trimmed }
+    }
+    return nil
   }
 }

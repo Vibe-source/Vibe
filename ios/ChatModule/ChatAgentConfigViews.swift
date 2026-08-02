@@ -366,6 +366,127 @@ private struct ChatAgentSettingsRowLabel: View {
     }
 }
 
+private struct ChatAgentSecretMetalCover: UIViewRepresentable {
+    let isDark: Bool
+    let isConcealed: Bool
+
+    final class Coordinator {
+        let renderer = MetalKeyMaskView.Coordinator(appearance: .softSpoiler)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> SecureParticleMaskView {
+        let view = SecureParticleMaskView(frame: .zero, device: context.coordinator.renderer.device)
+        view.delegate = context.coordinator.renderer
+        view.layer.cornerRadius = 10
+        view.layer.borderColor = UIColor.white.withAlphaComponent(isDark ? 0.05 : 0.12).cgColor
+        applySurface(to: view)
+        context.coordinator.renderer.setConcealed(isConcealed, animated: false)
+        return view
+    }
+
+    func updateUIView(_ uiView: SecureParticleMaskView, context: Context) {
+        applySurface(to: uiView)
+        context.coordinator.renderer.setConcealed(isConcealed, animated: true)
+    }
+
+    private func applySurface(to view: SecureParticleMaskView) {
+        view.setSurfaceColor(
+            isDark
+                ? UIColor(red: 0.22, green: 0.23, blue: 0.25, alpha: 1)
+                : UIColor(red: 0.86, green: 0.87, blue: 0.89, alpha: 1)
+        )
+    }
+}
+
+private struct ChatAgentInvokeSecretCard: View {
+    let secret: String?
+    let hint: String?
+    let isLoading: Bool
+    let isRevealed: Bool
+    let onReveal: () -> Void
+    let onCopy: () -> Void
+    let onRotate: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("INVOKE SECRET", systemImage: "key.horizontal.fill")
+                .font(.system(size: 12.5, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(.secondary)
+
+            ZStack {
+                if let secret, !secret.isEmpty {
+                    // The returned key is committed underneath first. The still-mounted
+                    // shader exits only in the next animation phase.
+                    Text(secret)
+                        .font(.system(size: 13.5, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.65)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 14)
+                        .padding(.trailing, 48)
+                }
+
+                ChatAgentSecretMetalCover(
+                    isDark: colorScheme == .dark,
+                    isConcealed: !isRevealed || secret == nil || isLoading
+                )
+
+                if secret != nil && !isLoading {
+                    HStack {
+                        Spacer()
+                        Button(action: onReveal) {
+                            Image(systemName: isRevealed ? "eye.slash.fill" : "eye.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                                .frame(width: 40, height: 40)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.trailing, 4)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 54)
+            .background(Color(uiColor: .tertiarySystemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .accessibilityLabel(isLoading ? "Issuing new secret" : "Invoke secret")
+
+            HStack(spacing: 10) {
+                Button(action: onCopy) {
+                    Text("Copy").frame(maxWidth: .infinity)
+                }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .disabled(secret == nil || isLoading)
+                    .frame(maxWidth: .infinity)
+
+                Button(action: onRotate) {
+                    Text("Rotate").frame(maxWidth: .infinity)
+                }
+                    .buttonStyle(.bordered)
+                    .disabled(isLoading)
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+
+            Text("Anyone with this secret can invoke your agent. Keep it private and rotate it if it leaks.")
+                .font(.system(size: 12.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+}
+
 struct ChatAgentSettingsView: View {
     @ObservedObject var viewModel: ChatAgentConfigViewModel
     @Environment(\.colorScheme) private var colorScheme
@@ -470,13 +591,11 @@ struct ChatAgentSettingsView: View {
             }
 
             Section {
-                ChatNativeAgentSecretCardRepresentable(
+                ChatAgentInvokeSecretCard(
                     secret: viewModel.card.latestSecret,
                     hint: viewModel.card.secretHint,
                     isLoading: viewModel.isRotatingInvokeSecret,
                     isRevealed: viewModel.isInvokeSecretRevealed,
-                    canReveal: viewModel.card.latestSecret != nil,
-                    isDark: colorScheme == .dark,
                     onReveal: { viewModel.isInvokeSecretRevealed.toggle() },
                     onCopy: {
                         guard let secret = viewModel.card.latestSecret else { return }
@@ -484,7 +603,6 @@ struct ChatAgentSettingsView: View {
                     },
                     onRotate: { showRotateInvokeSecretConfirm = true }
                 )
-                .frame(minHeight: 190)
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
             } header: {
@@ -535,6 +653,12 @@ struct ChatAgentSettingsView: View {
                 NavigationLink(destination: ChatAgentIntegrationView(viewModel: viewModel)) {
                     ChatAgentSettingsRowLabel(icon: "bolt.horizontal.circle.fill", tint: .indigo, title: "Integration & Delivery")
                 }
+                NavigationLink(destination: ChatAgentEnvironmentView(viewModel: viewModel)) {
+                    ChatAgentSettingsRowLabel(icon: "terminal.fill", tint: .mint, title: "Environment & IDs")
+                }
+                NavigationLink(destination: ChatAgentAPIDocumentationView(viewModel: viewModel)) {
+                    ChatAgentSettingsRowLabel(icon: "book.closed.fill", tint: .cyan, title: "API Documentation")
+                }
                 NavigationLink(destination: ChatAgentOutputSettingsView(viewModel: viewModel)) {
                     ChatAgentSettingsRowLabel(icon: "slider.horizontal.3", tint: .pink, title: "Output Controls")
                 }
@@ -561,11 +685,19 @@ struct ChatAgentSettingsView: View {
         .alert("Rotate invoke secret?", isPresented: $showRotateInvokeSecretConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Rotate", role: .destructive) {
+                // Keep the one persistent row covered for the entire request. Once
+                // the new key is in the model, reveal it on a later animation phase.
+                viewModel.isInvokeSecretRevealed = false
                 viewModel.isRotatingInvokeSecret = true
                 viewModel.onRotateInvokeSecret? { success, _, _ in
                     viewModel.isRotatingInvokeSecret = false
                     if success {
-                        viewModel.isInvokeSecretRevealed = true
+                        // updateCard has already installed the returned key. One main-
+                        // queue turn is enough to paint it underneath before UIKit flies
+                        // the still-mounted Metal cover out.
+                        DispatchQueue.main.async {
+                            viewModel.isInvokeSecretRevealed = true
+                        }
                     }
                 }
             }
@@ -583,6 +715,231 @@ struct ChatAgentSettingsView: View {
             if !success {
                 draftName = viewModel.card.displayName
             }
+        }
+    }
+}
+
+private struct ChatAgentDeveloperValueRow: View {
+    let title: String
+    let value: String
+    let onCopy: (String) -> Void
+
+    var body: some View {
+        Button {
+            onCopy(value)
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(value)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.tint)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Copies \(title)")
+    }
+}
+
+struct ChatAgentEnvironmentView: View {
+    @ObservedObject var viewModel: ChatAgentConfigViewModel
+
+    private var destinationChatId: String? {
+        viewModel.card.defaultDestinationChat?.chatId
+            ?? viewModel.card.attachedChats.first(where: {
+                ($0.type ?? "dm").lowercased() == "dm"
+            })?.chatId
+            ?? viewModel.card.attachedChats.first?.chatId
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                valueRow("VIBE_API_BASE_URL", viewModel.card.apiBaseURL)
+                valueRow("VIBE_AGENT_IDENTIFIER", viewModel.card.agentId)
+                valueRow("VIBE_DESTINATION_CHAT_ID", destinationChatId)
+            } header: {
+                Text("Environment")
+            } footer: {
+                Text("Use these values in your backend environment. The invoke secret is intentionally shown only immediately after creation or rotation.")
+            }
+
+            Section {
+                valueRow("Agent ID", viewModel.card.agentId)
+                valueRow("Agent User ID", viewModel.card.agentUserId)
+                if let defaultChat = viewModel.card.defaultDestinationChat {
+                    valueRow("Default Chat ID", defaultChat.chatId)
+                }
+                ForEach(Array(viewModel.card.attachedChats.enumerated()), id: \.element.chatId) {
+                    index, chat in
+                    valueRow(
+                        viewModel.card.attachedChats.count == 1
+                            ? "Attached Chat ID"
+                            : "Attached Chat ID \(index + 1)",
+                        chat.chatId
+                    )
+                }
+            } header: {
+                Text("Identifiers")
+            } footer: {
+                Text("Agent ID addresses the agent API. Chat ID identifies the conversation or delivery destination attached to this agent.")
+            }
+        }
+        .navigationTitle("Environment & IDs")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func valueRow(_ title: String, _ value: String?) -> some View {
+        if let value, !value.isEmpty {
+            ChatAgentDeveloperValueRow(title: title, value: value) {
+                viewModel.onCopy?($0)
+            }
+        }
+    }
+}
+
+struct ChatAgentAPIDocumentationView: View {
+    @ObservedObject var viewModel: ChatAgentConfigViewModel
+
+    private let docsBase = URL(string: "https://vibegram.io/docs/agents")!
+
+    private var destinationChatId: String? {
+        viewModel.card.defaultDestinationChat?.chatId
+            ?? viewModel.card.attachedChats.first(where: {
+                ($0.type ?? "dm").lowercased() == "dm"
+            })?.chatId
+            ?? viewModel.card.attachedChats.first?.chatId
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                developerValueRow(
+                    title: "Agent ID",
+                    value: viewModel.card.agentId
+                )
+                developerValueRow(
+                    title: "Destination Chat ID",
+                    value: destinationChatId
+                )
+            } header: {
+                Text("Integration")
+            } footer: {
+                Text("Use the Agent ID in the endpoint path. Send Destination Chat ID as destinationChatId for event delivery when the agent has no default destination.")
+            }
+
+            Section {
+                developerValueRow(
+                    title: "Invoke URL",
+                    value: viewModel.card.invokeURL
+                )
+                developerValueRow(
+                    title: "Events URL",
+                    value: viewModel.card.eventsURL
+                )
+            } header: {
+                Text("Endpoints")
+            }
+
+            Section {
+                documentationLink(
+                    icon: "bolt.fill",
+                    tint: .blue,
+                    title: "API Quickstart",
+                    subtitle: "Authentication, invoke requests, and first response",
+                    path: ""
+                )
+                documentationLink(
+                    icon: "terminal.fill",
+                    tint: .mint,
+                    title: "Environment Variables",
+                    subtitle: "Production .env setup and destination chat IDs",
+                    path: "/env"
+                )
+                documentationLink(
+                    icon: "chevron.left.forwardslash.chevron.right",
+                    tint: .orange,
+                    title: "Request Examples",
+                    subtitle: "Node, Python, curl, events, and callbacks",
+                    path: "/examples"
+                )
+                documentationLink(
+                    icon: "slider.horizontal.3",
+                    tint: .purple,
+                    title: "Configuration Reference",
+                    subtitle: "Agent fields, attached chats, delivery, and security",
+                    path: "/config"
+                )
+            } header: {
+                Text("Guides")
+            }
+        }
+        .navigationTitle("API Documentation")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func developerValueRow(title: String, value: String?) -> some View {
+        if let value, !value.isEmpty {
+            ChatAgentDeveloperValueRow(title: title, value: value) {
+                viewModel.onCopy?($0)
+            }
+        } else {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("Not configured")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func documentationLink(
+        icon: String,
+        tint: Color,
+        title: String,
+        subtitle: String,
+        path: String
+    ) -> some View {
+        Link(destination: path.isEmpty ? docsBase : docsBase.appendingPathComponent(String(path.dropFirst()))) {
+            HStack(spacing: 13) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(tint.gradient)
+                    .frame(width: 32, height: 32)
+                    .overlay {
+                        Image(systemName: icon)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
         }
     }
 }

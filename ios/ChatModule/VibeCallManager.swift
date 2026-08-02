@@ -226,6 +226,15 @@ public final class VibeNativeCallManager: NSObject {
     provider.reportNewIncomingCall(with: uuid, update: update) { error in
       if let error {
         NSLog("[VibeNativeCall] reportNewIncomingCall failed callId=%@ error=%@", callId, error.localizedDescription)
+        VibeLog.error(
+          "reportNewIncomingCall failed",
+          category: "call",
+          metadata: [
+            "source": source,
+            "callId": callId,
+            "error": error.localizedDescription,
+          ]
+        )
       } else {
         VibeDebugLog.log("[VibeNativeCall] reportNewIncomingCall ok callId=%@ uuid=%@", callId, uuid.uuidString)
       }
@@ -250,6 +259,11 @@ public final class VibeNativeCallManager: NSObject {
 
     guard let config = resolvePushSyncConfig() else {
       VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ missingSession=true", reason)
+      VibeLog.warning(
+        "push token sync skipped: missing session",
+        category: "push",
+        metadata: ["reason": reason]
+      )
       return
     }
 
@@ -270,6 +284,11 @@ public final class VibeNativeCallManager: NSObject {
 
     guard let url = URL(string: "\(config.apiBaseUrl)/api/user/profile") else {
       VibeDebugLog.log("[VibeNativeCall] push token sync skipped reason=%@ invalidURL=true", reason)
+      VibeLog.error(
+        "push token sync skipped: invalid url",
+        category: "push",
+        metadata: ["reason": reason, "host": URL(string: config.apiBaseUrl)?.host ?? "?"]
+      )
       return
     }
 
@@ -301,6 +320,7 @@ public final class VibeNativeCallManager: NSObject {
         self.pushSyncRetryForce = false
         if let error {
           NSLog("[VibeNativeCall] push token sync failed reason=%@ error=%@", reason, error.localizedDescription)
+          VibeLog.error("push token sync failed", category: "push", metadata: ["reason": reason, "error": error.localizedDescription])
           if shouldRetry {
             self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)", force: shouldRetryForce)
           }
@@ -311,6 +331,7 @@ public final class VibeNativeCallManager: NSObject {
           VibeDebugLog.log("[VibeNativeCall] push token sync ok reason=%@ status=%d", reason, status)
         } else {
           NSLog("[VibeNativeCall] push token sync failed reason=%@ status=%d", reason, status)
+          VibeLog.error("push token sync failed", category: "push", metadata: ["reason": reason, "status": String(status)])
         }
         if shouldRetry {
           self.syncStoredPushTokensLocked(reason: "queued-after-\(reason)", force: shouldRetryForce)
@@ -456,6 +477,13 @@ extension VibeNativeCallManager: PKPushRegistryDelegate {
     guard type == .voIP else { return }
     guard let normalized = normalizeIncomingCallPayload(userInfo: payload.dictionaryPayload) else {
       NSLog("[VibeNativeCall] PKPush incomingPush ignored reason=normalizeFailed")
+      VibeLog.warning(
+        "voip push ignored: normalize failed",
+        category: "call",
+        metadata: [
+          "keys": payload.dictionaryPayload.keys.map { String(describing: $0) }.sorted().joined(separator: ",")
+        ]
+      )
       return
     }
     NSLog("[VibeNativeCall] PKPush incomingPush normalized callId=%@ fromUser=%@", normalized["callId"] ?? "-", normalized["fromUserId"] ?? "-")

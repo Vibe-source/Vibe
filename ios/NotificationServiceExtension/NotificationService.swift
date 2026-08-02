@@ -8,6 +8,9 @@ final class NotificationService: UNNotificationServiceExtension {
   private var bestAttemptContent: UNMutableNotificationContent?
   private var avatarDownloadTask: URLSessionDataTask?
   private var mediaDownloadTask: URLSessionDataTask?
+  /// Guards against double delivery when donation completion races
+  /// `serviceExtensionTimeWillExpire`.
+  private var didDeliverContent = false
   private let logPrefix = "[VibeNotifyExt]"
   private let osLogger = OSLog(
     subsystem: "com.vibegram.app.NotificationServiceExtension",
@@ -175,10 +178,24 @@ final class NotificationService: UNNotificationServiceExtension {
   }
 
   private func emitBestAttemptContent() {
-    log("emitBestAttemptContent")
-    if let contentHandler, let bestAttemptContent {
-      contentHandler(bestAttemptContent)
+    // Donation completion and expiry can both try to finish the extension.
+    // contentHandler must be invoked at most once.
+    guard !didDeliverContent else {
+      log("emitBestAttemptContent skipped (already delivered)")
+      return
     }
+    guard let contentHandler else {
+      log("emitBestAttemptContent skipped (no contentHandler)")
+      return
+    }
+    guard let bestAttemptContent else {
+      log("emitBestAttemptContent skipped (no bestAttemptContent)")
+      return
+    }
+    didDeliverContent = true
+    self.contentHandler = nil
+    log("emitBestAttemptContent")
+    contentHandler(bestAttemptContent)
   }
 
   private func decodeInlineImageData(from raw: String) -> Data? {
@@ -221,6 +238,11 @@ final class NotificationService: UNNotificationServiceExtension {
   }
 
   private func finalizeNotification(avatarData: Data?, mediaData: Data?, payload: PayloadMetadata) {
+    // Expiry may have already delivered; avoid starting a second communication path.
+    guard !didDeliverContent else {
+      log("finalize skipped (already delivered)")
+      return
+    }
     guard let mutableContent = bestAttemptContent else {
       log("finalize missing mutableContent")
       emitBestAttemptContent()
@@ -241,8 +263,12 @@ final class NotificationService: UNNotificationServiceExtension {
     // string on the lock screen. The same information is already in the log
     // line above, which is where it belongs.
 
-    applyCommunicationStyle(to: mutableContent, payload: payload, avatarData: avatarData)
-    emitBestAttemptContent()
+    // Apple requires INInteraction.donate to finish before
+    // content.updating(from:). Emit only after that sequence completes.
+    applyCommunicationStyle(to: mutableContent, payload: payload, avatarData: avatarData) {
+      [weak self] in
+      self?.emitBestAttemptContent()
+    }
   }
 
   private func attachMediaImage(_ data: Data, to content: UNMutableNotificationContent) {
@@ -266,16 +292,31 @@ final class NotificationService: UNNotificationServiceExtension {
     }
   }
 
+  /// Applies communication notification styling after a successful intent donation.
+  ///
+  /// Apple requires `INInteraction.donate` to finish before
+  /// `UNNotificationContent.updating(from:)`. On donation failure the original
+  /// mutable content is kept so the notification is never lost.
   private func applyCommunicationStyle(
     to content: UNMutableNotificationContent,
     payload: PayloadMetadata,
-    avatarData: Data?
+    avatarData: Data?,
+    completion: @escaping () -> Void
   ) {
+    let finishOnMain: () -> Void = {
+      if Thread.isMainThread {
+        completion()
+      } else {
+        DispatchQueue.main.async(execute: completion)
+      }
+    }
+
     let normalizedType = payload.type.lowercased()
     if normalizedType == "call-start" || normalizedType == "call_start"
       || normalizedType == "incoming_call"
     {
       log("communication style skipped for type=\(payload.type)")
+      finishOnMain()
       return
     }
 
@@ -332,26 +373,14 @@ final class NotificationService: UNNotificationServiceExtension {
         suggestionType: .none
       )
 
-      let me = INPerson(
-        personHandle: INPersonHandle(value: "me", type: .unknown),
-        nameComponents: {
-          var components = PersonNameComponents()
-          components.nickname = "You"
-          return components
-        }(),
-        displayName: "You",
-        image: nil,
-        contactIdentifier: nil,
-        customIdentifier: nil,
-        isMe: true,
-        suggestionType: .none
-      )
-
       let conversationId = payload.chatId.isEmpty ? content.threadIdentifier : payload.chatId
       let groupName: INSpeakableString? = nil
 
+      // For an incoming direct message, iOS adds the current user as recipient.
+      // Supplying a synthetic "me" participant conflicts with Apple's
+      // communication-notification participant model.
       let intent = INSendMessageIntent(
-        recipients: [me],
+        recipients: nil,
         outgoingMessageType: .outgoingMessageText,
         content: content.body,
         speakableGroupName: groupName,
@@ -366,27 +395,56 @@ final class NotificationService: UNNotificationServiceExtension {
 
       let interaction = INInteraction(intent: intent, response: nil)
       interaction.direction = .incoming
+      log("interaction donation starting")
       interaction.donate { [weak self] error in
-        if let error {
-          self?.log("interaction donation failed error=\(error.localizedDescription)")
-        } else {
-          self?.log("interaction donated")
+        guard let self else {
+          finishOnMain()
+          return
         }
-      }
 
-      do {
-        if let updatedContent = try content.updating(from: intent) as? UNMutableNotificationContent
-        {
-          bestAttemptContent = updatedContent
-          log("communication style applied")
-        } else {
-          log("communication style skipped (updating returned immutable content)")
+        // Donation finished (or failed). Only then may we update content.
+        // Hop to main so bestAttemptContent / emit stay serialized with expiry.
+        let applyAndFinish = {
+          if let error {
+            // Keep original mutable content so the notification is never lost.
+            self.log("interaction donation failed error=\(error.localizedDescription)")
+            finishOnMain()
+            return
+          }
+
+          self.log("interaction donated")
+
+          // If expiry already delivered, skip updating — contentHandler is done.
+          if self.didDeliverContent {
+            self.log("communication update skipped (already delivered)")
+            finishOnMain()
+            return
+          }
+
+          do {
+            if let updatedContent = try content.updating(from: intent)
+              as? UNMutableNotificationContent
+            {
+              self.bestAttemptContent = updatedContent
+              self.log("communication style applied")
+            } else {
+              self.log("communication style skipped (updating returned immutable content)")
+            }
+          } catch {
+            self.log("communication style apply failed error=\(error.localizedDescription)")
+          }
+          finishOnMain()
         }
-      } catch {
-        log("communication style apply failed error=\(error.localizedDescription)")
+
+        if Thread.isMainThread {
+          applyAndFinish()
+        } else {
+          DispatchQueue.main.async(execute: applyAndFinish)
+        }
       }
     } else {
       log("communication style unavailable (< iOS 15)")
+      finishOnMain()
     }
   }
 

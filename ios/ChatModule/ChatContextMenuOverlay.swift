@@ -64,6 +64,9 @@ public final class ChatContextMenuOverlay: UIView {
 
   // The bubble snapshot (bubble+tail only, already positioned in window coords)
   private let bubbleSnapshot: UIView
+  // Stable pre-extraction pixels. Capturing after the overlay dismisses races
+  // Core Animation's hidden extracted state and can produce a transparent image.
+  private let deletionBubbleImage: UIImage?
   // The bubble's original frame in window coords (before any shifting)
   private let originalBubbleFrame: CGRect
   private let bubbleIsMe: Bool
@@ -94,6 +97,7 @@ public final class ChatContextMenuOverlay: UIView {
   init(
     messageId: String,
     bubbleSnapshot: UIView,
+    deletionBubbleImage: UIImage?,
     bubbleFrame: CGRect,
     bubbleIsMe: Bool,
     appearance: ChatListAppearance,
@@ -104,6 +108,7 @@ public final class ChatContextMenuOverlay: UIView {
   ) {
     self.messageId = messageId
     self.bubbleSnapshot = bubbleSnapshot
+    self.deletionBubbleImage = deletionBubbleImage
     self.originalBubbleFrame = bubbleFrame
     self.bubbleIsMe = bubbleIsMe
     self.appearance = appearance
@@ -308,6 +313,31 @@ public final class ChatContextMenuOverlay: UIView {
     )
 
     return finalBubbleFrame
+  }
+
+  /// Keep the extracted bubble and the existing glass card on-screen while the
+  /// action list drills into delete scope. Only the card's inner content moves;
+  /// its frame is remeasured in the same animation so this never reads as a
+  /// second modal appearing on top of the context menu.
+  func presentDeleteConfirmation(deleteForEveryoneTitle: String?) {
+    guard !isDismissing else { return }
+    holdDebugLog(
+      "delete confirmation begin everyone=\(deleteForEveryoneTitle == nil ? "N" : "Y")")
+    contextMenu.transitionToDeleteConfirmation(
+      deleteForEveryoneTitle: deleteForEveryoneTitle
+    ) { [weak self] in
+      guard let self else { return }
+      _ = self.layoutMenus()
+      self.layoutIfNeeded()
+    }
+  }
+
+  /// Returns the original bubble pixels at the original list slot, even though
+  /// the extracted context-menu copy may have shifted vertically to fit menus.
+  func deletionBubbleCapture(in targetView: UIView) -> (image: UIImage, frame: CGRect)? {
+    guard let deletionBubbleImage else { return nil }
+    let frameInTarget = convert(originalBubbleFrame, to: targetView)
+    return (deletionBubbleImage, frameInTarget)
   }
 
   // MARK: - Animate In / Out
@@ -745,6 +775,7 @@ final class ContextMenuView: UIView {
   }
 
   private let actions: [ActionItem]
+  private var showsDeleteConfirmation = false
 
   let messageId: String
 
@@ -845,6 +876,17 @@ final class ContextMenuView: UIView {
     stackCenterY.priority = .defaultHigh
     NSLayoutConstraint.activate([stackTop, stackBottom, stackCenterY])
 
+    installActions(actions)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  private func installActions(_ actions: [ActionItem]) {
+    for arranged in stack.arrangedSubviews {
+      stack.removeArrangedSubview(arranged)
+      arranged.removeFromSuperview()
+    }
+
     for (index, action) in actions.enumerated() {
       if action.id == "select" && index > 0 {
         let sepContainer = UIView()
@@ -873,7 +915,65 @@ final class ContextMenuView: UIView {
     }
   }
 
-  required init?(coder: NSCoder) { fatalError() }
+  /// Telegram-style drill-in: the original rows travel left, the delete choices
+  /// enter from the right, and the same glass card changes height around them.
+  func transitionToDeleteConfirmation(
+    deleteForEveryoneTitle: String?,
+    alongsideLayout: @escaping () -> Void
+  ) {
+    guard !showsDeleteConfirmation else { return }
+    showsDeleteConfirmation = true
+    layoutIfNeeded()
+
+    let oldRowsSnapshot = stack.snapshotView(afterScreenUpdates: false)
+    if let oldRowsSnapshot {
+      oldRowsSnapshot.frame = stack.frame
+      oldRowsSnapshot.isUserInteractionEnabled = false
+      glassView.contentView.addSubview(oldRowsSnapshot)
+    }
+
+    var deleteActions: [ActionItem] = []
+    if let title = deleteForEveryoneTitle,
+      !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      deleteActions.append(
+        ActionItem(
+          id: "deleteForEveryone",
+          title: title,
+          iconName: "",
+          isDestructive: true
+        ))
+    }
+    deleteActions.append(
+      ActionItem(
+        id: "deleteForMe",
+        title: "Delete for me",
+        iconName: "",
+        isDestructive: true
+      ))
+    installActions(deleteActions)
+
+    let travel = max(bounds.width, 220)
+    stack.transform = CGAffineTransform(translationX: travel, y: 0)
+    stack.alpha = 0
+
+    UIView.animate(
+      withDuration: 0.30,
+      delay: 0,
+      usingSpringWithDamping: 0.92,
+      initialSpringVelocity: 0,
+      options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction]
+    ) {
+      alongsideLayout()
+      self.layoutIfNeeded()
+      oldRowsSnapshot?.transform = CGAffineTransform(translationX: -travel, y: 0)
+      oldRowsSnapshot?.alpha = 0
+      self.stack.transform = .identity
+      self.stack.alpha = 1
+    } completion: { _ in
+      oldRowsSnapshot?.removeFromSuperview()
+    }
+  }
 
   @objc private func didTapAction(_ sender: ContextMenuRow) {
     delegate?.contextMenuDidSelectAction(sender.actionId, messageId: messageId)
@@ -903,9 +1003,13 @@ final class ContextMenuRow: UIControl {
     titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
     let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
-    if let image = UIImage(systemName: action.iconName, withConfiguration: config) {
+    if !action.iconName.isEmpty,
+      let image = UIImage(systemName: action.iconName, withConfiguration: config)
+    {
       iconView.image = image
       iconView.tintColor = action.isDestructive ? .systemRed : .label
+    } else {
+      iconView.isHidden = true
     }
     iconView.contentMode = .scaleAspectFit
 
@@ -926,7 +1030,10 @@ final class ContextMenuRow: UIControl {
       iconView.widthAnchor.constraint(equalToConstant: 20),
       iconView.heightAnchor.constraint(equalToConstant: 20),
 
-      titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 14),
+      titleLabel.leadingAnchor.constraint(
+        equalTo: action.iconName.isEmpty ? leadingAnchor : iconView.trailingAnchor,
+        constant: action.iconName.isEmpty ? 18 : 14
+      ),
       titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -18),
       titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
     ])

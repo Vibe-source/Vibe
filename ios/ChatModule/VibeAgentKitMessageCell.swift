@@ -237,10 +237,12 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     let normalizedLeadingText = leadingText?.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasLeadingText = normalizedLeadingText?.isEmpty == false
     guard expanded, hasLeadingText || !items.isEmpty else { return }
-    stepsStack.spacing = streaming ? 7.0 : 11.0
+    stepsStack.spacing = streaming ? 9.0 : 11.0
+    // Shell already supplies agent-turn bubble padding — keep stack margins minimal
+    // so prose isn't double-indented and hugs the same edge as plain them-bubbles.
     stepsStack.layoutMargins = streaming
-      ? UIEdgeInsets(top: 2.0, left: 6.0, bottom: 4.0, right: 0.0)
-      : UIEdgeInsets(top: 3.0, left: 6.0, bottom: 4.0, right: 0.0)
+      ? UIEdgeInsets(top: 2.0, left: 2.0, bottom: 4.0, right: 2.0)
+      : UIEdgeInsets(top: 2.0, left: 2.0, bottom: 4.0, right: 2.0)
     if let leadingText, hasLeadingText {
       stepsStack.addArrangedSubview(
         narrationWorkLogView(
@@ -327,8 +329,10 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     }
     guard !renderable.isEmpty else { clearStepsList(); return }
 
-    stepsStack.spacing = 9.0
-    stepsStack.layoutMargins = UIEdgeInsets(top: 4.0, left: 8.0, bottom: 5.0, right: 0.0)
+    // Structured streaming feed: a little more vertical air between narration blocks
+    // and tool rows so long answers don't read as one dense column.
+    stepsStack.spacing = 11.0
+    stepsStack.layoutMargins = UIEdgeInsets(top: 2.0, left: 2.0, bottom: 4.0, right: 2.0)
 
     let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
     let lineHeight: CGFloat = 24.0
@@ -481,11 +485,9 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
     stack.axis = .vertical
     stack.alignment = .fill
     stack.distribution = .fill
-    stack.spacing = 9.0
+    stack.spacing = 10.0
     stack.isLayoutMarginsRelativeArrangement = true
-    stack.layoutMargins = streaming
-      ? UIEdgeInsets(top: 0.0, left: 0.0, bottom: 0.0, right: 0.0)
-      : UIEdgeInsets(top: 0.0, left: 0.0, bottom: 2.0, right: 0.0)
+    stack.layoutMargins = UIEdgeInsets(top: 0.0, left: 0.0, bottom: 2.0, right: 0.0)
 
     let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
     let color = appearance.text

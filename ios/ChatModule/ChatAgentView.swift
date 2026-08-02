@@ -863,8 +863,19 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
     applyAppearance(rawAppearance)
   }
 
-  func synchronizeHostState() {
-    rebuildChatRows(scrollToBottom: false, animated: false)
+  /// Current persisted transcript for a host that wants to stage it authoritatively at
+  /// final bounds before navigation. Data-only: it does not touch either message list.
+  func currentHostRows() -> [[String: Any]] {
+    guard let activeConversation = activeConversationId.flatMap({ conversation(for: $0) }) else {
+      return []
+    }
+    return makeRawRows(for: activeConversation)
+  }
+
+  func synchronizeHostState(emitRows: Bool = true) {
+    if emitRows {
+      rebuildChatRows(scrollToBottom: false, animated: false)
+    }
     onStreamingStateChanged?(streamingConversationId != nil)
     notifyHeaderStateChanged()
   }
@@ -1407,7 +1418,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
       apiBaseURL: config.apiBaseURL,
       token: config.token
     )
-    let controller = ChatNativeAgentsControlController(
+    let controller = ChatAgentsMainViewController(
       apiContext: apiContext,
       appearance: appearance
     )
@@ -1635,11 +1646,15 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
         engineConfig["socketUrl"] ?? engineConfig["url"] ?? nativeCallConfig["socketUrl"])
       ?? (apiBase.replacingOccurrences(of: "^http", with: "ws", options: .regularExpression)
         + "/socket")
-    let token =
-      Self.normalizedString(
-        engineConfig["authToken"] ?? engineConfig["token"]
-          ?? nativeCallConfig["authToken"] ?? session?["loginToken"])
-      ?? userId
+    let token = [
+      Self.normalizedString(session?["loginToken"]),
+      Self.normalizedString(nativeCallConfig["authToken"]),
+      Self.normalizedString(engineConfig["authToken"] ?? engineConfig["token"]),
+    ].compactMap { $0 }.first { $0 != userId && $0.lowercased() != "undefined" }
+    guard let token else {
+      NSLog("[ChatNativeAgent] missing valid login token (user id is not socket auth)")
+      return nil
+    }
 
     guard let socketURL = URL(string: socketString) else {
       NSLog("[ChatNativeAgent] invalid socket url %@", socketString)

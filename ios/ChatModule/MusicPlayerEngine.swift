@@ -620,6 +620,11 @@ final class NativeMusicPlayerEngine: NSObject {
   private func startDownload(track: NativeMusicPlayerTrack, remoteURL: URL) {
     if downloadTasks[track.trackId] != nil { return }
     let destinationURL = store.cacheDestinationURL(for: track, remoteURL: remoteURL)
+    // Every re-download of a track the device already had went unexplained because nothing
+    // recorded WHY the store thought it had no file. `localURI` is what it believed it had.
+    NSLog(
+      "[MusicCache] DOWNLOAD trackId=%@ title=%@ remote=%@ localURI=%@",
+      track.trackId, track.title, remoteURL.absoluteString, track.localURI ?? "nil")
     var request = URLRequest(url: remoteURL)
     let host = remoteURL.host?.lowercased() ?? ""
     let isOwnHost = host == "vibegram.io" || host.hasSuffix(".vibegram.io")

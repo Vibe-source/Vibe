@@ -8,28 +8,57 @@ import UIKit
 /// how this codebase lost its notification extension in the first place, so the
 /// palette lives here once and `ChatAvatarFallbackStyle` reads it from here.
 enum VibeAvatarFallback {
-  /// Light/dark gradient pairs, indexed by a stable hash of the identity seed.
-  static let palettes: [(lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)] = [
-    ("#5B8DEF", "#3D6BC6", "#6EA2FF", "#355EAA"),
-    ("#1FA97A", "#167A60", "#3BC99A", "#126B55"),
-    ("#D66A5A", "#AF493F", "#E98574", "#963B33"),
-    ("#A06AD8", "#7C4EB2", "#B984EA", "#6E45A0"),
-    ("#D59A2E", "#AF741D", "#E6B24A", "#966418"),
-    ("#2F9AA8", "#207585", "#4BB6C4", "#1B6575"),
-    ("#E05A8A", "#B83E6A", "#F178A4", "#9C345B"),
-    ("#6078D6", "#4659AE", "#7A91EA", "#3A4E9C"),
+  /// The app's default avatar choices in their stable UI order. The notification
+  /// extension compiles this same file, so user-id hashing cannot select a
+  /// different tint from `ChatAvatarNodeView`.
+  static let paletteDefinitions: [(id: String, start: String, end: String)] = [
+    ("warm-gold", "#FFD77A", "#F4A65E"),
+    ("aurora", "#B68AF4", "#7D91EA"),
+    ("lime", "#C4DC78", "#70BE7D"),
+    ("ocean", "#70D8CD", "#4CA7D8"),
+    ("ember", "#86C5A5", "#EE7C62"),
+    ("rose", "#F6A67F", "#D975C9"),
+    ("midnight", "#78A5F5", "#5E72DC"),
+    ("earth", "#C9A58A", "#9C7464"),
+    ("graphite", "#A0A8B2", "#6D7886"),
+    ("ruby", "#ED8491", "#C9586D"),
+    ("teal", "#6BCDC9", "#41A9B7"),
+    ("mint", "#79DCB3", "#3DB98A"),
+    ("coral", "#FF8B6B", "#FF5E79"),
+    ("marigold", "#FFE17E", "#F5B15C"),
+    ("steel", "#A4B7CF", "#758EAF"),
   ]
+
+  /// Compatibility shape consumed by Home payload models. Avatar-node colors do
+  /// not vary by appearance, so both pairs deliberately use the same values.
+  static let palettes: [(lightStart: String, lightEnd: String, darkStart: String, darkEnd: String)] =
+    paletteDefinitions.map {
+      (
+        lightStart: $0.start,
+        lightEnd: $0.end,
+        darkStart: $0.start,
+        darkEnd: $0.end
+      )
+    }
 
   /// First non-empty of user id, then title, then chat id. The user id leads so
   /// a person keeps their colour even when their display name changes.
   static func stableSeed(title: String?, peerUserId: String?, chatId: String?) -> String {
-    [peerUserId, title, chatId]
+    let seed = [peerUserId, title, chatId]
       .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .first { !$0.isEmpty } ?? ""
+      .first { !$0.isEmpty }
+    return seed?.lowercased() ?? ""
   }
 
   static func paletteIndex(for seed: String) -> Int {
-    abs(seed.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }) % palettes.count
+    let normalized = seed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let safeSeed = normalized.isEmpty ? "user" : normalized
+    let hash = safeSeed.unicodeScalars.reduce(UInt(0)) { ($0 &* 31) &+ UInt($1.value) }
+    return Int(hash % UInt(paletteDefinitions.count))
+  }
+
+  static func paletteID(for seed: String) -> String {
+    paletteDefinitions[paletteIndex(for: seed)].id
   }
 
   static func gradient(
@@ -46,12 +75,14 @@ enum VibeAvatarFallback {
     )
   }
 
-  /// Matches the app: one word yields one letter, two or more yield two.
+  /// Exact `ChatAvatarNodeView` rule: one token yields up to two characters;
+  /// multiple tokens use the first character of the first and last tokens.
   static func initials(from name: String) -> String {
-    let parts = name.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "_" })
+    let parts = name.split(whereSeparator: { $0.isWhitespace || $0.isPunctuation })
     if parts.isEmpty { return "" }
-    if parts.count == 1 { return String(parts[0].prefix(1)).uppercased() }
-    return (String(parts[0].prefix(1)) + String(parts[1].prefix(1))).uppercased()
+    if parts.count == 1 { return String(parts[0].prefix(2)).uppercased() }
+    guard let first = parts.first?.first, let last = parts.last?.first else { return "" }
+    return (String(first) + String(last)).uppercased()
   }
 
   static func color(hex raw: String) -> UIColor {
@@ -70,9 +101,8 @@ enum VibeAvatarFallback {
   /// Renders the gradient disc with initials, or a person glyph when the name
   /// yields nothing usable.
   ///
-  /// `isDark` defaults to false: a notification is composed by an extension that
-  /// has no window and cannot read the user's interface style, and the light
-  /// pair reads correctly against both banner backgrounds.
+  /// `isDark` remains for source compatibility; the avatar node deliberately
+  /// uses one identity tint in both appearances.
   static func image(
     displayName: String?,
     userId: String?,

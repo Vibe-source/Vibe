@@ -15,14 +15,12 @@ let bubbleMetaTopSpacing: CGFloat = 1.0
 let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
 let bubbleMaxWidthFactor: CGFloat = 0.85
-// The inline agent-turn bubble must read as a NORMAL them-bubble: its answer prose is a
-// bare edge-to-edge label inside the body view (no internal leading inset), so the shell
-// has to supply the SAME inset a plain text bubble uses or the text hugs the bubble edge
-// and looks misaligned against every other incoming message. Keep these equal to the
-// plain-bubble constants — do not tighten them (the earlier 6/4 tightening is what made the
-// agent text sit ~6pt further left + higher than a real them-bubble).
-let agentTurnHorizontalPadding: CGFloat = bubbleHorizontalPadding
-let agentTurnVerticalPadding: CGFloat = bubbleTopPadding
+// Agent-turn bubbles carry long structured prose (headings, nested lists, code). WhatsApp
+// Meta AI style needs a bit more air than a one-line Telegram chat bubble: 14pt horizontal
+// + 10pt vertical keeps text off the plate edge without looking like a card. Plain text
+// bubbles stay on the tighter Telegram insets above.
+let agentTurnHorizontalPadding: CGFloat = 14.0
+let agentTurnVerticalPadding: CGFloat = 10.0
 // Match the plain-bubble width so an agent turn is the same shape as any other incoming
 // message. Rich content (diff cards / step lists) scrolls/wraps inside this width rather
 // than widening the whole bubble past its neighbours.

@@ -1,3 +1,4 @@
+import CoreImage
 import UIKit
 
 struct NativeMusicPlayerTheme {
@@ -160,6 +161,9 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
   private var entranceOffset: CGFloat = 0.0
   /// Tracks the last presented visibility so the entrance runs once per show.
   private var isBannerPresented = false
+  /// What the pill is currently showing, so a republish that changes nothing is free.
+  private var lastAppliedBannerSignature: String?
+  private var lastPlayButtonSymbol: String?
   private var renderedCoverTrackId: String?
   private var renderedCoverURL: String?
   private var renderedArtworkIdentifier: ObjectIdentifier?
@@ -191,31 +195,30 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
     contentContainer.clipsToBounds = true
     contentContainer.backgroundColor = .clear
 
-    miniProgressTrackView.layer.cornerCurve = .continuous
-    miniProgressTrackView.layer.cornerRadius = Self.miniHeight / 2.0
+    // Progress fill is clipped by the glass shell only — no extra corner radius on the art.
     miniProgressTrackView.clipsToBounds = true
     miniProgressTrackView.isUserInteractionEnabled = false
     contentContainer.addSubview(miniProgressTrackView)
 
+    // Soft full-banner art (blurred) — not a high-contrast photo strip.
     miniProgressImageView.contentMode = .scaleAspectFill
     miniProgressImageView.clipsToBounds = true
     miniProgressImageView.isUserInteractionEnabled = false
+    miniProgressImageView.alpha = 0.55
     miniProgressFillView.addSubview(miniProgressImageView)
 
-    // Soft tint only — no nested glass over the progress fill.
+    // Appearance-driven soft scrim over art (never systemBlue / high-contrast).
     miniProgressTintView.isUserInteractionEnabled = false
     miniProgressFillView.addSubview(miniProgressTintView)
 
-    miniProgressFillView.layer.cornerCurve = .continuous
-    miniProgressFillView.layer.cornerRadius = Self.miniHeight / 2.0
     miniProgressFillView.clipsToBounds = true
     miniProgressFillView.isUserInteractionEnabled = false
     miniProgressTrackView.addSubview(miniProgressFillView)
 
+    // Leading cover: square, no corner radius (capsule glass already softens the shell).
     miniArtworkView.contentMode = .scaleAspectFill
     miniArtworkView.clipsToBounds = true
-    miniArtworkView.layer.cornerCurve = .continuous
-    miniArtworkView.layer.cornerRadius = 12.0
+    miniArtworkView.layer.cornerRadius = 0
     miniArtworkView.isUserInteractionEnabled = false
     contentContainer.addSubview(miniArtworkView)
 
@@ -265,19 +268,24 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
     // One glass shell only — never nest another effect or opaque fill under it.
     applyGlassMaterial(to: miniBlurView, interactive: true, isDark: theme.isDark)
 
-    let secondaryAlpha: CGFloat = theme.isDark ? 0.72 : 0.62
-    miniArtworkView.backgroundColor = theme.text.withAlphaComponent(theme.isDark ? 0.08 : 0.06)
-    miniArtworkFallbackView.tintColor = theme.secondaryText
-    miniTitleLabel.textColor = theme.text
-    miniSubtitleLabel.textColor = theme.text.withAlphaComponent(secondaryAlpha)
+    // Appearance-system labels (not hard-coded white / blue).
+    miniArtworkView.backgroundColor = UIColor.secondarySystemFill
+    miniArtworkFallbackView.tintColor = UIColor.secondaryLabel
+    miniTitleLabel.textColor = UIColor.label
+    miniSubtitleLabel.textColor = UIColor.secondaryLabel
 
     miniProgressTrackView.backgroundColor = .clear
     miniProgressFillView.backgroundColor = .clear
-    miniProgressTintView.backgroundColor = theme.primary.withAlphaComponent(theme.isDark ? 0.38 : 0.32)
-    miniPlayButton.tintColor = theme.text
-    miniCloseButton.tintColor = theme.secondaryText
-    miniSpeedButton.tintColor = theme.text
-    miniSpeedButton.setTitleColor(theme.text.withAlphaComponent(0.92), for: .normal)
+    // Soft scrim over artwork — image color shows through, no systemBlue wash.
+    miniProgressTintView.backgroundColor =
+      theme.isDark
+      ? UIColor.black.withAlphaComponent(0.18)
+      : UIColor.white.withAlphaComponent(0.22)
+    miniProgressImageView.alpha = theme.isDark ? 0.50 : 0.42
+    miniPlayButton.tintColor = UIColor.label
+    miniCloseButton.tintColor = UIColor.secondaryLabel
+    miniSpeedButton.tintColor = UIColor.label
+    miniSpeedButton.setTitleColor(UIColor.label.withAlphaComponent(0.92), for: .normal)
 
     applyMiniControlButtonStyle(button: miniPlayButton, systemName: state.isPlaying ? "pause.fill" : "play.fill")
     applyMiniControlButtonStyle(button: miniCloseButton, systemName: "xmark")
@@ -308,13 +316,28 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
     isHidden = !shouldShow
     guard shouldShow, let track = nextState.currentTrack else {
       // Reset entrance state so the next appearance animates fresh.
+      lastAppliedBannerSignature = nil
       entranceOffset = 0.0
       alpha = 1.0
       return
     }
 
-    miniTitleLabel.text = track.title
-    miniSubtitleLabel.text = playbackDetailText(for: nextState, track: track)
+    let title = track.title
+    let detail = playbackDetailText(for: nextState, track: track)
+    // The playback source republishes on a timer for as long as anything is playing, and
+    // the elapsed readout only ticks once a second — so almost every call arrives with
+    // nothing to show. Re-laying out the pill anyway put avoidable work in every scroll.
+    let signature = [
+      track.trackId, title, detail,
+      nextState.isPlaying ? "1" : "0",
+      String(format: "%.2f", nextState.playbackRate),
+      nextState.artworkImage.map { String(UInt(bitPattern: ObjectIdentifier($0).hashValue)) } ?? "-",
+    ].joined(separator: "|")
+    guard signature != lastAppliedBannerSignature || !wasPresented else { return }
+    lastAppliedBannerSignature = signature
+
+    miniTitleLabel.text = title
+    miniSubtitleLabel.text = detail
 
     updateCoverImageIfNeeded(for: track, directImage: nextState.artworkImage)
     applyPlaybackButtons(for: nextState)
@@ -373,22 +396,27 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
     contentContainer.frame = miniBlurView.contentView.bounds
 
     let host = contentContainer.bounds
+    // Progress track fills the capsule; image is full-width so the fill only
+    // reveals more of the same soft art as progress grows (not a static stamp).
     miniProgressTrackView.frame = host
-    miniProgressTrackView.layer.cornerRadius = Self.miniHeight / 2.0
+    miniProgressTrackView.layer.cornerRadius = 0
 
     let duration = max(state.durationMs, (state.currentTrack?.durationSeconds ?? 0.0) * 1000.0, 1.0)
     let progress = CGFloat(max(0.0, min(1.0, state.progressMs / duration)))
 
-    let miniProgressWidth = miniProgressTrackView.bounds.width * progress
+    let trackW = miniProgressTrackView.bounds.width
+    let trackH = miniProgressTrackView.bounds.height
+    let miniProgressWidth = trackW * progress
     miniProgressFillView.frame = CGRect(
       x: 0.0,
       y: 0.0,
-      width: max(0.0, min(miniProgressTrackView.bounds.width, miniProgressWidth)),
-      height: miniProgressTrackView.bounds.height
+      width: max(0.0, min(trackW, miniProgressWidth)),
+      height: trackH
     )
-    miniProgressFillView.layer.cornerRadius = Self.miniHeight / 2.0
-    miniProgressImageView.frame = miniProgressFillView.bounds
-    miniProgressTintView.frame = miniProgressFillView.bounds
+    miniProgressFillView.layer.cornerRadius = 0
+    // Full banner width art inside the fill so cropping reveals continuous image.
+    miniProgressImageView.frame = CGRect(x: 0.0, y: 0.0, width: trackW, height: trackH)
+    miniProgressTintView.frame = miniProgressImageView.bounds
 
     let artworkSide: CGFloat = 24.0
     miniArtworkView.frame = CGRect(
@@ -397,8 +425,8 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
       width: artworkSide,
       height: artworkSide
     )
-    miniArtworkView.layer.cornerRadius = 12.0
-    miniArtworkFallbackView.frame = miniArtworkView.frame.insetBy(dx: 6.0, dy: 6.0)
+    miniArtworkView.layer.cornerRadius = 0
+    miniArtworkFallbackView.frame = miniArtworkView.frame.insetBy(dx: 5.0, dy: 5.0)
 
     let controlSide: CGFloat = 24.0
     let speedWidth: CGFloat = 34.0
@@ -548,9 +576,7 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
     coverImageTask?.cancel()
     coverImageTask = nil
     if let directImage {
-      miniArtworkView.image = directImage
-      miniProgressImageView.image = directImage
-      miniArtworkFallbackView.isHidden = true
+      applyBannerArtwork(directImage)
       return
     }
     // Keep prior image until the cached load returns (avoids banner artwork flash).
@@ -571,10 +597,33 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
       guard self.renderedCoverURL == expectedURL, self.renderedCoverTrackId == expectedTrackId else {
         return
       }
-      self.miniArtworkView.image = image
-      self.miniProgressImageView.image = image
-      self.miniArtworkFallbackView.isHidden = true
+      self.applyBannerArtwork(image)
     }
+  }
+
+  /// Sharp thumbnail + soft (blurred, low-contrast) progress wash from the same art.
+  private func applyBannerArtwork(_ image: UIImage) {
+    miniArtworkView.image = image
+    miniProgressImageView.image = Self.softProgressArtwork(from: image) ?? image
+    miniArtworkFallbackView.isHidden = true
+    setNeedsLayout()
+  }
+
+  /// Blurred, slightly darkened art for the progress fill — not a high-contrast photo.
+  private static func softProgressArtwork(from image: UIImage) -> UIImage? {
+    guard let ciImage = CIImage(image: image) else { return nil }
+    let extent = ciImage.extent
+    guard extent.width > 1, extent.height > 1 else { return nil }
+    let clamp = CIFilter(name: "CIAffineClamp")
+    clamp?.setValue(ciImage, forKey: kCIInputImageKey)
+    clamp?.setValue(NSValue(cgAffineTransform: .identity), forKey: kCIInputTransformKey)
+    let blur = CIFilter(name: "CIGaussianBlur")
+    blur?.setValue(clamp?.outputImage ?? ciImage, forKey: kCIInputImageKey)
+    blur?.setValue(18.0, forKey: kCIInputRadiusKey)
+    guard let blurred = blur?.outputImage?.cropped(to: extent) else { return nil }
+    let context = CIContext(options: [.useSoftwareRenderer: false])
+    guard let cg = context.createCGImage(blurred, from: extent) else { return nil }
+    return UIImage(cgImage: cg, scale: image.scale, orientation: image.imageOrientation)
   }
 
   private func playbackDetailText(for state: NativeMusicPlayerViewState, track: NativeMusicPlayerTrack) -> String {
@@ -587,6 +636,8 @@ final class NativeMusicPlayerBannerView: UIView, UIGestureRecognizerDelegate {
 
   private func applyPlaybackButtons(for state: NativeMusicPlayerViewState) {
     let name = state.isPlaying ? "pause.fill" : "play.fill"
+    guard name != lastPlayButtonSymbol else { return }
+    lastPlayButtonSymbol = name
     // Plain setImage — no crossfade (matches modal play button polish).
     miniPlayButton.setImage(
       UIImage(
@@ -644,6 +695,8 @@ final class NativeMusicPlayerRootOverlay {
   private let hostView = NativeMusicPlayerOverlayHostView(frame: .zero)
   private let bannerView = NativeMusicPlayerBannerView(frame: .zero)
   private var modalController: NativeMusicPlayerModalView?
+  private var cachedStoreChatTracks: [NativeMusicPlayerTrack] = []
+  private var cachedStoreChatTracksKey = ""
   private var musicObserver: NSObjectProtocol?
   private var voiceObserver: NSObjectProtocol?
   private var themeObserver: NSObjectProtocol?
@@ -651,6 +704,14 @@ final class NativeMusicPlayerRootOverlay {
   private var lastMusicPayload: [String: Any] = [:]
   private var lastVoiceSnapshot = VoiceBubblePlaybackSnapshot.empty
   private var activeSource: ActiveSource = .none
+  /// The last source that actually had something playing. `activeSource` drops to
+  /// `.none` the moment playback stops or fails — and every control in the still-open
+  /// sheet used to switch on it, so a failed track left the whole sheet alive but
+  /// completely inert: no row select, no next, no play. Controls route on this.
+  private var lastActiveSource: ActiveSource = .none
+  private var controlSource: ActiveSource {
+    activeSource != .none ? activeSource : lastActiveSource
+  }
 
   private enum ActiveSource {
     case none
@@ -714,9 +775,29 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   /// Keeps the overlay above pushed content when the lead re-layouts.
+  /// No-op when `hostView` is already the root's last (frontmost) subview.
   func bringToFront() {
     guard let rootView, hostView.superview === rootView else { return }
+    if rootView.subviews.last === hostView { return }
     rootView.bringSubviewToFront(hostView)
+  }
+
+  /// Places the music host immediately below a sibling on the same root view.
+  /// No-op when already immediately below `siblingView`, or when either view is
+  /// not a subview of the stored root. Lead uses this so toast stays above music
+  /// without thrashing z-order every layout pass.
+  func placeImmediatelyBelow(_ siblingView: UIView) {
+    guard let rootView,
+          hostView.superview === rootView,
+          siblingView.superview === rootView
+    else { return }
+    let subviews = rootView.subviews
+    guard let hostIndex = subviews.firstIndex(of: hostView),
+          let siblingIndex = subviews.firstIndex(of: siblingView)
+    else { return }
+    // Already immediately below (host one step behind sibling in z-order).
+    if hostIndex == siblingIndex - 1 { return }
+    rootView.insertSubview(hostView, belowSubview: siblingView)
   }
 
   // MARK: - Observers
@@ -783,9 +864,11 @@ final class NativeMusicPlayerRootOverlay {
 
     if voiceActive {
       activeSource = .voice
+      lastActiveSource = .voice
       bannerView.applyVoiceSnapshot(lastVoiceSnapshot)
     } else if musicActive {
       activeSource = .music
+      lastActiveSource = .music
       bannerView.applyStatePayload(lastMusicPayload)
     } else {
       activeSource = .none
@@ -802,17 +885,11 @@ final class NativeMusicPlayerRootOverlay {
     let isDark = style != .light
     var theme = NativeMusicPlayerTheme()
     theme.isDark = isDark
-    if isDark {
-      theme.surface = UIColor(white: 0.08, alpha: 1.0)
-      theme.text = .white
-      theme.secondaryText = UIColor(white: 1.0, alpha: 0.68)
-      theme.primary = UIColor.systemBlue
-    } else {
-      theme.surface = UIColor(white: 0.96, alpha: 1.0)
-      theme.text = UIColor(white: 0.08, alpha: 1.0)
-      theme.secondaryText = UIColor(white: 0.16, alpha: 0.72)
-      theme.primary = UIColor.systemBlue
-    }
+    // Dynamic system colors resolve against the current trait collection.
+    theme.surface = UIColor.secondarySystemBackground
+    theme.text = UIColor.label
+    theme.secondaryText = UIColor.secondaryLabel
+    theme.primary = UIColor.tintColor
     bannerView.applyTheme(theme)
     modalController?.applyTheme(theme)
   }
@@ -820,7 +897,7 @@ final class NativeMusicPlayerRootOverlay {
   // MARK: - Controls
 
   private func handleTogglePlayback() {
-    switch activeSource {
+    switch controlSource {
     case .music:
       let isPlaying = (lastMusicPayload["isPlaying"] as? Bool) ?? false
       NativeMusicPlayerEngine.shared.setIsPlaying(!isPlaying)
@@ -832,7 +909,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handleCyclePlaybackRate() {
-    switch activeSource {
+    switch controlSource {
     case .music:
       NativeMusicPlayerEngine.shared.cyclePlaybackRate()
     case .voice:
@@ -843,7 +920,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handleClose() {
-    switch activeSource {
+    switch controlSource {
     case .music:
       NativeMusicPlayerEngine.shared.reset()
     case .voice:
@@ -862,7 +939,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handleReorderQueue(_ orderedTrackIds: [String]) {
-    switch activeSource {
+    switch controlSource {
     case .voice:
       // Frozen API: trackIds == messageIds, full displayed order.
       VoiceBubblePlaybackCoordinator.shared.setManualQueueOrder(orderedTrackIds)
@@ -888,7 +965,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handleRemoveTrack(_ trackId: String) {
-    switch activeSource {
+    switch controlSource {
     case .music:
       NativeMusicPlayerEngine.shared.removeTrack(trackId)
     case .voice:
@@ -904,7 +981,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handlePlayNext() {
-    switch activeSource {
+    switch controlSource {
     case .music:
       NativeMusicPlayerEngine.shared.playNext()
     case .voice:
@@ -915,7 +992,7 @@ final class NativeMusicPlayerRootOverlay {
   }
 
   private func handlePlayPrevious() {
-    switch activeSource {
+    switch controlSource {
     case .music:
       NativeMusicPlayerEngine.shared.playPrev()
     case .voice:
@@ -948,7 +1025,7 @@ final class NativeMusicPlayerRootOverlay {
     }
     modal.onToggleQueueOrder = { [weak self] in
       guard let self else { return }
-      switch self.activeSource {
+      switch self.controlSource {
       case .music:
         NativeMusicPlayerEngine.shared.toggleQueueOrderMode()
       case .voice:
@@ -959,7 +1036,7 @@ final class NativeMusicPlayerRootOverlay {
     }
     modal.onToggleRepeat = { [weak self] in
       guard let self else { return }
-      switch self.activeSource {
+      switch self.controlSource {
       case .music:
         NativeMusicPlayerEngine.shared.toggleRepeatEnabled()
       case .voice:
@@ -970,7 +1047,7 @@ final class NativeMusicPlayerRootOverlay {
     }
     modal.onSeek = { [weak self] milliseconds in
       guard let self else { return }
-      switch self.activeSource {
+      switch self.controlSource {
       case .music:
         NativeMusicPlayerEngine.shared.seek(toMilliseconds: milliseconds)
       case .voice:
@@ -981,7 +1058,7 @@ final class NativeMusicPlayerRootOverlay {
     }
     modal.onSelectTrack = { [weak self] trackId in
       guard let self else { return }
-      switch self.activeSource {
+      switch self.controlSource {
       case .music:
         NativeMusicPlayerEngine.shared.selectTrack(trackId)
       case .voice:
@@ -994,11 +1071,15 @@ final class NativeMusicPlayerRootOverlay {
     // Guarantee the native sheet controller exists (the old configureSheet set this).
     modal.modalPresentationStyle = .pageSheet
     if let sheet = modal.sheetPresentationController {
-      sheet.detents = [.medium(), .large()]
-      sheet.selectedDetentIdentifier = .medium
+      // Compact detent is taller than .medium() so the now-playing hero has room;
+      // .large() is the queue-browsing mode.
+      let compact = NativeMusicPlayerModalView.compactDetent()
+      sheet.detents = [compact, .large()]
+      sheet.selectedDetentIdentifier = NativeMusicPlayerModalView.compactDetentIdentifier
       sheet.prefersGrabberVisible = true
       sheet.preferredCornerRadius = 28.0
-      sheet.largestUndimmedDetentIdentifier = .medium   // keep chat interactive behind at medium
+      // Keep the chat interactive behind the compact player.
+      sheet.largestUndimmedDetentIdentifier = NativeMusicPlayerModalView.compactDetentIdentifier
       sheet.delegate = modal
     }
 
@@ -1014,9 +1095,22 @@ final class NativeMusicPlayerRootOverlay {
     presenter.present(modal, animated: true)
   }
 
+  /// `tracks(forChatId:)` filters the whole library and sorts it with a locale-aware
+  /// comparator; `syncModalIfNeeded` runs on every playback tick. Memoised on the
+  /// store's revision so it only actually runs when the library changed.
+  private func storeChatTracks(forChatId chatId: String) -> [NativeMusicPlayerTrack] {
+    let key = "\(chatId)#\(NativeMusicPlayerStore.shared.revision)"
+    guard key != cachedStoreChatTracksKey else { return cachedStoreChatTracks }
+    cachedStoreChatTracksKey = key
+    cachedStoreChatTracks = NativeMusicPlayerStore.shared.tracks(forChatId: chatId)
+    return cachedStoreChatTracks
+  }
+
   private func syncModalIfNeeded() {
     guard let modal = modalController else { return }
 
+    // State mirrors reality, so this one stays on `activeSource` — only the controls
+    // fall back to `controlSource`.
     switch activeSource {
     case .music:
       let track = (lastMusicPayload["currentTrack"] as? [String: Any])
@@ -1037,7 +1131,7 @@ final class NativeMusicPlayerRootOverlay {
         queue.append(candidate)
       }
       if let chatId = track?.links["chat_id"] ?? track?.links["chatId"] {
-        for chatTrack in NativeMusicPlayerStore.shared.tracks(forChatId: chatId) {
+        for chatTrack in storeChatTracks(forChatId: chatId) {
           appendMusicTrack(chatTrack)
         }
         for chatTrack in ChatAudioQueueRegistry.shared.tracks(for: chatId) {
@@ -1047,13 +1141,10 @@ final class NativeMusicPlayerRootOverlay {
       for engineTrack in queuePayloads.compactMap(NativeMusicPlayerTrack.init) {
         appendMusicTrack(engineTrack)
       }
-      if let track {
-        appendMusicTrack(track)
-        if let idx = queue.firstIndex(where: { $0.trackId == track.trackId }), idx > 0 {
-          let item = queue.remove(at: idx)
-          queue.insert(item, at: 0)
-        }
-      }
+      // Append only — never hoist the playing track to the top. Re-sorting the list
+      // around whatever is playing means every Next press shuffles the rows under
+      // the reader's finger; the active row is already marked by accent + bars.
+      if let track { appendMusicTrack(track) }
       let library = libraryPayloads.compactMap(NativeMusicPlayerTrack.init)
       let isPlaying = (lastMusicPayload["isPlaying"] as? Bool) ?? false
       let progressMs =
@@ -1124,7 +1215,7 @@ final class NativeMusicPlayerRootOverlay {
         queue.append(chatTrack)
       }
       if let chatId = snapshot.chatId {
-        for chatTrack in NativeMusicPlayerStore.shared.tracks(forChatId: chatId) {
+        for chatTrack in storeChatTracks(forChatId: chatId) {
           appendTrack(chatTrack)
         }
         for chatTrack in ChatAudioQueueRegistry.shared.tracks(for: chatId) {
@@ -1134,14 +1225,9 @@ final class NativeMusicPlayerRootOverlay {
       for queued in VoiceBubblePlaybackCoordinator.shared.displayQueueTracks() {
         appendTrack(queued)
       }
-      if let track {
-        appendTrack(track)
-        // Ensure currently playing is first when it was newly appended at the end.
-        if let idx = queue.firstIndex(where: { $0.trackId == track.trackId }), idx > 0 {
-          let item = queue.remove(at: idx)
-          queue.insert(item, at: 0)
-        }
-      }
+      // Append only — see the music branch: hoisting the playing track re-sorts the
+      // whole list on every track change, which is the shift under the finger.
+      if let track { appendTrack(track) }
       let progressMs = max(0.0, snapshot.duration * Double(snapshot.progress) * 1000.0)
       let durationMs = max(0.0, snapshot.duration * 1000.0)
       modal.updateState(

@@ -1,18 +1,60 @@
 # Security & Privacy
 
-## Core Principles
+> **Current-status warning (verified 2026-08-02):** Much of the material below was
+> written as a target design and must not be treated as a description of the shipping
+> implementation, a completed audit, or a customer-facing security guarantee. The
+> production migration and its qualification gates are tracked in
+> `docs/production-timeline-core-refactor.md`.
 
-1. **End-to-End Encryption** — Messages encrypted on client, server never sees plaintext
-2. **Zero Knowledge** — Server cannot access or decrypt user data
+## Verified current implementation
+
+The following statements were verified against the current iOS implementation. They
+take precedence over the older target material below.
+
+- A one-to-one send with a resolved peer public key uses a fresh 256-bit AES key and
+  96-bit nonce with AES-GCM. The AES key is wrapped for the recipient (and, when
+  available, the sender) with RSA-OAEP-SHA-256.
+- **Groups and channels are not currently end-to-end encrypted.** The send path writes
+  the message JSON directly to the `encrypted_content` field when `isGroup` is true.
+- A one-to-one/agent path with no resolved peer public key also falls back to that
+  plaintext JSON behavior. Therefore “the server never sees plaintext” is not a valid
+  product-wide claim today.
+- The iOS SQLite history cache stores the normalized, decrypted row JSON in its
+  `payload` BLOB. That can include message text, captions, thumbnail data, media-key
+  metadata, and the original envelope. The cache is sandboxed by iOS but is not sealed
+  by an application-level at-rest key.
+- Existing encrypted media uses a whole-file AES-GCM envelope. Authentication is only
+  complete after the final tag is verified, so it must not be presented as authenticated
+  streaming decryption. A future chunked format must use a reviewed standard streaming
+  AEAD construction and retain decode compatibility with existing blobs.
+- Private-key operations remain platform-owned. No Rust/FFI core is currently an
+  authority for live encryption, persistence, or message rendering.
+
+Until the migration gates pass and an independent security review is complete:
+
+- describe E2E support per chat class, not as an app-wide guarantee;
+- do not claim zero knowledge, sealed local history, completed cryptographic audit,
+  screenshot prevention, or regulatory compliance solely from this document;
+- treat security telemetry as metadata-only and never log keys, plaintext, decrypted
+  media, notification bodies, or unredacted fixtures.
+
+## Target principles (not current guarantees)
+
+1. **End-to-End Encryption** — Target for every supported chat class; not yet achieved
+2. **Zero Knowledge** — Target after group E2E and sealed local persistence ship
 3. **Open Source** — All cryptography is auditable and verifiable
 4. **No Tracking** — Zero analytics, no telemetry, no user profiling
 5. **Privacy First** — Minimal data collection, maximum user control
 
 ---
 
-## Encryption
+## Legacy target design (not the current protocol)
 
 ### Message Encryption
+
+The TweetNaCl design in this subsection is historical/aspirational. It does not match
+the verified iOS hybrid RSA-OAEP-SHA-256 + AES-GCM path described above and must not be
+used to implement compatibility code.
 
 **Algorithm**: TweetNaCl Box (Public-Key Cryptography)
 - **Encryption**: XSalsa20

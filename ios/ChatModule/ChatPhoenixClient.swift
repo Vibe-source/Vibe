@@ -62,6 +62,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   private var heartbeatMissCount = 0
   private var nextRefValue: Int = 1
   private var isClosing = false
+  /// Compatibility retry for deployments whose edge does not forward custom headers
+  /// into Phoenix's upgrade connect_info. Header auth remains the normal/secure path;
+  /// only a measured HTTP 403 retries this same client once with Phoenix's legacy query
+  /// token, which the server intentionally retains for older mobile builds.
+  private var usesLegacyQueryAuthFallback = false
 
   init(
     baseURL: URL, params: [String: String], authToken: String? = nil,
@@ -80,6 +85,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     queue.async {
       self.cleanupLocked()
       guard let url = self.makeSocketURL() else {
+        VibeLog.error(
+          "invalid socket url",
+          category: "ws",
+          metadata: ["host": self.baseURL.host ?? "?"]
+        )
         self.callbacks.onError("invalid_socket_url")
         return
       }
@@ -90,11 +100,23 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
 
       var request = URLRequest(url: url)
       request.timeoutInterval = self.connectRequestTimeout
-      // Also send as Authorization header for any reverse-proxy / middleware
-      // that may inspect it (the primary auth is the ?token= query param).
+      // Phoenix only forwards x-* headers into UserSocket connect_info.
+      // Authorization is dropped; ?token= leaked credentials into proxies/logs.
+      // New clients authenticate solely via x-vibe-auth (server still accepts
+      // query token for older clients).
       if let token = self.authToken, !token.isEmpty {
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "x-vibe-auth")
       }
+      VibeLog.info(
+        "ws connecting",
+        category: "ws",
+        metadata: [
+          "host": url.host ?? "?",
+          "path": url.path,
+          "hasAuth": (self.authToken?.isEmpty == false) ? "true" : "false",
+          "authMode": self.usesLegacyQueryAuthFallback ? "legacy_query_retry" : "header",
+        ]
+      )
       let task = session.webSocketTask(with: request)
       // URLSessionWebSocketTask defaults maximumMessageSize to 1 MiB (1,048,576).
       // Agent-bridge session histories (especially Claude, with many tool events)
@@ -162,15 +184,16 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
       components.path = "/" + components.path + "/websocket"
     }
     var items = components.queryItems ?? []
+    // Never put login tokens on the WebSocket URL during the normal path. A single
+    // explicit HTTP-403 compatibility retry may opt in below for older deployments
+    // whose edge strips x-vibe-auth before Phoenix sees the upgrade.
+    items.removeAll { $0.name == "token" }
     for (key, value) in params where !key.isEmpty {
+      if key == "token" { continue }
       items.removeAll { $0.name == key }
       items.append(URLQueryItem(name: key, value: value))
     }
-    // Phoenix's UserSocket expects the auth token as a "token" query param.
-    // The Authorization header is NOT forwarded by Phoenix's :x_headers connect_info
-    // (only headers prefixed x- are forwarded), so we must pass via query param.
-    if let token = authToken, !token.isEmpty {
-      items.removeAll { $0.name == "token" }
+    if usesLegacyQueryAuthFallback, let token = authToken, !token.isEmpty {
       items.append(URLQueryItem(name: "token", value: token))
     }
     components.queryItems = items.isEmpty ? nil : items
@@ -199,11 +222,21 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
         let data = try? JSONSerialization.data(withJSONObject: frame),
         let text = String(data: data, encoding: .utf8)
       else {
+        VibeLog.error(
+          "ws serialize frame failed",
+          category: "ws",
+          metadata: ["event": event, "topic": topic]
+        )
         self.callbacks.onError("serialize_frame_failed:\(event)")
         return
       }
       task.send(.string(text)) { [weak self] error in
         if let error {
+          VibeLog.error(
+            "ws send failed",
+            category: "ws",
+            metadata: ["event": event, "error": error.localizedDescription]
+          )
           self?.callbacks.onError("send_failed:\(error.localizedDescription)")
         }
       }
@@ -215,14 +248,52 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
       guard let task = self.task else { return }
       task.receive { [weak self] result in
         guard let self else { return }
-        switch result {
-        case .success(let message):
-          self.handleMessage(message)
-          self.receiveNext()
-        case .failure(let error):
-          if self.isClosing { return }
-          self.callbacks.onError("receive_failed:\(error.localizedDescription)")
-          self.callbacks.onClose(-1, error.localizedDescription)
+        self.queue.async {
+          // URLSession may deliver completion from a task already replaced by a retry.
+          // A stale failure must never close/clean up the new socket.
+          guard self.task === task else { return }
+          switch result {
+          case .success(let message):
+            self.handleMessage(message)
+            self.receiveNext()
+          case .failure(let error):
+            if self.isClosing { return }
+            let response = task.response as? HTTPURLResponse
+            let statusCode = response?.statusCode ?? 0
+            VibeLog.error(
+              "ws receive failed",
+              category: "ws",
+              metadata: [
+                "host": self.baseURL.host ?? "?",
+                "path": task.originalRequest?.url?.path ?? self.baseURL.path,
+                "status": String(statusCode),
+                "upgrade": response?.value(forHTTPHeaderField: "Upgrade") ?? "",
+                "error": error.localizedDescription,
+              ]
+            )
+            // Production evidence: the authenticated HTTP API and LAN transport were
+            // healthy while the WebSocket upgrade alone returned 403. Retry this client
+            // exactly once through the server's documented legacy query-auth path. Do not
+            // notify the owner yet: that would discard this instance and lose the retry
+            // latch, causing an endless header-only reconnect loop and a false Connecting
+            // header. Invalid credentials still fail the fallback and surface normally.
+            if statusCode == 403,
+              !self.usesLegacyQueryAuthFallback,
+              self.authToken?.isEmpty == false
+            {
+              self.usesLegacyQueryAuthFallback = true
+              VibeLog.warning(
+                "ws header auth rejected; retrying compatibility auth",
+                category: "ws",
+                metadata: ["host": self.baseURL.host ?? "?", "status": "403"]
+              )
+              self.connect()
+              return
+            }
+            let diagnostic = statusCode > 0 ? "http_\(statusCode)" : "no_http_status"
+            self.callbacks.onError("receive_failed:\(diagnostic):\(error.localizedDescription)")
+            self.callbacks.onClose(-1, error.localizedDescription)
+          }
         }
       }
     }
@@ -332,6 +403,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     stopHeartbeatLocked()
     task?.cancel(with: .abnormalClosure, reason: nil)
     cleanupLocked()
+    VibeLog.warning(
+      "ws dead socket",
+      category: "ws",
+      metadata: ["reason": reason, "host": baseURL.host ?? "?"]
+    )
     callbacks.onError(reason)
     callbacks.onClose(4000, reason)
   }
@@ -348,6 +424,7 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     didOpenWithProtocol protocol: String?
   ) {
     queue.async {
+      guard self.task === webSocketTask else { return }
       self.startHeartbeatLocked()
       self.callbacks.onOpen()
     }
@@ -361,9 +438,19 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
   ) {
     let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) }
     queue.async {
+      guard self.task === webSocketTask else { return }
       self.stopHeartbeatLocked()
       self.cleanupLocked()
       if self.isClosing { return }
+      VibeLog.warning(
+        "ws closed",
+        category: "ws",
+        metadata: [
+          "code": String(closeCode.rawValue),
+          "reason": reasonText ?? "",
+          "host": self.baseURL.host ?? "?",
+        ]
+      )
       self.callbacks.onClose(Int(closeCode.rawValue), reasonText)
     }
   }
@@ -391,6 +478,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     // Evaluate the server trust first with standard validation.
     var error: CFError?
     guard SecTrustEvaluateWithError(serverTrust, &error) else {
+      VibeLog.error(
+        "ws tls trust failed",
+        category: "ws",
+        metadata: ["host": challenge.protectionSpace.host]
+      )
       completionHandler(.cancelAuthenticationChallenge, nil)
       return
     }
@@ -407,6 +499,11 @@ final class ChatPhoenixClient: NSObject, URLSessionWebSocketDelegate, URLSession
     }
 
     // No pin matched — reject.
+    VibeLog.error(
+      "ws tls pin rejected",
+      category: "ws",
+      metadata: ["host": challenge.protectionSpace.host]
+    )
     completionHandler(.cancelAuthenticationChallenge, nil)
   }
 

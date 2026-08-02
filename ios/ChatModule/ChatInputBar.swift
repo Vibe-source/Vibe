@@ -1188,7 +1188,13 @@ final class ChatInputBar: UIView {
 
   // Reply banner (inside the pill, above text row)
   private let replyBanner = UIView()
+  /// Hosts the draft chip's mark tile (was a 3pt Telegram-style colour rail).
   private let replyAccentBar = UIView()
+  private let replyMarkGradient = CAGradientLayer()
+  private let replyMarkMask = CAShapeLayer()
+  /// Accent resolved from the current appearance, kept so the chip can tint itself
+  /// without re-reading the theme on every layout pass.
+  private var replyChipAccent: UIColor = ChatListAppearance.brandAccentFallback
   private let replySenderLabel = UILabel()
   private let replyPreviewLabel = UILabel()
   private let replyDismissButton = UIButton(type: .system)
@@ -1420,7 +1426,7 @@ final class ChatInputBar: UIView {
     showReplyBanner(messageId: messageId, text: text.isEmpty ? "Add a description" : text, isMe: true)
     activeReplyToMessageId = nil
     activeEditMessageId = messageId
-    replySenderLabel.text = "Edit message"
+    replySenderLabel.text = "Editing"
     textView.text = text
     textViewDidChange(textView)
   }
@@ -1434,9 +1440,12 @@ final class ChatInputBar: UIView {
     activeForwardDraft = false
     activeEditMessageId = nil
     activeReplyToMessageId = messageId
-    replySenderLabel.text = isMe ? "You" : "Reply"
+    // The title line is the ACTION, in the accent — "You"/"Reply" mixed a person with a
+    // verb and read as a label on someone else's UI. Every mode now names its own state:
+    // Replying / Editing / Forwarding.
+    replySenderLabel.text = isMe ? "Replying to you" : "Replying"
     replyPreviewLabel.text = text
-    replyBanner.transform = .identity
+    prepareReplyChipEntrance()
     replyBannerAnimatingOut = false
     replyBannerVisible = true
     replyBanner.isHidden = false
@@ -1474,7 +1483,7 @@ final class ChatInputBar: UIView {
     activeForwardDraft = true
     replySenderLabel.text = title
     replyPreviewLabel.text = preview
-    replyBanner.transform = .identity
+    prepareReplyChipEntrance()
     replyBannerAnimatingOut = false
     replyBannerVisible = true
     replyBanner.isHidden = false
@@ -1526,10 +1535,14 @@ final class ChatInputBar: UIView {
       replyBanner.transform = .identity
       replyBanner.isHidden = false
       UIView.animate(
-        withDuration: 0.1, delay: 0,
-        options: [.curveEaseOut, .beginFromCurrentState]
+        withDuration: 0.14, delay: 0,
+        options: [.curveEaseIn, .beginFromCurrentState]
       ) {
+        // Sinks back into the pill it rose from — the chip belongs to the composer, so it
+        // leaves the way it arrived rather than blinking out.
         self.replyBanner.alpha = 0
+        self.replyBanner.transform = CGAffineTransform(translationX: 0, y: 8)
+          .scaledBy(x: 0.97, y: 0.97)
       }
       UIView.animate(
         withDuration: 0.18, delay: 0,
@@ -1682,12 +1695,11 @@ final class ChatInputBar: UIView {
     replyBannerVisible = true
     replyBanner.isHidden = false
     replyBanner.alpha = 1
-    replyBanner.transform = .identity
+    prepareReplyChipEntrance()
     replyBannerAnimatingOut = false
     replySenderLabel.text = title
     replyPreviewLabel.text = subtitle
-    replyAccentBar.backgroundColor =
-      appearance.bubbleMeGradient.last ?? ChatListAppearance.brandAccentFallback
+    replyAccentBar.backgroundColor = .clear
 
     let apply = {
       self.setNeedsLayout()
@@ -1732,21 +1744,48 @@ final class ChatInputBar: UIView {
     return nil
   }
 
+  /// The chip RISES out of the pill rather than appearing in place — the same vocabulary
+  /// as the send morph, where things travel between the composer and the list instead of
+  /// blinking. Self-contained so every entry point (reply, edit, forward, music draft)
+  /// gets it without threading the animation through their own layout springs.
+  private func prepareReplyChipEntrance() {
+    replyBanner.transform = CGAffineTransform(translationX: 0, y: 10)
+      .scaledBy(x: 0.97, y: 0.97)
+    UIView.animate(
+      withDuration: 0.3, delay: 0.0,
+      usingSpringWithDamping: 0.78, initialSpringVelocity: 0.6,
+      options: [.allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.replyBanner.transform = .identity
+    }
+  }
+
   private func layoutReplyBannerContents() {
     let b = replyBanner.bounds
     guard b.width > 0, b.height > 0 else { return }
-    let pad: CGFloat = 8
-    let accentW: CGFloat = 3
-    let dismissSize: CGFloat = 24
+    let pad: CGFloat = 9
+    let markSize: CGFloat = 22
+    let dismissSize: CGFloat = 26
 
-    replyAccentBar.frame = CGRect(x: pad, y: (b.height - 28) / 2, width: accentW, height: 28)
-    let textX = replyAccentBar.frame.maxX + 8
-    let textW = max(1, b.width - textX - dismissSize - pad)
-    replySenderLabel.frame = CGRect(x: textX, y: (b.height - 28) / 2, width: textW, height: 14)
+    replyAccentBar.frame = CGRect(
+      x: pad, y: (b.height - markSize) / 2, width: markSize, height: markSize)
+    // The tile carries the swipe gesture's silhouette at rest size — same shape, filled.
+    let markBounds = CGRect(origin: .zero, size: CGSize(width: markSize, height: markSize))
+    replyMarkGradient.frame = markBounds
+    replyMarkMask.frame = markBounds
+    replyMarkMask.path = ChatReplyMarkShape.path(
+      in: markBounds.insetBy(dx: 1.0, dy: 2.5), cornerRadius: 6.0
+    ).cgPath
+
+    let textX = replyAccentBar.frame.maxX + 9
+    let textW = max(1, b.width - textX - dismissSize - pad - 6)
+    let textBlockH: CGFloat = 29
+    let textTop = (b.height - textBlockH) / 2
+    replySenderLabel.frame = CGRect(x: textX, y: textTop, width: textW, height: 14)
     replyPreviewLabel.frame = CGRect(
       x: textX, y: replySenderLabel.frame.maxY + 1, width: textW, height: 14)
     replyDismissButton.frame = CGRect(
-      x: b.width - dismissSize - pad + 4,
+      x: b.width - dismissSize - pad,
       y: (b.height - dismissSize) / 2,
       width: dismissSize, height: dismissSize
     )
@@ -1914,19 +1953,35 @@ final class ChatInputBar: UIView {
     gifButton.addTarget(self, action: #selector(gifTapped), for: .touchUpInside)
     pillContainer.addSubview(gifButton)
 
-    // ── Reply banner (inside pill, above text row) ────────────────────
+    // ── Draft context chip (inside pill, above text row) ──────────────
+    // Telegram's version of this is a hairline colour rail + two lines of text, and every
+    // client that copied Telegram has one. Ours is a tinted PLATE carrying the same mini
+    // bubble silhouette the swipe gesture drew (`ChatReplyMarkShape`), so the mark you
+    // pulled off the message is visibly the thing now sitting over your keyboard. The
+    // title is tinted with the accent rather than white — the chip reads as a fragment of
+    // the message you are about to send, not as a system notice.
     replyBanner.clipsToBounds = true
     replyBanner.isHidden = true
     replyBanner.alpha = 0
+    replyBanner.layer.cornerRadius = 12
+    replyBanner.layer.cornerCurve = .continuous
+    replyBanner.layer.borderWidth = 0.5
     pillContainer.addSubview(replyBanner)
 
-    replyAccentBar.backgroundColor = ChatListAppearance.brandAccentFallback
-    replyAccentBar.layer.cornerRadius = 1.5
-    replyAccentBar.layer.cornerCurve = .continuous
+    // `replyAccentBar` is no longer a rail: it hosts the gradient-filled mark tile.
+    replyAccentBar.backgroundColor = .clear
+    replyMarkGradient.startPoint = CGPoint(x: 0.0, y: 0.0)
+    replyMarkGradient.endPoint = CGPoint(x: 1.0, y: 1.0)
+    replyMarkGradient.colors = [
+      ChatListAppearance.brandAccentFallback.cgColor,
+      ChatListAppearance.brandAccentFallback.cgColor,
+    ]
+    replyMarkGradient.mask = replyMarkMask
+    replyAccentBar.layer.addSublayer(replyMarkGradient)
     replyBanner.addSubview(replyAccentBar)
 
-    replySenderLabel.font = .systemFont(ofSize: 12, weight: .bold)
-    replySenderLabel.textColor = UIColor(white: 0.92, alpha: 1.0)
+    replySenderLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+    replySenderLabel.textColor = ChatListAppearance.brandAccentFallback
     replySenderLabel.lineBreakMode = .byTruncatingTail
     replyBanner.addSubview(replySenderLabel)
 
@@ -1935,9 +1990,14 @@ final class ChatInputBar: UIView {
     replyPreviewLabel.lineBreakMode = .byTruncatingTail
     replyBanner.addSubview(replyPreviewLabel)
 
-    let xCfg = UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+    // A 10pt glyph in a 24pt box was a dot to aim at. Same mark, given a real target and
+    // a soft disc so it reads as a button instead of a stray SVG.
+    let xCfg = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
     replyDismissButton.setImage(UIImage(systemName: "xmark", withConfiguration: xCfg), for: .normal)
-    replyDismissButton.tintColor = UIColor(white: 0.87, alpha: 0.5)
+    replyDismissButton.tintColor = UIColor(white: 0.87, alpha: 0.55)
+    replyDismissButton.layer.cornerRadius = 13
+    replyDismissButton.layer.cornerCurve = .continuous
+    replyDismissButton.backgroundColor = UIColor(white: 1.0, alpha: 0.07)
     replyDismissButton.addTarget(self, action: #selector(replyDismissTapped), for: .touchUpInside)
     replyBanner.addSubview(replyDismissButton)
 
@@ -2140,11 +2200,20 @@ final class ChatInputBar: UIView {
       micVADView.applyColor(a.textColorThem.withAlphaComponent(0.15))
     }
 
-    // Reply banner
-    replyAccentBar.backgroundColor = a.bubbleMeGradient.first ?? replyAccentBar.backgroundColor
-    replySenderLabel.textColor = a.textColorThem.withAlphaComponent(0.92)
-    replyPreviewLabel.textColor = a.textColorThem.withAlphaComponent(0.72)
-    replyDismissButton.tintColor = a.textColorThem.withAlphaComponent(0.5)
+    // Draft context chip — the mark tile wears the outgoing bubble's own gradient, and
+    // the plate is a wash of that same accent so the chip belongs to the message being
+    // composed rather than floating over it as chrome.
+    let chipAccent = a.bubbleMeGradient.first ?? ChatListAppearance.brandAccentFallback
+    replyChipAccent = chipAccent
+    replyMarkGradient.colors =
+      (a.bubbleMeGradient.count >= 2 ? a.bubbleMeGradient : [chipAccent, chipAccent])
+      .map(\.cgColor)
+    replyBanner.backgroundColor = chipAccent.withAlphaComponent(0.10)
+    replyBanner.layer.borderColor = chipAccent.withAlphaComponent(0.20).cgColor
+    replySenderLabel.textColor = chipAccent
+    replyPreviewLabel.textColor = a.textColorThem.withAlphaComponent(0.68)
+    replyDismissButton.tintColor = a.textColorThem.withAlphaComponent(0.55)
+    replyDismissButton.backgroundColor = a.textColorThem.withAlphaComponent(0.07)
     slideToCancelLabel.textColor = a.textColorThem.withAlphaComponent(0.78)
     slideChevronView.tintColor = a.textColorThem.withAlphaComponent(0.78)
     recordingTimerLabel.textColor = a.textColorThem.withAlphaComponent(0.95)
@@ -2534,15 +2603,59 @@ final class ChatInputBar: UIView {
   private func makeTextContentSnapshot() -> UIView? {
     let textBounds = textView.bounds
     guard textBounds.width > 1.0, textBounds.height > 1.0 else { return nil }
-    let previousTint = textView.tintColor
-    textView.tintColor = .clear
-    defer {
-      textView.tintColor = previousTint
-    }
-    guard let snapshot = textView.snapshotView(afterScreenUpdates: true) else {
-      return nil
-    }
-    return snapshot
+
+    // Never put another UITextView in the flight. Even a non-editable/non-selectable
+    // UITextView owns private marked-text and selection-decoration layers; on iOS 26
+    // those can survive in drawHierarchy as the dark rectangle seen behind the first
+    // one-word send. Build a plain label from the committed string instead. This makes
+    // it structurally impossible for caret/selection/marked-text chrome to enter the
+    // morph while preserving the composer's font, color, alignment, and TextKit insets.
+    let wrapper = UIView(frame: CGRect(origin: .zero, size: textBounds.size))
+    wrapper.backgroundColor = .clear
+    wrapper.isOpaque = false
+    wrapper.isUserInteractionEnabled = false
+    wrapper.clipsToBounds = true
+
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = textView.textAlignment
+    paragraph.lineBreakMode = textView.textContainer.lineBreakMode
+    paragraph.baseWritingDirection =
+      textView.effectiveUserInterfaceLayoutDirection == .rightToLeft
+      ? .rightToLeft : .leftToRight
+    let committedText = textView.text ?? ""
+    let cleanText = NSAttributedString(
+      string: committedText,
+      attributes: [
+        .font: textView.font ?? UIFont.systemFont(ofSize: 16),
+        .foregroundColor: textView.textColor ?? UIColor.label,
+        .paragraphStyle: paragraph,
+      ])
+    let label = UILabel()
+    label.backgroundColor = .clear
+    label.isOpaque = false
+    label.isUserInteractionEnabled = false
+    label.numberOfLines = textView.textContainer.maximumNumberOfLines
+    label.lineBreakMode = textView.textContainer.lineBreakMode
+    label.textAlignment = textView.textAlignment
+    label.semanticContentAttribute = textView.semanticContentAttribute
+    label.attributedText = cleanText
+
+    let insets = textView.textContainerInset
+    let fragmentPadding = textView.textContainer.lineFragmentPadding
+    let labelX = insets.left + fragmentPadding
+    let labelY = insets.top - textView.contentOffset.y
+    let labelWidth = max(
+      1.0,
+      textBounds.width - insets.left - insets.right - (fragmentPadding * 2.0))
+    let measured = label.sizeThatFits(
+      CGSize(width: labelWidth, height: CGFloat.greatestFiniteMagnitude))
+    label.frame = CGRect(
+      x: labelX,
+      y: labelY,
+      width: labelWidth,
+      height: max(measured.height, textView.font?.lineHeight ?? 20.0))
+    wrapper.addSubview(label)
+    return wrapper
   }
 
   private func makeBackgroundSnapshot(captureRect: CGRect) -> UIView? {

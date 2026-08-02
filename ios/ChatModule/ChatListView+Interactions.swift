@@ -1,98 +1,163 @@
 import AudioToolbox
 import ObjectiveC
 import UIKit
-import SwiftUI
 
 private let swipeReplyTrigger: CGFloat = 56.0
 private let swipeReplyMaxOffset: CGFloat = 80.0
 private let chatHoldDebugLogs = true
 private var chatRestrictSavingContentKey: UInt8 = 0
 
-/// Telegram-style circular reply indicator. Soft blur disc, thin outline arrow,
-/// no colour tint. It emerges from the right edge as the bubble slides, scaling
-/// and rotating in from the first pixel of the swipe. On the reply hit it fires a
-/// dedicated FX pass: a springy bounce, an expanding burst ring, and a glint
-/// shimmer that sweeps across the disc.
+/// Vibe's reply mark — NOT a frosted disc with an arrow in it (that is Telegram's, and
+/// every client that copied Telegram has one). The idea here is our own and it is a single
+/// sentence: **a reply is a fragment of your bubble reaching back to their message.**
+///
+/// So the mark is a miniature bubble in YOUR bubble's accent gradient, with the tail
+/// pointing left — back at the message being quoted. It is not stamped on screen; the pull
+/// DRAWS it: the outline strokes itself from the tail around as your finger travels, and at
+/// the trigger point the outline fills with the gradient and pops. Draw → fill → capture,
+/// which is the same "things travel and become other things" vocabulary as the send morph.
+/// Nothing rotates in, nothing shimmers, no SF Symbol.
+///
+/// The composer's reply chip wears the same silhouette (`ChatReplyMarkShape`), so the eye
+/// connects what you pulled with what landed above the keyboard.
+enum ChatReplyMarkShape {
+  /// A mini bubble whose bottom-LEFT corner is a tail, aimed back at the quoted message.
+  /// Inset so a stroke centred on the path never clips against the layer bounds.
+  static func path(in rect: CGRect, cornerRadius: CGFloat = 7.0) -> UIBezierPath {
+    let w = rect.width
+    let h = rect.height
+    let r = min(cornerRadius, min(w, h) * 0.5)
+    let tail: CGFloat = min(5.0, w * 0.22)
+    let path = UIBezierPath()
+    path.move(to: CGPoint(x: rect.minX + tail + r, y: rect.minY))
+    path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
+    path.addQuadCurve(
+      to: CGPoint(x: rect.maxX, y: rect.minY + r),
+      controlPoint: CGPoint(x: rect.maxX, y: rect.minY))
+    path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
+    path.addQuadCurve(
+      to: CGPoint(x: rect.maxX - r, y: rect.maxY),
+      controlPoint: CGPoint(x: rect.maxX, y: rect.maxY))
+    path.addLine(to: CGPoint(x: rect.minX + tail + r * 0.6, y: rect.maxY))
+    // The tail: a soft hook off the bottom-left, curving out and back — the same gesture
+    // as the message plate's tail, at a twelfth of the size.
+    path.addQuadCurve(
+      to: CGPoint(x: rect.minX, y: rect.maxY),
+      controlPoint: CGPoint(x: rect.minX + tail * 0.5, y: rect.maxY))
+    path.addQuadCurve(
+      to: CGPoint(x: rect.minX + tail, y: rect.maxY - r * 0.9),
+      controlPoint: CGPoint(x: rect.minX + tail * 0.85, y: rect.maxY - r * 0.35))
+    path.addLine(to: CGPoint(x: rect.minX + tail, y: rect.minY + r))
+    path.addQuadCurve(
+      to: CGPoint(x: rect.minX + tail + r, y: rect.minY),
+      controlPoint: CGPoint(x: rect.minX + tail, y: rect.minY))
+    path.close()
+    return path
+  }
+
+  /// Sentinels for the places that can only take an icon NAME (menu rows, toolbars).
+  /// Resolved to a drawn mark instead of an SF Symbol — `arrowshape.turn.up.left` is
+  /// Telegram's/Apple's reply glyph and reading it in our menu is what made the rest of
+  /// the refactor pointless.
+  static let replyGlyphName = "vibe.mark.reply"
+  static let forwardGlyphName = "vibe.mark.forward"
+
+  /// Template image of the mark, stroked to sit at the same visual weight as the regular
+  /// SF Symbols beside it. `mirrored` flips the tail to the right — the SAME silhouette
+  /// aimed away instead of back, which is exactly the difference between reply and
+  /// forward, so the pair is learnable from one shape.
+  static func glyphImage(
+    named name: String, side: CGFloat = 21.0, lineWidth: CGFloat = 1.6
+  ) -> UIImage? {
+    guard name == replyGlyphName || name == forwardGlyphName else { return nil }
+    let mirrored = name == forwardGlyphName
+    let size = CGSize(width: side, height: side)
+    let image = UIGraphicsImageRenderer(size: size).image { _ in
+      let rect = CGRect(origin: .zero, size: size)
+        .insetBy(dx: lineWidth, dy: side * 0.17)
+      let markPath = path(in: rect, cornerRadius: side * 0.3)
+      if mirrored {
+        markPath.apply(CGAffineTransform(translationX: size.width, y: 0.0).scaledBy(x: -1.0, y: 1.0))
+      }
+      markPath.lineWidth = lineWidth
+      markPath.lineJoinStyle = .round
+      UIColor.label.setStroke()
+      markPath.stroke()
+    }
+    return image.withRenderingMode(.alwaysTemplate)
+  }
+}
+
 final class ChatSwipeReplyIconView: UIView {
-  static let diameter: CGFloat = 28.0
-  private let blurView = UIVisualEffectView(effect: nil)
-  private let arrow = UIImageView()
+  static let diameter: CGFloat = 30.0
+  /// Stroked outline that draws itself as the finger travels.
+  private let outlineLayer = CAShapeLayer()
+  /// The same silhouette, gradient-filled — revealed only when the pull commits.
+  private let fillLayer = CAGradientLayer()
+  private let fillMask = CAShapeLayer()
+  /// Expanding ring on the hit; the one piece of the old FX worth keeping.
   private let ringLayer = CAShapeLayer()
-  private let shimmerHost = UIView()
-  private let shimmerLayer = CAGradientLayer()
   private(set) var didPop = false
 
   init() {
     super.init(frame: CGRect(x: 0, y: 0, width: Self.diameter, height: Self.diameter))
     isUserInteractionEnabled = false
 
-    blurView.frame = bounds
-    blurView.layer.cornerRadius = Self.diameter / 2.0
-    blurView.clipsToBounds = true
-    blurView.layer.borderWidth = 0.5
-    addSubview(blurView)
+    let markRect = bounds.insetBy(dx: 3.0, dy: 5.0)
+    let markPath = ChatReplyMarkShape.path(in: markRect)
 
-    // Burst-ring FX layer — invisible until the hit, then expands + fades.
     ringLayer.frame = bounds
     ringLayer.fillColor = UIColor.clear.cgColor
-    ringLayer.lineWidth = 1.5
-    ringLayer.path = UIBezierPath(ovalIn: bounds.insetBy(dx: 0.75, dy: 0.75)).cgPath
+    ringLayer.lineWidth = 1.4
+    ringLayer.path = ChatReplyMarkShape.path(in: markRect.insetBy(dx: -1.0, dy: -1.0)).cgPath
     ringLayer.opacity = 0.0
     layer.addSublayer(ringLayer)
 
-    // Thin outline arrow (not filled) for a lighter stroke at small size.
-    let cfg = UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)
-    arrow.image = UIImage(systemName: "arrowshape.turn.up.left", withConfiguration: cfg)
-    arrow.contentMode = .center
-    arrow.frame = bounds
-    addSubview(arrow)
+    fillLayer.frame = bounds
+    fillLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+    fillLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+    fillMask.path = markPath.cgPath
+    fillLayer.mask = fillMask
+    fillLayer.opacity = 0.0
+    layer.addSublayer(fillLayer)
 
-    // Glint-shimmer FX layer — a diagonal highlight clipped to the disc that
-    // sweeps across once on the hit. Hidden until then.
-    shimmerHost.frame = bounds
-    shimmerHost.layer.cornerRadius = Self.diameter / 2.0
-    shimmerHost.clipsToBounds = true
-    shimmerHost.isUserInteractionEnabled = false
-    shimmerHost.isHidden = true
-    addSubview(shimmerHost)
-
-    shimmerLayer.frame = CGRect(x: -Self.diameter, y: 0, width: Self.diameter, height: Self.diameter)
-    shimmerLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
-    shimmerLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
-    shimmerLayer.colors = [
-      UIColor.white.withAlphaComponent(0.0).cgColor,
-      UIColor.white.withAlphaComponent(0.75).cgColor,
-      UIColor.white.withAlphaComponent(0.0).cgColor,
-    ]
-    shimmerLayer.locations = [0.0, 0.5, 1.0]
-    shimmerHost.layer.addSublayer(shimmerLayer)
+    outlineLayer.frame = bounds
+    outlineLayer.path = markPath.cgPath
+    outlineLayer.fillColor = UIColor.clear.cgColor
+    outlineLayer.lineWidth = 1.6
+    outlineLayer.lineCap = .round
+    outlineLayer.lineJoin = .round
+    outlineLayer.strokeEnd = 0.0
+    layer.addSublayer(outlineLayer)
 
     alpha = 0.0
-    // Start from nothing so it visibly scales up as the swipe begins.
-    transform = CGAffineTransform(scaleX: 0.1, y: 0.1)
   }
 
   required init?(coder: NSCoder) { nil }
 
-  func applyTheme(isDark: Bool) {
-    // Soft, modern material — no colour tint, just a frosted disc.
-    blurView.effect = UIBlurEffect(
-      style: isDark ? .systemUltraThinMaterialDark : .systemUltraThinMaterialLight)
-    blurView.layer.borderColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: 0.12).cgColor
-    arrow.tintColor = isDark ? .white : UIColor(white: 0.12, alpha: 1.0)
-    ringLayer.strokeColor = UIColor(white: isDark ? 1.0 : 0.1, alpha: 0.9).cgColor
+  /// The mark wears the sender's OWN bubble gradient — the reply is going to become their
+  /// message, so it is already tinted like one before it exists.
+  func apply(appearance: ChatListAppearance) {
+    let gradient = appearance.bubbleMeGradient
+    let accent = gradient.first ?? ChatListAppearance.brandAccentFallback
+    fillLayer.colors = (gradient.count >= 2 ? gradient : [accent, accent]).map(\.cgColor)
+    outlineLayer.strokeColor = accent.withAlphaComponent(0.95).cgColor
+    ringLayer.strokeColor = accent.withAlphaComponent(0.9).cgColor
   }
 
   /// progress: 0 at rest, 1 at the trigger threshold (may exceed 1 past it).
   func apply(progress: CGFloat) {
     guard !didPop else { return }
     let p = max(0.0, min(1.0, progress))
-    // Fade in faster than it scales so it's visible from the first movement,
-    // while the scale keeps growing toward the threshold.
-    alpha = min(1.0, p * 1.7)
-    let angle = (1.0 - p) * (.pi / 5.0)  // rotate 36° -> 0° as it locks in
-    let scale = 0.2 + (0.8 * p)  // grows from tiny to full
-    transform = CGAffineTransform(rotationAngle: -angle).scaledBy(x: scale, y: scale)
+    // The stroke is the progress bar: the outline is literally incomplete until the pull
+    // is far enough to count, so the gesture teaches its own threshold.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    outlineLayer.strokeEnd = p
+    CATransaction.commit()
+    alpha = min(1.0, p * 2.0)
+    let scale = 0.72 + (0.28 * p)
+    transform = CGAffineTransform(scaleX: scale, y: scale)
   }
 
   func pop() {
@@ -100,39 +165,40 @@ final class ChatSwipeReplyIconView: UIView {
     didPop = true
     alpha = 1.0
 
-    // 1) Springy bounce — low damping for a lively overshoot.
+    // The outline completes and the silhouette floods with the bubble gradient — the
+    // quote has been captured.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    outlineLayer.strokeEnd = 1.0
+    CATransaction.commit()
+    let flood = CABasicAnimation(keyPath: "opacity")
+    flood.fromValue = 0.0
+    flood.toValue = 1.0
+    flood.duration = 0.18
+    flood.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    flood.fillMode = .forwards
+    flood.isRemovedOnCompletion = false
+    fillLayer.add(flood, forKey: "flood")
+    fillLayer.opacity = 1.0
+
     UIView.animate(
-      withDuration: 0.55, delay: 0.0, usingSpringWithDamping: 0.42,
+      withDuration: 0.5, delay: 0.0, usingSpringWithDamping: 0.46,
       initialSpringVelocity: 0.9, options: [.allowUserInteraction, .beginFromCurrentState],
-      animations: { self.transform = CGAffineTransform(scaleX: 1.18, y: 1.18) },
+      animations: { self.transform = CGAffineTransform(scaleX: 1.16, y: 1.16) },
       completion: nil)
 
-    // 2) Burst ring — expands beyond the disc and fades out.
     let ringScale = CABasicAnimation(keyPath: "transform.scale")
-    ringScale.fromValue = 0.85
-    ringScale.toValue = 2.0
+    ringScale.fromValue = 0.9
+    ringScale.toValue = 1.9
     let ringFade = CABasicAnimation(keyPath: "opacity")
-    ringFade.fromValue = 0.9
+    ringFade.fromValue = 0.85
     ringFade.toValue = 0.0
     let ringGroup = CAAnimationGroup()
     ringGroup.animations = [ringScale, ringFade]
-    ringGroup.duration = 0.45
+    ringGroup.duration = 0.42
     ringGroup.timingFunction = CAMediaTimingFunction(name: .easeOut)
     ringGroup.isRemovedOnCompletion = true
     ringLayer.add(ringGroup, forKey: "ringBurst")
-
-    // 3) Glint shimmer — a highlight sweeps diagonally across the disc once.
-    shimmerHost.isHidden = false
-    let sweep = CABasicAnimation(keyPath: "position.x")
-    sweep.fromValue = -Self.diameter / 2.0
-    sweep.toValue = Self.diameter * 1.5
-    sweep.duration = 0.5
-    sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-    sweep.isRemovedOnCompletion = true
-    shimmerLayer.add(sweep, forKey: "shimmerSweep")
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) { [weak self] in
-      self?.shimmerHost.isHidden = true
-    }
   }
 }
 
@@ -397,12 +463,12 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       cell.layer.shouldRasterize = true
     }
 
-    // Build the reply indicator that tracks the drag (Telegram-style). Add it
-    // INSIDE the collection view at index 0 — behind the cells but above the
-    // wallpaper — so the bubble slides over it to reveal it on the right edge
-    // (true "behind" effect) while still being guaranteed visible.
+    // Build the reply mark that tracks the drag. Add it INSIDE the collection view at
+    // index 0 — behind the cells but above the wallpaper — so the bubble slides over it
+    // to reveal it on the right edge (true "behind" effect) while still being guaranteed
+    // visible.
     let icon = ChatSwipeReplyIconView()
-    icon.applyTheme(isDark: resolvedAppearance().isDark)
+    icon.apply(appearance: resolvedAppearance())
     collectionView.insertSubview(icon, at: 0)
     swipeReplyIconView = icon
   }
@@ -557,9 +623,13 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     // bubbleSnapshotView already sets the snapshot's frame in window coordinates.
     // It captures at full scale to ensure tail bounding boxes remain mathematically identical.
     guard let bubbleSnapshot = cell.bubbleSnapshotView(in: window) else { return }
+    // Capture deletion material NOW, while the real cell is stable and visible.
+    // Waiting until context-menu dismissal with afterScreenUpdates=false returns
+    // the previous extracted/hidden render state even though the model is restored.
+    let deletionBubbleImage = cell.bubbleSnapshotImage(in: window)?.image
     let bubbleFrame = bubbleSnapshot.frame
     holdDebugLog(
-      "openContextMenu snapshot mid=\(messageId) bubbleFrame=\(NSCoder.string(for: bubbleFrame))"
+      "openContextMenu snapshot mid=\(messageId) bubbleFrame=\(NSCoder.string(for: bubbleFrame)) deletePixels=\(deletionBubbleImage == nil ? "N" : "Y")"
     )
 
     let hostWindow = resolveContextMenuHostWindow(appWindow: window)
@@ -572,6 +642,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     let overlay = ChatContextMenuOverlay(
       messageId: messageId,
       bubbleSnapshot: bubbleSnapshot,
+      deletionBubbleImage: deletionBubbleImage,
       bubbleFrame: bubbleFrameInHost,
       bubbleIsMe: isMe,
       appearance: self.resolvedAppearance(),
@@ -773,11 +844,53 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     }
 
     if actionId == "delete" {
-      if let row = rows.first(where: { $0.messageId == mid }),
-         let hostCell = self.contextMenuHostCell as? ChatListCell {
-         self.showDeleteDialog(for: mid, row: row, cell: hostCell)
+      guard let row = rows.first(where: { $0.messageId == mid }) else {
+        NSLog("[DeleteTrace] menu drill-in missing row mid=%@", mid)
+        overlay.animateOut(reason: "delete-missing-row", completion: nil)
+        return
       }
-      overlay.animateOut(reason: "action:\(actionId)", completion: nil)
+      let deleteConfig = contextDeleteConfiguration(for: row)
+      NSLog(
+        "[DeleteTrace] menu drill-in chat=%@ mid=%@ isMe=%@ everyone=%@",
+        deleteConfig.chatId,
+        mid,
+        row.isMe ? "Y" : "N",
+        deleteConfig.deleteForEveryoneTitle == nil ? "N" : "Y"
+      )
+      overlay.presentDeleteConfirmation(
+        deleteForEveryoneTitle: deleteConfig.deleteForEveryoneTitle)
+      return
+    }
+
+    if actionId == "deleteForMe" || actionId == "deleteForEveryone" {
+      guard let row = rows.first(where: { $0.messageId == mid }) else {
+        NSLog("[DeleteTrace] confirmation missing row mid=%@ action=%@", mid, actionId)
+        overlay.animateOut(reason: "delete-missing-row", completion: nil)
+        return
+      }
+      let deleteConfig = contextDeleteConfiguration(for: row)
+      let requestedEveryone = actionId == "deleteForEveryone"
+      let deleteForEveryone =
+        requestedEveryone && deleteConfig.deleteForEveryoneTitle != nil
+      let capturedCell = contextMenuHostCell as? ChatListCell
+      let deletionMaterial = overlay.deletionBubbleCapture(in: self)
+      NSLog(
+        "[DeleteTrace] material handoff mid=%@ preExtract=%@ frame=%@",
+        mid,
+        deletionMaterial == nil ? "N" : "Y",
+        deletionMaterial.map { NSCoder.string(for: $0.frame) } ?? "-"
+      )
+      overlay.animateOut(reason: "delete-confirmed") { [weak self, weak capturedCell] in
+        guard let self else { return }
+        self.executeMessageDeletion(
+          messageId: mid,
+          row: row,
+          cell: capturedCell,
+          deletionMaterial: deletionMaterial,
+          chatId: deleteConfig.chatId,
+          deleteForEveryone: deleteForEveryone
+        )
+      }
       return
     }
 
@@ -843,221 +956,363 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   }
 }
 
-// MARK: - Message Deletion Dialog & Wipe Overlay
+// MARK: - Message deletion / exact-pixel disintegration
 
-private var deleteDialogControllerKey: UInt8 = 0
+private struct ChatBubbleFragmentCapture {
+  let image: UIImage
+  let frame: CGRect
+  let isMe: Bool
+  let messageId: String
+}
 
 extension ChatListView {
-  private var deleteDialogController: UIViewController? {
-    get { objc_getAssociatedObject(self, &deleteDialogControllerKey) as? UIViewController }
-    set { objc_setAssociatedObject(self, &deleteDialogControllerKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-  }
-
-  fileprivate func showDeleteDialog(for messageId: String, row: ChatListRow, cell: ChatListCell) {
-    let dialogView = ChatMessageDeleteDialogView(
-      isDark: self.resolvedAppearance().isDark,
-      deleteForMe: { [weak self] in
-        self?.executeMessageDeletion(messageId: messageId, row: row, cell: cell, deleteForEveryone: false)
-      },
-      deleteForEveryone: { [weak self] in
-        self?.executeMessageDeletion(messageId: messageId, row: row, cell: cell, deleteForEveryone: true)
-      },
-      cancel: { [weak self] in
-        self?.dismissDeleteDialog()
-      }
-    )
-    let hostingController = UIHostingController(rootView: dialogView)
-    hostingController.view.backgroundColor = .clear
-    hostingController.view.frame = self.bounds
-    hostingController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    
-    self.addSubview(hostingController.view)
-    self.deleteDialogController = hostingController
-  }
-
-  private func dismissDeleteDialog() {
-    self.deleteDialogController?.view.removeFromSuperview()
-    self.deleteDialogController = nil
-  }
-
-  private func executeMessageDeletion(messageId: String, row: ChatListRow, cell: ChatListCell, deleteForEveryone: Bool) {
-    dismissDeleteDialog()
-
-    // 1. Show the wipe overlay
-    if let snapshot = cell.bubbleSnapshotView(in: self) {
-       let overlay = ChatMessageDeletionWipeOverlayView(frame: self.bounds, snapshot: snapshot, isDark: self.resolvedAppearance().isDark)
-       self.addSubview(overlay)
-       overlay.animateAndRemove()
-       
-       // Hide the actual cell content so it doesn't show behind the wipe
-       cell.isHidden = true
-       DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-           cell.isHidden = false
-       }
+  private func executeMessageDeletion(
+    messageId: String,
+    row: ChatListRow,
+    cell: ChatListCell?,
+    deletionMaterial: (image: UIImage, frame: CGRect)?,
+    chatId: String,
+    deleteForEveryone: Bool
+  ) {
+    let normalizedChatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedChatId.isEmpty else {
+      NSLog("[DeleteTrace] UI reject invalid chat mid=%@", messageId)
+      onNativeEvent(["type": "agentToast", "message": "Couldn't identify this chat."])
+      return
     }
 
-    // 2. Perform deletion natively via ChatEngine
-    let chatId = row.chatId ?? ""
-    ChatEngine.shared.deleteMessage([
-      "chatId": chatId,
-      "messageId": messageId,
-      "skipRemoteDelete": !deleteForEveryone
-    ])
-  }
-}
-
-private struct ChatMessageDeleteDialogView: View {
-  let isDark: Bool
-  let deleteForMe: () -> Void
-  let deleteForEveryone: () -> Void
-  let cancel: () -> Void
-
-  var body: some View {
-    ZStack {
-      Color.black.opacity(0.3)
-        .ignoresSafeArea()
-        .onTapGesture { cancel() }
-      
-      VStack(spacing: 0) {
-        Text("Delete Message")
-          .font(.headline)
-          .foregroundColor(isDark ? .white : .black)
-          .padding(.top, 20)
-          .padding(.bottom, 12)
-        
-        Button(role: .destructive, action: deleteForEveryone) {
-          Text("Delete for everyone")
-            .foregroundColor(.red)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-        }
-        Divider()
-        Button(role: .destructive, action: deleteForMe) {
-          Text("Delete for me")
-            .foregroundColor(.red)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-        }
-        Divider()
-        Button(role: .cancel, action: cancel) {
-          Text("Cancel")
-            .foregroundColor(isDark ? .white : .black)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-        }
-      }
-      .background(ChatGlassEffectView(cornerRadius: 24))
-      .padding(40)
+    let renderedMaterial = deletionMaterial ?? cell?.bubbleSnapshotImage(in: self)
+    let capture = renderedMaterial.map {
+      ChatBubbleFragmentCapture(
+        image: $0.image,
+        frame: $0.frame,
+        isMe: row.isMe,
+        messageId: messageId
+      )
     }
-  }
-}
 
-private struct ChatGlassEffectView: UIViewRepresentable {
-  let cornerRadius: CGFloat
-  func makeUIView(context: Context) -> UIVisualEffectView {
-    let view = UIVisualEffectView(effect: nil)
-    if #available(iOS 26.0, *) {
-      let glass = UIGlassEffect()
-      glass.isInteractive = true
-      view.effect = glass
-      view.contentView.backgroundColor = .clear
+    var activeFragments: ChatBubbleFragmentDisintegrationView?
+    if let capture {
+      let fragments = ChatBubbleFragmentDisintegrationView(
+        frame: bounds,
+        captures: [capture],
+        perCaptureBudget: deletionFragmentBudget(for: row)
+      )
+      fragments.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      addSubview(fragments)
+      bringSubviewToFront(fragments)
+      cell?.contentView.alpha = 0
+      fragments.animateAndRemove()
+      activeFragments = fragments
+      NSLog(
+        "[DeleteTrace] fragments start mid=%@ count=%d flow=%@ frame=%@",
+        messageId,
+        fragments.fragmentCount,
+        row.isMe ? "upper-left-inward" : "upper-right-inward",
+        NSCoder.string(for: capture.frame)
+      )
     } else {
-      view.effect = UIBlurEffect(style: .systemThinMaterial)
+      NSLog("[DeleteTrace] fragments skipped mid=%@ reason=no-visible-capture", messageId)
     }
-    view.layer.cornerRadius = cornerRadius
-    view.layer.cornerCurve = .continuous
-    view.clipsToBounds = true
-    return view
+
+    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+
+    // 120 ms visual lead before engine deletion triggers collection reflow
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+      [weak self, weak cell, weak activeFragments] in
+      let result = ChatEngine.shared.deleteMessage([
+        "chatId": normalizedChatId,
+        "messageId": messageId,
+        "forEveryone": deleteForEveryone,
+      ])
+      let accepted = (result["accepted"] as? Bool) == true
+      NSLog(
+        "[DeleteTrace] UI result chat=%@ mid=%@ scope=%@ accepted=%@ capture=%@ reason=%@",
+        normalizedChatId,
+        messageId,
+        deleteForEveryone ? "everyone" : "me",
+        accepted ? "Y" : "N",
+        capture == nil ? "N" : "Y",
+        String(describing: result["reason"] ?? "-")
+      )
+
+      guard accepted else {
+        // Restore hidden cell and clean up fragments on deletion failure
+        cell?.contentView.alpha = 1
+        activeFragments?.removeFromSuperview()
+
+        let reason = String(describing: result["reason"] ?? "")
+        let message: String
+        switch reason {
+        case "no_native_socket", "chat_not_joined":
+          message = "Chat is reconnecting. Try again in a moment."
+        case "delete_disabled_in_blackout":
+          message = "Deletion is unavailable in relay-only mode."
+        case "invalid_payload":
+          message = "Couldn't identify this message."
+        case "saved_messages_not_ready":
+          message = "Saved Messages is still preparing. Try again in a moment."
+        default:
+          message = "Couldn't delete this message right now."
+        }
+        self?.onNativeEvent([
+          "type": "agentToast",
+          "message": message,
+        ])
+        return
+      }
+    }
+
+    // Reuse already restores alpha. This is only a safety valve for a rejected or
+    // malformed delta so a still-mounted cell can never remain permanently hidden.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { [weak self, weak cell] in
+      guard let self, let cell,
+        cell.row?.messageId == messageId,
+        self.rows.contains(where: { $0.messageId == messageId })
+      else { return }
+      cell.contentView.alpha = 1
+      NSLog("[DeleteTrace] visibility safety restore mid=%@", messageId)
+    }
   }
-  func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
+
+  private func deletionFragmentBudget(for row: ChatListRow) -> Int {
+    switch row.visualKind {
+    case .media:
+      // Photographic cells need more samples than text; otherwise each source
+      // tile remains visibly square even after the early sparkle collapse.
+      return 1_600
+    case .video, .videoNote:
+      return 1_350
+    case .sticker:
+      return 1_150
+    case .text, .voice, .document:
+      return 900
+    }
+  }
+
+  /// Clear Chat uses the same material transformation for every visible bubble.
+  /// The engine/history clear begins once the exact-pixel fragments have replaced
+  /// the cells, while the pieces continue flying independently above the list.
+  func animateClearChatDisintegration(completion: @escaping () -> Void) {
+    let visibleCells =
+      collectionView.visibleCells
+      .compactMap { $0 as? ChatListCell }
+      .sorted { $0.frame.minY < $1.frame.minY }
+    let captures: [ChatBubbleFragmentCapture] = visibleCells.compactMap { cell in
+      guard let row = cell.row,
+        let messageId = row.messageId,
+        let rendered = cell.bubbleSnapshotImage(in: self)
+      else { return nil }
+      return ChatBubbleFragmentCapture(
+        image: rendered.image,
+        frame: rendered.frame,
+        isMe: row.isMe,
+        messageId: messageId
+      )
+    }
+    guard !captures.isEmpty else {
+      NSLog("[DeleteTrace] clear fragments skipped visible=0")
+      completion()
+      return
+    }
+
+    let perCaptureBudget = max(180, min(520, 2_400 / max(captures.count, 1)))
+    let fragments = ChatBubbleFragmentDisintegrationView(
+      frame: bounds,
+      captures: captures,
+      perCaptureBudget: perCaptureBudget
+    )
+    fragments.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    addSubview(fragments)
+    bringSubviewToFront(fragments)
+    for cell in visibleCells { cell.contentView.alpha = 0 }
+    fragments.animateAndRemove()
+    NSLog(
+      "[DeleteTrace] clear fragments start bubbles=%d fragments=%d",
+      captures.count,
+      fragments.fragmentCount
+    )
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: completion)
+  }
 }
 
-private final class ChatMessageDeletionWipeOverlayView: UIView {
-  private let snapshotContainer = UIView()
-  private let emitter = CAEmitterLayer()
+private final class ChatBubbleFragmentDisintegrationView: UIView {
+  private var fragmentLayers: [CALayer] = []
+  private var captureIndexByLayer: [ObjectIdentifier: Int] = [:]
+  private let captures: [ChatBubbleFragmentCapture]
+  private(set) var fragmentCount = 0
 
-  init(frame: CGRect, snapshot: UIView, isDark: Bool) {
+  init(
+    frame: CGRect,
+    captures: [ChatBubbleFragmentCapture],
+    perCaptureBudget: Int
+  ) {
+    self.captures = captures
     super.init(frame: frame)
     isUserInteractionEnabled = false
     clipsToBounds = false
 
-    snapshotContainer.frame = snapshot.frame
-    addSubview(snapshotContainer)
-
-    snapshot.frame = snapshotContainer.bounds
-    snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    snapshotContainer.addSubview(snapshot)
-
-    emitter.emitterPosition = CGPoint(x: snapshotContainer.bounds.width, y: snapshotContainer.bounds.midY)
-    emitter.emitterSize = CGSize(width: 1, height: snapshotContainer.bounds.height)
-    emitter.emitterShape = .line
-
-    let cell = CAEmitterCell()
-    cell.contents = createParticleImage(isDark: isDark)?.cgImage
-    cell.birthRate = 6000
-    cell.lifetime = 0.55
-    cell.velocity = 500
-    cell.velocityRange = 250
-    cell.emissionLongitude = .pi // Point left
-    cell.emissionRange = .pi / 6 // Slight spread
-    cell.scale = 0.2
-    cell.scaleRange = 0.1
-    cell.scaleSpeed = -0.3
-    cell.alphaSpeed = -1.5
-    cell.yAcceleration = -400 // Go to top
-
-    emitter.emitterCells = [cell]
-    snapshotContainer.layer.addSublayer(emitter)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    for (captureIndex, capture) in captures.enumerated() {
+      installFragments(
+        for: capture,
+        captureIndex: captureIndex,
+        budget: max(perCaptureBudget, 36)
+      )
+    }
+    CATransaction.commit()
   }
 
   required init?(coder: NSCoder) { fatalError() }
 
+  private func installFragments(
+    for capture: ChatBubbleFragmentCapture,
+    captureIndex: Int,
+    budget: Int
+  ) {
+    guard let cgImage = capture.image.cgImage else { return }
+    let width = max(capture.frame.width, 1)
+    let height = max(capture.frame.height, 1)
+    let area = width * height
+    // Preserve the source image for the first frame, but sample it densely enough
+    // that detailed media does not turn into a few large white rectangles.
+    let desired = max(128, min(budget, Int(area / 6.5)))
+    let tileSide = max(1.5, sqrt(area / CGFloat(desired)))
+    let columns = max(1, Int(ceil(width / tileSide)))
+    let rows = max(1, Int(ceil(height / tileSide)))
+
+    for row in 0..<rows {
+      for column in 0..<columns {
+        let localX = CGFloat(column) * tileSide
+        let localY = CGFloat(row) * tileSide
+        let tileWidth = min(tileSide, width - localX)
+        let tileHeight = min(tileSide, height - localY)
+        guard tileWidth > 0.25, tileHeight > 0.25 else { continue }
+
+        let fragment = CALayer()
+        fragment.contents = cgImage
+        fragment.contentsScale = capture.image.scale
+        fragment.contentsGravity = .resize
+        fragment.magnificationFilter = .nearest
+        fragment.minificationFilter = .nearest
+        fragment.allowsEdgeAntialiasing = false
+        fragment.contentsRect = CGRect(
+          x: localX / width,
+          y: localY / height,
+          width: tileWidth / width,
+          height: tileHeight / height
+        )
+        fragment.frame = CGRect(
+          x: capture.frame.minX + localX,
+          y: capture.frame.minY + localY,
+          width: tileWidth,
+          height: tileHeight
+        )
+        layer.addSublayer(fragment)
+        fragmentLayers.append(fragment)
+        captureIndexByLayer[ObjectIdentifier(fragment)] = captureIndex
+      }
+    }
+    fragmentCount = fragmentLayers.count
+  }
+
   func animateAndRemove() {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-      self.emitter.birthRate = 0
+    let now = CACurrentMediaTime()
+    for (index, fragment) in fragmentLayers.enumerated() {
+      let captureIndex =
+        captureIndexByLayer[ObjectIdentifier(fragment)] ?? 0
+      let capture = captures[min(captureIndex, captures.count - 1)]
+      // Inward trajectory: outgoing (isMe) moves left (-1), incoming (!isMe) moves right (+1).
+      let direction: CGFloat = capture.isMe ? -1 : 1
+      let normalizedSideProgress: CGFloat
+      if capture.frame.width > 0 {
+        let localX = fragment.position.x - capture.frame.minX
+        normalizedSideProgress =
+          capture.isMe
+          ? max(0, min(1, (capture.frame.width - localX) / capture.frame.width))
+          : max(0, min(1, localX / capture.frame.width))
+      } else {
+        normalizedSideProgress = 0
+      }
+      let jitterA = Self.noise(index &* 17 &+ captureIndex &* 131)
+      let jitterB = Self.noise(index &* 29 &+ captureIndex &* 197)
+      let jitterC = Self.noise(index &* 43 &+ captureIndex &* 251)
+      let delay = TimeInterval((normalizedSideProgress * 0.022) + (jitterA * 0.012))
+      let duration = 0.58 + TimeInterval(jitterB * 0.16)
+      let start = fragment.position
+      let horizontal = direction * (46 + (jitterB * 92))
+      let vertical = -(34 + (jitterC * 94))
+      let end = CGPoint(x: start.x + horizontal, y: start.y + vertical)
+      let curl = (jitterA - 0.5) * 42
+      let control1 = CGPoint(
+        x: start.x + horizontal * 0.28,
+        y: start.y + vertical * 0.18 + curl * 0.18
+      )
+      let control2 = CGPoint(
+        x: start.x + horizontal * 0.74 - direction * curl * 0.12,
+        y: start.y + vertical * 0.66
+      )
+
+      let position = CAKeyframeAnimation(keyPath: "position")
+      let path = CGMutablePath()
+      path.move(to: start)
+      path.addCurve(to: end, control1: control1, control2: control2)
+      position.path = path
+      position.timingFunction = CAMediaTimingFunction(name: .easeOut)
+
+      let opacity = CAKeyframeAnimation(keyPath: "opacity")
+      opacity.values = [1, 0.96, 0.66, 0]
+      opacity.keyTimes = [0, 0.10, 0.68, 1]
+
+      // Use area/height, not width alone: a wide one-line text bubble is still small
+      // material, while a tall voice/media card needs particles that remain readable.
+      let captureAreaRoot = sqrt(max(capture.frame.width * capture.frame.height, 1.0))
+      let heightFactor = max(0.0, min(1.0, (capture.frame.height - 40.0) / 180.0))
+      let areaFactor = max(0.0, min(1.0, (captureAreaRoot - 70.0) / 300.0))
+      let materialSizeFactor = max(heightFactor, areaFactor)
+      let baseSparkleSide = 0.85 + (materialSizeFactor * 2.65) + (jitterC * 0.55)
+      let sourceSide = max(max(fragment.bounds.width, fragment.bounds.height), 1.0)
+      let adaptiveSparkleScale = min(0.85, max(0.20, baseSparkleSide / sourceSide))
+
+      // Monotonic scale reduction: starts at 1.0, retains source scale/material past 50ms,
+      // transitions smoothly to adaptiveSparkleScale, and fades to 0 without rebound.
+      let scaleMid = 1.0 - (1.0 - adaptiveSparkleScale) * 0.22
+      let scaleLate = adaptiveSparkleScale
+      let scaleEnd: CGFloat = 0.0
+
+      let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+      scale.values = [1.0, scaleMid, scaleLate, scaleEnd]
+      scale.keyTimes = [0.0, 0.28, 0.72, 1.0]
+      scale.timingFunctions = [
+        CAMediaTimingFunction(name: .easeOut),
+        CAMediaTimingFunction(name: .easeInEaseOut),
+        CAMediaTimingFunction(name: .easeIn),
+      ]
+
+      let rotation = CABasicAnimation(keyPath: "transform.rotation")
+      rotation.fromValue = 0
+      rotation.toValue = direction * (.pi * 0.18 + (jitterA - 0.5) * 2.6)
+
+      let group = CAAnimationGroup()
+      group.animations = [position, opacity, scale, rotation]
+      group.beginTime = fragment.convertTime(now, from: nil) + delay
+      group.duration = duration
+      group.fillMode = .forwards
+      group.isRemovedOnCompletion = false
+      fragment.add(group, forKey: "delete-disintegrate")
     }
 
-    let maskLayer = CAGradientLayer()
-    maskLayer.colors = [UIColor.black.cgColor, UIColor.clear.cgColor]
-    maskLayer.locations = [0.0, 0.05]
-    maskLayer.startPoint = CGPoint(x: 1.0, y: 0.5) // Start right
-    maskLayer.endPoint = CGPoint(x: 0.0, y: 0.5)   // End left
-    maskLayer.frame = snapshotContainer.bounds
-    snapshotContainer.layer.mask = maskLayer
-
-    let duration: TimeInterval = 0.55
-
-    let maskAnimation = CABasicAnimation(keyPath: "locations")
-    maskAnimation.fromValue = [-0.1, 0.0]
-    maskAnimation.toValue = [1.0, 1.1]
-    maskAnimation.duration = duration * 0.8
-    maskAnimation.fillMode = .forwards
-    maskAnimation.isRemovedOnCompletion = false
-    maskLayer.add(maskAnimation, forKey: "maskWipe")
-
-    let moveEmitterAnimation = CABasicAnimation(keyPath: "emitterPosition.x")
-    moveEmitterAnimation.fromValue = snapshotContainer.bounds.width
-    moveEmitterAnimation.toValue = 0
-    moveEmitterAnimation.duration = duration * 0.8
-    moveEmitterAnimation.fillMode = .forwards
-    moveEmitterAnimation.isRemovedOnCompletion = false
-    emitter.add(moveEmitterAnimation, forKey: "moveEmitter")
-
-    UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut, animations: {
-      // Dissolves perfectly in place, no transform
-    }) { _ in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.92) { [weak self] in
+      guard let self else { return }
+      NSLog("[DeleteTrace] fragments complete count=%d", self.fragmentCount)
       self.removeFromSuperview()
     }
   }
 
-  private func createParticleImage(isDark: Bool) -> UIImage? {
-    let size = CGSize(width: 1, height: 4)
-    UIGraphicsBeginImageContextWithOptions(size, false, 0)
-    guard let context = UIGraphicsGetCurrentContext() else { return nil }
-    context.setFillColor(isDark ? UIColor.white.withAlphaComponent(0.9).cgColor : UIColor.black.withAlphaComponent(0.9).cgColor)
-    context.fill(CGRect(origin: .zero, size: size))
-    let image = UIGraphicsGetImageFromCurrentImageContext()
-    UIGraphicsEndImageContext()
-    return image
+  private static func noise(_ seed: Int) -> CGFloat {
+    let value = sin(Double(seed &* 7_919 &+ 104_729)) * 43_758.545_312_3
+    return CGFloat(value - floor(value))
   }
 }

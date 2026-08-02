@@ -3,6 +3,11 @@ import UIKit
 private let chatNativeAgentBoldRegex = try! NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*")
 private let chatNativeAgentMarkdownLinkRegex = try! NSRegularExpression(pattern: "\\[([^\\]]+)\\]\\((https?://[^)]+)\\)")
 private let chatNativeAgentInlineCodeRegex = try! NSRegularExpression(pattern: "`([^`]+)`")
+/// Bare `@username` mentions (person/agent handles). Length matches server
+/// `validate_username_string` (3…30, `[a-z0-9_]`). Lookbehind skips emails (`a@b.com`).
+private let chatNativeAgentMentionRegex = try! NSRegularExpression(
+  pattern: #"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{3,30})\b"#
+)
 
 protocol ChatNativeStreamingTextLabelDelegate: AnyObject {
   func streamingTextLabel(_ label: ChatNativeStreamingTextLabel, didTap url: URL)
@@ -56,25 +61,38 @@ enum ChatNativeAgentTextRenderer {
     lineHeight: CGFloat? = nil
   ) -> NSAttributedString {
     let isRtl = isRTL(text)
-    let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.alignment = isRtl ? .right : .natural
-    paragraphStyle.baseWritingDirection = isRtl ? .rightToLeft : .leftToRight
-    paragraphStyle.lineBreakMode = .byWordWrapping
-    if let lineHeight {
-      paragraphStyle.minimumLineHeight = lineHeight
-      paragraphStyle.maximumLineHeight = lineHeight
-    }
+    // Prefer lineSpacing over min/max lineHeight locks — fixed line boxes make long
+    // agent answers look cramped and uneven next to headings/lists. Default to a
+    // WhatsApp-like ~1.35× body line when callers omit an explicit target.
+    let resolvedLineHeight = lineHeight ?? max(font.lineHeight + 4.0, font.pointSize * 1.35)
+    let lineSpacing = max(0.0, resolvedLineHeight - font.lineHeight)
+    return applyLineMarkdown(
+      text,
+      font: font,
+      textColor: textColor,
+      isRtl: isRtl,
+      lineSpacing: lineSpacing
+    )
+  }
 
-    var baseAttrs: [NSAttributedString.Key: Any] = [
-      .font: font,
-      .foregroundColor: textColor,
-      .paragraphStyle: paragraphStyle,
-    ]
-    if let lineHeight {
-      baseAttrs[.baselineOffset] = (lineHeight - font.lineHeight) * 0.25
-    }
-
-    return applyLineMarkdown(text, baseAttrs: baseAttrs, font: font, textColor: textColor)
+  /// Shared paragraph style for one rendered line/paragraph. `spacingBefore` separates
+  /// sections; `firstLineHeadIndent`/`headIndent` hang list markers and nested levels.
+  private static func makeParagraphStyle(
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat,
+    firstLineHeadIndent: CGFloat = 0.0,
+    headIndent: CGFloat = 0.0
+  ) -> NSMutableParagraphStyle {
+    let style = NSMutableParagraphStyle()
+    style.alignment = isRtl ? .right : .natural
+    style.baseWritingDirection = isRtl ? .rightToLeft : .leftToRight
+    style.lineBreakMode = .byWordWrapping
+    style.lineSpacing = lineSpacing
+    style.paragraphSpacingBefore = spacingBefore
+    style.firstLineHeadIndent = firstLineHeadIndent
+    style.headIndent = headIndent
+    return style
   }
 
   // MARK: - Block parsing
@@ -206,37 +224,115 @@ enum ChatNativeAgentTextRenderer {
 
   // MARK: - Line-level markdown
 
-  // MARK: - Line-level helpers
-
-  /// Processes a normal-text block line by line, handling headings and table
-  /// separator rows, then applying inline formatting to each regular line.
+  /// Processes a normal-text block line by line. Blank source lines become paragraph
+  /// gaps (not empty rows); lists hang under their markers; nested bullets indent
+  /// with hollow markers so long agent answers read like WhatsApp Meta AI cards.
   private static func applyLineMarkdown(
     _ text: String,
-    baseAttrs: [NSAttributedString.Key: Any],
     font: UIFont,
-    textColor: UIColor
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat
   ) -> NSAttributedString {
     let result = NSMutableAttributedString()
-    var addedAny = false
 
-    for line in text.components(separatedBy: "\n") {
-      // Skip table separator rows like |---|---|
-      if isTableSeparatorLine(line) { continue }
+    // Spacing scales with body font. Blank lines → inter-paragraph gap; headings
+    // get a larger gap above + a small gap into their body.
+    let paragraphGap = max(10.0, (font.pointSize * 0.72).rounded())
+    let headingGap = max(14.0, (font.pointSize * 1.0).rounded())
+    let headingBodyGap = max(4.0, (font.pointSize * 0.28).rounded())
+    let listItemGap = max(4.0, (font.pointSize * 0.28).rounded())
+    let listNestStep = max(14.0, (font.pointSize * 0.95).rounded())
 
-      if addedAny {
-        result.append(NSAttributedString(string: "\n", attributes: baseAttrs))
-      }
+    var emittedContent = false
+    var pendingBlank = false
+    var previousWasHeading = false
+    var previousWasListItem = false
 
-      // Heading lines: # / ## / ###
-      if let (level, headingText) = parseHeadingLine(line) {
-        result.append(renderHeadingLine(headingText, level: level, baseFont: font, textColor: textColor, baseAttrs: baseAttrs))
-        addedAny = true
+    for rawLine in text.components(separatedBy: "\n") {
+      if isTableSeparatorLine(rawLine) { continue }
+
+      if rawLine.trimmingCharacters(in: .whitespaces).isEmpty {
+        if emittedContent { pendingBlank = true }
         continue
       }
 
-      // Regular line with inline formatting (bold, links, code, URLs).
-      result.append(applyInlineFormatting(line, baseAttrs: baseAttrs, font: font))
-      addedAny = true
+      let heading = parseHeadingLine(rawLine)
+      let bullet = heading == nil ? parseBulletListLine(rawLine) : nil
+      let numbered = (heading == nil && bullet == nil) ? parseNumberedListLine(rawLine) : nil
+      let isListItem = bullet != nil || numbered != nil
+
+      var spacingBefore: CGFloat = 0.0
+      if emittedContent {
+        if heading != nil {
+          spacingBefore = headingGap
+        } else if previousWasHeading {
+          spacingBefore = headingBodyGap
+        } else if pendingBlank {
+          spacingBefore = (isListItem && previousWasListItem) ? listItemGap : paragraphGap
+        } else if isListItem && previousWasListItem {
+          spacingBefore = listItemGap
+        }
+        result.append(NSAttributedString(string: "\n", attributes: [.font: font]))
+      }
+
+      if let (level, headingText) = heading {
+        result.append(
+          renderHeadingLine(
+            headingText,
+            level: level,
+            baseFont: font,
+            textColor: textColor,
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
+          )
+        )
+      } else if let (nestLevel, listText) = bullet {
+        result.append(
+          renderBulletListItem(
+            listText,
+            nestLevel: nestLevel,
+            nestStep: listNestStep,
+            font: font,
+            textColor: textColor,
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
+          )
+        )
+      } else if let (nestLevel, prefix, listText) = numbered {
+        result.append(
+          renderNumberedListItem(
+            prefix,
+            text: listText,
+            nestLevel: nestLevel,
+            nestStep: listNestStep,
+            font: font,
+            textColor: textColor,
+            isRtl: isRtl,
+            lineSpacing: lineSpacing,
+            spacingBefore: spacingBefore
+          )
+        )
+      } else {
+        let style = makeParagraphStyle(
+          isRtl: isRtl,
+          lineSpacing: lineSpacing,
+          spacingBefore: spacingBefore
+        )
+        let attributes: [NSAttributedString.Key: Any] = [
+          .font: font,
+          .foregroundColor: textColor,
+          .paragraphStyle: style,
+        ]
+        result.append(applyInlineFormatting(rawLine, baseAttrs: attributes, font: font))
+      }
+
+      emittedContent = true
+      pendingBlank = false
+      previousWasHeading = heading != nil
+      previousWasListItem = isListItem
     }
 
     return result
@@ -262,31 +358,147 @@ enum ChatNativeAgentTextRenderer {
     return content.isEmpty ? nil : (level, content)
   }
 
+  /// Leading whitespace → nest level (2 spaces or 1 tab per level). Returns
+  /// `(nestLevel, body)` for `-` / `*` / `+` / `•` markers.
+  private static func parseBulletListLine(_ line: String) -> (Int, String)? {
+    let (nestLevel, trimmed) = listNestLevel(line)
+    for marker in ["- ", "* ", "+ ", "• ", "○ ", "◦ ", "▪ "] {
+      if trimmed.hasPrefix(marker) {
+        let text = String(trimmed.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (nestLevel, text)
+      }
+    }
+    return nil
+  }
+
+  private static func parseNumberedListLine(_ line: String) -> (Int, String, String)? {
+    let (nestLevel, trimmed) = listNestLevel(line)
+    var idx = trimmed.startIndex
+    while idx < trimmed.endIndex, trimmed[idx].isNumber {
+      idx = trimmed.index(after: idx)
+    }
+    guard idx > trimmed.startIndex else { return nil }
+    let rest = String(trimmed[idx...])
+    guard rest.hasPrefix(". ") else { return nil }
+    let prefix = String(trimmed[..<idx]) + "."
+    let text = String(rest.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+    return text.isEmpty ? nil : (nestLevel, prefix, text)
+  }
+
+  private static func listNestLevel(_ line: String) -> (Int, String) {
+    var spaces = 0
+    var idx = line.startIndex
+    while idx < line.endIndex {
+      let ch = line[idx]
+      if ch == " " {
+        spaces += 1
+      } else if ch == "\t" {
+        spaces += 2
+      } else {
+        break
+      }
+      idx = line.index(after: idx)
+    }
+    let nest = min(4, spaces / 2)
+    return (nest, String(line[idx...]))
+  }
+
+  private static func bulletMarker(for nestLevel: Int) -> String {
+    switch nestLevel {
+    case 0: return "•  "
+    case 1: return "○  "
+    default: return "▪  "
+    }
+  }
+
+  private static func renderBulletListItem(
+    _ text: String,
+    nestLevel: Int,
+    nestStep: CGFloat,
+    font: UIFont,
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
+  ) -> NSAttributedString {
+    let marker = bulletMarker(for: nestLevel)
+    let baseIndent = CGFloat(nestLevel) * nestStep
+    let markerWidth = (marker as NSString).size(withAttributes: [.font: font]).width
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore,
+      firstLineHeadIndent: baseIndent,
+      headIndent: baseIndent + markerWidth
+    )
+    let base: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
+    let result = NSMutableAttributedString(string: marker, attributes: base)
+    result.append(applyInlineFormatting(text, baseAttrs: base, font: font))
+    return result
+  }
+
+  private static func renderNumberedListItem(
+    _ prefix: String,
+    text: String,
+    nestLevel: Int,
+    nestStep: CGFloat,
+    font: UIFont,
+    textColor: UIColor,
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
+  ) -> NSAttributedString {
+    let marker = "\(prefix) "
+    let baseIndent = CGFloat(nestLevel) * nestStep
+    let markerWidth = (marker as NSString).size(withAttributes: [.font: font]).width
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore,
+      firstLineHeadIndent: baseIndent,
+      headIndent: baseIndent + markerWidth
+    )
+    let base: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
+    let result = NSMutableAttributedString(string: marker, attributes: base)
+    result.append(applyInlineFormatting(text, baseAttrs: base, font: font))
+    return result
+  }
+
   private static func renderHeadingLine(
     _ text: String,
     level: Int,
     baseFont: UIFont,
     textColor: UIColor,
-    baseAttrs: [NSAttributedString.Key: Any]
+    isRtl: Bool,
+    lineSpacing: CGFloat,
+    spacingBefore: CGFloat
   ) -> NSAttributedString {
-    let scale: CGFloat = level == 1 ? 1.22 : level == 2 ? 1.10 : 1.0
+    let scale: CGFloat = level == 1 ? 1.18 : level == 2 ? 1.10 : 1.04
     let headingFont: UIFont = {
       if let d = baseFont.fontDescriptor.withSymbolicTraits(.traitBold) {
         return UIFont(descriptor: d, size: round(baseFont.pointSize * scale))
       }
       return UIFont.boldSystemFont(ofSize: round(baseFont.pointSize * scale))
     }()
-    // Build a fresh paragraph style without the tight line-height lock.
-    let ps = NSMutableParagraphStyle()
-    if let existing = baseAttrs[.paragraphStyle] as? NSParagraphStyle { ps.setParagraphStyle(existing) }
-    ps.minimumLineHeight = 0
-    ps.maximumLineHeight = 0
-    var attrs = baseAttrs
-    attrs[.font] = headingFont
-    attrs[.foregroundColor] = textColor
-    attrs[.paragraphStyle] = ps
-    attrs.removeValue(forKey: .baselineOffset)
-    return NSAttributedString(string: text, attributes: attrs)
+    let style = makeParagraphStyle(
+      isRtl: isRtl,
+      lineSpacing: lineSpacing,
+      spacingBefore: spacingBefore
+    )
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: headingFont,
+      .foregroundColor: textColor,
+      .paragraphStyle: style,
+    ]
+    return applyInlineFormatting(text, baseAttrs: attrs, font: headingFont)
   }
 
   private static func applyInlineFormatting(
@@ -379,7 +591,54 @@ enum ChatNativeAgentTextRenderer {
       }
     }
 
+    // 5) Auto-link @username — keep visible `@handle` text, attach a routeable
+    // `vibe://u?handle=` so a tap can push the DM/agent chat immediately.
+    applyMentionLinks(to: mutable, baseAttrs: baseAttrs, linkColor: linkColor)
+
     return mutable
+  }
+
+  /// Marks bare `@username` spans as tappable handle links. Skips ranges that
+  /// already carry a `.link` (markdown/URL) and skips reserved non-profile tokens
+  /// that the share router would refuse (`api`, `settings`, …).
+  private static func applyMentionLinks(
+    to mutable: NSMutableAttributedString,
+    baseAttrs: [NSAttributedString.Key: Any],
+    linkColor: UIColor
+  ) {
+    let fullRange = NSRange(mutable.string.startIndex..., in: mutable.string)
+    let matches = chatNativeAgentMentionRegex.matches(in: mutable.string, range: fullRange)
+    guard !matches.isEmpty else { return }
+
+    for match in matches.reversed() {
+      guard match.numberOfRanges > 1,
+        let handleSwiftRange = Range(match.range(at: 1), in: mutable.string)
+      else { continue }
+      let handle = String(mutable.string[handleSwiftRange])
+      let linkRange = match.range
+      guard linkRange.location != NSNotFound, linkRange.length > 0 else { continue }
+
+      // Condition: already a link (e.g. markdown label that happens to contain @x).
+      var hasLink = false
+      mutable.enumerateAttribute(.link, in: linkRange, options: []) { value, _, stop in
+        if value != nil {
+          hasLink = true
+          stop.pointee = true
+        }
+      }
+      if hasLink { continue }
+
+      // Condition: reserved SPA paths are not people/agents — leave as plain text.
+      if VibeShareLinks.isReservedHandle(handle) { continue }
+
+      guard let url = URL(string: "vibe://u?handle=\(handle.lowercased())") else { continue }
+      var linkAttrs = baseAttrs
+      linkAttrs[.link] = url
+      linkAttrs[.foregroundColor] = linkColor
+      linkAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+      // Keep the original `@username` glyphs; only attach route + underline.
+      mutable.addAttributes(linkAttrs, range: linkRange)
+    }
   }
 
   private static func cleanURLDisplay(_ url: URL) -> String {
@@ -2972,14 +3231,13 @@ final class ChatNativeStreamingTextLabel: UITextView {
   }
 
   private func handleTappedURL(_ url: URL) {
-    // If link looks like an internal Vibe chat URL, post a notification to let
-    // the app route to the chat; otherwise present an in-app browser modal.
-    if let chatId = extractChatId(from: url) {
-      NotificationCenter.default.post(
-        name: Notification.Name("ChatNative.OpenChat"),
-        object: nil,
-        userInfo: ["chatId": chatId, "url": url.absoluteString]
-      )
+    // Internal routes (vibe://u?handle=@username, share-host handles, room links,
+    // chatId UUIDs) push a chat immediately via the shared share-link router.
+    // External http(s) still open the in-app browser.
+    if let target = Self.routeTarget(for: url) {
+      Task { @MainActor in
+        VibeRoomLinkRouter.shared.handle(target: target)
+      }
       return
     }
 
@@ -2988,14 +3246,27 @@ final class ChatNativeStreamingTextLabel: UITextView {
     }
   }
 
-  private func extractChatId(from url: URL) -> String? {
+  /// Maps a tapped URL onto a `VibeShareLinkTarget` when the app can open it as a
+  /// chat/profile/room. Returns nil for ordinary web links.
+  private static func routeTarget(for url: URL) -> VibeShareLinkTarget? {
+    if let target = VibeRoomLinkRouter.target(from: url) {
+      return target
+    }
+    // Legacy vibegram paths that embed a chat UUID but weren't classified above.
+    if let chatId = extractChatId(from: url) {
+      return .chat(chatId)
+    }
+    return nil
+  }
+
+  private static func extractChatId(from url: URL) -> String? {
     // Heuristic: host contains vibe / vibegram and a UUID appears in the path or query
     let host = url.host?.lowercased() ?? ""
     if host.contains("vibe") || host.contains("vibegram") || url.scheme == "vibe" {
       let path = url.path
       let ns = path as NSString
       let range = NSRange(location: 0, length: ns.length)
-      if let m = Self.uuidRegex.firstMatch(in: path, range: range) {
+      if let m = uuidRegex.firstMatch(in: path, range: range) {
         return (ns.substring(with: m.range) as String)
       }
       if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false), let items = comps.queryItems {

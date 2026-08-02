@@ -28,10 +28,10 @@ enum VibeAgentKitTextRenderer {
     lineHeight: CGFloat? = nil
   ) -> NSAttributedString {
     let isRtl = isRTL(text)
-    let lineSpacing: CGFloat = {
-      guard let lineHeight else { return 0.0 }
-      return max(0.0, lineHeight - font.lineHeight)
-    }()
+    // Default ~1.35× body line when callers omit a target — matches WhatsApp-style
+    // agent prose density without locking min/max line boxes.
+    let resolvedLineHeight = lineHeight ?? max(font.lineHeight + 4.0, font.pointSize * 1.35)
+    let lineSpacing = max(0.0, resolvedLineHeight - font.lineHeight)
     return applyLineMarkdown(
       text,
       font: font,
@@ -43,12 +43,13 @@ enum VibeAgentKitTextRenderer {
 
   /// Shared paragraph style for a single rendered line/paragraph. `spacingBefore`
   /// is the vertical gap above this paragraph (used to separate paragraphs and
-  /// give headings breathing room); `headIndent` hangs wrapped list-item text
-  /// under the marker.
+  /// give headings breathing room); `firstLineHeadIndent`/`headIndent` hang list
+  /// markers and nested levels so wrapped lines stay under the body text.
   private static func makeParagraphStyle(
     isRtl: Bool,
     lineSpacing: CGFloat,
     spacingBefore: CGFloat,
+    firstLineHeadIndent: CGFloat = 0.0,
     headIndent: CGFloat = 0.0
   ) -> NSMutableParagraphStyle {
     let style = NSMutableParagraphStyle()
@@ -57,6 +58,7 @@ enum VibeAgentKitTextRenderer {
     style.lineBreakMode = .byWordWrapping
     style.lineSpacing = lineSpacing
     style.paragraphSpacingBefore = spacingBefore
+    style.firstLineHeadIndent = firstLineHeadIndent
     style.headIndent = headIndent
     return style
   }
@@ -152,10 +154,13 @@ enum VibeAgentKitTextRenderer {
     // above plus a small gap before their body.
     // Paragraphs need a clearly visible gap or the answer reads as one continuous
     // block; headings get a larger gap above so sections are insulated.
-    let paragraphGap = max(11.0, (font.pointSize * 0.8).rounded())
-    let headingGap = max(16.0, (font.pointSize * 1.1).rounded())
-    let headingBodyGap = max(3.0, (font.pointSize * 0.22).rounded())
-    let listItemGap = max(3.0, (font.pointSize * 0.25).rounded())
+    // WhatsApp-style structure: visible paragraph gaps, section headings with
+    // breathing room, tight-but-readable list item gaps, nested bullet indents.
+    let paragraphGap = max(10.0, (font.pointSize * 0.72).rounded())
+    let headingGap = max(14.0, (font.pointSize * 1.0).rounded())
+    let headingBodyGap = max(4.0, (font.pointSize * 0.28).rounded())
+    let listItemGap = max(4.0, (font.pointSize * 0.28).rounded())
+    let listNestStep = max(14.0, (font.pointSize * 0.95).rounded())
 
     var emittedContent = false
     var pendingBlank = false
@@ -203,10 +208,12 @@ enum VibeAgentKitTextRenderer {
             spacingBefore: spacingBefore
           )
         )
-      } else if let listText = bullet {
+      } else if let (nestLevel, listText) = bullet {
         result.append(
           renderBulletListItem(
             listText,
+            nestLevel: nestLevel,
+            nestStep: listNestStep,
             font: font,
             textColor: textColor,
             isRtl: isRtl,
@@ -214,11 +221,13 @@ enum VibeAgentKitTextRenderer {
             spacingBefore: spacingBefore
           )
         )
-      } else if let (prefix, listText) = numbered {
+      } else if let (nestLevel, prefix, listText) = numbered {
         result.append(
           renderNumberedListItem(
             prefix,
             text: listText,
+            nestLevel: nestLevel,
+            nestStep: listNestStep,
             font: font,
             textColor: textColor,
             isRtl: isRtl,
@@ -249,19 +258,46 @@ enum VibeAgentKitTextRenderer {
     return result
   }
 
-  private static func parseBulletListLine(_ line: String) -> String? {
-    let trimmed = line.trimmingCharacters(in: .whitespaces)
-    for marker in ["- ", "* ", "+ ", "• "] {
+  /// Leading whitespace → nest level (2 spaces or 1 tab per level).
+  private static func listNestLevel(_ line: String) -> (Int, String) {
+    var spaces = 0
+    var idx = line.startIndex
+    while idx < line.endIndex {
+      let ch = line[idx]
+      if ch == " " {
+        spaces += 1
+      } else if ch == "\t" {
+        spaces += 2
+      } else {
+        break
+      }
+      idx = line.index(after: idx)
+    }
+    let nest = min(4, spaces / 2)
+    return (nest, String(line[idx...]))
+  }
+
+  private static func bulletMarker(for nestLevel: Int) -> String {
+    switch nestLevel {
+    case 0: return "•  "
+    case 1: return "○  "
+    default: return "▪  "
+    }
+  }
+
+  private static func parseBulletListLine(_ line: String) -> (Int, String)? {
+    let (nestLevel, trimmed) = listNestLevel(line)
+    for marker in ["- ", "* ", "+ ", "• ", "○ ", "◦ ", "▪ "] {
       if trimmed.hasPrefix(marker) {
         let text = String(trimmed.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
-        return text.isEmpty ? nil : text
+        return text.isEmpty ? nil : (nestLevel, text)
       }
     }
     return nil
   }
 
-  private static func parseNumberedListLine(_ line: String) -> (String, String)? {
-    let trimmed = line.trimmingCharacters(in: .whitespaces)
+  private static func parseNumberedListLine(_ line: String) -> (Int, String, String)? {
+    let (nestLevel, trimmed) = listNestLevel(line)
     var idx = trimmed.startIndex
     while idx < trimmed.endIndex, trimmed[idx].isNumber {
       idx = trimmed.index(after: idx)
@@ -271,24 +307,28 @@ enum VibeAgentKitTextRenderer {
     guard rest.hasPrefix(". ") else { return nil }
     let prefix = String(trimmed[..<idx]) + "."
     let text = String(rest.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-    return text.isEmpty ? nil : (prefix, text)
+    return text.isEmpty ? nil : (nestLevel, prefix, text)
   }
 
   private static func renderBulletListItem(
     _ text: String,
+    nestLevel: Int,
+    nestStep: CGFloat,
     font: UIFont,
     textColor: UIColor,
     isRtl: Bool,
     lineSpacing: CGFloat,
     spacingBefore: CGFloat
   ) -> NSAttributedString {
-    let marker = "•  "
-    let indent = (marker as NSString).size(withAttributes: [.font: font]).width
+    let marker = bulletMarker(for: nestLevel)
+    let baseIndent = CGFloat(nestLevel) * nestStep
+    let markerWidth = (marker as NSString).size(withAttributes: [.font: font]).width
     let style = makeParagraphStyle(
       isRtl: isRtl,
       lineSpacing: lineSpacing,
       spacingBefore: spacingBefore,
-      headIndent: indent
+      firstLineHeadIndent: baseIndent,
+      headIndent: baseIndent + markerWidth
     )
     let base: [NSAttributedString.Key: Any] = [
       .font: font,
@@ -303,6 +343,8 @@ enum VibeAgentKitTextRenderer {
   private static func renderNumberedListItem(
     _ prefix: String,
     text: String,
+    nestLevel: Int,
+    nestStep: CGFloat,
     font: UIFont,
     textColor: UIColor,
     isRtl: Bool,
@@ -310,12 +352,14 @@ enum VibeAgentKitTextRenderer {
     spacingBefore: CGFloat
   ) -> NSAttributedString {
     let marker = "\(prefix) "
-    let indent = (marker as NSString).size(withAttributes: [.font: font]).width
+    let baseIndent = CGFloat(nestLevel) * nestStep
+    let markerWidth = (marker as NSString).size(withAttributes: [.font: font]).width
     let style = makeParagraphStyle(
       isRtl: isRtl,
       lineSpacing: lineSpacing,
       spacingBefore: spacingBefore,
-      headIndent: indent
+      firstLineHeadIndent: baseIndent,
+      headIndent: baseIndent + markerWidth
     )
     let base: [NSAttributedString.Key: Any] = [
       .font: font,

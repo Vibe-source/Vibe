@@ -239,6 +239,7 @@ public final class ChatMainView: UIView,
   private var headerMode: ChatMainHeaderMode = .default
   private var builtInAgentChatMode = false
   private var bridgeProvider: String = ""
+  private var ownedStandaloneAgentMode = false
   private var isOnline = false
   private var surfacePresenceOnline: Bool?
   private var chatTitleText: String = "Chat"
@@ -277,6 +278,7 @@ public final class ChatMainView: UIView,
   private var bridgeSessionProjectName: String?
   private var bridgeSessionProjectPath: String?
   private var defersEngineStateRefreshes = false
+  private var engineStateUpdatesSuspended = false
   private var pinnedBannerMessageId: String?
   private var pinnedBannerTitle: String?
   private var pinnedBannerBody: String?
@@ -506,6 +508,10 @@ public final class ChatMainView: UIView,
     updateProfileTexts()
   }
 
+  func animateClearChatDisintegration(completion: @escaping () -> Void) {
+    chatListView.animateClearChatDisintegration(completion: completion)
+  }
+
   func setEngineSurfaceId(_ value: String) {
     chatListView.setEngineSurfaceId(value)
   }
@@ -520,8 +526,35 @@ public final class ChatMainView: UIView,
     VibeDebugLog.log("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
   }
 
+  func setEngineStateUpdatesSuspended(_ suspended: Bool) {
+    if engineStateUpdatesSuspended == suspended { return }
+    engineStateUpdatesSuspended = suspended
+    if suspended {
+      // Drop any in-flight / queued snapshot without touching visible header/profile state.
+      engineStateRefreshGeneration &+= 1
+      engineStateRefreshWorkItem?.cancel()
+      engineStateRefreshWorkItem = nil
+      return
+    }
+    guard !defersEngineStateRefreshes else { return }
+    scheduleEngineStateRefresh(force: true, reason: "hostBecameVisible")
+  }
+
   func setDefersTranscriptUpdatesForPresentation(_ value: Bool) {
     chatListView.setDefersTranscriptUpdatesForPresentation(value)
+  }
+
+  func beginNavigationPushPrestaging() {
+    chatListView.beginNavigationPushPrestaging()
+  }
+
+  func setNavigationPrestageSafeAreaBottom(_ inset: CGFloat) {
+    chatListView.setNavigationPrestageSafeAreaBottom(inset)
+  }
+
+  @discardableResult
+  func finishNavigationPushPrestaging() -> Bool {
+    chatListView.finishNavigationPushPrestaging()
   }
 
   func completeTranscriptPresentation() {
@@ -572,6 +605,12 @@ public final class ChatMainView: UIView,
 
   func setEnginePeerAgentId(_ value: String) {
     chatListView.setEnginePeerAgentId(value)
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    let next = !normalized.isEmpty && ChatOwnedAgentIdsCache.agentIds.contains(normalized)
+    guard ownedStandaloneAgentMode != next else { return }
+    ownedStandaloneAgentMode = next
+    updateChatModeHeaderControls()
+    setNeedsLayout()
   }
 
   /// Host controller asks (at view-appear) to mount the isolated agent surface as this DM's
@@ -1363,6 +1402,7 @@ public final class ChatMainView: UIView,
     newChatButton.accessibilityIdentifier = "chat.new"
     newChatButton.accessibilityLabel = "New Chat"
 
+    callButton.addTarget(self, action: #selector(handlePrimaryTrailingActionPressed), for: .touchUpInside)
     historyButton.addTarget(self, action: #selector(handleHistoryPressed), for: .touchUpInside)
     newChatButton.addTarget(self, action: #selector(handleNewChatPressed), for: .touchUpInside)
     selectionDoneButton.addTarget(self, action: #selector(handleSelectionDonePressed), for: .touchUpInside)
@@ -1868,6 +1908,7 @@ public final class ChatMainView: UIView,
     titleButton.menu = nil
 
     let isAgent = !bridgeProvider.isEmpty
+    let isOwnedAgent = ownedStandaloneAgentMode
     let isAgentGroup = isGroupOrChannel && chatListView.groupHasBridgeAgentsPublic
     // Agent DMs, multi-agent groups, and the built-in Vibe AI surface: history /
     // new-chat instead of call actions. Plain human groups keep call/video.
@@ -1888,15 +1929,22 @@ public final class ChatMainView: UIView,
     } else {
       selectionDoneButton.isHidden = true
       callButton.isHidden =
-        isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader || searchActive
+        (isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader || searchActive)
+          && !isOwnedAgent
       videoCallButton.isHidden =
-        isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader || searchActive
-      historyButton.isHidden = !showAgentHistory
+        isOwnedAgent || isAgent || isAgentGroup || builtInAgentChatMode || usesSavedMessagesHeader
+          || searchActive
+      historyButton.isHidden = isOwnedAgent || !showAgentHistory
       // Agent DMs always have a transport chat id. Gating this control on an empty
       // engineChatId made New Chat unreachable in normal Grok/Claude/Codex sessions.
       // Groups with agents also get New Chat so a report-scoped view can be cleared.
       // Built-in Vibe AI uses the same chrome for conversation History / New Chat.
-      newChatButton.isHidden = !showAgentHistory
+      newChatButton.isHidden = isOwnedAgent || !showAgentHistory
+      callButton.setImage(
+        isOwnedAgent ? createAgentSettingsMenuIcon() : UIImage(systemName: "phone"),
+        for: .normal
+      )
+      callButton.accessibilityLabel = isOwnedAgent ? "Agent settings" : "Audio call"
       rightActionsGlassView.isHidden = usesSavedMessagesHeader || searchActive
       menuButton.isHidden = !(usesSavedMessagesHeader || searchActive)
       menuGlassView.isHidden = !(usesSavedMessagesHeader || searchActive)
@@ -1933,6 +1981,7 @@ public final class ChatMainView: UIView,
       }
       return
     }
+    guard !engineStateUpdatesSuspended else { return }
     let changeReason = (notification.userInfo?["reason"] as? String) ?? "(unknown)"
     let changedChatId = (notification.userInfo?["chatId"] as? String) ?? ""
     if changeReason == "surfaceBindingChanged" {
@@ -1983,6 +2032,7 @@ public final class ChatMainView: UIView,
   }
 
   private func scheduleEngineStateRefresh(force: Bool = false, reason: String) {
+    guard !engineStateUpdatesSuspended else { return }
     guard !defersEngineStateRefreshes else {
       updateHeaderTexts()
       updateProfileTexts()
@@ -2046,6 +2096,7 @@ public final class ChatMainView: UIView,
         guard let self else { return }
         guard self.engineStateRefreshGeneration == generation else { return }
         guard self.engineChatId == chatId, self.enginePeerUserId == peerUserId else { return }
+        guard !self.engineStateUpdatesSuspended else { return }
         guard !self.defersEngineStateRefreshes else { return }
         self.applyEngineStateSnapshot(
           chatId: chatId,
@@ -2094,7 +2145,7 @@ public final class ChatMainView: UIView,
     if force || nextOnline != isOnline || nextLastSeen != engineLastSeenTimestampMs {
       isOnline = nextOnline
       engineLastSeenTimestampMs = nextLastSeen
-      applyTheme()
+      applyPresenceTheme()
       shouldUpdateHeader = true
       shouldUpdateProfile = true
     }
@@ -4197,23 +4248,9 @@ public final class ChatMainView: UIView,
     agentContentView.backgroundColor = profileBackground
     applyProfileWallpaperAppearance()
     profileAvatarView.backgroundColor = .clear
-    let showsProfilePresence = shouldShowDirectPresence()
-    profileOnlineDotView.isHidden = !showsProfilePresence
-    profileOnlineDotView.backgroundColor =
-      showsProfilePresence && isOnline
-      ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
-      : appearance.timeColorThem.withAlphaComponent(0.32)
-    profileOnlineDotView.layer.borderColor = profileBackground.cgColor
     let profileGoldColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
     profileNameLabel.textColor = bridgeProvider.isEmpty ? text : profileGoldColor
-    if !bridgeProvider.isEmpty {
-      profileHandleLabel.textColor = profileGoldColor.withAlphaComponent(0.92)
-    } else if showsProfilePresence && isOnline {
-      profileHandleLabel.textColor =
-        UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
-    } else {
-      profileHandleLabel.textColor = secondary
-    }
+    applyPresenceTheme()
     profileBioLabel.textColor = secondary
 
     profileMuteButton.applyTheme(foreground: text, background: actionBg)
@@ -4255,6 +4292,29 @@ public final class ChatMainView: UIView,
       surfaceColor: profileCardBg,
       accentColor: accentColor
     )
+  }
+
+  /// Presence-only styling (dot, border, handle color) — avoids full glass rebuilds on online/last-seen.
+  private func applyPresenceTheme() {
+    let secondary = appearance.timeColorThem.withAlphaComponent(0.85)
+    let isDarkTheme = appearance.isDark
+    let profileBackground = isDarkTheme ? Self.themeDarkBg : Self.themeLightBg
+    let showsProfilePresence = shouldShowDirectPresence()
+    profileOnlineDotView.isHidden = !showsProfilePresence
+    profileOnlineDotView.backgroundColor =
+      showsProfilePresence && isOnline
+      ? UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+      : appearance.timeColorThem.withAlphaComponent(0.32)
+    profileOnlineDotView.layer.borderColor = profileBackground.cgColor
+    let profileGoldColor = UIColor(red: 244 / 255, green: 182 / 255, blue: 53 / 255, alpha: 1)
+    if !bridgeProvider.isEmpty {
+      profileHandleLabel.textColor = profileGoldColor.withAlphaComponent(0.92)
+    } else if showsProfilePresence && isOnline {
+      profileHandleLabel.textColor =
+        UIColor(red: 83.0 / 255.0, green: 224.0 / 255.0, blue: 138.0 / 255.0, alpha: 1.0)
+    } else {
+      profileHandleLabel.textColor = secondary
+    }
   }
 
   private func applyProfileWallpaperAppearance() {
@@ -5070,15 +5130,12 @@ public final class ChatMainView: UIView,
       (status["state"] as? String)?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased() ?? ""
+    // A closed/configuring chat socket is not proof that the device cannot reach the
+    // service: Home may be healthy over HTTP/LAN while no chat topic currently demands
+    // a socket. Treating those bootstrap states as network failure made every otherwise
+    // healthy header say "Connecting". Only the transport's explicit offline verdict is
+    // allowed to replace presence; history catch-up has its separate "Updating" phase.
     return stateValue == "offline"
-      || stateValue == "disconnected"
-      || stateValue == "native-socket-closed"
-      || stateValue == "native-connect-stale"
-      || stateValue == "native-config-missing"
-      || stateValue.contains("disconnect")
-      || stateValue.contains("unreachable")
-      || stateValue.contains("fail")
-      || stateValue.contains("error")
   }
 
   /// True while history / session payload is applying for this chat (Updating only).
@@ -5483,6 +5540,14 @@ public final class ChatMainView: UIView,
     }
   }
 
+  @objc private func handlePrimaryTrailingActionPressed() {
+    if ownedStandaloneAgentMode {
+      onNativeEvent(["type": "headerAvatarPressed"])
+    } else {
+      onNativeEvent(["type": "headerAudioCallPressed"])
+    }
+  }
+
   @objc private func handleHistoryPressed() {
     // Built-in Vibe AI: conversation History (server + local chat ids).
     if builtInAgentChatMode {
@@ -5873,6 +5938,27 @@ public final class ChatMainView: UIView,
       hands.addLine(to: CGPoint(x: 34.95 * scale, y: 32.35 * scale))
       hands.addLine(to: CGPoint(x: 43.26 * scale, y: 38.72 * scale))
       cgContext.addPath(hands.cgPath)
+      cgContext.strokePath()
+    }.withRenderingMode(.alwaysTemplate)
+  }
+
+  /// Minimal two-stroke menu used for an owned agent's settings route. Drawn in
+  /// Core Graphics so it stays template-tintable and keeps true rounded 1.5pt
+  /// strokes instead of borrowing a three-line or filter-shaped SF Symbol.
+  private func createAgentSettingsMenuIcon() -> UIImage {
+    let size = CGSize(width: 22, height: 22)
+    let format = UIGraphicsImageRendererFormat()
+    format.opaque = false
+    format.scale = window?.screen.scale ?? traitCollection.displayScale
+    return UIGraphicsImageRenderer(size: size, format: format).image { context in
+      let cgContext = context.cgContext
+      cgContext.setStrokeColor(UIColor.black.cgColor)
+      cgContext.setLineWidth(1.5)
+      cgContext.setLineCap(.round)
+      cgContext.move(to: CGPoint(x: 3.0, y: 7.5))
+      cgContext.addLine(to: CGPoint(x: 19.0, y: 7.5))
+      cgContext.move(to: CGPoint(x: 3.0, y: 14.5))
+      cgContext.addLine(to: CGPoint(x: 19.0, y: 14.5))
       cgContext.strokePath()
     }.withRenderingMode(.alwaysTemplate)
   }

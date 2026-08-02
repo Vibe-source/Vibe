@@ -60,6 +60,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let tierBadgeImageView = UIImageView()
   private let previewLabel = UILabel()
   private let timeLabel = UILabel()
+  private let receiptStatusView = UIImageView()
   private let unreadBadge = UIView()
   private let unreadLabel = UILabel()
   private let muteIconView = UIImageView()
@@ -69,8 +70,10 @@ final class ChatHomeCardCell: UITableViewCell {
   private var rowContentLeadingConstraint: NSLayoutConstraint?
   private var avatarWidthConstraint: NSLayoutConstraint?
   private var avatarHeightConstraint: NSLayoutConstraint?
+  private var receiptStatusWidthConstraint: NSLayoutConstraint?
   private var currentEditingLayout = false
   private var compactForwardStyle = false
+  private var renderedReceiptStatus: String?
   private lazy var swipePanGestureRecognizer: UIPanGestureRecognizer = {
     let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleSwipePan(_:)))
     gesture.delegate = self
@@ -135,6 +138,10 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarHeightConstraint?.constant = 60
     compactForwardStyle = false
     previewLabel.isHidden = false
+    receiptStatusView.image = nil
+    receiptStatusView.isHidden = false
+    receiptStatusWidthConstraint?.constant = 20
+    renderedReceiptStatus = nil
     rightCheckmarkView.image = UIImage(systemName: "circle")
     rightCheckmarkView.transform = .identity
     currentRow = nil
@@ -275,6 +282,56 @@ final class ChatHomeCardCell: UITableViewCell {
     timeLabel.isHidden = showsRightCheckmark || compactForwardStyle
     timeLabel.text = row.timeLabel
     timeLabel.textColor = secondary
+
+    let receiptStatus = (showsRightCheckmark || compactForwardStyle)
+      ? nil
+      : row.latestOutgoingDisplayStatus?.lowercased()
+    let receiptGlyphStatus: String? = {
+      switch receiptStatus {
+      case "sent", "delivered": return "single"
+      case "read": return "double"
+      default: return nil
+      }
+    }()
+    // Keep a fixed slot throughout the lifecycle of an outgoing message, including
+    // pending/sending before its first tick appears. Incoming rows reserve no blank gap.
+    // This prevents receipt arrival from shifting the title/preview or looking doubled.
+    receiptStatusView.isHidden = false
+    let reservesReceiptSlot = !(showsRightCheckmark || compactForwardStyle)
+      && ["pending", "sending", "sent", "delivered", "read"].contains(receiptStatus ?? "")
+    receiptStatusWidthConstraint?.constant = reservesReceiptSlot ? 20 : 0
+    receiptStatusView.isAccessibilityElement = receiptGlyphStatus != nil
+    receiptStatusView.accessibilityLabel = receiptGlyphStatus == "double"
+      ? NSLocalizedString("Read", comment: "Home list outgoing message receipt")
+      : NSLocalizedString("Sent", comment: "Home list outgoing message receipt")
+    receiptStatusView.image = receiptGlyphStatus.map {
+      homeStatusCheckImage(
+        double: $0 == "double",
+        color: $0 == "double" ? badgeBackground : secondary
+      )
+    }
+    if let previous = renderedReceiptStatus,
+      previous != receiptGlyphStatus,
+      receiptGlyphStatus != nil,
+      window != nil
+    {
+      receiptStatusView.transform = CGAffineTransform(scaleX: 0.78, y: 0.78)
+      receiptStatusView.alpha = 0.35
+      UIView.animate(
+        withDuration: 0.22,
+        delay: 0,
+        usingSpringWithDamping: 0.72,
+        initialSpringVelocity: 0.25,
+        options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.receiptStatusView.transform = .identity
+        self.receiptStatusView.alpha = 1
+      }
+    } else {
+      receiptStatusView.transform = .identity
+      receiptStatusView.alpha = 1
+    }
+    renderedReceiptStatus = receiptGlyphStatus
 
     unreadBadge.isHidden = showsRightCheckmark || compactForwardStyle || !(row.unreadCount > 0 || row.markedUnread)
     unreadLabel.text = row.unreadCount > 0 ? "\(row.unreadCount)" : ""
@@ -550,10 +607,16 @@ final class ChatHomeCardCell: UITableViewCell {
     previewLabel.numberOfLines = 1
 
     timeLabel.translatesAutoresizingMaskIntoConstraints = false
-    timeLabel.font = .systemFont(ofSize: 13, weight: .medium)
+    timeLabel.font = .systemFont(ofSize: 13, weight: .regular)
     timeLabel.textAlignment = .right
     timeLabel.setContentHuggingPriority(.required, for: .horizontal)
     timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    receiptStatusView.translatesAutoresizingMaskIntoConstraints = false
+    receiptStatusView.contentMode = .scaleAspectFit
+    receiptStatusView.isHidden = false
+    receiptStatusView.setContentHuggingPriority(.required, for: .horizontal)
+    receiptStatusView.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     unreadBadge.translatesAutoresizingMaskIntoConstraints = false
     unreadBadge.layer.cornerRadius = 10
@@ -608,12 +671,27 @@ final class ChatHomeCardCell: UITableViewCell {
     iconStack.spacing = 7
     iconStack.alignment = .center
 
-    let metaStack = UIStackView(arrangedSubviews: [timeLabel, unreadBadge, iconStack])
+    // Telegram-style metadata: receipt immediately beside the date on the title line;
+    // unread/mute/pin occupy the preview line. The former equal-spacing vertical stack
+    // centered all three items as a loose column and made the date visibly drift down.
+    let topMetaStack = UIStackView(arrangedSubviews: [receiptStatusView, timeLabel])
+    topMetaStack.translatesAutoresizingMaskIntoConstraints = false
+    topMetaStack.axis = .horizontal
+    topMetaStack.spacing = 3
+    topMetaStack.alignment = .center
+
+    let bottomMetaStack = UIStackView(arrangedSubviews: [iconStack, unreadBadge])
+    bottomMetaStack.translatesAutoresizingMaskIntoConstraints = false
+    bottomMetaStack.axis = .horizontal
+    bottomMetaStack.spacing = 7
+    bottomMetaStack.alignment = .center
+
+    let metaStack = UIStackView(arrangedSubviews: [topMetaStack, bottomMetaStack])
     metaStack.translatesAutoresizingMaskIntoConstraints = false
     metaStack.axis = .vertical
-    metaStack.spacing = 5
+    metaStack.spacing = 2
     metaStack.alignment = .trailing
-    metaStack.distribution = .equalSpacing
+    metaStack.distribution = .fillEqually
     metaStack.setContentHuggingPriority(.required, for: .horizontal)
     metaStack.setContentCompressionResistancePriority(.required, for: .horizontal)
 
@@ -711,8 +789,18 @@ final class ChatHomeCardCell: UITableViewCell {
       textStack.trailingAnchor.constraint(equalTo: metaStack.leadingAnchor, constant: -10),
 
       metaStack.trailingAnchor.constraint(equalTo: rowContentContainer.trailingAnchor, constant: -16),
-      metaStack.centerYAnchor.constraint(equalTo: rowContentContainer.centerYAnchor),
+      // Exact two-line alignment: receipt/date follows the title baseline and lower
+      // metadata follows the preview baseline, independent of which icons are hidden.
+      metaStack.topAnchor.constraint(equalTo: textStack.topAnchor),
+      metaStack.bottomAnchor.constraint(equalTo: textStack.bottomAnchor),
       metaStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
+
+      {
+        let width = receiptStatusView.widthAnchor.constraint(equalToConstant: 20)
+        self.receiptStatusWidthConstraint = width
+        return width
+      }(),
+      receiptStatusView.heightAnchor.constraint(equalToConstant: 14),
 
       unreadBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 20),
       unreadBadge.heightAnchor.constraint(equalToConstant: 20),
@@ -1306,6 +1394,51 @@ final class ChatHomeCardCell: UITableViewCell {
     min(1, max(0, value))
   }
 
+}
+
+/// Compact one/two-tick renderer shared by every Home cell configuration. One tick is
+/// sent/delivered; two ticks are read. Drawing the paths avoids font-dependent spacing
+/// and keeps the mark crisp at the small list-row size.
+private func homeStatusCheckImage(double: Bool, color: UIColor) -> UIImage {
+  let size = CGSize(width: 20, height: 14)
+  return UIGraphicsImageRenderer(size: size).image { context in
+    // ~7.5pt visual height: still balanced with the adjacent 13pt date, but a touch
+    // quieter than the first enlarged pass. The old 0.60 scale was only ~5.5pt tall.
+    let scale: CGFloat = 0.82
+    let baseX: CGFloat = 0.16
+    let baseY = (size.height - (24 * scale)) * 0.5
+    func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+      CGPoint(x: baseX + x * scale, y: baseY + y * scale)
+    }
+
+    color.setStroke()
+    let first = UIBezierPath()
+    if double {
+      first.move(to: point(4, 12.9))
+      first.addLine(to: point(7.14286, 16.5))
+      first.addLine(to: point(15, 7.5))
+    } else {
+      first.move(to: point(4, 12))
+      first.addLine(to: point(8.94975, 16.9497))
+      first.addLine(to: point(19.5572, 6.34326))
+    }
+    first.lineWidth = (double ? 1.5 : 1.7) * scale
+    first.lineCapStyle = .round
+    first.lineJoinStyle = .round
+    first.stroke()
+
+    if double {
+      let second = UIBezierPath()
+      second.move(to: point(20, 7.5625))
+      second.addLine(to: point(11.4283, 16.5625))
+      second.addLine(to: point(11, 16))
+      second.lineWidth = 1.5 * scale
+      second.lineCapStyle = .round
+      second.lineJoinStyle = .round
+      second.stroke()
+    }
+    context.cgContext.flush()
+  }.withRenderingMode(.alwaysOriginal)
 }
 
 private final class ChatHomeSwipeActionButton: UIButton {
