@@ -1,0 +1,310 @@
+import SwiftUI
+import UIKit
+
+// In-app diagnostics viewer for the VibeLog store. Lets the user (or an admin
+// walking someone through a bug) see recent structured logs, filter by
+// level/category, and export a redacted report to share. This is the "we finally
+// know what happened" surface the client was missing.
+
+struct DiagnosticsView: View {
+  @State private var entries: [VibeLogEntry] = []
+  @State private var minLevel: VibeLogLevel = .debug
+  @State private var categoryFilter: String? = nil
+  @State private var expanded: Set<UUID> = []
+  @State private var shareURL: ShareItem? = nil
+  @State private var showClearConfirm = false
+  @State private var autoRefresh = true
+  @State private var coreSelfTestResult: String = ""
+  @State private var coreSelfTestRunning: Bool = false
+  @State private var coreBridgeEnabled: Bool = VibeCoreBridge.isEnabled
+  @State private var coreShadowEnabled: Bool =
+    VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineShadowCompareEnabled
+
+  private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+  private var categories: [String] { VibeLog.shared.categories() }
+
+  private var filtered: [VibeLogEntry] {
+    entries
+      .filter { $0.level >= minLevel }
+      .filter { categoryFilter == nil || $0.category == categoryFilter }
+      .reversed()  // most recent first
+  }
+
+  var body: some View {
+    List {
+      Section {
+        deviceContextRow
+      }
+
+      Section {
+        // The switch only gates `runSelfTest`, which builds a core against the
+        // app's own user id. It changes no rendering, so leaving it off is safe
+        // and turning it on cannot alter what any chat shows.
+        Toggle("Bridge enabled", isOn: $coreBridgeEnabled)
+          .onChange(of: coreBridgeEnabled) { _, on in
+            VibeCoreBridge.setEnabled(on)
+            if !on { coreSelfTestResult = "" }
+          }
+
+        Button("Run core self-test") {
+          coreSelfTestRunning = true
+          VibeCoreBridge.runSelfTest { result in
+            DispatchQueue.main.async {
+              coreSelfTestResult = result
+              coreSelfTestRunning = false
+            }
+          }
+        }
+        .disabled(coreSelfTestRunning || !coreBridgeEnabled)
+
+        if !coreSelfTestResult.isEmpty {
+          Text(coreSelfTestResult)
+            .font(.footnote.monospaced())
+        }
+
+        // A throwaway surface rendered from the Rust core instead of
+        // ChatEngine. Lets the data layer (ordering, dedup, deltas, windowing)
+        // be exercised where a wrong answer costs nothing, before the same
+        // host is pointed at the production list in P4.
+        //
+        // Independent of the switch above: it builds its own core over a
+        // scratch chat id, so it works with the bridge off and cannot touch the
+        // app's data either way.
+        NavigationLink("Core preview list") {
+          VibeCorePreviewView()
+        }
+
+        // Stage 2: the same core through the real render path — VibeTimelineHost
+        // into a UICollectionView with frozen geometry and anchor preservation.
+        // This is the stack P4 points at the production list.
+        NavigationLink("Core list (UIKit render path)") {
+          VibeCoreListPreviewView()
+        }
+
+        // P4 rollout gate. Shadow only: the core runs beside your real 1:1 DMs
+        // and reports where its ordering differs from the list's. It renders
+        // nothing, so the worst case is a log line.
+        Toggle("Shadow-compare real DMs", isOn: $coreShadowEnabled)
+          .onChange(of: coreShadowEnabled) { _, on in
+            let defaults = UserDefaults.standard
+            defaults.set(on, forKey: VibeTimelineUserDefaultsFeatureFlags.shadowCompareKey)
+            // 1:1 DM only. P5 widens this per class, each with its own soak.
+            defaults.set(
+              on ? Int(VibeTimelineChatClassEligibility.directMessage.rawValue) : 0,
+              forKey: VibeTimelineUserDefaultsFeatureFlags.eligibleChatClassesKey)
+            VibeLog.notice(
+              "shadow compare \(on ? "enabled" : "disabled") (reopen a chat to arm)",
+              category: "core")
+          }
+      } header: {
+        Text("Rust core")
+      } footer: {
+        Text(
+          "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it."
+        )
+      }
+
+      Section {
+        Picker("Minimum level", selection: $minLevel) {
+          ForEach(VibeLogLevel.allCases, id: \.self) { lvl in
+            Text(lvl.label).tag(lvl)
+          }
+        }
+        Picker("Category", selection: Binding(
+          get: { categoryFilter ?? "" },
+          set: { categoryFilter = $0.isEmpty ? nil : $0 }
+        )) {
+          Text("All").tag("")
+          ForEach(categories, id: \.self) { Text($0).tag($0) }
+        }
+      }
+
+      Section {
+        if filtered.isEmpty {
+          Text("No log entries yet.")
+            .foregroundStyle(.secondary)
+            .font(.footnote)
+        } else {
+          ForEach(filtered) { entry in
+            entryRow(entry)
+              .contentShape(Rectangle())
+              .onTapGesture { toggle(entry.id) }
+          }
+        }
+      } header: {
+        Text("\(filtered.count) entr\(filtered.count == 1 ? "y" : "ies")")
+      }
+    }
+    .listStyle(.insetGrouped)
+    .navigationTitle("Diagnostics & Logs")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .topBarTrailing) {
+        Menu {
+          // Exports what is on screen. A reconnect storm can be 96% of the
+          // buffer, and an unfiltered export of that answers no question anyone
+          // asked — so the filters apply to the file too, and the file says so.
+          Button {
+            if let url = VibeLog.shared.exportFileURL(
+              header: Self.deviceContext(), minLevel: minLevel, category: categoryFilter)
+            {
+              shareURL = ShareItem(url: url)
+            }
+          } label: { Label("Export what's shown", systemImage: "square.and.arrow.up") }
+
+          Button {
+            if let url = VibeLog.shared.exportFileURL(header: Self.deviceContext()) {
+              shareURL = ShareItem(url: url)
+            }
+          } label: { Label("Export everything", systemImage: "square.and.arrow.up.on.square") }
+
+          Button {
+            autoRefresh.toggle()
+          } label: {
+            Label(autoRefresh ? "Pause live refresh" : "Resume live refresh",
+                  systemImage: autoRefresh ? "pause" : "play")
+          }
+
+          Button(role: .destructive) {
+            showClearConfirm = true
+          } label: { Label("Clear logs", systemImage: "trash") }
+        } label: {
+          Image(systemName: "ellipsis.circle")
+        }
+      }
+    }
+    .sheet(item: $shareURL) { item in
+      ActivityView(activityItems: [item.url])
+    }
+    .confirmationDialog("Clear all diagnostic logs?", isPresented: $showClearConfirm, titleVisibility: .visible) {
+      Button("Clear logs", role: .destructive) {
+        VibeLog.shared.clear()
+        reload()
+      }
+      Button("Cancel", role: .cancel) {}
+    }
+    .onAppear { reload() }
+    .onReceive(refreshTimer) { _ in if autoRefresh { reload() } }
+  }
+
+  // MARK: Rows
+
+  private var deviceContextRow: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      ForEach(Self.deviceContext().sorted(by: { $0.key < $1.key }), id: \.key) { kv in
+        HStack {
+          Text(kv.key).foregroundStyle(.secondary)
+          Spacer()
+          Text(kv.value).multilineTextAlignment(.trailing)
+        }
+        .font(.caption.monospaced())
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func entryRow(_ entry: VibeLogEntry) -> some View {
+    VStack(alignment: .leading, spacing: 3) {
+      HStack(spacing: 6) {
+        Text(entry.level.symbol)
+        Text(entry.category)
+          .font(.caption2.weight(.semibold))
+          .padding(.horizontal, 6).padding(.vertical, 1)
+          .background(color(for: entry.level).opacity(0.15), in: Capsule())
+          .foregroundStyle(color(for: entry.level))
+        if entry.repeats > 1 {
+          Text("×\(entry.repeats)")
+            .font(.caption2.monospaced().weight(.semibold))
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Color.secondary.opacity(0.18), in: Capsule())
+        }
+        Spacer()
+        Text(shortTime(entry.ts))
+          .font(.caption2.monospaced())
+          .foregroundStyle(.secondary)
+      }
+      Text(entry.message)
+        .font(.callout)
+        .lineLimit(expanded.contains(entry.id) ? nil : 2)
+        .foregroundStyle(entry.level >= .warning ? color(for: entry.level) : .primary)
+
+      if expanded.contains(entry.id) {
+        if let meta = entry.metadata, !meta.isEmpty {
+          ForEach(meta.sorted(by: { $0.key < $1.key }), id: \.key) { kv in
+            Text("\(kv.key): \(kv.value)")
+              .font(.caption2.monospaced())
+              .foregroundStyle(.secondary)
+          }
+        }
+        Text("\(entry.file):\(entry.line) · \(entry.function) · \(entry.thread)")
+          .font(.caption2.monospaced())
+          .foregroundStyle(.tertiary)
+      }
+    }
+    .padding(.vertical, 2)
+  }
+
+  // MARK: Helpers
+
+  private func toggle(_ id: UUID) {
+    if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+  }
+
+  private func reload() {
+    entries = VibeLog.shared.snapshot()
+  }
+
+  private func color(for level: VibeLogLevel) -> Color {
+    switch level {
+    case .debug: return .gray
+    case .info: return .blue
+    case .notice: return .teal
+    case .warning: return .orange
+    case .error: return .red
+    case .fault: return .purple
+    }
+  }
+
+  private func shortTime(_ date: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f.string(from: date)
+  }
+
+  static func deviceContext() -> [String: String] {
+    let d = UIDevice.current
+    let info = Bundle.main.infoDictionary
+    let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+    let build = (info?["CFBundleVersion"] as? String) ?? "?"
+    return [
+      "app": "\(version) (\(build))",
+      "os": "\(d.systemName) \(d.systemVersion)",
+      "device": deviceModelIdentifier(),
+      "model": d.model,
+    ]
+  }
+
+  private static func deviceModelIdentifier() -> String {
+    var sysinfo = utsname()
+    uname(&sysinfo)
+    let mirror = Mirror(reflecting: sysinfo.machine)
+    let id = mirror.children.compactMap { ($0.value as? Int8).flatMap { $0 == 0 ? nil : Character(UnicodeScalar(UInt8($0))) } }
+    return String(id)
+  }
+}
+
+// Identifiable wrapper so `.sheet(item:)` can carry the export URL.
+private struct ShareItem: Identifiable {
+  let id = UUID()
+  let url: URL
+}
+
+// UIActivityViewController bridge for the share sheet.
+private struct ActivityView: UIViewControllerRepresentable {
+  let activityItems: [Any]
+  func makeUIViewController(context: Context) -> UIActivityViewController {
+    UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+  }
+  func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}

@@ -51,6 +51,14 @@ targets:
     dependencies:
       - package: GiphyUISDK
         product: GiphyUISDK
+      # Rust timeline core (P2). A *static* xcframework, so `embed: false`:
+      # embedding would copy it into Frameworks/ and ship the archive itself.
+      # Linked into the app target ONLY — the notification service extension
+      # must never get it (see that target's OTHER_LDFLAGS note; it also has no
+      # App Group, so it could not use a store even if it linked one).
+      # Regenerate with scripts/build-core-xcframework.sh; not checked in.
+      - framework: Vendor/VibeCore/VibeCoreFFI.xcframework
+        embed: false
       # Embeds the notification service extension. Without it the app ships
       # without an NSE, `mutable-content: 1` has nothing to act on, and rich
       # notifications fall back to the app icon instead of the sender's avatar.
@@ -80,6 +88,11 @@ targets:
             CFBundleURLName: com.vibegram.app.room-link
             CFBundleURLSchemes:
               - vibe
+        # Communication notifications are authorized on the parent app, not
+        # just described by the service extension. Apple requires every donated
+        # intent type here before SpringBoard will retain sender/avatar context.
+        NSUserActivityTypes:
+          - INSendMessageIntent
         UIBackgroundModes:
           - audio
           - voip
@@ -176,18 +189,45 @@ targets:
         # Do not inherit app PRODUCT_NAME "Vibe" or swiftmodules collide.
         SWIFT_OBJC_BRIDGING_HEADER: ""
         OTHER_LDFLAGS: ""
+  # Unit tests for additive Timeline contracts / replay harness (ids + metrics only).
+  # Does not exercise the live chat path. Regenerated into pbxproj via XcodeGen.
+  VibeTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: VibeTests
+    dependencies:
+      - target: Vibe
+    settings:
+      base:
+        PRODUCT_NAME: VibeTests
+        PRODUCT_MODULE_NAME: VibeTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.vibegram.app.tests
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: BXY4DH6H7D
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Vibe.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Vibe"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+        # Do not inherit app PRODUCT_NAME "Vibe" or swiftmodules collide.
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+        OTHER_LDFLAGS: ""
 schemes:
   Vibe:
     build:
       targets:
         Vibe: all
         VibeNotificationServiceExtension: all
+        VibeTests: [test]
         VibeUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
+        - VibeTests
         - VibeUITests
     archive:
       config: Release

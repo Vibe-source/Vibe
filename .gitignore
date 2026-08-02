@@ -10,6 +10,11 @@ build/
 *.aab
 *.apks
 *.jar
+# Rust core build output. `Cargo.lock` IS committed (this is a binary crate
+# graph shipped into the app), only the target dirs are ignored. The glob
+# matters: the standalone crates under core/ each carry their own target/.
+core/target/
+core/**/target/
 
 # Build info and cache
 *.tsbuildinfo
@@ -171,3 +176,17 @@ docs/MESH_NETWORKING.md
 
 # Team-run scratch (boards + briefs) — temporary by contract, cleaned after each run
 .vibe/team/
+
+# Rust core build output (regenerate: scripts/build-core-xcframework.sh)
+core/target/
+core/**/target/
+ios/Vendor/VibeCore/
+core/vibe_core_ffi/generated/
+
+# Diagnostics exports shared off the device for triage — per-run, often >250 KB,
+# and already redacted copies of a log that lives on the phone.
+vibe-diagnostics-*.txt
+
+# BEAM crash dumps. Local boot artifacts (~3 MB), never useful to another checkout.
+erl_crash.dump
+**/erl_crash.dump
