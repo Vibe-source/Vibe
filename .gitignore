@@ -183,6 +183,11 @@ core/**/target/
 ios/Vendor/VibeCore/
 core/vibe_core_ffi/generated/
 
+# The only way to regenerate the XCFramework ignored above. The blanket `*.sh`
+# rule was silently swallowing it, which left the branch unbuildable from a
+# fresh clone: no binary in git, and no script to rebuild one.
+!scripts/build-core-xcframework.sh
+
 # Diagnostics exports shared off the device for triage — per-run, often >250 KB,
 # and already redacted copies of a log that lives on the phone.
 vibe-diagnostics-*.txt
