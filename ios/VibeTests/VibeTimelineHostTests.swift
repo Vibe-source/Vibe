@@ -327,15 +327,63 @@ final class VibeTimelineHostTests: XCTestCase {
       "default flags must not arm the probe")
 
     let noAllowlist = VibeTimelineFeatureFlags(vibeTimelineShadowCompareEnabled: true)
+    // The RENDER allowlist must not arm the probe either — only the shadow one.
+    let wrongAllowlist = VibeTimelineFeatureFlags(
+      vibeTimelineShadowCompareEnabled: true, eligibleChatClasses: .directMessage)
+    XCTAssertNil(
+      VibeTimelineShadowProbe.makeIfEligible(
+        chatId: "c1", isGroupOrChannel: false, flags: wrongAllowlist),
+      "the render allowlist must not arm a diagnostic")
     XCTAssertNil(
       VibeTimelineShadowProbe.makeIfEligible(
         chatId: "c1", isGroupOrChannel: false, flags: noAllowlist),
       "an empty class allowlist must not arm the probe")
   }
 
+  /// The debug default is deliberate, and only covers the harmless gate.
+  ///
+  /// Shadow comparison arms itself in debug so real-conversation divergence data
+  /// accumulates without anyone remembering a switch. The async host must not:
+  /// it changes what the user sees, and "it was on in debug" is not a rollout.
+  func testDebugArmsShadowComparisonButNeverTheAsyncHost() {
+    let defaults = UserDefaults(suiteName: "shadow-default-\(UUID().uuidString)")!
+    let flags = VibeTimelineUserDefaultsFeatureFlags(defaults: defaults).flags
+
+    XCTAssertFalse(
+      flags.vibeAsyncTimelineV1Enabled, "the render-path gate must never default on")
+
+    // The render allowlist stays empty in every configuration. This is the
+    // assertion that keeps the two gates independent: an earlier version of this
+    // change armed shadow comparison by defaulting the SHARED allowlist to DM,
+    // which would have made the async host go live for DMs the instant anyone
+    // enabled its flag. Two risks, two lists.
+    XCTAssertEqual(
+      flags.eligibleChatClasses.rawValue, 0,
+      "arming the diagnostic must not widen the render rollout")
+    XCTAssertFalse(flags.isAsyncTimelineEnabled(for: .directMessage))
+
+    #if DEBUG
+      XCTAssertTrue(flags.vibeTimelineShadowCompareEnabled)
+      XCTAssertTrue(flags.shadowEligibleChatClasses.contains(.directMessage))
+      // Armed for DMs and nothing else — P4 covers 1:1 only.
+      XCTAssertFalse(flags.shadowEligibleChatClasses.contains(.group))
+      XCTAssertFalse(flags.shadowEligibleChatClasses.contains(.channel))
+    #else
+      XCTAssertFalse(flags.vibeTimelineShadowCompareEnabled)
+      XCTAssertEqual(flags.shadowEligibleChatClasses.rawValue, 0)
+    #endif
+
+    // An explicit write still wins in both directions.
+    defaults.set(false, forKey: VibeTimelineUserDefaultsFeatureFlags.shadowCompareKey)
+    XCTAssertFalse(
+      VibeTimelineUserDefaultsFeatureFlags(defaults: defaults).flags
+        .vibeTimelineShadowCompareEnabled,
+      "turning it off in Diagnostics must survive the debug default")
+  }
+
   func testTheShadowProbeIsDirectMessageOnly() {
     let on = VibeTimelineFeatureFlags(
-      vibeTimelineShadowCompareEnabled: true, eligibleChatClasses: .directMessage)
+      vibeTimelineShadowCompareEnabled: true, shadowEligibleChatClasses: .directMessage)
 
     XCTAssertNotNil(
       VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: false, flags: on))

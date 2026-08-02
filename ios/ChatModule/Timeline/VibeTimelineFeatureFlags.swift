@@ -51,9 +51,17 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
   var vibeAsyncTimelineV1Enabled: Bool
   /// Dual-apply shadow comparison (ids/metrics only). Independent of async host.
   var vibeTimelineShadowCompareEnabled: Bool
-  /// Explicit per-class rollout allowlist. Empty by default, including when the
-  /// umbrella flag is accidentally enabled.
+  /// Explicit per-class rollout allowlist **for the render path**. Empty by
+  /// default, including when the umbrella flag is accidentally enabled.
   var eligibleChatClasses: VibeTimelineChatClassEligibility
+  /// Per-class allowlist for shadow comparison only.
+  ///
+  /// Deliberately a separate field from ``eligibleChatClasses``. Sharing one
+  /// allowlist between "compare quietly and log" and "render this to the user"
+  /// couples a diagnostic to a rollout: widening it to gather data would silently
+  /// widen what the render gate would cover the moment anyone enabled it. Two
+  /// risks, two lists.
+  var shadowEligibleChatClasses: VibeTimelineChatClassEligibility
   /// Active window override; `nil` uses `VibeTimelineWindowPolicy.defaultActiveWindowCount`.
   var activeWindowOverride: Int?
 
@@ -61,11 +69,13 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
     vibeAsyncTimelineV1Enabled: Bool = false,
     vibeTimelineShadowCompareEnabled: Bool = false,
     eligibleChatClasses: VibeTimelineChatClassEligibility = [],
+    shadowEligibleChatClasses: VibeTimelineChatClassEligibility = [],
     activeWindowOverride: Int? = nil
   ) {
     self.vibeAsyncTimelineV1Enabled = vibeAsyncTimelineV1Enabled
     self.vibeTimelineShadowCompareEnabled = vibeTimelineShadowCompareEnabled
     self.eligibleChatClasses = eligibleChatClasses
+    self.shadowEligibleChatClasses = shadowEligibleChatClasses
     self.activeWindowOverride = activeWindowOverride
   }
 
@@ -101,7 +111,12 @@ struct VibeTimelineFixedFeatureFlags: VibeTimelineFeatureFlagProviding {
   }
 }
 
-/// UserDefaults-backed provider. Missing keys resolve to **false** / policy default.
+/// UserDefaults-backed provider.
+///
+/// Missing keys resolve to **false** / policy default in release. In debug the
+/// *shadow comparison* pair (flag + DM allowlist) resolves on instead, because it
+/// renders nothing and only writes log lines — see the comment at the resolution
+/// site. The async-host flag is default-off in every configuration.
 ///
 /// Does not write defaults on read. Enabling the async path requires an explicit write
 /// elsewhere (settings, remote config bridge, or test setup).
@@ -135,7 +150,27 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     // `bool(forKey:)` returns false when unset — correct default-off semantics.
     // Still use `object(forKey:)` so we never treat an accidental non-bool as true.
     let asyncEnabled = defaults.object(forKey: asyncKey) as? Bool ?? false
-    let shadowEnabled = defaults.object(forKey: shadowKey) as? Bool ?? false
+
+    // The two gates get different defaults, on purpose.
+    //
+    // `vibeAsyncTimelineV1Enabled` changes what the user sees, so it stays
+    // default-off everywhere including debug — qualification has to be an
+    // intentional act.
+    //
+    // Shadow comparison changes nothing: it feeds the core the rows the engine
+    // is already about to render, compares the two orderings, and writes a log
+    // line. Its worst failure is a log line. Leaving it off by default meant the
+    // only data that can open the read-authority gate was gathered exclusively
+    // when someone remembered to flip a switch — which is to say, almost never.
+    // Debug builds arm it; release builds still require the explicit write.
+    let shadowDefault: Bool
+    #if DEBUG
+      shadowDefault = true
+    #else
+      shadowDefault = false
+    #endif
+    let shadowEnabled = defaults.object(forKey: shadowKey) as? Bool ?? shadowDefault
+
     let eligibilityRaw: UInt32
     if let value = defaults.object(forKey: eligibilityKey) as? Int {
       eligibilityRaw = value >= 0 && UInt64(value) <= UInt64(UInt32.max) ? UInt32(value) : 0
@@ -150,10 +185,16 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     } else {
       windowOverride = nil
     }
+    // An armed probe with an empty allowlist compares nothing, so the shadow
+    // allowlist follows the shadow flag: debug arms the one class P4 covers.
+    let shadowClasses: VibeTimelineChatClassEligibility =
+      shadowEnabled ? .directMessage : []
+
     return VibeTimelineFeatureFlags(
       vibeAsyncTimelineV1Enabled: asyncEnabled,
       vibeTimelineShadowCompareEnabled: shadowEnabled,
       eligibleChatClasses: VibeTimelineChatClassEligibility(rawValue: eligibilityRaw),
+      shadowEligibleChatClasses: shadowClasses,
       activeWindowOverride: windowOverride
     )
   }

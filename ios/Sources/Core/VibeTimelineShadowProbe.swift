@@ -79,7 +79,8 @@ final class VibeTimelineShadowProbe {
   ) -> VibeTimelineShadowProbe? {
     guard flags.vibeTimelineShadowCompareEnabled else { return nil }
     guard !isGroupOrChannel else { return nil }
-    guard flags.eligibleChatClasses.contains(.directMessage) else { return nil }
+    // The shadow allowlist, not the render one — see the note on the field.
+    guard flags.shadowEligibleChatClasses.contains(.directMessage) else { return nil }
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
     VibeLog.notice(

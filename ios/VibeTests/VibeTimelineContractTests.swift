@@ -50,9 +50,16 @@ final class VibeTimelineFeatureFlagTests: XCTestCase {
     let provider = VibeTimelineUserDefaultsFeatureFlags(defaults: defaults)
     XCTAssertNil(defaults.object(forKey: VibeTimelineUserDefaultsFeatureFlags.asyncTimelineKey))
     XCTAssertFalse(provider.flags.vibeAsyncTimelineV1Enabled)
-    XCTAssertFalse(provider.flags.vibeTimelineShadowCompareEnabled)
     XCTAssertNil(provider.flags.activeWindowOverride)
+    // The render allowlist is empty in every configuration — the debug default
+    // arms shadow comparison only, through its own separate list.
     XCTAssertEqual(provider.flags.eligibleChatClasses, [])
+    #if DEBUG
+      XCTAssertTrue(provider.flags.vibeTimelineShadowCompareEnabled)
+    #else
+      XCTAssertFalse(provider.flags.vibeTimelineShadowCompareEnabled)
+      XCTAssertEqual(provider.flags.shadowEligibleChatClasses, [])
+    #endif
   }
 
   func testAsyncTimelineReadsExplicitFalseAndTrue() {
