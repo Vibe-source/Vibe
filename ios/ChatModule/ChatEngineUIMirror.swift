@@ -1,5 +1,35 @@
 import Foundation
 
+/// One unanswered bridge approval prompt, as the UI needs to see it.
+///
+/// A value type carrying the exact fields the ask sheet reads, so answering "is there a
+/// prompt waiting for this chat" never touches engine state. The engine keys these by
+/// request id and scans for a chat match; the UI only ever asks per chat, so the mirror
+/// stores them the way they are read.
+struct ChatEngineBridgeAskSnapshot: Sendable, Equatable {
+  let requestId: String
+  let chatId: String
+  let kind: String
+  let provider: String
+  let sessionId: String
+  let resumedFromSessionId: String
+
+  /// The payload shape `outstandingAgentBridgeAskInfo` has always returned. Built here
+  /// so the mirror path and the queue fallback cannot drift into two different
+  /// dictionaries — the sheet reads these keys by name.
+  var payload: [AnyHashable: Any] {
+    [
+      "chatId": chatId,
+      "requestId": requestId,
+      "kind": kind,
+      "provider": provider,
+      "sessionId": sessionId,
+      "resumedFromSessionId": resumedFromSessionId,
+      "reason": "agentBridgeAsk",
+    ]
+  }
+}
+
 /// One chat's agent-progress state, as the UI needs to see it.
 ///
 /// A value type rather than a reference into the engine, so the mirror can hand
@@ -102,6 +132,11 @@ final class ChatEngineUIMirror: @unchecked Sendable {
   private var onlineUserIds: Set<String> = []
   private var lastSeenByUserId: [String: Int64] = [:]
 
+  /// Unanswered bridge approval prompts, already filtered to the ones still worth
+  /// showing. Stored per chat because that is how it is asked for; the engine holds it
+  /// keyed by request id and scans, which is the wrong shape for a hot read.
+  private var pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:]
+
   /// Until the first publish the mirror cannot distinguish "nothing is
   /// happening" from "nobody has told me yet", so readers fall back to the
   /// queue. One publish lands on the first engine notification.
@@ -123,7 +158,8 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     typingByChatId: [String: Set<String>],
     agentProgressByChatId: [String: ChatEngineAgentProgressSnapshot],
     onlineUserIds: Set<String>,
-    lastSeenByUserId: [String: Int64]
+    lastSeenByUserId: [String: Int64],
+    pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:]
   ) {
     lock.lock()
     defer { lock.unlock() }
@@ -131,6 +167,7 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     self.agentProgressByChatId = agentProgressByChatId
     self.onlineUserIds = onlineUserIds
     self.lastSeenByUserId = lastSeenByUserId
+    self.pendingAskByChatId = pendingAskByChatId
     hasPublished = true
     publishes += 1
   }
@@ -171,6 +208,30 @@ final class ChatEngineUIMirror: @unchecked Sendable {
 
   func isUserOnline(userId: String) -> Bool? {
     read { onlineUserIds.contains(userId) }
+  }
+
+  /// The oldest unanswered approval prompt for a chat, optionally narrowed to one
+  /// provider.
+  ///
+  /// Double-optional for the same reason `agentProgress` is: the outer `nil` means
+  /// nothing has been published and the caller must ask the queue, the inner `nil` means
+  /// published and this chat has no prompt waiting. Collapsing them turns a cold start
+  /// into a confident "no approval pending" — and a missed approval prompt is a run that
+  /// silently waits forever.
+  ///
+  /// Provider matching is deliberately permissive in the same way the engine's own scan
+  /// is: a prompt with no provider recorded matches any provider asked for, because a
+  /// prompt that cannot be attributed still has to be answerable.
+  func pendingBridgeAsk(chatId: String, provider: String)
+    -> ChatEngineBridgeAskSnapshot??
+  {
+    read {
+      guard let prompts = pendingAskByChatId[chatId] else { return nil }
+      return prompts.first { prompt in
+        guard !provider.isEmpty, !prompt.provider.isEmpty else { return true }
+        return prompt.provider == provider
+      }
+    }
   }
 
   func lastSeenTimestampMs(userId: String) -> Int64?? {

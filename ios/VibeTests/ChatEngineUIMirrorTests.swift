@@ -208,3 +208,98 @@ final class ChatEngineUIMirrorTests: XCTestCase {
     XCTAssertEqual(mirror.isUserOnline(userId: "U1"), true)
   }
 }
+
+// MARK: - Pending bridge approvals
+
+/// The 90 ms stall: `outstandingAgentBridgeAskInfo` blocked the main thread while the
+/// engine queue loaded history. The scan was never the cost — the wait was.
+///
+/// A missed approval prompt is a run that waits forever with nothing on screen, so the
+/// cold-start distinction matters more here than anywhere else in the mirror: "nothing
+/// published yet" must never be answered as "no approval pending".
+extension ChatEngineUIMirrorTests {
+
+  private func ask(
+    _ requestId: String, chat: String = "c1", provider: String = "codex"
+  ) -> ChatEngineBridgeAskSnapshot {
+    ChatEngineBridgeAskSnapshot(
+      requestId: requestId, chatId: chat, kind: "ask", provider: provider,
+      sessionId: "s-\(requestId)", resumedFromSessionId: "")
+  }
+
+  func testBeforeAnyPublishTheCallerIsSentToTheQueue() {
+    let mirror = ChatEngineUIMirror()
+    XCTAssertNil(
+      mirror.pendingBridgeAsk(chatId: "c1", provider: "codex"),
+      "a cold mirror must say 'ask the queue', never 'no approval pending'")
+  }
+
+  func testAPublishedChatWithNoPromptAnswersEmptyRatherThanUnknown() {
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: [:])
+    let answer = mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")
+    XCTAssertNotNil(answer, "published means the caller must not fall back to the queue")
+    XCTAssertNil(answer!, "…and this chat genuinely has nothing waiting")
+  }
+
+  func testAPendingPromptIsReturnedWithoutTouchingTheEngine() {
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c1": [ask("r1")]])
+    let prompt = mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")
+    XCTAssertEqual(prompt??.requestId, "r1")
+    XCTAssertEqual(prompt??.payload["reason"] as? String, "agentBridgeAsk")
+    XCTAssertEqual(prompt??.payload["sessionId"] as? String, "s-r1")
+  }
+
+  func testAPromptForAnotherProviderIsNotReturned() {
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c1": [ask("r1", provider: "claude")]])
+    XCTAssertNil(mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")!)
+  }
+
+  func testAPromptWithNoProviderMatchesAnyProvider() {
+    // An unattributable prompt still has to be answerable, or the run waits forever.
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c1": [ask("r1", provider: "")]])
+    XCTAssertEqual(
+      mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")??.requestId, "r1")
+  }
+
+  func testAnEmptyProviderQueryMatchesAnyPrompt() {
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c1": [ask("r1", provider: "claude")]])
+    XCTAssertEqual(mirror.pendingBridgeAsk(chatId: "c1", provider: "")??.requestId, "r1")
+  }
+
+  func testAnotherChatsPromptIsNotReturned() {
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c2": [ask("r1", chat: "c2")]])
+    XCTAssertNil(mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")!)
+  }
+
+  func testTheSamePromptIsReturnedEveryTime() {
+    // The engine sorts by request id before publishing precisely so this holds. A sheet
+    // that swaps which request it is answering mid-flight is worse than a late one.
+    let mirror = ChatEngineUIMirror()
+    mirror.publish(
+      typingByChatId: [:], agentProgressByChatId: [:], onlineUserIds: [],
+      lastSeenByUserId: [:], pendingAskByChatId: ["c1": [ask("r1"), ask("r2"), ask("r3")]])
+    let first = mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")??.requestId
+    for _ in 0..<20 {
+      XCTAssertEqual(mirror.pendingBridgeAsk(chatId: "c1", provider: "codex")??.requestId, first)
+    }
+    XCTAssertEqual(first, "r1")
+  }
+}

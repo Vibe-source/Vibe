@@ -2649,6 +2649,14 @@ final class ChatEngine {
     let chatId = normalizedString(rawChatId) ?? ""
     guard !chatId.isEmpty else { return nil }
     let provider = (rawProvider ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    // A device run caught this blocking the main thread for 90 ms while opening a Codex
+    // DM. The scan below is a handful of dictionary reads — the 90 ms was spent *waiting*
+    // for the engine queue, which happened to be loading history. Any main-thread reader
+    // is exposed to the duration of whatever the queue is running, so the fix is to stop
+    // being a main-thread reader rather than to make the scan quicker.
+    if let published = uiMirror.pendingBridgeAsk(chatId: chatId, provider: provider) {
+      return published?.payload
+    }
     return syncOnQueue {
       for (rid, payload) in agentBridgeAskByRequestId {
         guard (normalizedString(payload["chatId"]) ?? "") == chatId else { continue }
@@ -13814,11 +13822,37 @@ final class ChatEngine {
         updatedAtMs: state.updatedAtMs
       )
     }
+    // Unanswered approval prompts, grouped the way they are read. The engine keys them
+    // by request id and the getter scans; a chat with no agent running contributes
+    // nothing, so this map is empty in the ordinary case.
+    var pendingAsk: [String: [ChatEngineBridgeAskSnapshot]] = [:]
+    for (requestId, payload) in agentBridgeAskByRequestId {
+      guard !presentedAskRequestIds.contains(requestId) else { continue }
+      guard let chatId = normalizedString(payload["chatId"]), !chatId.isEmpty else { continue }
+      pendingAsk[chatId, default: []].append(
+        ChatEngineBridgeAskSnapshot(
+          requestId: requestId,
+          chatId: chatId,
+          kind: normalizedString(payload["kind"]) ?? "ask",
+          provider: (normalizedString(payload["provider"]) ?? "").lowercased(),
+          sessionId: normalizedString(payload["sessionId"] ?? payload["session_id"]) ?? "",
+          resumedFromSessionId: normalizedString(
+            payload["resumedFromSessionId"] ?? payload["resumed_from_session_id"]) ?? ""
+        ))
+    }
+    // Dictionary iteration has no order, and the getter returns the *first* match. Sort
+    // by request id so two reads of the same state cannot answer with different prompts
+    // — an approval sheet that swaps which request it is answering mid-flight is worse
+    // than one that is late.
+    for (chatId, prompts) in pendingAsk where prompts.count > 1 {
+      pendingAsk[chatId] = prompts.sorted { $0.requestId < $1.requestId }
+    }
     uiMirror.publish(
       typingByChatId: peerTypingUserIdsByChatId,
       agentProgressByChatId: progress,
       onlineUserIds: onlineUsers,
-      lastSeenByUserId: lastSeenByUserId
+      lastSeenByUserId: lastSeenByUserId,
+      pendingAskByChatId: pendingAsk
     )
     // Sampled, so the export can answer "is the UI still queueing?" without a
     // profiler. `fallback` climbing after launch means the mirror stopped being
