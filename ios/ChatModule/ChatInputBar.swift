@@ -1372,6 +1372,14 @@ final class ChatInputBar: UIView {
   private var readyBannerAction: ReadyBannerAction = .none
 
   private(set) var barHeight: CGFloat = 0
+
+  /// Whether the composer is what the keyboard is up for.
+  ///
+  /// Ground truth for the list's keyboard geometry: `keyboardHeight` there is written only
+  /// by notifications and so is a remembered value, which survives a chat close that the
+  /// hide notification never reached.
+  var isComposerFirstResponder: Bool { textView.isFirstResponder }
+
   var bottomSafeAreaInset: CGFloat = 0 {
     didSet { if abs(oldValue - bottomSafeAreaInset) > 0.5 { setNeedsLayout() } }
   }

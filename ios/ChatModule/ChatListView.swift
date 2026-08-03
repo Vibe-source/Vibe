@@ -2606,6 +2606,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // for exactly the opens that need it most. Retry at attach; self-guarded.
       // A new visit: the next close gets to record its own viewport again.
       viewportPersistedForCurrentClose = false
+      resyncKeyboardHeightFromReality(reason: "attach")
       installReopenSnapshotOverlayIfAvailable()
       mountDeferredPresentationSeedAfterFirstFrame()
       revalidateListRenderOnAttach()
@@ -2618,7 +2619,41 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // ordinary detached-stash rules (didMoveToWindow mounts on the next attach).
       defersPresentationSeedMountUnderRaster = false
       removeReopenSnapshotOverlay(reason: "detached", animated: false)
+      // Leaving with the keyboard up: the pop takes the composer's first responder with
+      // it, but `keyboardWillHide` is not guaranteed to reach a view that is already off
+      // the window. A remembered height then rides into whatever this view shows next.
+      resyncKeyboardHeightFromReality(reason: "detach")
     }
+  }
+
+  /// Re-derives `keyboardHeight` from whether anything here is actually editing.
+  ///
+  /// The reported bug: leave a chat with the keyboard open, come back, and the transcript
+  /// sits a keyboard's height too high with a gap under the last message which then closes
+  /// and drags everything down.
+  ///
+  /// `keyboardHeight` is only ever written by the will-change / will-hide notifications,
+  /// so it is a *remembered* value, and it is one term of `contentPaddingBottom` — which
+  /// is a section inset, so it is inside `contentSize`. A stale one does not merely add
+  /// padding: it makes the whole transcript taller than it is, and the correction when the
+  /// truth arrives moves every row.
+  ///
+  /// First responder is the ground truth: no editor here, no keyboard for this view. It
+  /// cannot make the value wrong — a keyboard that really is up has a first responder to
+  /// prove it, and its notification carries the real height.
+  private func resyncKeyboardHeightFromReality(reason: String) {
+    guard keyboardHeight > 0 else { return }
+    let stillEditing =
+      inputBar?.isComposerFirstResponder == true || agentComposerView?.isFirstResponder == true
+    guard !stillEditing else { return }
+    let stale = keyboardHeight
+    keyboardHeight = 0
+    inputBar?.keyboardHeightForPanels = 0
+    inputBar?.keyboardProgress = 0.0
+    NSLog(
+      "[KbViewport] RESYNC chat=%@ reason=%@ dropped stale keyboardHeight=%.0f (nothing is editing)",
+      String(engineChatId.prefix(12)), reason, stale)
+    if window != nil { layoutInputBarAndInset() }
   }
 
   /// Commit-first push, step 2: this fires during transition setup — the same runloop
@@ -2733,7 +2768,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // wallpaper PASSES the luma spread check — that poisoned raster then covered the
     // first ~500ms of every open with a convincing "empty chat" (the reported bug,
     // screenshot-confirmed). Old files are never read again and age out of Caches.
-    return NSString(string: "\(chatId)|w\(width)|\(theme)|v2")
+    //
+    // v3: orphan every raster captured while the keyboard guard read the wrong property.
+    // That guard tested `adjustedContentInset.bottom`, but the keyboard's clearance lives
+    // in the section inset, so keyboard-up rasters were cached for months. Without this
+    // bump each chat would replay its poisoned image once more — the fix would look like
+    // it had not landed.
+    return NSString(string: "\(chatId)|w\(width)|\(theme)|v3")
   }
 
   /// Anchor-keyed twin of the reopen raster for chats left MID-HISTORY. Keyed by the same
@@ -2804,10 +2845,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // height above the image bottom — the next open then draws the transcript that far
     // too high with bare wallpaper beneath it, and the live mount snaps it back down.
     // That is the reported "extra gap from the bottom on open, then the list shifts".
-    guard collectionView.adjustedContentInset.bottom <= 40 else {
+    //
+    // The keyboard's clearance does NOT ride in `contentInset`. `layoutInputBarAndInset`
+    // puts `barHeight + keyboardHeight` into `contentPaddingBottom`, which is the flow
+    // layout's SECTION inset and therefore part of `contentSize`. This guard used to read
+    // `adjustedContentInset.bottom`, which carries the safe area and nothing else — device
+    // logs show it at 0 on every close, keyboard up or down — so it never once fired for
+    // the case it was written for, and the keyboard-up raster was cached and replayed on
+    // every reopen.
+    let bottomClearance = collectionView.adjustedContentInset.bottom + keyboardHeight
+    guard bottomClearance <= 40 else {
       NSLog(
-        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — keyboard inset %.0f (bottom-pinned replay would gap)",
-        String(engineChatId.prefix(12)), collectionView.adjustedContentInset.bottom)
+        "[ChatOpen] reopen-snapshot CAPTURE-SKIP chat=%@ — bottom clearance %.0f (inset %.0f + keyboard %.0f), bottom-pinned replay would gap",
+        String(engineChatId.prefix(12)), bottomClearance,
+        collectionView.adjustedContentInset.bottom, keyboardHeight)
       return
     }
     let visibleBottom = collectionView.contentOffset.y + collectionView.bounds.height
@@ -7680,6 +7731,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     meta["dInsetBottom"] = String(format: "%.0f", dInsetBottom)
     meta["dRows"] = String(dRows)
     meta["anchor"] = String(key.prefix(14))
+    meta["kb"] = String(format: "%.0f", keyboardHeight)
+    meta["padBottom"] = String(format: "%.0f", contentPaddingBottom)
     let causes = pendingGeometryCauses.joined(separator: ",")
     pendingGeometryCauses.removeAll(keepingCapacity: true)
     if !causes.isEmpty { meta["caused"] = causes }
