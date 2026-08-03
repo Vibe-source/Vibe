@@ -7566,7 +7566,110 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       collectionView.contentOffset.y, collectionView.contentSize.height, boundsH,
       spanTop == .greatestFiniteMagnitude ? -1 : spanTop,
       spanBottom == -.greatestFiniteMagnitude ? -1 : spanBottom)
+    recordViewportDrift(stage: stage)
     logViewportVisibility(stage)
+  }
+
+  /// One checkpoint in the open sequence, enough to tell a shift from a scroll.
+  private struct ViewportCheckpoint {
+    let stage: String
+    let offsetY: CGFloat
+    let contentH: CGFloat
+    let insetTop: CGFloat
+    let insetBottom: CGFloat
+    let rowCount: Int
+    /// A row that was on screen, and where it sat *relative to the viewport*.
+    let anchorKey: String?
+    let anchorScreenY: CGFloat
+  }
+
+  private var lastViewportCheckpoint: ViewportCheckpoint?
+
+  /// Measures whether the transcript moved under the user, and says why.
+  ///
+  /// `contentOffset` on its own cannot answer this. When rows are prepended the
+  /// offset *must* change or the content would slide; when an inset settles the
+  /// offset changes and nothing visibly moves. The only thing that corresponds
+  /// to what a person sees is whether a row they were already looking at kept
+  /// its position on screen.
+  ///
+  /// So the anchor is a real row key and its `frame.minY - contentOffset.y`.
+  /// Drift on that number is a shift, in points, and it is the gate: it must be
+  /// zero between `seed` and `settled`. A device run on 2026-08-03 showed the
+  /// offset moving 4266→4238 with `contentH` unchanged at 5222 — 28 pt that no
+  /// existing log could attribute, because none of them tracked a row.
+  ///
+  /// The attribution matters as much as the number. `contentH` moving means rows
+  /// changed size or count; insets moving means chrome settled late; neither
+  /// moving while the anchor drifts means something called `setContentOffset`
+  /// directly, which is the hardest class to find by reading code.
+  private func recordViewportDrift(stage: String) {
+    let offsetY = collectionView.contentOffset.y
+    let inset = collectionView.adjustedContentInset
+    var anchorKey: String?
+    var anchorScreenY: CGFloat = 0
+    // Topmost materialized cell — the row the user is most likely reading, and
+    // the one a prepend would push away first.
+    var bestY = CGFloat.greatestFiniteMagnitude
+    for cell in collectionView.visibleCells {
+      guard let indexPath = collectionView.indexPath(for: cell),
+        rows.indices.contains(indexPath.item),
+        cell.frame.minY < bestY
+      else { continue }
+      bestY = cell.frame.minY
+      anchorKey = rows[indexPath.item].key
+      anchorScreenY = cell.frame.minY - offsetY
+    }
+
+    let checkpoint = ViewportCheckpoint(
+      stage: stage,
+      offsetY: offsetY,
+      contentH: collectionView.contentSize.height,
+      insetTop: inset.top,
+      insetBottom: inset.bottom,
+      rowCount: rows.count,
+      anchorKey: anchorKey,
+      anchorScreenY: anchorScreenY)
+    defer { lastViewportCheckpoint = checkpoint }
+
+    guard let previous = lastViewportCheckpoint else { return }
+    // Only comparable when the same row is on screen in both checkpoints.
+    guard let key = checkpoint.anchorKey, key == previous.anchorKey else { return }
+
+    let drift = checkpoint.anchorScreenY - previous.anchorScreenY
+    let dContent = checkpoint.contentH - previous.contentH
+    let dInsetTop = checkpoint.insetTop - previous.insetTop
+    let dInsetBottom = checkpoint.insetBottom - previous.insetBottom
+    let dRows = checkpoint.rowCount - previous.rowCount
+
+    var meta: [String: String] = [:]
+    meta["chat"] = String(engineChatId.prefix(12))
+    meta["from"] = previous.stage
+    meta["to"] = stage
+    meta["driftPt"] = String(format: "%.1f", drift)
+    meta["dContentH"] = String(format: "%.0f", dContent)
+    meta["dInsetTop"] = String(format: "%.0f", dInsetTop)
+    meta["dInsetBottom"] = String(format: "%.0f", dInsetBottom)
+    meta["dRows"] = String(dRows)
+    meta["anchor"] = String(key.prefix(14))
+    // Blames the cause rather than leaving it to be inferred from four numbers.
+    meta["blame"] = {
+      if abs(drift) < 0.5 { return "none" }
+      if dRows != 0 { return "rows" }
+      if abs(dContent) >= 0.5 { return "height" }
+      if abs(dInsetTop) >= 0.5 || abs(dInsetBottom) >= 0.5 { return "inset" }
+      return "offset-set"
+    }()
+
+    if abs(drift) < 0.5 {
+      VibeLog.info("viewport held", category: "list", metadata: meta)
+    } else {
+      VibeLog.error("LIST SHIFTED under the user", category: "list", metadata: meta)
+      NSLog(
+        "[ListShift] chat=%@ %@→%@ drift=%.1fpt blame=%@ dContentH=%.0f dRows=%d dInsetT=%.0f dInsetB=%.0f anchor=%@",
+        String(engineChatId.prefix(12)), previous.stage, stage, drift,
+        meta["blame"] ?? "-", dContent, dRows, dInsetTop, dInsetBottom, String(key.prefix(14)))
+    }
   }
 
   /// Second half of the blank-open probe. Coverage says the cells EXIST and sit under the
@@ -10698,6 +10801,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // A new conversation opens bounded again; "revealed" is a property of the
     // chat the user scrolled through, not of the view that rendered it.
     transcriptWindowRevealed = false
+    // Comparing an anchor across two different conversations would report the
+    // switch itself as a shift.
+    lastViewportCheckpoint = nil
     isRevealingOlderTranscriptRows = false
     pendingHistoryRevealAfterScroll = false
     resetOlderHistoryPaginationState(clearExhausted: true)
