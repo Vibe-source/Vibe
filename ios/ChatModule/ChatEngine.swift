@@ -445,6 +445,11 @@ final class ChatEngine {
   private var canceledOutboundMessageIds = Set<String>()
   private var nativeTypingStateByChatId: [String: Bool] = [:]
   private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
+
+  /// Lock-guarded copy of the small state the UI polls, so those reads never
+  /// queue behind engine work. Published from ``postChangeLocked``; see
+  /// ``ChatEngineUIMirror`` for why the direction is inverted.
+  let uiMirror = ChatEngineUIMirror()
   private var agentProgressByChatId: [String: AgentProgressState] = [:]
   // Last time this chat's transcript showed a RUNNING agent turn (ms). A watch-mirrored
   // session (e.g. one running in the IDE) re-pushes its whole transcript every watch
@@ -1489,17 +1494,17 @@ final class ChatEngine {
   }
 
   func isUserOnline(userId: String?) -> Bool {
-    syncOnQueue {
-      guard let normalized = normalizedUpper(userId), !normalized.isEmpty else { return false }
-      return onlineUsers.contains(normalized)
-    }
+    guard let normalized = normalizedUpper(userId), !normalized.isEmpty else { return false }
+    // Mirror first — presence is polled from header refresh, which runs on the
+    // main thread during scroll. See `ChatEngineUIMirror`.
+    if let published = uiMirror.isUserOnline(userId: normalized) { return published }
+    return syncOnQueue { onlineUsers.contains(normalized) }
   }
 
   func lastSeenTimestampMs(userId: String?) -> Int64? {
-    syncOnQueue {
-      guard let normalized = normalizedUpper(userId), !normalized.isEmpty else { return nil }
-      return lastSeenByUserId[normalized]
-    }
+    guard let normalized = normalizedUpper(userId), !normalized.isEmpty else { return nil }
+    if let published = uiMirror.lastSeenTimestampMs(userId: normalized) { return published }
+    return syncOnQueue { lastSeenByUserId[normalized] }
   }
 
   func connect() -> [String: Any] {
@@ -5637,45 +5642,37 @@ final class ChatEngine {
 
   func typingUserIds(chatId: String?) -> [String] {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return [] }
+    if let published = uiMirror.typingUserIds(chatId: chatId) { return published }
     return syncOnQueue {
       Array(peerTypingUserIdsByChatId[chatId] ?? []).sorted()
     }
   }
 
+  /// The chat's live agent progress, or `nil` when nothing is running.
+  ///
+  /// This getter is the one a device run caught blocking the main thread for
+  /// 64 ms — not because the lookup is slow, but because it queued behind a
+  /// decrypt. It reads the mirror now; the queue is only touched before the
+  /// first publish.
+  ///
+  /// The terminal/staleness rules live in
+  /// ``ChatEngineAgentProgressSnapshot/activePayload(nowMs:)`` so both paths
+  /// share one implementation. Two copies of a "has this gone stale" rule is how
+  /// a spinner ends up running forever on one path and not the other.
   func agentProgress(chatId: String?) -> [String: Any]? {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return nil }
+    let now = Int64(nowMs())
+    if let published = uiMirror.agentProgress(chatId: chatId) {
+      return published?.activePayload(nowMs: now)
+    }
     return syncOnQueue { () -> [String: Any]? in
       guard let state = agentProgressByChatId[chatId] else { return nil }
-      let status = state.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      // Terminal / idle statuses are not live work — never advertise them as active.
-      let terminal: Set<String> = [
-        "done", "completed", "complete", "idle", "failed", "error", "cancelled", "canceled",
-        "stopped", "settled", "success",
-      ]
-      if terminal.contains(status) {
-        return nil
-      }
-      // Stale map entries (no update for 90s) must not keep home rows on "Working…".
-      let ageMs = Int64(nowMs()) - state.updatedAtMs
-      if ageMs > 90_000 {
-        return nil
-      }
-      let activeHints = ["running", "streaming", "in_progress", "active", "thinking", "tool", "wait"]
-      let looksActive =
-        status.isEmpty
-        || activeHints.contains(where: { status.contains($0) })
-        || ageMs < 15_000
-      guard looksActive else { return nil }
-      var payload: [String: Any] = [
-        "label": state.label,
-        "status": state.status,
-        "updatedAtMs": state.updatedAtMs,
-        "isActive": true,
-      ]
-      if let tool = state.tool {
-        payload["tool"] = tool
-      }
-      return payload
+      return ChatEngineAgentProgressSnapshot(
+        label: state.label,
+        tool: state.tool,
+        status: state.status,
+        updatedAtMs: state.updatedAtMs
+      ).activePayload(nowMs: now)
     }
   }
 
@@ -13785,7 +13782,54 @@ final class ChatEngine {
       source, chatId, generation, inserted.count, updated.count, deleted.count)
   }
 
+  /// Copies the UI-polled state out to the mirror. Engine queue only.
+  ///
+  /// Called from ``postChangeLocked`` rather than from each mutation site: this
+  /// is the funnel every UI-visible change already passes through, so hanging
+  /// the publish here means a new mutation path cannot forget to update the
+  /// mirror unless it also forgot to notify the UI — in which case the mirror is
+  /// not what is broken.
+  private func publishUIMirrorLocked() {
+    // The first three assignments are copy-on-write retains, not deep copies.
+    // Only the agent-progress transform allocates, over a map that holds one
+    // entry per chat with a running agent.
+    var progress: [String: ChatEngineAgentProgressSnapshot] = [:]
+    progress.reserveCapacity(agentProgressByChatId.count)
+    for (chatId, state) in agentProgressByChatId {
+      progress[chatId] = ChatEngineAgentProgressSnapshot(
+        label: state.label,
+        tool: state.tool,
+        status: state.status,
+        updatedAtMs: state.updatedAtMs
+      )
+    }
+    uiMirror.publish(
+      typingByChatId: peerTypingUserIdsByChatId,
+      agentProgressByChatId: progress,
+      onlineUserIds: onlineUsers,
+      lastSeenByUserId: lastSeenByUserId
+    )
+    // Sampled, so the export can answer "is the UI still queueing?" without a
+    // profiler. `fallback` climbing after launch means the mirror stopped being
+    // published and the stalls are back.
+    uiMirrorPublishes += 1
+    if uiMirrorPublishes % Self.uiMirrorLogInterval == 1 {
+      let counts = uiMirror.counts
+      VibeLog.info(
+        "ui mirror", category: "engine",
+        metadata: [
+          "reads": String(counts.mirrorReads),
+          "fallback": String(counts.fallbackReads),
+          "publishes": String(counts.publishes),
+        ])
+    }
+  }
+
+  private var uiMirrorPublishes = 0
+  private static let uiMirrorLogInterval = 200
+
   private func postChangeLocked(reason: String, userInfo: [String: Any]) {
+    publishUIMirrorLocked()
     var info = userInfo
     info["reason"] = reason
     info["timestamp"] = nowMs()
@@ -13870,6 +13914,13 @@ final class ChatEngine {
       NSLog(
         "[ChatEngine][MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for %dms at %@",
         elapsedMs, callSite)
+      // Also into the exportable log. Retiring these stalls is the scroll goal,
+      // and a stall that only reaches the Xcode console cannot be measured from
+      // a device the debugger is not attached to — which is every real run. The
+      // >50 ms threshold keeps this rare enough not to crowd the ring.
+      VibeLog.error(
+        "main-thread stall in syncOnQueue", category: "engine",
+        metadata: ["ms": String(elapsedMs), "callSite": callSite])
     }
     return result
   }

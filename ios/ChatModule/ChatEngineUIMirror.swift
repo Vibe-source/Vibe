@@ -1,0 +1,196 @@
+import Foundation
+
+/// One chat's agent-progress state, as the UI needs to see it.
+///
+/// A value type rather than a reference into the engine, so the mirror can hand
+/// it to the main thread without the main thread touching engine state.
+struct ChatEngineAgentProgressSnapshot: Sendable, Equatable {
+  let label: String
+  let tool: String?
+  let status: String
+  let updatedAtMs: Int64
+
+  /// Statuses that mean the work is over. Advertising any of these as live work
+  /// is what leaves a row stuck on "Working…" forever.
+  private static let terminalStatuses: Set<String> = [
+    "done", "completed", "complete", "idle", "failed", "error", "cancelled", "canceled",
+    "stopped", "settled", "success",
+  ]
+
+  private static let activeHints = [
+    "running", "streaming", "in_progress", "active", "thinking", "tool", "wait",
+  ]
+
+  /// The payload the UI renders, or `nil` when this is not live work.
+  ///
+  /// **This is the only implementation of the liveness rule.** It used to live
+  /// inside the engine's queue-hopping getter; moving the read off the queue
+  /// would have meant a second copy, and two copies of a staleness rule drift —
+  /// one of them keeps a spinner running forever and nobody can tell which.
+  ///
+  /// Because staleness is derived from `nowMs` at *read* time rather than baked
+  /// in at publish time, a mirror entry that stops being refreshed expires on
+  /// its own. That is what makes it safe for the mirror to be republished only
+  /// on engine notifications: the failure mode of a missed publish is a stale
+  /// entry, and a stale entry here answers `nil`.
+  func activePayload(nowMs: Int64) -> [String: Any]? {
+    let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if Self.terminalStatuses.contains(normalized) { return nil }
+
+    // No update for 90s is not live work, whatever the last status claimed.
+    let ageMs = nowMs - updatedAtMs
+    if ageMs > 90_000 { return nil }
+
+    let looksActive =
+      normalized.isEmpty
+      || Self.activeHints.contains(where: { normalized.contains($0) })
+      || ageMs < 15_000
+    guard looksActive else { return nil }
+
+    var payload: [String: Any] = [
+      "label": label,
+      "status": status,
+      "updatedAtMs": updatedAtMs,
+      "isActive": true,
+    ]
+    if let tool { payload["tool"] = tool }
+    return payload
+  }
+}
+
+/// Main-thread-readable mirror of the small state the UI polls constantly.
+///
+/// # Why this exists
+///
+/// The engine owns one serial queue, and every UI getter used to hop onto it to
+/// read a single dictionary entry. That read costs microseconds; the *wait* does
+/// not. A device run on 2026-08-03 measured
+/// `[MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for 64ms at
+/// agentProgress(chatId:)` — 64 ms of frozen UI to look up one key, because the
+/// queue was busy decrypting when the header asked.
+///
+/// The cost is structural, not incidental: any main-thread reader is exposed to
+/// the duration of whatever the queue happens to be running. Making the queue
+/// faster narrows the window but never closes it. So the direction inverts — the
+/// queue **publishes** and the UI **reads a lock**, and there is nothing left to
+/// block on.
+///
+/// # Freshness
+///
+/// Published from `postChangeLocked`, the funnel every UI-visible engine
+/// mutation already passes through. So the mirror is never staler than the last
+/// notification the UI acted on: a reader that woke up because of a change sees
+/// the state that caused it.
+///
+/// A mutation that somehow posts no notification leaves an entry stale rather
+/// than wrong, and every field here degrades safely — agent progress expires
+/// itself at read time (see ``ChatEngineAgentProgressSnapshot/activePayload(nowMs:)``),
+/// typing indicators are re-sent every few seconds by their sender, and presence
+/// re-publishes on the next presence event.
+///
+/// # What does not belong here
+///
+/// Anything expensive or large. `getChatRows` builds and decrypts a whole
+/// transcript; mirroring it would move that cost rather than remove it, and
+/// double the memory while doing so. This mirror is for the small, hot, polled
+/// reads only.
+final class ChatEngineUIMirror: @unchecked Sendable {
+  private let lock = NSLock()
+
+  private var typingByChatId: [String: Set<String>] = [:]
+  private var agentProgressByChatId: [String: ChatEngineAgentProgressSnapshot] = [:]
+  private var onlineUserIds: Set<String> = []
+  private var lastSeenByUserId: [String: Int64] = [:]
+
+  /// Until the first publish the mirror cannot distinguish "nothing is
+  /// happening" from "nobody has told me yet", so readers fall back to the
+  /// queue. One publish lands on the first engine notification.
+  private var hasPublished = false
+
+  private var mirrorReads = 0
+  private var fallbackReads = 0
+  private var publishes = 0
+
+  // MARK: Publish (engine queue only)
+
+  /// Replaces the mirrored state. Call only from the engine's serial queue.
+  ///
+  /// Cheap by construction: Swift collections are copy-on-write, so the three
+  /// collection assignments are retains rather than deep copies. Only the
+  /// agent-progress transform allocates, and that map holds one entry per chat
+  /// with a *running* agent — normally zero.
+  func publish(
+    typingByChatId: [String: Set<String>],
+    agentProgressByChatId: [String: ChatEngineAgentProgressSnapshot],
+    onlineUserIds: Set<String>,
+    lastSeenByUserId: [String: Int64]
+  ) {
+    lock.lock()
+    defer { lock.unlock() }
+    self.typingByChatId = typingByChatId
+    self.agentProgressByChatId = agentProgressByChatId
+    self.onlineUserIds = onlineUserIds
+    self.lastSeenByUserId = lastSeenByUserId
+    hasPublished = true
+    publishes += 1
+  }
+
+  // MARK: Read (any thread, never blocks on the engine)
+
+  /// Reads mirrored state, or returns `nil` when the caller must fall back to
+  /// the queue because nothing has been published yet.
+  private func read<T>(_ body: () -> T) -> T? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard hasPublished else {
+      fallbackReads += 1
+      return nil
+    }
+    mirrorReads += 1
+    return body()
+  }
+
+  func typingUserIds(chatId: String) -> [String]? {
+    read { Array(typingByChatId[chatId] ?? []).sorted() }
+  }
+
+  /// Double-optional on purpose, and the two levels mean different things:
+  /// the outer `nil` is "the mirror has nothing published, go ask the queue",
+  /// the inner `nil` is "published, and this chat has no agent running".
+  /// Collapsing them would turn a cold start into a false "no agent".
+  func agentProgress(chatId: String) -> ChatEngineAgentProgressSnapshot?? {
+    read { agentProgressByChatId[chatId] }
+  }
+
+  /// True when any agent-progress entry exists for this chat, regardless of
+  /// liveness. Mirrors the engine's own "is there an entry" check rather than
+  /// the derived-active one — they are deliberately different questions.
+  func hasAgentProgressEntry(chatId: String) -> Bool? {
+    read { agentProgressByChatId[chatId] != nil }
+  }
+
+  func isUserOnline(userId: String) -> Bool? {
+    read { onlineUserIds.contains(userId) }
+  }
+
+  func lastSeenTimestampMs(userId: String) -> Int64?? {
+    read { lastSeenByUserId[userId] }
+  }
+
+  // MARK: Diagnostics
+
+  /// Counters for the exported log, so a run can answer "did the UI stop
+  /// queueing?" without a profiler. A high `fallback` after launch means the
+  /// mirror is not being published and the stalls are back.
+  var summary: String {
+    lock.lock()
+    defer { lock.unlock() }
+    return "mirror reads=\(mirrorReads) fallback=\(fallbackReads) publishes=\(publishes)"
+  }
+
+  var counts: (mirrorReads: Int, fallbackReads: Int, publishes: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (mirrorReads, fallbackReads, publishes)
+  }
+}
