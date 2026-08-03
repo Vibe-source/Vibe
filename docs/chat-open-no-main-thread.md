@@ -102,20 +102,58 @@ the wrong half is load-bearing:
 - **`NSAttributedString.boundingRect(with:options:context:)` can.** It is
   CoreText over an immutable string. No view, no main thread.
 
-`measureMessageBubbleLayout` (`ChatListViewCells.swift:4712`) is main-bound only
-because it builds views to ask them. So the work is to write metrics that do not:
+### What the audit found — `docs/row-height-formulas.md`, 2026-08-03
+
+A full inventory of every height path settles what is and is not movable, and it
+is not a clean sweep:
+
+**Off-main safe today — `boundingRect` and arithmetic only:**
+plain text, rich text, media (known aspect), voice, video note, sticker,
+document, link/music preview, reply preview, forwarded header, day separator,
+`AgentRuntimeSummaryView.measuredHeight` (already a pure formula),
+`AgentIntegrationPackView.measuredHeight` (a constant, 72),
+`ChatNativeAgentTextRenderer.measuredSize`.
+
+**Not movable — `VibeAgentTurnContentView.measuredHeight`
+(`VibeAgentTurnContentView.swift:362–420`):**
+it pins a width constraint on a shared template view, calls `configure`,
+`layoutIfNeeded`, then `systemLayoutSizeFitting(…, .fittingSizeLevel)`. The body
+is a `UIStackView` whose arranged subviews are built in a **loop over progress
+items**, each of which is itself Auto Layout sized. There is no arithmetic that
+reproduces that without rebuilding the stack — and rebuilding it in order to
+predict it is worse than laying it out.
+
+### So the split is by *when*, not only by *where*
+
+Requirement 1 says the push must not be settled by the main thread. It does not
+say every measurement must leave the main thread — it says none of them may
+happen **during the push**. Two mechanisms, applied where each actually works:
+
+| Rows | Mechanism |
+|---|---|
+| everything except agent turns | `VibeRowMetrics` — pure, off-main, measured while the transcript is prepared |
+| agent turns | measured on main but **off the push** — at prewarm, or when the turn settles — then frozen |
+
+A frozen agent-turn height is as good as an off-main one for this requirement,
+because the push reads a number either way. What matters is that the number
+exists before `pushViewController` and is never re-derived after.
+
+This is also why P4-C is not optional. Without a prepared timeline there is
+nowhere for either measurement to happen except during the push.
 
 ```
 VibeRowMetrics.height(kind:text:font:width:mediaAspect:…) -> CGFloat
 ```
 
-pure arithmetic plus `boundingRect`, no `UIView` in the call graph, callable from
-any thread. Every row kind the transcript can hold needs a case, and each case
-needs a test asserting it agrees with the view-based measurement it replaces —
-disagreement here is a shift, which is exactly what this exists to prevent.
+no `UIView` in the call graph, callable from any thread. Each case needs a test
+asserting it agrees with the view-based measurement it replaces to within
+0.5 pt — a disagreement is a shift, which is the thing this exists to prevent.
 
-Until this lands, the push still pays for measurement, so requirement 1 is not
-met however good the rest is.
+**Trap the audit surfaced:** `estimateMessageHeight` is the *exact* path despite
+the name, and `presentationSeedMessageHeight` is the progressive one. The two
+disagree on settled agent turns, where the seed uses a `boundingRect` + character
+formula capped at 430 while the exact path lays out the real view. That
+disagreement is a shift by construction and is a strong candidate for the 28 pt.
 
 ---
 
