@@ -1,6 +1,15 @@
 # Chat open with no main-thread work, and a list that never shifts
 
-**Status:** P4-A landed 2026-08-03. B, C, D specified, not built.
+**Status:** P4-A, B, C landed 2026-08-03. D specified, not built.
+
+**Is the core live?** For a real chat, **no** — and that is a scoping fact, not a
+switch left off. `VibeCollectionMessageListHost` is referenced from exactly two
+places: `VibeCoreListPreview` (the Diagnostics "Core list (UIKit)" screen) and its
+tests. `ChatMainView` contains no reference to it at all. Every `[ChatOpen]` line
+in a device log comes from `ChatListView`. What *is* live for real chats is the
+core's ordering, behind `vibeTimelineCoreOrderAuthorityEnabled`, and the P4-B/C
+measurement path, which is Swift. P4-D is what makes the core the render path,
+and it is the largest remaining piece — see its section.
 
 Two requirements, stated by the product owner, that everything below serves:
 
@@ -196,7 +205,7 @@ disagreement is a shift by construction and is a strong candidate for the 28 pt.
 
 ---
 
-## P4-C — the prepared timeline · **not built**
+## P4-C — the prepared timeline · **landed**
 
 `getChatRows` blocks the main thread for 109 ms because the chat **pulls** from
 the engine at open. The core exists partly to make that structurally impossible:
@@ -216,6 +225,75 @@ Chat open then costs one array hand-off and a `reloadData` over pre-sized rows.
 Also removes the 60-in / 60-out / 80-in churn: pagination becomes a core window
 move, not three separate `setRows` passes each re-deciding the whole list.
 
+### What shipped
+
+`VibeTimelinePreparedStore` — heights measured off the push through
+`VibeRowMetrics`, which calls `measureMessageBubbleLayout`, the function the
+cell itself calls. Agreement is identity, not tolerance.
+
+Two feeds, both at moments the main thread is idle:
+
+| Feed | Covers |
+|---|---|
+| `persistHistoryRowsToStoreLocked` | a chat whose rows changed on the network |
+| `captureReopenSnapshot` (the settle beat) | reopening a chat that changed nothing — far more common |
+
+Three ways a prepared height could be wrong, each closed. Measured at another
+width: the width is published from `groupMeasurementExtras`, the one funnel that
+derives it, and a change drops every prepared transcript. Measured from a row
+that has since changed: the row comes back *with* the height and the caller
+compares it with `chatListRowContentEqual`, the same predicate its in-memory
+cache uses. Measured before the media aspect was known: the square-fallback flag
+now survives the trip through the gate, so `VibeRowMetrics` returns
+`Measured { height, mediaAspectWasUnknown }` and a provisional height is promoted
+as provisional rather than frozen as exact.
+
+A hit is promoted into `messageHeightCache` exactly as a fresh measurement is, so
+`hasExactProgressiveHeight` is already true and the warmup skips the row —
+otherwise the warmup re-measures and returns the same number a frame later, a
+second pass whose only outcomes are "no change" and "a shift".
+
+### The other half: the mount was inside the animation
+
+Prepared heights kill the *sizing* cost, and the device log says sizing was never
+the expensive part:
+
+```
+seed-profile sizeCalls=240 sizeMs=10  configure=22 configureMs=20  cell=22 cellMs=112
+```
+
+10 ms of measurement against **112 ms of cell configuration**. And it ran here:
+
+```
+11.345 viewWillAppear sinceTapMs=49          ← push begins
+11.386 seed-mount PUSH-COVERED rows=134
+11.582 presentation-seed totalMs=180         ← inside the animation
+11.912 viewDidAppear sinceTapMs=615
+```
+
+A raster-covered push stashed its seed and mounted it on the *next main turn* —
+the commit carrying the slide's first frame. Interactive gestures are tracked on
+the main thread, so this is the reported "the push isn't smooth and swiping back
+doesn't follow my finger": the finger was queued behind a transcript nobody could
+see, under a raster that is a pixel-exact photograph of the same thing.
+
+The mount now waits for `completeTranscriptPresentation()`. It also does *less*
+work than before — with the mount deferred, mid-push payloads take the stash lane
+and upgrade it monotonically instead of arriving as `retain-frozen` and then
+`apply-pending`, so an open mounts once rather than mounting, freezing and
+reconciling.
+
+**Ordering trap:** the mount must run before `defersTranscriptUpdatesForPresentation`
+flips. `installPresentationSeedIfNeeded` refuses to seed once presentation is no
+longer deferred, so a mount ordered after the assignment silently does nothing and
+the chat arrives empty behind its own raster.
+
+### Still owed by P4-C
+
+The engine hand-off is the *height* hand-off only. `getChatRows` is still a
+synchronous read at open, and the core still does not own the window for a real
+chat — see P4-D.
+
 ---
 
 ## P4-D — point the chat surface at the host · **not built**
@@ -233,6 +311,32 @@ What stops being on the path, rather than being optimised:
 
 That list is the answer to "will the old functions be removed?" — they are
 removed by **replacement**, once the thing replacing them can draw a chat.
+
+### Measured scope, 2026-08-03
+
+The swap is bigger than one line of this plan implies, and the number should be
+on record rather than discovered mid-migration:
+
+- `ChatMainView` calls into `chatListView` at **87 sites**
+- `ChatListView` is not a transcript. It owns the **input bar**
+  (`setInputBarEnabled`, `setComposerText`, `setNativeSendEnabled`), the
+  wallpaper, selection mode, reactions, the date pin, search, jump-to-bottom and
+  scroll-to-message. `VibeCollectionMessageListHost` draws rows and nothing else.
+
+So "point `ChatMainView` at the host" is not a swap — most of those 87 calls are
+chrome that has to live somewhere first. Two honest shapes:
+
+1. **Extract a transcript protocol.** `ChatMainView` holds
+   `any VibeChatTranscriptSurface`; `ChatListView` and a core-backed view both
+   satisfy it. Smallest diff, but it leaves the chrome inside the old file and
+   the two implementations owe each other behaviour at every seam.
+2. **A parallel screen behind the gate.** A `VibeCoreChatViewController` built on
+   the host plus the existing `ChatInputBar`, routed to only for eligible 1:1
+   DMs. The old path is untouched, so the blast radius is the flag. This is how
+   the rewrites this plan cites actually shipped, and it is the recommendation.
+
+Either way the prerequisite is done: P4-A gave the host real cells, P4-B gave it
+off-main measurement, P4-C gave it a transcript prepared before the push.
 
 ---
 
