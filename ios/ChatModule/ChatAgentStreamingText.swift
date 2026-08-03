@@ -2153,8 +2153,17 @@ final class AgentBridgeFileViewerController: UIViewController {
 // MARK: - AgentIntegrationPackView
 
 final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
+  /// Same rule as `AgentCodeBlockView`: reachable from a measurement pass, so it is
+  /// guarded even though `measuredHeight` is a constant today and does not read it.
   private static var expandedStorageKeys = Set<String>()
+  private static let expandedStorageKeysLock = NSLock()
   private static let collapsedHeight: CGFloat = 72.0
+
+  private static func isStorageKeyExpanded(_ key: String) -> Bool {
+    expandedStorageKeysLock.lock()
+    defer { expandedStorageKeysLock.unlock() }
+    return expandedStorageKeys.contains(key)
+  }
 
   private let cardView = UIView()
   private let iconView = UIImageView()
@@ -2177,7 +2186,7 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
   private var isExpanded = false
 
   static func isExpanded(pack: AgentIntegrationPack, storageKey: String? = nil) -> Bool {
-    expandedStorageKeys.contains(resolvedStorageKey(pack: pack, storageKey: storageKey))
+    isStorageKeyExpanded(resolvedStorageKey(pack: pack, storageKey: storageKey))
   }
 
   static func measuredHeight(
@@ -2278,7 +2287,7 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
     currentAvailableWidth = availableWidth
     currentTextColor = textColor
     currentStorageKey = Self.resolvedStorageKey(pack: pack, storageKey: storageKey)
-    isExpanded = Self.expandedStorageKeys.contains(currentStorageKey)
+    isExpanded = Self.isStorageKeyExpanded(currentStorageKey)
 
     let accent = UIColor.systemTeal
     cardView.backgroundColor = textColor.withAlphaComponent(0.055)
@@ -2424,7 +2433,28 @@ final class AgentIntegrationPackView: UIControl, UIGestureRecognizerDelegate {
 
 final class AgentCodeBlockView: UIView {
   private static let collapsedLineLimit = 12
+  /// Read by `measureBubbleCodeBlockHeight`, which runs off the main thread once a
+  /// transcript is measured before it is pushed — while a tap on main can be writing
+  /// it. An unguarded `Set` across those two is a data race, and the symptom would be
+  /// a corrupt height rather than a crash, i.e. a shift nobody can reproduce.
   private static var expandedStorageKeys = Set<String>()
+  private static let expandedStorageKeysLock = NSLock()
+
+  private static func isStorageKeyExpanded(_ key: String) -> Bool {
+    expandedStorageKeysLock.lock()
+    defer { expandedStorageKeysLock.unlock() }
+    return expandedStorageKeys.contains(key)
+  }
+
+  private static func setStorageKey(_ key: String, expanded: Bool) {
+    expandedStorageKeysLock.lock()
+    defer { expandedStorageKeysLock.unlock() }
+    if expanded {
+      expandedStorageKeys.insert(key)
+    } else {
+      expandedStorageKeys.remove(key)
+    }
+  }
 
   private let cardView = UIView()
   private let topBarView = UIView()
@@ -2455,7 +2485,7 @@ final class AgentCodeBlockView: UIView {
   }
 
   static func isExpanded(code: String, language: String? = nil, storageKey: String? = nil) -> Bool {
-    expandedStorageKeys.contains(Self.storageKey(code: code, language: language, override: storageKey))
+    isStorageKeyExpanded(Self.storageKey(code: code, language: language, override: storageKey))
   }
 
   override init(frame: CGRect) {
@@ -2542,7 +2572,7 @@ final class AgentCodeBlockView: UIView {
     currentAvailableWidth = availableWidth
     originalBaseFont = baseFont
     expansionStorageKey = Self.storageKey(code: code, language: language, override: storageKey)
-    isExpanded = Self.expandedStorageKeys.contains(expansionStorageKey)
+    isExpanded = Self.isStorageKeyExpanded(expansionStorageKey)
     codeFont = UIFont.monospacedSystemFont(ofSize: max(12.5, baseFont.pointSize - 2.5), weight: .regular)
 
     let outerH: CGFloat = 0.0
@@ -2676,11 +2706,7 @@ final class AgentCodeBlockView: UIView {
 
   @objc private func handleExpand() {
     isExpanded.toggle()
-    if isExpanded {
-      Self.expandedStorageKeys.insert(expansionStorageKey)
-    } else {
-      Self.expandedStorageKeys.remove(expansionStorageKey)
-    }
+    Self.setStorageKey(expansionStorageKey, expanded: isExpanded)
     _ = configure(
       code: codeContent,
       language: codeLang,

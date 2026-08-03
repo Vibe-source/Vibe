@@ -2,95 +2,109 @@ import CoreGraphics
 import Foundation
 import UIKit
 
-/// Row heights as arithmetic, with no `UIView` in the call graph.
+/// Which rows can be measured before the push, and how tall they are.
 ///
-/// # Why this exists
+/// # Why this is a gate and not a second implementation
 ///
-/// The list's heights are decided today by `measureMessageBubbleLayout`, which
-/// gets its answers by building views and asking them. That is main-thread-only
-/// by construction, so chat open pays for measurement during the push — and a
-/// push that computes is a push that can be late, which is what a user sees as a
-/// stall and then a shift.
+/// The first version of this file reimplemented the list's height formulas as pure
+/// arithmetic, on the belief that `measureMessageBubbleLayout` was main-thread-bound.
+/// **That belief was wrong**, and the audit that produced `docs/row-height-formulas.md`
+/// is what disproved it: `ChatListViewCells.swift` contains no `@MainActor`, and every
+/// height in it comes from `NSAttributedString.boundingRect` or
+/// `NSString.size(withAttributes:)` — CoreText over immutable strings — plus arithmetic.
+/// The single exception is `VibeAgentTurnContentView.measuredHeight`, which lays out a
+/// real `UIStackView`.
 ///
-/// Everything here is `NSAttributedString.boundingRect` plus arithmetic:
-/// CoreText over an immutable string, callable from any thread. That makes a
-/// transcript measurable **before** it is pushed, and a row measured before the
-/// push and never re-measured cannot shift.
+/// A parallel implementation would have to agree with the real one to within half a
+/// point, forever, across every kind, and a disagreement is not a rounding error — it is
+/// a row that changes size after the user can see it. That agreement burden *is* the
+/// defect this project exists to remove; `ChatListView` is 22,586 lines partly because
+/// heights are decided in more than one place. So this file does not compute heights.
+/// It calls the same function the cell calls, and agreement is identity.
 ///
-/// # What is deliberately not here
+/// What it adds is the thing that was actually missing: **a decision about which rows may
+/// be measured off the main thread**, so a transcript can be measured before it is pushed
+/// instead of during. A row measured before the push and never re-measured cannot shift.
 ///
-/// **Agent turns.** `VibeAgentTurnContentView.measuredHeight` pins a width
-/// constraint on a template view, lays it out, and asks
-/// `systemLayoutSizeFitting`, over a `UIStackView` whose arranged subviews are
-/// built in a loop over progress items — each itself Auto Layout sized. No
-/// arithmetic reproduces that, and rebuilding the stack in order to predict it
-/// would cost more than laying it out. Agent turns stay view-measured; they move
-/// off the *push* instead of off the *thread*, by being measured at prewarm or
-/// at settle and then frozen. At mount time a frozen height and an off-main
-/// height are the same thing: a number that already exists.
+/// # The one row that cannot
 ///
-/// # Correctness rule
-///
-/// Every function here must agree with the view-based path it replaces to within
-/// half a point. A disagreement is not a rounding difference — it is a row that
-/// changes size after it is on screen, which is the exact defect this whole
-/// effort exists to remove. Constants are transcribed from
-/// `docs/row-height-formulas.md`, which cites a declaration site for each.
+/// Agent turns. `VibeAgentTurnContentView.measuredHeight` pins a width constraint on a
+/// shared template view, calls `layoutIfNeeded`, then `systemLayoutSizeFitting`, over a
+/// stack whose arranged subviews are built in a loop over progress items. It must stay on
+/// main. Agent turns therefore move off the *push* rather than off the *thread*: measured
+/// at prewarm or at settle, then frozen. At mount time a frozen height and an off-main
+/// height are the same thing — a number that already exists.
 enum VibeRowMetrics {
 
-  // MARK: Constants
+  // MARK: The gate
+
+  /// Whether this row's height can only be produced on the main thread.
+  ///
+  /// Conservative on purpose: a row wrongly called off-main-safe is a race, while a row
+  /// wrongly called main-only is merely measured later than it could have been.
+  static func requiresMainThread(_ row: ChatListRow) -> Bool {
+    bubbleUsesAgentTurnContent(row)
+  }
+
+  /// Exact row height, or `nil` when the row must be measured on the main thread.
+  ///
+  /// Mirrors the structure of `ChatListView.estimateMessageHeight` — which is the *exact*
+  /// path despite its name — minus its caches, which are main-thread state. Callers hold
+  /// their own storage for the result.
+  ///
+  /// Safe to call from any thread when `requiresMainThread(row)` is `false`.
+  static func height(
+    row: ChatListRow,
+    rowWidth: CGFloat,
+    state: AgentTurnBubbleState = AgentTurnBubbleState()
+  ) -> CGFloat? {
+    guard rowWidth > 0 else { return nil }
+
+    // Centered service pills: agent control events (interrupt, /compact) and failed
+    // turns are not bubbles and never reach the measure path.
+    if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
+      return servicePillBaseHeight + serviceDecisionActionsHeight(for: row)
+    }
+
+    guard !requiresMainThread(row) else { return nil }
+
+    let metrics = measureMessageBubbleLayout(row: row, rowWidth: rowWidth, agentTurnState: state)
+    return metrics.bubbleHeight + metrics.tallOuterToggleReserve
+  }
+
+  /// `height(row:rowWidth:state:)` for a batch, with the main-only rows reported rather
+  /// than silently dropped — the caller has to measure or freeze those separately, and a
+  /// row that quietly has no height is a row that gets an estimate, which is a shift.
+  static func heights(
+    rows: [ChatListRow],
+    rowWidth: CGFloat,
+    state: AgentTurnBubbleState = AgentTurnBubbleState()
+  ) -> (byKey: [String: CGFloat], deferredKeys: [String]) {
+    var byKey: [String: CGFloat] = [:]
+    byKey.reserveCapacity(rows.count)
+    var deferred: [String] = []
+    for row in rows {
+      if let height = height(row: row, rowWidth: rowWidth, state: state) {
+        byKey[row.key] = height
+      } else {
+        deferred.append(row.key)
+      }
+    }
+    return (byKey, deferred)
+  }
+
+  // MARK: Primitives
   //
-  // Transcribed from `ChatListViewConstants.swift` via the audit. A typo in this
-  // block is a shift, so each carries its source.
+  // Kept because they have no counterpart in the measure path and are used to size
+  // things the list composes itself (separators, the width a caller lays text out in).
+  // Anything with a counterpart lives in `measureMessageBubbleLayout` and only there.
 
   static let messageHorizontalInset: CGFloat = 8  // ChatListViewConstants:4
   static let bubbleHorizontalPadding: CGFloat = 12  // :9
-  static let bubbleTopPadding: CGFloat = 5  // :11
-  static let bubbleBottomPadding: CGFloat = 6  // :13
-  static let bubbleMetaTopSpacing: CGFloat = 1  // :14
-  static let bubbleMetaHeight: CGFloat = 14  // :15
   static let bubbleMaxWidthFactor: CGFloat = 0.85  // :17
-
-  /// Reaction chrome, added to many kinds. Also the size of the unexplained
-  /// 28 pt open shift measured on device — worth remembering when one appears.
-  static let reactionHeightOffset: CGFloat = 28  // ChatListViewCells:4713
-
-  static let textBubbleFloor: CGFloat = 34  // :5142 — 34, not 36
-  static let replyPreviewHeight: CGFloat = 36
-  static let replyPreviewSpacing: CGFloat = 6
-  static let inlineAttachmentSpacing: CGFloat = 8
-  static let inlineAttachmentHeight: CGFloat = 48
-  static let linkPreviewSpacing: CGFloat = 8
-
   static let dayRowHeight: CGFloat = 30  // ChatListView:13344
   static let outOfBoundsRowHeight: CGFloat = 56  // :13339
-  static let servicePillBaseHeight: CGFloat = 36  // :13943, :14104
-  static let serviceDecisionActionsHeight: CGFloat = 40  // ChatListViewCells:2303
-  static let agentActionsRowHeight: CGFloat = 36  // :4669
-
-  static let voiceMediaHeight: CGFloat = 60  // :4855
-  static let musicFileMediaHeight: CGFloat = 68  // :4849
-  static let voiceTopPadding: CGFloat = 2  // :4978
-  static let voiceBottomPadding: CGFloat = 7  // :4981
-  static let voiceBubbleFloor: CGFloat = 66  // :4985
-  static let mediaBubbleFloor: CGFloat = 48  // :4985
-  static let fullBleedMediaFloor: CGFloat = 56  // :4984
-
-  static let videoNoteSide: CGFloat = 200  // :4858
-  static let documentRowHeight: CGFloat = 80  // ChatListViewCells:2356
-
-  static let mediaMinWidth: CGFloat = 120  // :4884
-  static let mediaMinHeight: CGFloat = 84  // :4885
-  static let mediaMaxHeight: CGFloat = 380  // :4888
-  static let mediaAspectMin: CGFloat = 0.2  // :4882
-  static let mediaAspectMax: CGFloat = 5.0  // :4882
-
-  static let stickerMinSide: CGFloat = 72  // :2344
-  static let stickerDefaultSide: CGFloat = 136  // :2345
-  static let stickerMaxWidth: CGFloat = 152  // :2346
-  static let stickerMaxHeight: CGFloat = 184  // :2347
-
-  // MARK: Widths
+  static let servicePillBaseHeight: CGFloat = 36  // ChatListView:14104
 
   /// The width a bubble's text is laid out in, from the row width.
   static func textMaxWidth(rowWidth: CGFloat) -> CGFloat {
@@ -98,17 +112,12 @@ enum VibeRowMetrics {
     return max(1, maxBubbleWidth - bubbleHorizontalPadding * 2)
   }
 
-  // MARK: Text
-
   /// Laid-out height of an attributed string at a given width.
   ///
-  /// `boundingRect` is CoreText over an immutable string and is safe off the
-  /// main thread — unlike `UILabel.sizeThatFits`, which is the reason the
-  /// existing path cannot leave it. `.usesLineFragmentOrigin` and
-  /// `.usesFontLeading` match what the cell measures with; dropping either
-  /// changes the answer for multi-line text.
-  ///
-  /// `ceil` matches the existing path, which rounds up before it commits.
+  /// `boundingRect` is CoreText over an immutable string and is safe off the main thread
+  /// — unlike `UILabel.sizeThatFits`. `.usesLineFragmentOrigin` and `.usesFontLeading`
+  /// match what the measure path uses; dropping either changes the answer for multi-line
+  /// text. `ceil` matches too — the measure path rounds up before it commits.
   static func textHeight(_ attributed: NSAttributedString, width: CGFloat) -> CGFloat {
     guard width > 0, attributed.length > 0 else { return 0 }
     let bounds = attributed.boundingRect(
@@ -118,105 +127,5 @@ enum VibeRowMetrics {
     return ceil(bounds.height)
   }
 
-  // MARK: Bubbles
-
-  /// Where the meta (time + ticks) sits, which changes how the body stacks.
-  enum MetaLayout {
-    /// Meta on its own line under the body — rich text, previews, RTL, tall.
-    case bottom
-    /// Meta inline beside short LTR text.
-    case inline
-  }
-
-  /// Height of a plain or rich text bubble.
-  ///
-  /// Mirrors `measureMessageBubbleLayout` `:5124–5143`. Pass `textHeight`
-  /// already collapsed when the row is tall-collapsed — the cap is line-count
-  /// based (`floor(420 / lineHeight) * lineHeight`), not a raw 420, so it cannot
-  /// be applied here without the font.
-  static func textBubbleHeight(
-    textHeight: CGFloat,
-    metaLayout: MetaLayout,
-    hasReplyPreview: Bool = false,
-    inlineAttachmentHeight: CGFloat = 0,
-    linkPreviewHeight: CGFloat = 0,
-    hasReaction: Bool = false
-  ) -> CGFloat {
-    let replyBlock = hasReplyPreview ? replyPreviewHeight + replyPreviewSpacing : 0
-    let metaBlock = bubbleMetaTopSpacing + bubbleMetaHeight
-
-    let bodyHeight: CGFloat
-    if inlineAttachmentHeight > 0 {
-      bodyHeight =
-        replyBlock + max(textHeight, 0) + inlineAttachmentSpacing + inlineAttachmentHeight
-        + metaBlock
-    } else {
-      switch metaLayout {
-      case .bottom:
-        let preview = linkPreviewHeight > 0 ? linkPreviewSpacing + linkPreviewHeight : 0
-        bodyHeight = replyBlock + max(textHeight, 0) + preview + metaBlock
-      case .inline:
-        // The meta sits beside the text, so a one-line bubble is not taller for
-        // having a timestamp in it.
-        bodyHeight = replyBlock + max(textHeight, bubbleMetaHeight)
-      }
-    }
-
-    let padded =
-      bodyHeight + bubbleTopPadding + bubbleBottomPadding
-      + (hasReaction ? reactionHeightOffset : 0)
-    return max(textBubbleFloor, padded)
-  }
-
-  // MARK: Fixed kinds
-
   static func daySeparatorHeight() -> CGFloat { dayRowHeight }
-
-  static func servicePillHeight(hasLiveDecisionActions: Bool) -> CGFloat {
-    servicePillBaseHeight + (hasLiveDecisionActions ? serviceDecisionActionsHeight : 0)
-  }
-
-  static func agentActionsHeight() -> CGFloat { agentActionsRowHeight }
-
-  static func voiceBubbleHeight(hasReaction: Bool = false, isMusicFile: Bool = false) -> CGFloat {
-    let media = isMusicFile ? musicFileMediaHeight : voiceMediaHeight
-    let padded =
-      media + voiceTopPadding + voiceBottomPadding + (hasReaction ? reactionHeightOffset : 0)
-    return max(voiceBubbleFloor, padded)
-  }
-
-  // MARK: Media
-
-  /// Displayed height of a media attachment at a given bubble width.
-  ///
-  /// The aspect clamp is what stops a malformed or hostile attachment from
-  /// claiming a screen — and the durable natural-size store exists because an
-  /// *unknown* aspect defaulting to square and then being corrected after decode
-  /// is one of the list's real shifts. Callers must pass the stored natural size
-  /// rather than a guess; `nil` here is honest about not knowing.
-  static func mediaDisplayHeight(
-    naturalSize: CGSize?,
-    bubbleWidth: CGFloat,
-    isSticker: Bool = false
-  ) -> CGFloat? {
-    guard let naturalSize, naturalSize.width > 0, naturalSize.height > 0 else { return nil }
-    let rawAspect = naturalSize.height / naturalSize.width
-    let aspect = min(max(rawAspect, mediaAspectMin), mediaAspectMax)
-
-    if isSticker {
-      let side = min(stickerMaxWidth, max(stickerMinSide, bubbleWidth))
-      return min(stickerMaxHeight, side * aspect)
-    }
-
-    let width = max(mediaMinWidth, bubbleWidth)
-    return min(mediaMaxHeight, max(mediaMinHeight, width * aspect))
-  }
-
-  static func stickerFallbackSide() -> CGFloat { stickerDefaultSide }
-
-  static func videoNoteHeight() -> CGFloat { videoNoteSide }
-
-  static func documentHeight(hasReaction: Bool = false) -> CGFloat {
-    documentRowHeight + (hasReaction ? reactionHeightOffset : 0)
-  }
 }

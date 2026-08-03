@@ -89,7 +89,7 @@ so a missing payload leaves a correctly-sized gap rather than a hole.
 
 ---
 
-## P4-B — measurement that can leave the main thread · **not built**
+## P4-B — measurement that can leave the main thread · **landed**
 
 **This corrects a claim made earlier in this project.** Measurement was called
 main-thread-bound "and never will be", on the grounds that text measurement is
@@ -141,13 +141,52 @@ exists before `pushViewController` and is never re-derived after.
 This is also why P4-C is not optional. Without a prepared timeline there is
 nowhere for either measurement to happen except during the push.
 
-```
-VibeRowMetrics.height(kind:text:font:width:mediaAspect:…) -> CGFloat
+### What shipped, and the second correction
+
+The first cut of `VibeRowMetrics` reimplemented the height formulas as pure
+arithmetic, on the assumption that `measureMessageBubbleLayout` could not leave
+the main thread. **It can.** `ChatListViewCells.swift` contains no `@MainActor`
+and no `UIView` sizing on the ordinary path — every height in it is
+`boundingRect`, `NSString.size(withAttributes:)`, or arithmetic. The one
+exception is the agent-turn branch.
+
+So the parallel implementation was deleted before it could ship. It would have
+owed the real path 0.5 pt of agreement, on every kind, forever — and that
+agreement burden is the defect being removed, not a step toward removing it.
+Heights are already decided in more than one place in this list; adding a
+thirteenth was the wrong move.
+
+`VibeRowMetrics` is now a **gate**, not a calculator:
+
+```swift
+VibeRowMetrics.requiresMainThread(_ row:) -> Bool          // agent turns
+VibeRowMetrics.height(row:rowWidth:state:) -> CGFloat?     // nil = must stay on main
+VibeRowMetrics.heights(rows:rowWidth:) -> (byKey:, deferredKeys:)
 ```
 
-no `UIView` in the call graph, callable from any thread. Each case needs a test
-asserting it agrees with the view-based measurement it replaces to within
-0.5 pt — a disagreement is a shift, which is the thing this exists to prevent.
+`height` calls `measureMessageBubbleLayout` — the same function the cell calls —
+so agreement is **identity**, not tolerance, and there is no drift to test for.
+What is tested is the part that is new and can be wrong: the classification, and
+that a real row measures to the same number off the main thread
+(`testARealRowMeasuresTheSameOffTheMainThread`) under concurrency.
+
+`heights` returns deferred keys rather than dropping main-only rows, because a
+row with no prepared height silently falls back to an estimate — and an estimate
+that disagrees with the later measurement is precisely the shift.
+
+**One real hazard the audit found and fixed:** `AgentCodeBlockView`'s
+`expandedStorageKeys` is a plain `static var Set<String>`, read by
+`measureBubbleCodeBlockHeight` and written by a tap on main. Measuring off-main
+made that an unsynchronised set across threads, whose symptom is a wrong height
+rather than a crash. Both it and `AgentIntegrationPackView`'s equivalent are now
+lock-guarded. Everything else measurement touches was already safe:
+`ChatMediaNaturalSizeStore` is `NSLock`-guarded and `chatMediaNaturalSizeCache`
+is an `NSCache`.
+
+Measuring off-main also makes something *better*, not just cheaper: the natural-size
+probe (`probeLocalMediaSize`, `chatMediaImageHeaderSize`) is file I/O that today
+runs on main, which is part of why the square fallback exists at all. Off the push
+it is free to run every time, which removes the guess.
 
 **Trap the audit surfaced:** `estimateMessageHeight` is the *exact* path despite
 the name, and `presentationSeedMessageHeight` is the progressive one. The two
