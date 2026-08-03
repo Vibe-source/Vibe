@@ -117,7 +117,7 @@ struct DiagnosticsView: View {
         Text("Rust core")
       } footer: {
         Text(
-          "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it.\n\n\"Core orders the list\" is the first setting here that changes what you see: the core reorders the newest messages in a 1:1 DM, and nothing else. Turn it on only after shadow-compare has reported CLEAN — and if the order ever looks wrong, turn it off and reopen the chat."
+          "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it.\n\n\"Core orders the list\" is the first setting here that changes what you see: the core reorders the newest messages in a 1:1 DM, and nothing else. Turn it on only after shadow-compare has reported CLEAN — and if the order ever looks wrong, turn it off and reopen the chat.\n\n\"Open DMs on the core\" replaces the chat screen itself for 1:1 DMs — the transcript is rendered by the core, with nothing measured or mounted before the push. Groups, channels, agent chats and Saved Messages keep the old screen no matter what. It is a preview: bubbles look identical because they are the same cell, but hold-to-preview, swipe-to-reply and the message menu are not ported yet, so turn it off to get them back."
         )
       }
 

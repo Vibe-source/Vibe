@@ -15826,12 +15826,12 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     let chatHomeVC = UIHostingController(rootView: ChatHomeScreen().environmentObject(coordinator))
     chatHomeVC.tabBarItem = UITabBarItem(
       title: "Chats",
-      image: UIImage(systemName: "bubble.left.and.bubble.right.fill"),
+      image: Self.roundedRectTabIcon(systemName: "bubble.left.and.bubble.right.fill", cornerRadius: 6),
       selectedImage: nil)
 
     let agentsVC = makeAgentsTabRoot()
     agentsVC.tabBarItem = UITabBarItem(
-      title: "Agents", image: UIImage(systemName: "cpu"), selectedImage: nil)
+      title: "AI", image: Self.aiTextTabIcon(), selectedImage: nil)
 
     let settingsVC = makeHosted(SettingsRootView())
     settingsVC.tabBarItem = UITabBarItem(
@@ -15850,6 +15850,11 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     configureGlobalSearchBarAppearance()
     applyTabBarAppearance()
     AppAppearanceController.applyStoredPreference()
+
+    // Force layout so tab bar item labels are fully sized on first paint
+    // (avoids text clipping until a tab switch triggers relayout).
+    tabBar.setNeedsLayout()
+    tabBar.layoutIfNeeded()
 
     VibeNativeCallOverlayPresenter.shared.startObserving()
     VibeNativeCallOverlayPresenter.shared.refreshFromEngine()
@@ -16272,6 +16277,73 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       badgePath.stroke()
     }
     return image.withRenderingMode(.alwaysOriginal)
+  }
+
+  // MARK: - Custom tab bar icons
+
+  /// Renders an SF Symbol inside a rounded-rect container so the chat icon
+  /// gets more pronounced corner radius rather than the default sharp edges.
+  private static func roundedRectTabIcon(systemName: String, cornerRadius: CGFloat) -> UIImage? {
+    let size: CGFloat = 28
+    let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+    guard let symbol = UIImage(systemName: systemName, withConfiguration: config) else { return nil }
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format)
+    let image = renderer.image { ctx in
+      let rect = CGRect(x: 0, y: 0, width: size, height: size)
+      UIBezierPath(roundedRect: rect, cornerRadius: cornerRadius).addClip()
+      let symbolSize = symbol.size
+      let drawRect = CGRect(
+        x: (size - symbolSize.width) / 2,
+        y: (size - symbolSize.height) / 2,
+        width: symbolSize.width,
+        height: symbolSize.height
+      )
+      symbol.draw(in: drawRect)
+    }
+    return image.withRenderingMode(.alwaysTemplate)
+  }
+
+  /// Renders "AI" as a tab bar icon image using a bold rounded system font.
+  /// This replaces the generic cpu SF Symbol with clear branding text.
+  private static func aiTextTabIcon() -> UIImage? {
+    let text = "AI"
+    let fontSize: CGFloat = 18
+    let font: UIFont
+    if let rounded = UIFont(name: "SFProRounded-Bold", size: fontSize) {
+      font = rounded
+    } else if let descriptor = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+      .fontDescriptor.withDesign(.rounded) {
+      font = UIFont(descriptor: descriptor, size: fontSize)
+    } else {
+      font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+    }
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: UIColor.label
+    ]
+    let textSize = text.size(withAttributes: attributes)
+    let padding: CGFloat = 2
+    let canvasSize = CGSize(
+      width: ceil(textSize.width) + padding * 2,
+      height: ceil(textSize.height) + padding
+    )
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = UIScreen.main.scale
+    format.opaque = false
+    let renderer = UIGraphicsImageRenderer(size: canvasSize, format: format)
+    let image = renderer.image { _ in
+      let drawRect = CGRect(
+        x: (canvasSize.width - textSize.width) / 2,
+        y: (canvasSize.height - textSize.height) / 2,
+        width: textSize.width,
+        height: textSize.height
+      )
+      text.draw(in: drawRect, withAttributes: attributes)
+    }
+    return image.withRenderingMode(.alwaysTemplate)
   }
 }
 

@@ -178,6 +178,32 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     self.eligibilityKey = eligibilityKey
   }
 
+  /// Opens or closes the render-path gate for 1:1 DMs, both halves at once.
+  ///
+  /// The two keys are separate for good reason — one says "the async path exists", the
+  /// other says "for which chat classes" — but they are useless individually: an armed
+  /// flag with an empty allowlist renders nothing, and an allowlist behind a closed flag
+  /// is inert. A caller flipping one and forgetting the other sees no change and
+  /// concludes the core does not work, which is the failure mode this project has
+  /// already hit twice. One switch, both keys.
+  static func setDirectMessageRenderPathEnabled(
+    _ enabled: Bool, defaults: UserDefaults = .standard
+  ) {
+    defaults.set(enabled, forKey: asyncTimelineKey)
+    defaults.set(
+      enabled ? Int(VibeTimelineChatClassEligibility.directMessage.rawValue) : 0,
+      forKey: eligibleChatClassesKey)
+    VibeLog.notice(
+      "[VibeCore] DM render path \(enabled ? "ENABLED" : "disabled")", category: "core")
+  }
+
+  /// Whether the DM render path is fully open — both keys, as `canRender` reads them.
+  static func isDirectMessageRenderPathEnabled(defaults: UserDefaults = .standard) -> Bool {
+    let flags = VibeTimelineUserDefaultsFeatureFlags(defaults: defaults).flags
+    return flags.vibeAsyncTimelineV1Enabled
+      && flags.eligibleChatClasses.contains(.directMessage)
+  }
+
   var flags: VibeTimelineFeatureFlags {
     // `bool(forKey:)` returns false when unset — correct default-off semantics.
     // Still use `object(forKey:)` so we never treat an accidental non-bool as true.

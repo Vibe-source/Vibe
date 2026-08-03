@@ -314,29 +314,63 @@ removed by **replacement**, once the thing replacing them can draw a chat.
 
 ### Measured scope, 2026-08-03
 
-The swap is bigger than one line of this plan implies, and the number should be
-on record rather than discovered mid-migration:
-
 - `ChatMainView` calls into `chatListView` at **87 sites**
-- `ChatListView` is not a transcript. It owns the **input bar**
-  (`setInputBarEnabled`, `setComposerText`, `setNativeSendEnabled`), the
-  wallpaper, selection mode, reactions, the date pin, search, jump-to-bottom and
-  scroll-to-message. `VibeCollectionMessageListHost` draws rows and nothing else.
+- `ChatListView` is 23,091 lines and **591 functions**, of which roughly **177
+  are list engine** (heights, sizing, seed, raster, scroll/anchor, data source)
+  and **414 are chrome and features** (input bar, keyboard, wallpaper, banners,
+  agent surface, overlays, send morph, sheets)
+- `ChatListView` is therefore not a transcript. It owns the input bar, the
+  wallpaper, theme handling, selection mode, reactions, the date pin, search,
+  jump-to-bottom, share/sheet presentation, the Telegram send morph, the cell
+  removal animation, and the top/bottom edge masks.
+- `ChatListView+Interactions.swift` (1,318 lines) holds hold-to-preview morph,
+  swipe-to-reply, the context menu and the dismiss tap — all installed on
+  `collectionView`, all working off `indexPath → row`.
 
-So "point `ChatMainView` at the host" is not a swap — most of those 87 calls are
-chrome that has to live somewhere first. Two honest shapes:
+### The approach that was tried and rejected
 
-1. **Extract a transcript protocol.** `ChatMainView` holds
-   `any VibeChatTranscriptSurface`; `ChatListView` and a core-backed view both
-   satisfy it. Smallest diff, but it leaves the chrome inside the old file and
-   the two implementations owe each other behaviour at every seam.
-2. **A parallel screen behind the gate.** A `VibeCoreChatViewController` built on
-   the host plus the existing `ChatInputBar`, routed to only for eligible 1:1
-   DMs. The old path is untouched, so the blast radius is the flag. This is how
-   the rewrites this plan cites actually shipped, and it is the recommendation.
+A parallel `VibeCoreChatViewController` — host plus `ChatInputBar`, routed to for
+gated DMs, old path untouched. It was built, it compiled, it routed, and it was
+**deleted the same day**.
 
-Either way the prerequisite is done: P4-A gave the host real cells, P4-B gave it
-off-main measurement, P4-C gave it a transcript prepared before the push.
+It rendered an empty transcript. The cause is the argument against the whole
+shape: engine rows are **nested** — the timestamp lives at
+`row["message"]["timestampMs"]`, not at the top level — and the re-derived feed
+read the top level, got `nil` for every row, and skipped all of them. One small
+piece of the row feed, re-derived, wrong within the hour. The header, wallpaper,
+theme, sheets, send morph and edge masks are far more intricate than that feed
+and are already tuned; re-deriving them would produce twenty of the same bug,
+each in code that had already been paid for once.
+
+### The approach being built: replace the engine, keep the file
+
+The product owner's call, and the right one: **`ChatListView` keeps everything
+except its list engine.**
+
+```
+core → VibeTimelineHost → (VibeMessageListHost) ChatListView
+                                                 ├─ collectionView — unchanged
+                                                 ├─ chrome, masks, morph, interactions — unchanged
+                                                 └─ items + heights — told by the core, never derived
+```
+
+`ChatListView` adopts `VibeMessageListHost` (8 methods, every one of them
+something it already does). `collectionView` is a `let` referenced **449 times**
+and it never moves, so every mask, gesture, overlay and animation bound to it
+keeps working *by construction* rather than by re-implementation.
+
+What that deletes, by replacement rather than by editing:
+
+- the twelve post-hoc height movers in `docs/chat-list-seams-map.md`
+- `sizeForItemAt` as a decision — the layout reads frozen geometry
+- the dual seed/exact sizing paths and the progressive warmup
+- `syncOnQueue`-from-main reads during open
+
+What it must not change, and what "hard refactor" means here: the appearance and
+every other system stay **exactly** as they are. Header (avatar node, back,
+edit/selection), wallpaper, theme, share/sheet rendering, send morph, cell
+removal animation, and the top/bottom edge masks are not to be re-derived,
+re-tuned, or "improved" in passing. Only the engine changes.
 
 ---
 
