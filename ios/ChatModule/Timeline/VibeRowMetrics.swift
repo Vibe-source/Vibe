@@ -58,6 +58,30 @@ enum VibeRowMetrics {
     rowWidth: CGFloat,
     state: AgentTurnBubbleState = AgentTurnBubbleState()
   ) -> CGFloat? {
+    guard !requiresMainThread(row) else { return nil }
+    return measuredHeight(row: row, rowWidth: rowWidth, state: state)
+  }
+
+  /// Exact row height for a caller that is already on the main thread.
+  ///
+  /// Answers for every row, agent turns included — the gate above is about *which
+  /// thread*, not about capability. A measurer running on main has no reason to refuse
+  /// a row and fall back to an estimate, and an estimate that later disagrees with the
+  /// measurement is the shift itself.
+  ///
+  /// `nil` only for a width that cannot be laid out in.
+  @MainActor
+  static func mainThreadHeight(
+    row: ChatListRow,
+    rowWidth: CGFloat,
+    state: AgentTurnBubbleState = AgentTurnBubbleState()
+  ) -> CGFloat? {
+    measuredHeight(row: row, rowWidth: rowWidth, state: state)
+  }
+
+  private static func measuredHeight(
+    row: ChatListRow, rowWidth: CGFloat, state: AgentTurnBubbleState
+  ) -> CGFloat? {
     guard rowWidth > 0 else { return nil }
 
     // Centered service pills: agent control events (interrupt, /compact) and failed
@@ -65,8 +89,7 @@ enum VibeRowMetrics {
     if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
       return servicePillBaseHeight + serviceDecisionActionsHeight(for: row)
     }
-
-    guard !requiresMainThread(row) else { return nil }
+    if row.kind == .day { return dayRowHeight }
 
     let metrics = measureMessageBubbleLayout(row: row, rowWidth: rowWidth, agentTurnState: state)
     return metrics.bubbleHeight + metrics.tallOuterToggleReserve

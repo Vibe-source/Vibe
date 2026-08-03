@@ -281,6 +281,7 @@ final class VibeCoreListPreviewModel: ObservableObject {
       enriched["measured"] = String(stats.measured)
       enriched["reused"] = String(stats.reused)
       enriched["remeasureAll"] = String(stats.invalidations)
+      enriched["placeholderSized"] = String(stats.placeholders)
     }
     enriched["settledHeightChanges"] = String(listHost.settledGeometryViolations)
     enriched["anchorDrifted"] = String(listHost.anchorDriftViolations)

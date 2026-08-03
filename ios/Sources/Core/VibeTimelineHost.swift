@@ -68,9 +68,26 @@ final class VibeRowMeasurementCache {
   private var contentSizeCategory: UIContentSizeCategory = .large
   private var themeEpoch: UInt64 = 0
 
+  /// The parsed row behind a message id.
+  ///
+  /// The seam that lets the core size a **real** conversation. Without it the
+  /// measurement below is a placeholder — one font, one media box, no reply chrome, no
+  /// reactions, no agent turns — which was fine while the host also drew a placeholder
+  /// bubble, and became a guaranteed mismatch the moment it started drawing
+  /// `ChatListCell`. A real cell in a placeholder-sized slot is exactly the "measured
+  /// one thing, drew another" defect, just relocated.
+  ///
+  /// Supplied by the chat surface, alongside the host's own `rowProvider`. Absent (the
+  /// Diagnostics preview) the placeholder still applies.
+  var rowProvider: ((String) -> ChatListRow?)?
+
   private(set) var measurements = 0
   private(set) var reuses = 0
   private(set) var invalidations = 0
+  /// Rows the provider could not supply, so they were sized by the placeholder. In a
+  /// real chat this must be zero — a non-zero count means the core is laying out rows
+  /// it cannot actually size, and the heights on screen are fiction.
+  private(set) var placeholderMeasurements = 0
 
   var metrics: VibeTimelineMetrics = .default
 
@@ -125,6 +142,40 @@ final class VibeRowMeasurementCache {
   // MARK: Measurement
 
   private func measure(_ message: VibeFfiMessage, revision: UInt64) -> VibeMeasuredRow {
+    if let row = rowProvider?(message.messageId),
+      let height = VibeRowMetrics.mainThreadHeight(row: row, rowWidth: width)
+    {
+      return measuredFromRealRow(height: height, revision: revision)
+    }
+    placeholderMeasurements += 1
+    return placeholderMeasure(message, revision: revision)
+  }
+
+  /// Geometry for a row that `ChatListCell` will draw.
+  ///
+  /// Only the height is real, and only the height is used: the cell owns its own
+  /// internal layout, so the bubble spec and media box below are not consulted for these
+  /// rows. They are filled in finite and non-zero because `VibeRenderItemValidator`
+  /// rejects degenerate geometry, and a rejected item is a dropped row.
+  private func measuredFromRealRow(height: CGFloat, revision: UInt64) -> VibeMeasuredRow {
+    VibeMeasuredRow(
+      size: CGSize(width: max(1, width), height: max(1, ceil(height))),
+      layout: VibeBubbleLayoutSpec(
+        textFrame: .zero,
+        mediaBoxFrame: .zero,
+        replyFrame: .zero,
+        metaFrame: .zero,
+        avatarGutter: .zero
+      ),
+      revision: revision
+    )
+  }
+
+  /// The pre-`rowProvider` measurement: one font, one media box, no chrome.
+  ///
+  /// Kept for the Diagnostics preview, which has no parsed rows to provide. It must
+  /// never size a real chat — see `placeholderMeasurements`.
+  private func placeholderMeasure(_ message: VibeFfiMessage, revision: UInt64) -> VibeMeasuredRow {
     let available = max(80, width - metrics.horizontalInset * 2)
     let maxBubble = max(60, available * metrics.maxBubbleWidthFraction)
     let textWidth = maxBubble - metrics.bubblePaddingH * 2
@@ -459,8 +510,19 @@ final class VibeTimelineHost {
     return true
   }
 
-  var measurementStats: (measured: Int, reused: Int, invalidations: Int) {
-    (cache.measurements, cache.reuses, cache.invalidations)
+  /// Supplies the parsed row behind a message id, for both measuring and drawing.
+  ///
+  /// One provider for both on purpose: a chat that can draw a row but not size it (or
+  /// the reverse) puts a real cell in a placeholder slot, which is the same
+  /// measured-one-thing-drew-another defect the core exists to remove. Set it before the
+  /// first mount — rows measured without it are counted in `placeholderMeasurements`.
+  func setRowProvider(_ provider: @escaping (String) -> ChatListRow?) {
+    cache.rowProvider = provider
+    (listHost as? VibeCollectionMessageListHost)?.rowProvider = provider
+  }
+
+  var measurementStats: (measured: Int, reused: Int, invalidations: Int, placeholders: Int) {
+    (cache.measurements, cache.reuses, cache.invalidations, cache.placeholderMeasurements)
   }
 
   // MARK: Mount

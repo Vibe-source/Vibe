@@ -56,6 +56,83 @@ final class VibeTimelineHostTests: XCTestCase {
     return cache
   }
 
+  // MARK: Sizing a real conversation
+
+  private func chatRow(_ id: String, text: String) -> ChatListRow {
+    ChatListRow(raw: [
+      "kind": "message",
+      "key": id,
+      "message": [
+        "id": id, "text": text, "timestamp": "22:20", "isMe": false, "type": "text",
+      ],
+    ])!
+  }
+
+  func testWithoutAProviderRowsAreSizedByThePlaceholderAndSaySo() {
+    // The preview has no parsed rows and legitimately uses the placeholder. What must
+    // never happen quietly is a *real* chat doing it, so the count is the alarm.
+    let cache = makeCache()
+    _ = cache.settledGeometry(for: message(id: "m1", text: "hello"))
+    XCTAssertEqual(cache.placeholderMeasurements, 1)
+  }
+
+  func testAProvidedRowIsSizedByTheListsOwnMeasurement() {
+    // The core drawing `ChatListCell` into a slot sized by the placeholder is the same
+    // measured-one-thing-drew-another defect it exists to remove, one layer down.
+    let cache = makeCache(width: 390)
+    let text = String(repeating: "a body long enough to wrap several times over. ", count: 4)
+    let row = chatRow("m1", text: text)
+    cache.rowProvider = { id in id == "m1" ? row : nil }
+
+    let measured = cache.settledGeometry(for: message(id: "m1", text: text))
+
+    XCTAssertEqual(cache.placeholderMeasurements, 0)
+    XCTAssertEqual(
+      measured.size.height,
+      VibeRowMetrics.mainThreadHeight(row: row, rowWidth: 390).map { ceil($0) })
+  }
+
+  func testAProvidedRowAndThePlaceholderDisagree() {
+    // If these ever matched, the test above would be proving nothing.
+    let text = String(repeating: "wrapping body text with real bubble chrome. ", count: 6)
+    let row = chatRow("m1", text: text)
+    let withProvider = makeCache(width: 390)
+    withProvider.rowProvider = { _ in row }
+    let real = withProvider.settledGeometry(for: message(id: "m1", text: text)).size.height
+
+    let placeholder = makeCache(width: 390)
+      .settledGeometry(for: message(id: "m1", text: text)).size.height
+
+    XCTAssertNotEqual(real, placeholder)
+  }
+
+  func testAMissingRowFallsBackRatherThanDroppingTheMessage() {
+    // A provider that answers nil for an id still in the window must leave a
+    // correctly-ordered, positively-sized gap. A zero-height item is rejected by the
+    // validator, which would drop the row entirely.
+    let cache = makeCache()
+    cache.rowProvider = { _ in nil }
+    let measured = cache.settledGeometry(for: message(id: "ghost", text: "hello"))
+    XCTAssertGreaterThan(measured.size.height, 0)
+    XCTAssertEqual(cache.placeholderMeasurements, 1)
+  }
+
+  func testProvidedRowsStillFreezeAfterTheFirstMeasurement() {
+    // The freeze is the whole mechanism, and it must not be an artefact of the
+    // placeholder being cheap.
+    let cache = makeCache()
+    let row = chatRow("m1", text: "some body text")
+    cache.rowProvider = { _ in row }
+    let m = message(id: "m1", text: "some body text")
+
+    let first = cache.settledGeometry(for: m)
+    for _ in 0..<20 { _ = cache.settledGeometry(for: m) }
+
+    XCTAssertEqual(cache.measurements, 1)
+    XCTAssertEqual(cache.reuses, 20)
+    XCTAssertEqual(cache.settledGeometry(for: m).size, first.size)
+  }
+
   // MARK: Frozen geometry
 
   func testASettledRowIsMeasuredExactlyOnce() {
