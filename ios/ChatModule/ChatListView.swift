@@ -556,231 +556,6 @@ private final class ChatListTextPreviewController: UIViewController {
   }
 }
 
-private func formatNativeMusicPlayerTime(_ seconds: Double) -> String {
-  guard seconds.isFinite, seconds > 0 else { return "0:00" }
-  let total = max(0, Int(seconds.rounded()))
-  return String(format: "%d:%02d", total / 60, total % 60)
-}
-
-private final class ChatNativeMusicPlayerBar: UIView {
-  static let preferredHeight: CGFloat = 68.0
-
-  private let blurView = UIVisualEffectView(effect: nil)
-  private let artworkView = UIImageView()
-  private let artworkPlaceholderView = UIImageView()
-  private let titleLabel = UILabel()
-  private let subtitleLabel = UILabel()
-  private let playbackButton = VoicePlayProgressView()
-  private let closeButton = UIButton(type: .system)
-  private let progressTrackView = UIView()
-  private let progressFillView = UIView()
-  private var snapshot = VoiceBubblePlaybackSnapshot.empty
-
-  var onTogglePlayback: (() -> Void)?
-  var onClose: (() -> Void)?
-
-  override init(frame: CGRect) {
-    super.init(frame: frame)
-    clipsToBounds = false
-    layer.cornerCurve = .continuous
-    layer.cornerRadius = 20.0
-
-    blurView.isUserInteractionEnabled = false
-    blurView.clipsToBounds = true
-    blurView.layer.cornerCurve = .continuous
-    blurView.layer.cornerRadius = 20.0
-    addSubview(blurView)
-
-    artworkView.contentMode = .scaleAspectFill
-    artworkView.clipsToBounds = true
-    artworkView.layer.cornerCurve = .continuous
-    artworkView.layer.cornerRadius = 12.0
-    addSubview(artworkView)
-
-    artworkPlaceholderView.contentMode = .scaleAspectFit
-    artworkPlaceholderView.image = UIImage(systemName: "music.note")
-    addSubview(artworkPlaceholderView)
-
-    titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-    titleLabel.numberOfLines = 1
-    addSubview(titleLabel)
-
-    subtitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-    subtitleLabel.numberOfLines = 1
-    addSubview(subtitleLabel)
-
-    playbackButton.isUserInteractionEnabled = true
-    playbackButton.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTogglePlayback)))
-    addSubview(playbackButton)
-
-    closeButton.tintColor = .white
-    closeButton.setImage(
-      UIImage(systemName: "xmark")?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)),
-      for: .normal
-    )
-    closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
-    addSubview(closeButton)
-
-    progressTrackView.isUserInteractionEnabled = false
-    progressTrackView.layer.cornerCurve = .continuous
-    progressTrackView.layer.cornerRadius = 1.5
-    addSubview(progressTrackView)
-
-    progressFillView.isUserInteractionEnabled = false
-    progressFillView.layer.cornerCurve = .continuous
-    progressFillView.layer.cornerRadius = 1.5
-    addSubview(progressFillView)
-
-    isHidden = true
-  }
-
-  required init?(coder: NSCoder) {
-    return nil
-  }
-
-  func applyAppearance(_ appearance: ChatListAppearance) {
-    let isDark = appearance.isDark
-    blurView.effect = UIBlurEffect(
-      style: isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight)
-    backgroundColor = UIColor.clear
-    artworkView.backgroundColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: isDark ? 0.08 : 0.06)
-    artworkPlaceholderView.tintColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: 0.48)
-    titleLabel.textColor = isDark ? .white : UIColor(white: 0.08, alpha: 1.0)
-    subtitleLabel.textColor = isDark ? UIColor(white: 1.0, alpha: 0.68) : UIColor(white: 0.16, alpha: 0.72)
-    progressTrackView.backgroundColor = UIColor(white: isDark ? 1.0 : 0.0, alpha: isDark ? 0.18 : 0.12)
-    // White bar fill to match white play/download icon chrome.
-    progressFillView.backgroundColor = .white
-    playbackButton.applyStyle(
-      fillColor: UIColor(white: isDark ? 0.22 : 0.18, alpha: 0.96),
-      iconTint: .white,
-      ringTint: .white
-    )
-  }
-
-  func applySnapshot(_ snapshot: VoiceBubblePlaybackSnapshot) {
-    self.snapshot = snapshot
-    let shouldShow = snapshot.presentsGlobalPlayer && snapshot.messageId != nil
-    isHidden = !shouldShow
-    guard shouldShow else { return }
-
-    artworkView.image = snapshot.artwork
-    artworkPlaceholderView.isHidden = snapshot.artwork != nil
-    titleLabel.text = snapshot.title ?? "Audio"
-
-    let newSubtitle: String
-    if snapshot.isDownloading {
-      // Quiet status — no percent spam that reflows the subtitle every tick.
-      newSubtitle = "Loading"
-    } else if snapshot.duration > 0.0 {
-      let current = snapshot.duration * Double(snapshot.progress)
-      newSubtitle = "\(formatNativeMusicPlayerTime(current)) / \(formatNativeMusicPlayerTime(snapshot.duration))"
-    } else {
-      newSubtitle = snapshot.subtitle ?? ""
-    }
-    if subtitleLabel.text != newSubtitle {
-      subtitleLabel.text = newSubtitle
-    }
-
-    playbackButton.setArtworkImage(nil)
-    playbackButton.setUploadState(isUploading: false, progress: nil)
-    if snapshot.isDownloading {
-      playbackButton.setDownloadState(
-        needsDownload: true,
-        isDownloading: true,
-        progress: snapshot.downloadProgress.map { CGFloat($0) }
-      )
-    } else {
-      playbackButton.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
-      playbackButton.setPlaybackState(
-        isPlaying: snapshot.isPlaying,
-        progress: snapshot.progress,
-        level: snapshot.isPlaying ? 0.22 : 0.0
-      )
-    }
-
-    if bounds.width > 0 {
-      let progressWidth = max(0.0, closeButton.frame.minX - 10.0 - titleLabel.frame.minX)
-      // While loading, drive the bar from download progress (smooth muted fill).
-      // While playing, use playback progress.
-      let fillFraction: CGFloat
-      if snapshot.isDownloading {
-        fillFraction = max(0.04, min(1.0, CGFloat(snapshot.downloadProgress ?? 0.12)))
-      } else {
-        fillFraction = max(0.0, min(1.0, snapshot.progress))
-      }
-      let hideProgress = !snapshot.isDownloading && snapshot.duration <= 0.0
-      progressFillView.frame.size.width = progressWidth * fillFraction
-      if progressTrackView.isHidden != hideProgress {
-        progressTrackView.isHidden = hideProgress
-        progressFillView.isHidden = hideProgress
-      }
-    } else {
-      setNeedsLayout()
-    }
-  }
-
-  override func layoutSubviews() {
-    super.layoutSubviews()
-    blurView.frame = bounds
-
-    let inset: CGFloat = 10.0
-    let artworkSide: CGFloat = bounds.height - (inset * 2.0)
-    artworkView.frame = CGRect(x: inset, y: inset, width: artworkSide, height: artworkSide)
-    artworkPlaceholderView.frame = artworkView.frame.insetBy(dx: 10.0, dy: 10.0)
-
-    let closeSide: CGFloat = 28.0
-    closeButton.frame = CGRect(
-      x: bounds.width - inset - closeSide,
-      y: floor((bounds.height - closeSide) * 0.5),
-      width: closeSide,
-      height: closeSide
-    )
-
-    let playbackSide: CGFloat = 34.0
-    playbackButton.frame = CGRect(
-      x: closeButton.frame.minX - 8.0 - playbackSide,
-      y: floor((bounds.height - playbackSide) * 0.5),
-      width: playbackSide,
-      height: playbackSide
-    )
-
-    let textX = artworkView.frame.maxX + 10.0
-    let textRight = playbackButton.frame.minX - 10.0
-    let textWidth = max(0.0, textRight - textX)
-    titleLabel.frame = CGRect(x: textX, y: inset + 8.0, width: textWidth, height: 18.0)
-    subtitleLabel.frame = CGRect(x: textX, y: titleLabel.frame.maxY + 4.0, width: textWidth, height: 16.0)
-
-    let progressX = textX
-    let progressY = bounds.height - 10.0
-    let progressWidth = max(0.0, closeButton.frame.minX - 10.0 - progressX)
-    let fillFraction: CGFloat
-    if snapshot.isDownloading {
-      fillFraction = max(0.04, min(1.0, CGFloat(snapshot.downloadProgress ?? 0.12)))
-    } else {
-      fillFraction = max(0.0, min(1.0, snapshot.progress))
-    }
-    progressTrackView.frame = CGRect(x: progressX, y: progressY, width: progressWidth, height: 3.0)
-    progressFillView.frame = CGRect(
-      x: progressX,
-      y: progressY,
-      width: progressWidth * fillFraction,
-      height: 3.0
-    )
-    // Keep the muted bar visible during load (fill shows download), hide only when idle with no duration.
-    let hideProgress = !snapshot.isDownloading && snapshot.duration <= 0.0
-    progressTrackView.isHidden = hideProgress
-    progressFillView.isHidden = hideProgress
-  }
-
-  @objc private func handleTogglePlayback() {
-    onTogglePlayback?()
-  }
-
-  @objc private func handleClose() {
-    onClose?()
-  }
-}
 
 private let chatListSendVerticalTiming = CAMediaTimingFunction(
   controlPoints: Float(0.19919472913616398),
@@ -13753,12 +13528,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  // [GroupCellOverlap] Debug probe for the "messy overlapping Codex cell" report. Logs
-  // (via NSLog so it shows in Console) only when two ADJACENT group rows are laid out with
-  // overlapping frames — silent otherwise. Captures each row's identity (agent kind / error
-  // / notice), assigned frame Y+height, and a text prefix so we can tell whether it's a
-  // notice+result pair or a single row that grew without reflow. Remove once fixed.
-  private var lastOverlapProbeAt: TimeInterval = 0
 
   /// After group batch updates (agent settle swaps), verify the CELL layer matches the
   /// data source. The flow layout's frames never overlap by construction, but rapid
@@ -13802,21 +13571,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  // Mirror overlap-probe lines to a file in the app's tmp dir so they can be pulled off the
-  // device without root: `devicectl device copy from --domain-type temporary
-  // --domain-identifier com.vibegram.app --source group_overlap_probe.log ...`.
-  private static func appendOverlapProbeLine(_ line: String) {
-    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("group_overlap_probe.log")
-    let stamped = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
-    guard let data = stamped.data(using: .utf8) else { return }
-    if let handle = FileHandle(forWritingAtPath: path) {
-      handle.seekToEndOfFile()
-      handle.write(data)
-      try? handle.close()
-    } else {
-      try? data.write(to: URL(fileURLWithPath: path))
-    }
-  }
 
   private func maybeLoadOlderBridgeHistoryIfNeeded(offsetY: CGFloat) {
     guard currentBridgeProvider != nil else { return }
@@ -14432,20 +14186,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       return nil
     }
     return messageId
-  }
-
-  private func rawRowStableIdentity(_ row: [String: Any]) -> String? {
-    if let key = row["key"] as? String {
-      let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty { return "key:\(trimmed)" }
-    }
-    if let messageId = messageId(fromRawRow: row) { return "message:\(messageId)" }
-    if let kind = row["kind"] as? String,
-      let timestamp = row["timestampMs"] ?? row["timestamp_ms"]
-    {
-      return "\(kind):\(String(describing: timestamp))"
-    }
-    return nil
   }
 
 
@@ -22439,20 +22179,6 @@ extension ChatListView: ChatInputBarDelegate {
     }
   }
 
-  private func startDotPulseAnimation() {
-    for (i, dot) in activityDots.enumerated() {
-      dot.layer.removeAnimation(forKey: "dotPulse")
-      let anim = CABasicAnimation(keyPath: "opacity")
-      anim.fromValue = 0.3
-      anim.toValue = 1.0
-      anim.duration = 0.5
-      anim.autoreverses = true
-      anim.repeatCount = .infinity
-      anim.beginTime = CACurrentMediaTime() + Double(i) * 0.15
-      anim.isRemovedOnCompletion = false
-      dot.layer.add(anim, forKey: "dotPulse")
-    }
-  }
 
   private func stopDotPulseAnimation() {
     for dot in activityDots {

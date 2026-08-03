@@ -9,7 +9,6 @@ private let chatCellReactionDebugLogs = false
 private let chatCellMediaDebugLogs = false
 private let chatCellInlineVideoDebugLogs = false
 private let chatCellBubbleFlickerDebugLogs = false
-private let bubbleBoldRegex = try! NSRegularExpression(pattern: "\\*\\*(.+?)\\*\\*")
 private let chatMediaImageCache: NSCache<NSString, UIImage> = {
   let cache = NSCache<NSString, UIImage>()
   cache.countLimit = 96
@@ -125,25 +124,6 @@ func chatStableRemoteMediaIdentity(_ url: URL) -> String {
   return comps?.string ?? url.absoluteString
 }
 
-private func chatMediaDiskCacheDir() -> URL {
-  VibeMediaVault.shared.directory(for: .image)
-}
-
-private func migrateLegacyMediaCacheFolder(named name: String, into destination: URL) {
-  let fm = FileManager.default
-  guard
-    let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first
-  else { return }
-  let legacy = caches.appendingPathComponent(name, isDirectory: true)
-  guard fm.fileExists(atPath: legacy.path) else { return }
-  guard let items = try? fm.contentsOfDirectory(atPath: legacy.path) else { return }
-  for item in items {
-    let src = legacy.appendingPathComponent(item)
-    let dst = destination.appendingPathComponent(item)
-    if fm.fileExists(atPath: dst.path) { continue }
-    try? fm.copyItem(at: src, to: dst)
-  }
-}
 
 /// Strips tracking query params from Giphy (and similar CDN) URLs so the same
 /// media content always maps to the same cache key regardless of session tokens.
@@ -372,9 +352,6 @@ func chatDecodedMicroThumbnail(fromBase64 value: String?, cacheKey: String?) -> 
   return out
 }
 
-private func chatMediaPreviewVideoCacheDir() -> URL {
-  VibeMediaVault.shared.directory(for: .videoPreview)
-}
 
 private func chatMediaResolvedVideoExtension(
   urlString: String,
@@ -1574,14 +1551,12 @@ let bubbleTailBottomOverhang: CGFloat = 0.5
 
 private let bubbleMessageFont = UIFont.systemFont(ofSize: 16)
 private let bubbleMetaFont = UIFont.systemFont(ofSize: 10, weight: .medium)
-private let bubbleMetaPendingFont = UIFont.systemFont(ofSize: 10.5, weight: .semibold)
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 4.0
 private let bubbleMetaItemGap: CGFloat = 2.0
 private let bubbleRTLTailSideReserve: CGFloat = 0.0
 private let bubbleStatusSlotWidth: CGFloat = 17.0
 private let bubbleStatusSlotHeight: CGFloat = 14.0
-private let bubbleStatusCheckStrokeWidth: CGFloat = 1.0
 
 private final class ChatPendingStatusView: UIView {
   private let ringLayer = CAShapeLayer()
@@ -2002,18 +1977,6 @@ private let chatDownloadByteCountFormatter: ByteCountFormatter = {
 
 private func formatDownloadByteCount(_ bytes: Int64) -> String {
   chatDownloadByteCountFormatter.string(fromByteCount: bytes)
-}
-
-/// `"2.3 MB / 7.8 MB"` when total is known; just total until first bytes arrive; nil until known.
-private func formatDownloadSizeCaption(downloadedBytes: Int64?, totalBytes: Int64?) -> String? {
-  if let totalBytes, totalBytes > 0 {
-    let totalText = formatDownloadByteCount(totalBytes)
-    if let downloadedBytes, downloadedBytes > 0 {
-      return "\(formatDownloadByteCount(downloadedBytes)) / \(totalText)"
-    }
-    return totalText
-  }
-  return nil
 }
 
 private let chatTransferProgressQuantizationStep: CGFloat = 0.01
@@ -3064,17 +3027,6 @@ private let bubbleMusicLinkPreviewHeight: CGFloat =
   bubbleMusicLinkArtTop + bubbleMusicLinkArtworkHeight + bubbleMusicLinkArtBottomGap
   + bubbleMusicLinkTextBlockHeight + bubbleMusicLinkBottomPad
 private let bubbleMusicLinkPreviewMinWidth: CGFloat = 480.0
-// Agent `type: music` rows use the same Telegram card proportions inside the bubble.
-// Media container is already inset by `bubbleHorizontalPadding` (12pt) — do NOT add a
-// second large horizontal pad around the art or the cover looks stubby vs Telegram.
-private let musicMessageCardArtTop: CGFloat = 10.0
-private let musicMessageCardArtMaxSide: CGFloat = 248.0
-private let musicMessageCardArtBottomGap: CGFloat = 10.0
-private let musicMessageCardTextBlockHeight: CGFloat = 62.0
-private let musicMessageCardBottomPad: CGFloat = 8.0
-private let musicMessageCardHeight: CGFloat =
-  musicMessageCardArtTop + musicMessageCardArtMaxSide + musicMessageCardArtBottomGap
-  + musicMessageCardTextBlockHeight + musicMessageCardBottomPad
 // Gap between rich-text blocks (prose ↔ code card ↔ runtime summary). A touch more
 // air keeps multi-block agent answers from stacking into one dense column.
 private let bubbleRichTextBlockSpacing: CGFloat = 10.0
@@ -3435,11 +3387,6 @@ func bubbleIsMusicPreviewURL(_ url: URL) -> Bool {
     "youtube.com", "youtu.be", "music.youtube.com",
   ]
   return musicHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
-}
-
-private func bubbleMusicPreviewURL(for row: ChatListRow) -> URL? {
-  guard let url = bubblePreviewURL(for: row), bubbleIsMusicPreviewURL(url) else { return nil }
-  return url
 }
 
 private func bubbleRowPreviewHeight(for row: ChatListRow) -> CGFloat {
@@ -6289,7 +6236,6 @@ final class VoiceWaveformView: UIView {
       alpha: ia + ((aa - ia) * t)
     ).cgColor
   }
-
 
 
   private static func makeDefaultEnvelope(count: Int) -> [CGFloat] {
@@ -9560,7 +9506,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   // for a 1:1 agent turn (see bubbleUsesAgentTurnContent).
   private let agentTurnContentView = VibeAgentTurnContentView()
   private var agentTurnState = AgentTurnBubbleState()
-  private var agentTurnContentWidthConstraint: NSLayoutConstraint?
   // Reconfigure gate for agentTurnContentView: `layoutSubviews` runs on every scroll
   // tick / pin adjustment, but `configure(row:)` re-parses the FULL progress payload
   // (all nodes) and rebuilds the body — far too heavy per layout pass on a large turn.
