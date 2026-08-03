@@ -52,6 +52,13 @@ final class VibeCoreEngineState {
   var frozenGeometry: [String: CGFloat] = [:]
   /// Rows whose height changed while settled. §9.1 requires this to be 0.
   var settledGeometryChanges = 0
+  /// The core, or `nil` when a gate said no. Built once per chat.
+  var driver: VibeCoreListDriver?
+  /// Eligibility is resolved once per chat, not once per row batch — a gate that could
+  /// change mid-chat would swap the sizing authority under a reader.
+  var eligibilityChecked = false
+  /// Width the core was last told to measure against.
+  var layoutWidth: CGFloat = 0
 }
 
 extension ChatListView: VibeMessageListHost {
@@ -80,6 +87,77 @@ extension ChatListView: VibeMessageListHost {
   }
 
   var view: UIView { self }
+
+  // MARK: Lifecycle
+
+  /// Hands the core the window this list is about to render.
+  ///
+  /// **This is the entire call site.** One line inside `setRows`, taking the values it
+  /// already has in hand, so the 23,091-line file gains a single statement rather than a
+  /// migration. `chatId` and `isGroupOrChannel` are passed in rather than read off the
+  /// view because both live in `private` storage that another file cannot see — and
+  /// widening an access modifier to suit a caller is how a boundary stops being one.
+  ///
+  /// Safe to call on every batch: eligibility is resolved once, the driver dedups rows
+  /// it has already ingested, and an identical re-emitted window asks the core nothing.
+  func feedCoreEngine(chatId: String, isGroupOrChannel: Bool, rows sourceRows: [[String: Any]]) {
+    if !coreState.eligibilityChecked {
+      coreState.eligibilityChecked = true
+      coreState.driver = Self.makeCoreDriverIfEligible(
+        chatId: chatId, isGroupOrChannel: isGroupOrChannel, listHost: self)
+      coreState.driver?.start { [weak self] messageId in
+        guard let self else { return nil }
+        return self.rows.first { $0.messageId == messageId || $0.key == messageId }
+      }
+    }
+    guard let driver = coreState.driver else { return }
+    // The width rows are measured against, from the same expression the sizing path
+    // uses. A core measuring against a width the cells never use produces heights that
+    // are wrong rather than missing, which is strictly worse than having none.
+    let width = max(0, bounds.width - (messageHorizontalInset * 2))
+    if width > 0, abs(coreState.layoutWidth - width) > 0.5 {
+      coreState.layoutWidth = width
+      driver.setLayoutWidth(width)
+    }
+    driver.observe(rows: sourceRows)
+  }
+
+  /// Tears the core down. Called when the chat changes or the view goes away — a driver
+  /// left holding the previous chat's generation high-water mark fences off everything
+  /// the next one sends.
+  func shutdownCoreEngine() {
+    coreState.driver?.shutdown()
+    coreState.driver = nil
+    coreState.eligibilityChecked = false
+    coreState.generation = 0
+    coreState.orderedMessageIds.removeAll()
+    coreState.frozenGeometry.removeAll()
+    coreState.layoutWidth = 0
+  }
+
+  /// Builds a driver only when every gate agrees, otherwise `nil`.
+  ///
+  /// Fails closed on every input. Kept here, next to the thing it governs, so the rule
+  /// that P4 is **1:1 DM only** is written once rather than being a condition someone can
+  /// widen in passing at a call site.
+  ///
+  /// Saved Messages is named explicitly because it slipped through a DM-only allowlist
+  /// once already: it answers `false` to `isGroupOrChannel`, and its dual-id history is
+  /// exactly the kind of ordering quirk that earns its own soak.
+  static func makeCoreDriverIfEligible(
+    chatId: String,
+    isGroupOrChannel: Bool,
+    listHost: VibeMessageListHost,
+    flags: VibeTimelineFeatureFlags = VibeTimelineUserDefaultsFeatureFlags().flags
+  ) -> VibeCoreListDriver? {
+    guard flags.vibeAsyncTimelineV1Enabled else { return nil }
+    guard flags.eligibleChatClasses.contains(.directMessage) else { return nil }
+    guard !isGroupOrChannel else { return nil }
+    let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, !trimmed.hasPrefix("saved_messages") else { return nil }
+    NSLog("[VibeCore] driver ARMED chat=%@", String(trimmed.prefix(12)))
+    return VibeCoreListDriver(chatId: trimmed, listHost: listHost)
+  }
 
   // MARK: Mount
 
