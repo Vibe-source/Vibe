@@ -607,7 +607,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var lastKnownViewportHeight: CGFloat = 0.0
   private var contentPaddingTop: CGFloat = sectionTopInset
   private var requestedContentPaddingBottom: CGFloat = sectionBottomInset
-  private var contentPaddingBottom: CGFloat = sectionBottomInset
+  /// Clearance under the last row, as a **section inset** — part of `contentSize`, not
+  /// `contentInset` (see `logViewportCoverage`).
+  ///
+  /// It is assigned from six places and starts at `sectionBottomInset` (14) before the
+  /// composer has ever been laid out, then becomes `barHeight + keyboardHeight` on the
+  /// first layout pass that has a bar. That is a real two-phase settle on chat open, and
+  /// because it is a section inset it moves `contentSize` and therefore everything below
+  /// it. Every change is recorded so `recordViewportDrift` can name the mutation instead
+  /// of reporting the category — "blame=height" is where an investigation starts,
+  /// "pad 14→56 (inputBar)" is where it ends.
+  private var contentPaddingBottom: CGFloat = sectionBottomInset {
+    didSet { noteBottomPaddingChange(from: oldValue) }
+  }
+  /// Geometry mutations since the last viewport checkpoint, newest last.
+  private var pendingGeometryCauses: [String] = []
   private var isApplyingRowsUpdate = false
   private var pendingStreamingTextLayoutInvalidation = false
   // A streaming relayout arrived while the user was scrolling and was deferred to
@@ -7585,6 +7599,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private var lastViewportCheckpoint: ViewportCheckpoint?
 
+  /// Records a bottom-padding change so the next drift report can name it.
+  ///
+  /// Bounded: a stall during a keyboard animation would otherwise accumulate one entry
+  /// per frame and the line would be unreadable at exactly the moment it matters.
+  private func noteBottomPaddingChange(from oldValue: CGFloat) {
+    guard abs(contentPaddingBottom - oldValue) >= 0.5 else { return }
+    if pendingGeometryCauses.count < 6 {
+      pendingGeometryCauses.append(
+        String(format: "pad %.0f→%.0f", oldValue, contentPaddingBottom))
+    } else if pendingGeometryCauses.count == 6 {
+      pendingGeometryCauses.append("…")
+    }
+  }
+
   /// Measures whether the transcript moved under the user, and says why.
   ///
   /// `contentOffset` on its own cannot answer this. When rows are prepended the
@@ -7652,9 +7680,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     meta["dInsetBottom"] = String(format: "%.0f", dInsetBottom)
     meta["dRows"] = String(dRows)
     meta["anchor"] = String(key.prefix(14))
+    let causes = pendingGeometryCauses.joined(separator: ",")
+    pendingGeometryCauses.removeAll(keepingCapacity: true)
+    if !causes.isEmpty { meta["caused"] = causes }
     // Blames the cause rather than leaving it to be inferred from four numbers.
+    // A recorded mutation outranks the inferred category: `contentPaddingBottom` is a
+    // section inset, so it moves `contentSize` and reads as "height" — which sends the
+    // reader looking at row measurement for something the composer did.
     meta["blame"] = {
       if abs(drift) < 0.5 { return "none" }
+      if !causes.isEmpty { return "bottomPad" }
       if dRows != 0 { return "rows" }
       if abs(dContent) >= 0.5 { return "height" }
       if abs(dInsetTop) >= 0.5 || abs(dInsetBottom) >= 0.5 { return "inset" }
@@ -7666,9 +7701,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     } else {
       VibeLog.error("LIST SHIFTED under the user", category: "list", metadata: meta)
       NSLog(
-        "[ListShift] chat=%@ %@→%@ drift=%.1fpt blame=%@ dContentH=%.0f dRows=%d dInsetT=%.0f dInsetB=%.0f anchor=%@",
+        "[ListShift] chat=%@ %@→%@ drift=%.1fpt blame=%@ caused=[%@] dContentH=%.0f dRows=%d dInsetT=%.0f dInsetB=%.0f anchor=%@",
         String(engineChatId.prefix(12)), previous.stage, stage, drift,
-        meta["blame"] ?? "-", dContent, dRows, dInsetTop, dInsetBottom, String(key.prefix(14)))
+        meta["blame"] ?? "-", causes, dContent, dRows, dInsetTop, dInsetBottom,
+        String(key.prefix(14)))
     }
   }
 
@@ -16676,10 +16712,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     inputBarEnabled = enabled
 
     if enabled {
-      if abs(contentPaddingBottom - sectionBottomInset) > 0.5 {
-        contentPaddingBottom = sectionBottomInset
-        updateBottomAnchorInset()
-      }
+      // Deliberately NOT reset to `sectionBottomInset` here.
+      //
+      // It used to be, and `layoutInputBarAndInset` then raised it to
+      // `barHeight + keyboardHeight` on the next layout pass. Because this value is a
+      // flow-layout *section* inset it is inside `contentSize`, so those are two
+      // different transcript geometries: the seed sizes and bottom-positions the list
+      // against ~14 pt of clearance, then the composer claims its real ~56, `contentSize`
+      // grows by the difference, the list is no longer at the bottom, and
+      // `scrollToBottom` drags it back. That correction is the reported "gap under the
+      // last message on open, which then closes and pushes everything down".
+      //
+      // Holding the previous value is strictly better than resetting: it is either
+      // already right (re-enable on the same chat) or about to be corrected below by a
+      // real measurement, and neither is 14.
       // The glass agent composer is only for the Claude/Codex bridge DMs. The default
       // "Vibe AI" agent (agentChatMode without a bridge provider) and every normal DM use
       // the standard ChatInputBar instead.
@@ -16737,6 +16783,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // Re-sync after title wiring in case group control mode / live rows changed.
       syncComposerStopState()
 
+      // Claim the composer's clearance NOW, while the transcript is still empty and
+      // moving it costs nothing, rather than on the layout pass after the rows are
+      // already sized and positioned against the wrong value.
+      layoutInputBarAndInset()
       positionTransitionOverlayHost()
       VibeDebugLog.log("[ChatListView] native input bar ENABLED")
     } else {
