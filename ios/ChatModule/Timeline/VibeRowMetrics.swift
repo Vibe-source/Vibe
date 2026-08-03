@@ -79,20 +79,52 @@ enum VibeRowMetrics {
     measuredHeight(row: row, rowWidth: rowWidth, state: state)
   }
 
+  /// A height, plus whether it is one this list already knows will change.
+  ///
+  /// `mediaAspectWasUnknown` is not a detail: a media row whose natural size nothing
+  /// knew yet is sized by the square fallback, and that number is corrected the moment
+  /// the aspect resolves. A caller that freezes it as exact has cached the shift rather
+  /// than removed it — which is the bug `isProvisional` exists to catch in the list's
+  /// own cache, and it has to survive the trip through this gate.
+  struct Measured: Equatable {
+    let height: CGFloat
+    let mediaAspectWasUnknown: Bool
+  }
+
+  /// ``height(row:rowWidth:state:)`` with the provisional flag kept.
+  static func measured(
+    row: ChatListRow,
+    rowWidth: CGFloat,
+    state: AgentTurnBubbleState = AgentTurnBubbleState()
+  ) -> Measured? {
+    guard !requiresMainThread(row) else { return nil }
+    return measuredRow(row: row, rowWidth: rowWidth, state: state)
+  }
+
   private static func measuredHeight(
     row: ChatListRow, rowWidth: CGFloat, state: AgentTurnBubbleState
   ) -> CGFloat? {
+    measuredRow(row: row, rowWidth: rowWidth, state: state)?.height
+  }
+
+  private static func measuredRow(
+    row: ChatListRow, rowWidth: CGFloat, state: AgentTurnBubbleState
+  ) -> Measured? {
     guard rowWidth > 0 else { return nil }
 
     // Centered service pills: agent control events (interrupt, /compact) and failed
     // turns are not bubbles and never reach the measure path.
     if agentSystemDividerText(for: row) != nil || agentErrorNoticeText(for: row) != nil {
-      return servicePillBaseHeight + serviceDecisionActionsHeight(for: row)
+      return Measured(
+        height: servicePillBaseHeight + serviceDecisionActionsHeight(for: row),
+        mediaAspectWasUnknown: false)
     }
-    if row.kind == .day { return dayRowHeight }
+    if row.kind == .day { return Measured(height: dayRowHeight, mediaAspectWasUnknown: false) }
 
     let metrics = measureMessageBubbleLayout(row: row, rowWidth: rowWidth, agentTurnState: state)
-    return metrics.bubbleHeight + metrics.tallOuterToggleReserve
+    return Measured(
+      height: metrics.bubbleHeight + metrics.tallOuterToggleReserve,
+      mediaAspectWasUnknown: metrics.mediaAspectWasUnknown)
   }
 
   /// `height(row:rowWidth:state:)` for a batch, with the main-only rows reported rather
@@ -103,12 +135,22 @@ enum VibeRowMetrics {
     rowWidth: CGFloat,
     state: AgentTurnBubbleState = AgentTurnBubbleState()
   ) -> (byKey: [String: CGFloat], deferredKeys: [String]) {
-    var byKey: [String: CGFloat] = [:]
+    let batch = measuredBatch(rows: rows, rowWidth: rowWidth, state: state)
+    return (batch.byKey.mapValues(\.height), batch.deferredKeys)
+  }
+
+  /// ``heights(rows:rowWidth:state:)`` with the provisional flag kept per row.
+  static func measuredBatch(
+    rows: [ChatListRow],
+    rowWidth: CGFloat,
+    state: AgentTurnBubbleState = AgentTurnBubbleState()
+  ) -> (byKey: [String: Measured], deferredKeys: [String]) {
+    var byKey: [String: Measured] = [:]
     byKey.reserveCapacity(rows.count)
     var deferred: [String] = []
     for row in rows {
-      if let height = height(row: row, rowWidth: rowWidth, state: state) {
-        byKey[row.key] = height
+      if let measured = measured(row: row, rowWidth: rowWidth, state: state) {
+        byKey[row.key] = measured
       } else {
         deferred.append(row.key)
       }

@@ -1240,6 +1240,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     case agentEstimate = "agent-ESTIMATE"
     case cache
     case persisted = "persist"
+    case prepared = "prepared-off-push"
     case measuredVoice = "measure-voice"
     case measuredCircle = "measure-circle"
     case measuredMedia = "measure-media"
@@ -1493,6 +1494,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// probe, because a flag that changes mid-chat would reorder a list the reader
   /// is already looking at.
   private var coreOrderAuthorityEnabled: Bool = false
+  /// Last measurement width handed to ``VibeTimelinePreparedStore``. Local so the
+  /// sizing path pays a float compare rather than a lock.
+  private var publishedMeasurementWidth: CGFloat = 0
+  /// Prepared-height hits and misses for this open, reported once by the seed. A
+  /// prepared store that silently never hits and one that is working are otherwise
+  /// indistinguishable from the log, which is how the shadow probe nearly shipped dark.
+  private var seedPreparedHits = 0
+  private var seedPreparedMisses = 0
   /// Puts `[HeightShift]` events into the exportable log, and separates the
   /// corrections that moved the reader's screen from the ones under the fold.
   /// See `docs/chat-list-seams-map.md` for the twelve sites that can produce them.
@@ -1940,6 +1949,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     measurementWidth: CGFloat, extraTop: CGFloat, extraLeading: CGFloat
   ) {
     let width = max(0.0, bounds.width - (messageHorizontalInset * 2.0))
+    // P4-C — publish the number rows must be measured against, from the one funnel
+    // that derives it. Anywhere else and the prepared heights would be measured
+    // against a width the cells never use, which is a wrong height rather than a
+    // missing one. Guarded by a local compare so this stays a float test on the
+    // sizing hot path rather than a lock acquisition per row.
+    if abs(publishedMeasurementWidth - width) > 0.5, width > 0 {
+      publishedMeasurementWidth = width
+      VibeTimelinePreparedStore.shared.setMeasurementWidth(width)
+    }
     let ctx = groupCellContext(at: indexPath)
     let extraLeading = ctx.reservesGutter ? Self.groupIncomingExtraLeading : 0.0
     var extraTop =
@@ -2826,7 +2844,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// The JPEG twin (same data-protection class as the plaintext SQLite message store)
   /// makes the FIRST open after a relaunch frame-1 too, not just same-session reopens.
   func captureReopenSnapshot() {
-    guard window != nil, !rows.isEmpty, let key = reopenSnapshotKey() else { return }
+    guard window != nil, !rows.isEmpty else { return }
+    // P4-C — the settle beat is also when this chat's heights are prepared for its next
+    // open. Deliberately here rather than at bind time: the transcript is final, the
+    // main thread is idle, and the measurement lands on the store's own queue. The
+    // engine's persist choke covers a chat whose rows changed on the network; this
+    // covers the far more common case, which is reopening a chat that changed nothing.
+    VibeTimelinePreparedStore.shared.prepareAsync(
+      chatId: engineChatId, rows: rows, reason: "settle")
+    guard let key = reopenSnapshotKey() else { return }
     // Rows in the MODEL are not pixels on screen: a teardown/empty-render state has
     // rows set but zero materialized cells, and drawHierarchy of that view is pure
     // wallpaper — which the doodle wallpaper's luma spread happily passes. Requiring
@@ -6054,6 +6080,58 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       String(chatId.prefix(12)), decoded.e.count)
   }
 
+  /// P4-C — a height this row was already given, measured **off the push**.
+  ///
+  /// Consulted ahead of the disk-persisted heights and behind the in-memory cache,
+  /// which is exactly where its trustworthiness ranks: it came from
+  /// `measureMessageBubbleLayout` at the current width — the same function the cell
+  /// calls, so agreement is identity — but from the transcript as it stood when the
+  /// engine last persisted it, so it has to prove the row has not changed since.
+  ///
+  /// That proof is `chatListRowContentEqual`, the same predicate guarding the
+  /// in-memory cache one branch above. If a prepared height can be stale past that
+  /// check, so can a cached one, and the bug is not here.
+  ///
+  /// On a hit the entry is promoted into `messageHeightCache` exactly as a fresh
+  /// measurement would be, so `hasExactProgressiveHeight` is already true and the
+  /// progressive warmup skips the row. Without that promotion the warmup would
+  /// re-measure it later and hand back the same number a frame afterwards — a second
+  /// pass whose only possible outcomes are "no change" and "a shift".
+  private func preparedSeedHeight(
+    _ row: ChatListRow, rowWidth: CGFloat, state: AgentTurnBubbleState
+  ) -> CGFloat? {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return nil }
+    guard
+      let hit = VibeTimelinePreparedStore.shared.preparedRow(
+        chatId: chatId, key: row.key, width: rowWidth)
+    else {
+      seedPreparedMisses += 1
+      VibeTimelinePreparedStore.shared.noteHit(false)
+      return nil
+    }
+    guard chatListRowContentEqual(hit.row, row) else {
+      seedPreparedMisses += 1
+      VibeTimelinePreparedStore.shared.noteHit(false)
+      return nil
+    }
+    // A media row measured before anything knew its aspect was sized by the square
+    // fallback, and that number IS going to change. If the aspect has resolved since,
+    // the prepared height is already wrong; take the miss and let the normal path
+    // measure it against what is known now.
+    if hit.measured.mediaAspectWasUnknown, chatMediaNaturalAspectIsKnownInMemory(for: row) {
+      seedPreparedMisses += 1
+      VibeTimelinePreparedStore.shared.noteHit(false)
+      return nil
+    }
+    messageHeightCache[row.key] = RowHeightCacheEntry(
+      row: row, rowWidth: rowWidth, state: state, height: hit.measured.height,
+      isProvisional: hit.measured.mediaAspectWasUnknown)
+    seedPreparedHits += 1
+    VibeTimelinePreparedStore.shared.noteHit(true)
+    return hit.measured.height
+  }
+
   /// Exact-height fallback consulted only after the in-memory caches miss. On a hit the
   /// entry is promoted into the normal cache (with the live row) so every later lookup —
   /// including `hasExactProgressiveHeight` — takes the standard path.
@@ -8583,6 +8661,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       seedProfCellCalls, Int(seedProfCellNs / 1_000_000),
       Int(seedProfInsetNs / 1_000_000), Int(seedProfContentSizeNs / 1_000_000),
       Int(seedProfOffsetNs / 1_000_000))
+    // P4-C liveness. A prepared store that never hits and one that was never built are
+    // indistinguishable in every other line of this log, and "the flag was on but the
+    // path was dark" has already happened twice on this project. `hit` is the number of
+    // rows whose height was produced off the push; `miss` is the number this open still
+    // measured itself.
+    let preparedStats = VibeTimelinePreparedStore.shared.stats
+    NSLog(
+      "[VibeCore] seed-prepared chat=%@ hit=%d miss=%d width=%.0f storePrepared=%d storeHit=%d storeMiss=%d",
+      String(engineChatId.prefix(12)), seedPreparedHits, seedPreparedMisses,
+      publishedMeasurementWidth, preparedStats.preparations, preparedStats.hits,
+      preparedStats.misses)
+    seedPreparedHits = 0
+    seedPreparedMisses = 0
     logSeedShiftForecast(seedRows)
     // Whatever the raster did or didn't do, real content is on screen from here.
     noteChatOpenCovered(by: "seed")
@@ -14055,6 +14146,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       !cachedHeightIsStaleGuess(cached, row)
     {
       return noteRowHeight(cached.height, row, .cache)
+    } else if let prepared = preparedSeedHeight(row, rowWidth: rowWidth, state: state) {
+      return noteRowHeight(prepared, row, .prepared)
     } else if let persisted = promotePersistedHeightIfAvailable(
       row, rowWidth: rowWidth, state: state, contentVersion: "")
     {

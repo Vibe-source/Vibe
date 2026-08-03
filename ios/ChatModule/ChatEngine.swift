@@ -12240,6 +12240,8 @@ final class ChatEngine {
     }
     var entries: [(messageId: String, ts: Int64, payload: Data)] = []
     entries.reserveCapacity(rows.count)
+    var durableRows: [[String: Any]] = []
+    durableRows.reserveCapacity(rows.count)
     for row in rows {
       guard !isTransientStreamRow(row),
         let messageId = messageId(fromRow: row),
@@ -12247,9 +12249,18 @@ final class ChatEngine {
         let payload = try? JSONSerialization.data(withJSONObject: row, options: [])
       else { continue }
       entries.append((messageId, messageTimestampMs(fromRow: row), payload))
+      durableRows.append(row)
     }
     guard !entries.isEmpty else { return 0 }
     messageStore.upsertMessages(userId: userId, chatId: chatId, entries: entries)
+    // P4-C — the engine **pushes** its transcript at the same choke it persists it,
+    // so the next open reads prepared heights instead of measuring during the push.
+    // This is a copy and a dispatch; the measuring happens on the store's own utility
+    // queue, never here. Putting it at the persist choke rather than at a load site
+    // is deliberate: every path that changes the durable transcript passes through
+    // here exactly once, so there is no second feed to keep in agreement.
+    VibeTimelinePreparedStore.shared.prepareAsync(
+      chatId: chatId, rawRows: durableRows, reason: "persist")
     historyRestoreMissChats.remove(chatId)
     if let deletedIds = deletedMessageIdsByChat[chatId], !deletedIds.isEmpty {
       messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: Array(deletedIds))
