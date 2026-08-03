@@ -48,7 +48,6 @@ private func chatListUITrace(_ message: String, fault: Bool = false) {
 
 private let chatListMediaVerboseDebugLogs = false
 private let chatListInlineVideoVerboseDebugLogs = false
-private let chatListBubbleFlickerDebugLogs = false
 private let chatListEngineBindingQueue = DispatchQueue(
   label: "com.vibe.chatlist.engine-binding",
   qos: .utility
@@ -564,7 +563,6 @@ private let chatListSendVerticalTiming = CAMediaTimingFunction(
   Float(0.91025390625)
 )
 private let chatReactionDebugLogs = true
-private let chatGapDebugOverlayEnabled = false
 /// Presentation-layer sampling of the last cells across a send flight (see
 /// startSendFlightSampler). Diagnostic-only; the reported jump is mid-animation, which
 /// no settle-time log can capture.
@@ -594,8 +592,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private let scrollToneOverlay = UIView()
   private let scrollToneTopView = ChatWallpaperEdgeEffectView(edge: .top)
   private let scrollToneBottomView = ChatWallpaperEdgeEffectView(edge: .bottom)
-  private let gapDebugOverlay = UIView()
-  private let gapDebugLabel = UILabel()
   var rows: [ChatListRow] = []
   private var appearance = ChatListAppearance.fallback
   private var lastRawAppearance: [String: Any]?
@@ -711,10 +707,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// never a live list mutation. Even if cache/server content differs, replace it in one
   /// disabled-actions reload instead of exposing insert/delete animations or offset churn.
   private var pendingPresentationSeedReconcile = false
-  /// Starts transcript windowing for that same reconciliation. The mounted seed normally
-  /// contains 16 rows, so using the old `rows.count <= largeTranscriptThreshold` proxy
-  /// incorrectly parsed and measured the complete transcript immediately after the push.
-  private var pendingPresentationSeedWindowStart = false
   /// Commit-first push: a seed computed while this view is detached (engine bind runs
   /// before pushViewController) is stashed here instead of mounting. Mounting pre-attach
   /// makes UIKit materialize every visible cell synchronously before the transition's
@@ -1319,7 +1311,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var mediaDownloadTasks: [String: URLSessionDownloadTask] = [:]
   private var visibleAutoDownloadWorkItem: DispatchWorkItem?
   private var reactionDebugTargetMessageId: String?
-  private var reactionDebugTargetEmoji: String?
   private var reactionDebugRemainingRowsChecks: Int = 0
 
   private var hiddenMessageId: String?
@@ -1433,8 +1424,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var scrollingDatePills: [String: ScrollingDatePillView] = [:]
   /// Precomputed while rows are applied, so a scroll tick only does an index lookup.
   private var scrollingDateLabelsByRowKey: [String: String] = [:]
-  /// Signed per-tick scroll delta — drives the sticky date pill's push direction.
-  private var lastScrollDeltaY: CGFloat = 0.0
   /// Pending linger fade-out for the sticky date pill after scrolling settles.
   private var scrollingDatePillHideWorkItem: DispatchWorkItem?
   /// De-dupes the `[ChatOpen] date-pin` log across the per-frame update calls.
@@ -1489,7 +1478,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     label: "chat.document.page-preview", qos: .userInitiated)
   private var documentByteSizeProbeKeys: Set<String> = []
 
-  private var isPeerTyping: Bool = false
   /// P4 core rollout: shadow probe, or `nil` when any gate says no. `coreShadowChecked`
   /// keeps the eligibility decision to once per chat instead of once per row batch.
   private var coreShadowProbe: VibeTimelineShadowProbe?
@@ -2029,19 +2017,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let isSelected =
       selected
       ?? (row.messageId.map { selectedMessageIds.contains($0) } ?? false)
-    if chatListBubbleFlickerDebugLogs, isGroupOrChannel {
-      NSLog(
-        "[BubbleFlicker] list.configure item=%d id=%@ isMe=%@ agent=%@ gutter=%@ name=%@ color=%@ isGroupFlag=%@",
-        indexPath.item,
-        row.messageId ?? row.key,
-        row.isMe ? "Y" : "N",
-        row.isAgentMessage ? "Y" : "N",
-        groupContext.reservesGutter ? "Y" : "N",
-        groupContext.senderName ?? "—",
-        groupContext.senderColor.map { Self.debugUIColorHex($0) } ?? "nil",
-        row.isGroupOrChannel ? "Y" : "N"
-      )
-    }
     cell.hostChatId = engineChatId
     cell.configure(
       row: row,
@@ -2221,32 +2196,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }.resume()
   }
 
-  private static func debugUIColorHex(_ color: UIColor) -> String {
-    var r: CGFloat = 0
-    var g: CGFloat = 0
-    var b: CGFloat = 0
-    var a: CGFloat = 0
-    color.getRed(&r, green: &g, blue: &b, alpha: &a)
-    return String(
-      format: "#%02X%02X%02X@%.2f",
-      Int((r * 255).rounded()),
-      Int((g * 255).rounded()),
-      Int((b * 255).rounded()),
-      a
-    )
-  }
-
   private func reconfigureVisibleMessageCells(reason: String) {
     guard !rows.isEmpty else { return }
-    if chatListBubbleFlickerDebugLogs {
-      NSLog(
-        "[BubbleFlicker] list.reconfigureVisible reason=%@ visible=%d isGroup=%@ rows=%d",
-        reason,
-        collectionView.visibleCells.count,
-        isGroupOrChannel ? "Y" : "N",
-        rows.count
-      )
-    }
     UIView.performWithoutAnimation {
       CATransaction.begin()
       CATransaction.setDisableActions(true)
@@ -2426,23 +2377,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // (see updateScrollingDatePill) and are screen-fixed and non-interactive, so they
     // never participate in list layout.
 
-    if chatGapDebugOverlayEnabled {
-      gapDebugOverlay.isUserInteractionEnabled = false
-      gapDebugOverlay.backgroundColor = UIColor.red.withAlphaComponent(0.24)
-      gapDebugOverlay.layer.borderColor = UIColor.red.withAlphaComponent(0.95).cgColor
-      gapDebugOverlay.layer.borderWidth = 1
-
-      gapDebugLabel.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
-      gapDebugLabel.textColor = .white
-      gapDebugLabel.backgroundColor = UIColor.red.withAlphaComponent(0.82)
-      gapDebugLabel.textAlignment = .center
-      gapDebugLabel.layer.cornerRadius = 4
-      gapDebugLabel.clipsToBounds = true
-
-      gapDebugOverlay.addSubview(gapDebugLabel)
-      addSubview(gapDebugOverlay)
-    }
-
     setupActivityOverlay()
     setupDebugPanel()
 
@@ -2539,31 +2473,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private func pixelAlignedValue(_ value: CGFloat) -> CGFloat {
     let scale = max(window?.screen.scale ?? UIScreen.main.scale, 1.0)
     return (value * scale).rounded() / scale
-  }
-
-  private func layoutGapDebugOverlay() {
-    guard chatGapDebugOverlayEnabled else { return }
-
-    let overlayHeight = max(0, contentPaddingBottom)
-    gapDebugOverlay.isHidden = overlayHeight <= 0.5
-    guard overlayHeight > 0.5 else { return }
-
-    gapDebugOverlay.frame = CGRect(
-      x: 0,
-      y: max(0, bounds.height - overlayHeight),
-      width: bounds.width,
-      height: overlayHeight
-    )
-    let labelWidth = min(max(128, bounds.width * 0.46), max(128, bounds.width - 16))
-    gapDebugLabel.frame = CGRect(x: 8, y: 6, width: labelWidth, height: 18)
-    gapDebugLabel.text = String(
-      format: "LIST inset %.0f req %.0f",
-      contentPaddingBottom,
-      requestedContentPaddingBottom
-    )
-
-    positionTransitionOverlayHost()
-    bringSubviewToFront(gapDebugOverlay)
   }
 
   private func positionTransitionOverlayHost() {
@@ -3330,12 +3239,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       layoutJumpToBottomButton()
     }
     layoutActivityOverlay()
-    layoutGapDebugOverlay()
     layoutBridgeCommandOverlay()
     layoutAgentResponseNotice()
     layoutBridgeUsageBanner()
     layoutBridgeTaskBanner()
-    layoutPendingBridgeQueue()
     // History-pick loading overlay: keep frame/insets in sync with the feed (keyboard /
     // composer / header changes). Gate on the in-flight flag so we never instantiate
     // the lazy skeleton on chats that never open History.
@@ -4156,7 +4063,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private static let agentResponseWatchdogSeconds: TimeInterval = 24.0
   private var agentResponseWatchdogWork: DispatchWorkItem?
   private var agentResponseWatchdogMessageId: String?
-  private var agentResponseWatchdogChatId: String?
   private var agentResponseWatchdogBaselineAgentRows = 0
   private var agentResponseWatchdogSend: PendingAgentSend?
   private var lastAgentResponseSend: PendingAgentSend?
@@ -4175,7 +4081,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     cancelAgentResponseWatchdog(reason: "re-arm")
     hideAgentResponseNotice(animated: false)
     agentResponseWatchdogMessageId = messageId
-    agentResponseWatchdogChatId = chatId
     agentResponseWatchdogSend = send
     agentResponseWatchdogBaselineAgentRows = currentAgentRowCount()
     let work = DispatchWorkItem { [weak self] in
@@ -4198,7 +4103,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog("[AgentWatchdog] cancelled messageId=%@ reason=%@", mid, reason)
     }
     agentResponseWatchdogMessageId = nil
-    agentResponseWatchdogChatId = nil
     agentResponseWatchdogSend = nil
   }
 
@@ -4731,9 +4635,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private var lastUsageBannerProvider: String?
-  /// Snapshot of carousel page count last applied to the banner (for left dots).
-  private var lastUsageBannerPageCount: Int = 0
-  private var lastUsageBannerPageIndex: Int = 0
 
   private func showBridgeUsageBanner(
     text: String,
@@ -4762,8 +4663,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       banner = created
     }
     lastUsageBannerProvider = provider
-    lastUsageBannerPageCount = pageCount
-    lastUsageBannerPageIndex = pageIndex
     let accent = UIColor { trait in
       trait.userInterfaceStyle == .dark
         ? UIColor(red: 0.98, green: 0.76, blue: 0.28, alpha: 1.0)
@@ -4991,10 +4890,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   /// Survives view rebinds (leaving/reopening the DM) for the app session.
   private static var pendingBridgeSendsByChat: [String: [PendingBridgeSend]] = [:]
-  private var pendingBridgeQueueContainer: UIView?
-  private var pendingBridgeQueueScroll: UIScrollView?
-  private var pendingBridgeQueueStack: UIStackView?
-  private var pendingBridgeQueueHeader: UILabel?
   private var bridgeQueueFlushWorkItem: DispatchWorkItem?
 
   private var pendingBridgeChatKey: String {
@@ -5137,15 +5032,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Push the pending-queue strip into the input bar (preview + Steer + ✕).
   /// No separate floating overlay over the list.
   private func refreshPendingBridgeQueueUI(animated: Bool) {
-    // Tear down any legacy floating overlay if it still exists.
-    if let container = pendingBridgeQueueContainer {
-      container.removeFromSuperview()
-      pendingBridgeQueueContainer = nil
-      pendingBridgeQueueScroll = nil
-      pendingBridgeQueueStack = nil
-      pendingBridgeQueueHeader = nil
-    }
-
     guard let inputBar else { return }
     let queue = pendingBridgeSends
     let show = !queue.isEmpty && currentBridgeProvider != nil
@@ -5160,10 +5046,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.steerPendingBridgeSend(messageId: id)
     }
     inputBar.setPendingQueueItems(items, animated: animated)
-  }
-
-  private func layoutPendingBridgeQueue() {
-    // Queue UI lives inside ChatInputBar now — nothing to layout on the list.
   }
 
   // MARK: - Live background-task banner (bridge runs)
@@ -6537,7 +6419,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// Separator insertion happens after this returns, so the window always gets
   /// its own correct header.
   private func windowedPayloadForParsing(_ fullRows: [[String: Any]]) -> [[String: Any]] {
-    pendingPresentationSeedWindowStart = false
     // Search needs every match, not the newest N of them — a windowed search
     // would silently fail to find older hits.
     guard
@@ -8585,7 +8466,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ? true
       : (fullWindow ? !fullWindowHeightsCovered : !isGroupOrChannel)
     pendingPresentationSeedReconcile = true
-    pendingPresentationSeedWindowStart = true
     pruneAgentTurnState(for: seedRows)
     pruneStopCancelRequestedKeys(using: seedRows)
     syncComposerStopState()
@@ -11007,7 +10887,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     progressiveHeightWarmupGeneration &+= 1
     usesProgressiveTranscriptSizing = false
     pendingPresentationSeedReconcile = false
-    pendingPresentationSeedWindowStart = false
     deferredPresentationSeedSourceRows = nil
     deferredPresentationSeedPreferredRows = nil
     // Seed ranks are per-open: carrying the previous chat's rank across a rebind would
@@ -13033,7 +12912,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     if reason == "peerTyping" {
       // Typing indicator is handled in header; do not show list-level typing UI.
-      setPeerTyping(false)
       return
     }
     if reason == "agentProgress" {
@@ -13611,7 +13489,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if customContextMenuOverlay != nil {
       dismissCustomContextMenu(animated: false)
     }
-    lastScrollDeltaY = offsetY - previousOffsetY
     previousOffsetY = offsetY
     updateScrollToneOverlay(offsetY: offsetY)
     refreshWallpaperSnapshotIfNeeded()
@@ -14820,7 +14697,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let trimmedEmoji = emoji.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !targetMessageId.isEmpty, !trimmedEmoji.isEmpty else { return }
     reactionDebugTargetMessageId = targetMessageId
-    reactionDebugTargetEmoji = trimmedEmoji
     reactionDebugRemainingRowsChecks = 12
     reactionDebugLog(
       "applyLocal start id=\(targetMessageId) emoji=\(trimmedEmoji) sourceCount=\(sourceRowsPayload.count) nativeOut=\(nativeOutgoingRowsById[targetMessageId] != nil ? "Y" : "N") nativeEngine=\(nativeEngineRowsById[targetMessageId] != nil ? "Y" : "N")"
@@ -16726,25 +16602,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 
   private func bindWallpaperBackdrop(to cell: ChatListCell) {
-    let hasSnap =
-      wallpaperSnapshot != nil
-      && wallpaperSnapshotSize.width > 1.0
-      && wallpaperSnapshotSize.height > 1.0
-    // Scroll rebinds every frame — only log when the snap presence flips for this cell.
-    if chatListBubbleFlickerDebugLogs, isGroupOrChannel {
-      let rowId = cell.bubbleView.debugRowId
-      let prevHas = cell.bubbleView.wallpaperSnapshot != nil
-      if prevHas != hasSnap {
-        NSLog(
-          "[BubbleFlicker] list.bindWallpaper id=%@ snap %@->%@ size=%.0fx%.0f",
-          rowId.isEmpty ? "—" : rowId,
-          prevHas ? "Y" : "N",
-          hasSnap ? "Y" : "N",
-          wallpaperSnapshotSize.width,
-          wallpaperSnapshotSize.height
-        )
-      }
-    }
     cell.applyWallpaperBackdrop(
       snapshot: wallpaperSnapshot,
       containerSize: wallpaperSnapshotSize,
@@ -22585,7 +22442,7 @@ extension ChatListView: ChatInputBarDelegate {
   }
 
   private func layoutActivityOverlay() {
-    guard activityOverlay.alpha > 0 || isPeerTyping else { return }
+    guard activityOverlay.alpha > 0 else { return }
 
     let overlayH: CGFloat = 28
     let overlayMaxW = min(bounds.width - 32, 260)
@@ -22618,34 +22475,6 @@ extension ChatListView: ChatInputBarDelegate {
   }
 
 
-  private func hideActivityOverlay() {
-    guard activityOverlay.alpha > 0 else { return }
-    UIView.animate(withDuration: 0.2, delay: 0, options: .curveEaseIn) {
-      self.activityOverlay.alpha = 0
-      self.activityOverlay.transform = CGAffineTransform(translationX: 0, y: 4)
-    } completion: { _ in
-      self.stopDotPulseAnimation()
-      self.activityOverlay.transform = .identity
-    }
-  }
-
-
-  private func stopDotPulseAnimation() {
-    for dot in activityDots {
-      dot.layer.removeAnimation(forKey: "dotPulse")
-    }
-  }
-
-  private func setPeerTyping(_ _: Bool) {
-    let next = false
-    if isPeerTyping == next { return }
-    isPeerTyping = next
-    updateActivityOverlayState()
-  }
-
-  private func updateActivityOverlayState() {
-    hideActivityOverlay()
-  }
 }
 
 /// Small cached-history affordance pinned to the chat viewport. The arc fills as the

@@ -820,19 +820,50 @@ final class ChatEngine {
 
     let rawQueues = payload["queueByChat"] as? [String: Any] ?? [:]
     var restoredQueues: [String: [String]] = [:]
+    var healedFanOutDrafts = 0
     for (chatId, value) in rawQueues {
       if let ids = value as? [String], !ids.isEmpty {
         if isBuiltInAgentChatId(chatId) || isVolatileBridgeAgentChatLocked(chatId: chatId) {
           skippedBridgeDrafts += ids.count
           continue
         }
-        let keptIds = ids.filter { restoredDrafts[$0] != nil }
+        var keptIds = ids.filter { restoredDrafts[$0] != nil }
+        // Heal a fan-out queue rather than restoring it intact.
+        //
+        // A replay bug fixed on 2026-08-03 could mint a new message per replay pass
+        // instead of retrying the queued one; a single send to a peer with an
+        // unresolved key reached 3,310 drafts and the watchdog killed the app. Those
+        // drafts outlive the fix because they are persisted, so a device that hit it
+        // would restore straight back into an unusable state.
+        //
+        // The oldest are kept because those are the ones the user actually typed; the
+        // tail is the duplication. Dropping is safe in the sense that matters — every
+        // one of them is unsent, and an unsent duplicate is not a message anyone is
+        // waiting on.
+        if keptIds.count > Self.maxQueuedOutboundReplay {
+          let dropped = keptIds.count - Self.maxQueuedOutboundReplay
+          let survivors = Array(keptIds.prefix(Self.maxQueuedOutboundReplay))
+          for id in keptIds.dropFirst(Self.maxQueuedOutboundReplay) {
+            restoredDrafts.removeValue(forKey: id)
+          }
+          keptIds = survivors
+          healedFanOutDrafts += dropped
+          NSLog(
+            "[ChatEngine] restoreOutboundState HEALED chatId=%@ dropped=%d kept=%d — queue was a replay fan-out, not a backlog",
+            String(chatId.prefix(12)), dropped, keptIds.count)
+        }
         if !keptIds.isEmpty { restoredQueues[chatId] = keptIds }
       }
     }
 
     pendingOutboundDraftsByMessageId = restoredDrafts
     pendingOutboundQueueByChat = restoredQueues
+    if healedFanOutDrafts > 0 {
+      appendJournalLocked(
+        event: "native-outgoing-restore-healed",
+        payload: ["dropped": healedFanOutDrafts])
+      persistOutboundStateLocked()
+    }
     if skippedBridgeDrafts > 0 {
       appendJournalLocked(
         event: "native-bridge-outgoing-restore-skip",
@@ -3905,7 +3936,19 @@ final class ChatEngine {
 
     return syncOnQueue {
       canceledOutboundMessageIds.remove(messageId)
-      let effectivePayload = payload
+      // Stamp the resolved id into the payload BEFORE anything queues it.
+      //
+      // A queued draft is replayed by handing it back to this function. Without an id
+      // in the payload, `providedMessageId` is nil, a fresh UUID is minted, and the
+      // replay is a brand-new message rather than a retry of this one — so every replay
+      // pass adds another queue entry instead of re-sending the existing one.
+      //
+      // Measured on device, 2026-08-03: one message sent to a peer whose key had not
+      // resolved grew the queue to 3,310 drafts in seconds and blocked the main thread
+      // for 31s until the watchdog killed the app. The ids in the log were all distinct
+      // UUIDs, which is what gave it away — those were not retries, they were new sends.
+      var effectivePayload = payload
+      effectivePayload["messageId"] = messageId
       let isGroup =
         (payload["isGroup"] as? Bool) == true || (payload["isGroupOrChannel"] as? Bool) == true
       NSLog(
@@ -4075,7 +4118,15 @@ final class ChatEngine {
             peerUserIdHint: peerUserId,
             trigger: "send_missing_friend_key"
           )
-          loadChatHistoryIfNeededLocked(chatId: chatId, force: true)
+          // A forced history load used to run here, and it closed a feedback loop:
+          // history completing calls `scheduleReplayQueuedOutboundLocked(trigger:
+          // "history_loaded")`, which replays every queued draft, and each replay that
+          // still has no key lands back on this branch and forces history again.
+          //
+          // It was never the right mechanism either — loading a transcript does not
+          // resolve a friend's public key. `scheduleFriendPublicKeyFetchLocked` above is
+          // what does, and the replay it triggers on success is the one that should send
+          // these drafts.
           DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.ensureNativeTransport(trigger: "send_missing_friend_key")
           }
@@ -11355,6 +11406,14 @@ final class ChatEngine {
     persistOutboundStateLocked()
   }
 
+  /// Ceiling on a single chat's unsent queue before replay refuses to run.
+  ///
+  /// Generous on purpose — a genuine offline stretch can legitimately bank a lot of
+  /// messages, and refusing to send those would be a worse bug than the one this
+  /// guards. Nobody types 500 messages into one chat while offline; a queue past this
+  /// is a fan-out, not a backlog.
+  private static let maxQueuedOutboundReplay = 500
+
   private func scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
     if isBuiltInAgentChatId(chatId) {
       dropQueuedOutboundForChatLocked(chatId: chatId, reason: "built_in_agent_replay_\(trigger)")
@@ -11362,6 +11421,24 @@ final class ChatEngine {
     }
     let ids = pendingOutboundQueueByChat[chatId] ?? []
     guard !ids.isEmpty else { return }
+    // Runaway guard. A replay that re-queues instead of re-sending turns this into an
+    // exponential fan-out — measured at 3,310 drafts for one message on 2026-08-03,
+    // with the main thread blocked 31s until the watchdog killed the app.
+    //
+    // The cause of that incident is fixed above (drafts now carry their own id, so a
+    // replay is a retry rather than a new send) and the loop edge that drove it is
+    // gone. This stays because the failure mode is unrecoverable-by-the-user: the app
+    // dies before anyone can open a chat to clear it. A queue this size is a bug, and
+    // refusing to replay it keeps the app usable while the log names the chat.
+    guard ids.count <= Self.maxQueuedOutboundReplay else {
+      NSLog(
+        "[ChatEngine] scheduleReplayQueuedOutboundLocked REFUSED chatId=%@ trigger=%@ count=%d — queue past %d, replaying it would fan out",
+        chatId, trigger, ids.count, Self.maxQueuedOutboundReplay)
+      appendJournalLocked(
+        event: "native-outgoing-replay-refused",
+        payload: ["chatId": chatId, "count": ids.count, "trigger": trigger])
+      return
+    }
     NSLog(
       "[ChatEngine] scheduleReplayQueuedOutboundLocked chatId=%@ trigger=%@ count=%d", chatId,
       trigger, ids.count)
