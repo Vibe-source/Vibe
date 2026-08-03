@@ -72,6 +72,22 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
   /// widen what the render gate would cover the moment anyone enabled it. Two
   /// risks, two lists.
   var shadowEligibleChatClasses: VibeTimelineChatClassEligibility
+  /// Bounds how many transcript rows the **existing** `ChatListView` parses,
+  /// measures and mounts at once.
+  ///
+  /// Independent of every other gate here, because it governs the shipping list
+  /// rather than the core render path. `ChatListView` already contains a full
+  /// windowing implementation — scroll-up detection, reveal, prepend, anchor
+  /// preservation — wired to the scroll handler and permanently inert, because
+  /// the one function that would populate it (`windowedPayloadForParsing`) was
+  /// reduced to returning its input unchanged. So today only agent DMs are
+  /// capped, and normal DMs, groups and channels mount every message ever sent.
+  ///
+  /// This flag re-arms that machinery. It is not part of the core migration and
+  /// does not wait on it: §2 of the refactor doc lists the bounded window as
+  /// achievable in Swift alone, and the 2026-07-23 scale review named the
+  /// missing cap as the first thing that breaks at scale.
+  var vibeTranscriptWindowEnabled: Bool
   /// Active window override; `nil` uses `VibeTimelineWindowPolicy.defaultActiveWindowCount`.
   var activeWindowOverride: Int?
 
@@ -79,6 +95,7 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
     vibeAsyncTimelineV1Enabled: Bool = false,
     vibeTimelineShadowCompareEnabled: Bool = false,
     vibeTimelineCoreOrderAuthorityEnabled: Bool = false,
+    vibeTranscriptWindowEnabled: Bool = false,
     eligibleChatClasses: VibeTimelineChatClassEligibility = [],
     shadowEligibleChatClasses: VibeTimelineChatClassEligibility = [],
     activeWindowOverride: Int? = nil
@@ -86,6 +103,7 @@ struct VibeTimelineFeatureFlags: Sendable, Equatable {
     self.vibeAsyncTimelineV1Enabled = vibeAsyncTimelineV1Enabled
     self.vibeTimelineShadowCompareEnabled = vibeTimelineShadowCompareEnabled
     self.vibeTimelineCoreOrderAuthorityEnabled = vibeTimelineCoreOrderAuthorityEnabled
+    self.vibeTranscriptWindowEnabled = vibeTranscriptWindowEnabled
     self.eligibleChatClasses = eligibleChatClasses
     self.shadowEligibleChatClasses = shadowEligibleChatClasses
     self.activeWindowOverride = activeWindowOverride
@@ -136,6 +154,7 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
   static let asyncTimelineKey = "vibeAsyncTimelineV1Enabled"
   static let shadowCompareKey = "vibeTimelineShadowCompareEnabled"
   static let coreOrderAuthorityKey = "vibeTimelineCoreOrderAuthorityEnabled"
+  static let transcriptWindowKey = "vibeTranscriptWindowEnabled"
   static let activeWindowKey = "vibeTimelineActiveWindowCount"
   static let eligibleChatClassesKey = "vibeTimelineEligibleChatClassesMask"
 
@@ -188,6 +207,26 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     let orderAuthority =
       defaults.object(forKey: Self.coreOrderAuthorityKey) as? Bool ?? false
 
+    // Debug arms it, release does not — the same split shadow comparison uses.
+    //
+    // This one *does* reach the screen, so the asymmetry needs justifying: the
+    // rows it withholds are not lost, they are the ones the user has to scroll
+    // up to reach, and the reveal path that restores them is already shipping
+    // code driven by the same scroll handler. The failure mode is "older history
+    // arrives on scroll instead of being pre-mounted", which is how every large
+    // transcript in every messaging app behaves. Leaving it default-off in debug
+    // would mean the cap is only ever exercised by someone who remembered to
+    // flip a switch, which is how the machinery got to be inert in the first
+    // place.
+    let transcriptWindowDefault: Bool
+    #if DEBUG
+      transcriptWindowDefault = true
+    #else
+      transcriptWindowDefault = false
+    #endif
+    let transcriptWindow =
+      defaults.object(forKey: Self.transcriptWindowKey) as? Bool ?? transcriptWindowDefault
+
     let eligibilityRaw: UInt32
     if let value = defaults.object(forKey: eligibilityKey) as? Int {
       eligibilityRaw = value >= 0 && UInt64(value) <= UInt64(UInt32.max) ? UInt32(value) : 0
@@ -211,6 +250,7 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
       vibeAsyncTimelineV1Enabled: asyncEnabled,
       vibeTimelineShadowCompareEnabled: shadowEnabled,
       vibeTimelineCoreOrderAuthorityEnabled: orderAuthority,
+      vibeTranscriptWindowEnabled: transcriptWindow,
       eligibleChatClasses: VibeTimelineChatClassEligibility(rawValue: eligibilityRaw),
       shadowEligibleChatClasses: shadowClasses,
       activeWindowOverride: windowOverride

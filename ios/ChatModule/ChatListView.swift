@@ -1041,6 +1041,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var chatOpenStartedAt: TimeInterval = 0
   private var windowedTranscriptSourceRows: [[String: Any]]?
   private var windowedTranscriptVisibleCount = 0
+  /// Sticky for the lifetime of the open chat: once the user has scrolled up far
+  /// enough to reveal the full transcript, every later `setRows` keeps it whole.
+  ///
+  /// Without this the window would re-clamp on the next engine delta and yank
+  /// the rows back out from under someone who is reading them. Cleared on chat
+  /// switch, so the next conversation opens bounded again.
+  private var transcriptWindowRevealed = false
+  private lazy var transcriptWindowEnabled: Bool =
+    VibeTimelineUserDefaultsFeatureFlags().flags.vibeTranscriptWindowEnabled
+  private lazy var transcriptWindowLimit: Int =
+    VibeTimelineUserDefaultsFeatureFlags().flags.resolvedActiveWindowCount
   private var isRevealingOlderTranscriptRows = false
   /// Crossing the cached-history threshold only queues work while UIKit owns the pan.
   /// Performing a batch insert (even with a mathematically exact anchor correction)
@@ -6358,14 +6369,80 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       String(chatId.prefix(12)), rows.count, max(snapshot.rows.count, snapshot.sourceRows.count))
   }
 
-  /// Parsing is cheap compared with rich-cell measurement, so retain every cached row in
-  /// one stable collection. `sizeForItemAt` bounds open cost through progressive sizing;
-  /// no identities are inserted merely because the user scrolled upward.
+  /// Bounds the rows that get parsed, measured and mounted to the newest window.
+  ///
+  /// This is the single seam where the transcript's render cost is decided:
+  /// whatever comes back here is what `parsedRowsReusingCache` decrypts, what
+  /// `sizeForItemAt` measures, and what the collection view instantiates cells
+  /// for. Returning the full array — which is what this function did, taking
+  /// `fullRows` and handing back `fullRows` — is why a 4,000-message chat pays
+  /// for 4,000 rows on every apply.
+  ///
+  /// The rows above the window are not dropped. `windowedTranscriptSourceRows`
+  /// holds the full set, and `maybeRevealOlderTranscriptRows` restores it when
+  /// the user scrolls up — machinery that has been built and wired to the scroll
+  /// handler this whole time, unreachable only because nothing ever assigned
+  /// that property anything but `nil`.
+  ///
+  /// Windows the **filtered, pre-separator** rows on purpose: taking a suffix
+  /// after day separators are inserted can slice a day group away from its own
+  /// header, leaving the first messages on screen with no date above them.
+  /// Separator insertion happens after this returns, so the window always gets
+  /// its own correct header.
   private func windowedPayloadForParsing(_ fullRows: [[String: Any]]) -> [[String: Any]] {
     pendingPresentationSeedWindowStart = false
-    windowedTranscriptSourceRows = nil
-    windowedTranscriptVisibleCount = fullRows.count
-    return fullRows
+    // Search needs every match, not the newest N of them — a windowed search
+    // would silently fail to find older hits.
+    guard
+      let keep = Self.transcriptWindowKeepCount(
+        rowCount: fullRows.count,
+        limit: transcriptWindowLimit,
+        enabled: transcriptWindowEnabled,
+        revealed: transcriptWindowRevealed,
+        isSearching: !searchQuery.isEmpty)
+    else {
+      windowedTranscriptSourceRows = nil
+      windowedTranscriptVisibleCount = fullRows.count
+      return fullRows
+    }
+    windowedTranscriptSourceRows = fullRows
+    windowedTranscriptVisibleCount = keep
+    VibeLog.info(
+      "transcript windowed", category: "list",
+      metadata: [
+        "chat": String(engineChatId.prefix(12)),
+        "shown": String(keep),
+        "of": String(fullRows.count),
+        "withheld": String(fullRows.count - keep),
+      ])
+    return Array(fullRows.suffix(keep))
+  }
+
+  /// How many rows from the tail to keep, or `nil` to keep every row.
+  ///
+  /// Pulled out as a pure function because this is the rule that decides which
+  /// of a user's messages are on screen, and it should be provable without a
+  /// view, a chat, or a device. Every `nil` below is a case where withholding a
+  /// row would be wrong rather than merely deferred.
+  static func transcriptWindowKeepCount(
+    rowCount: Int,
+    limit: Int,
+    enabled: Bool,
+    revealed: Bool,
+    isSearching: Bool
+  ) -> Int? {
+    guard enabled else { return nil }
+    // The user already scrolled up and asked for the whole thing.
+    guard !revealed else { return nil }
+    // Search needs every match, not the newest N of them. A windowed search
+    // would silently fail to find older hits and look like data loss.
+    guard !isSearching else { return nil }
+    // A limit that is zero or negative would blank the transcript; treat a
+    // misconfigured window as no window rather than as an empty chat.
+    guard limit > 0 else { return nil }
+    // Nothing to withhold.
+    guard rowCount > limit else { return nil }
+    return limit
   }
 
   func setOpeningUnreadCount(_ value: Int) {
@@ -7287,6 +7364,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if !isGroupOrChannel {
       showCachedHistoryLoadingIndicator()
     }
+    // Latch before the re-apply. `isRevealingOlderTranscriptRows` is cleared as
+    // soon as the reveal completes, so it cannot be what keeps the transcript
+    // whole — without a sticky flag the very next engine delta would re-clamp
+    // the window and pull rows out from under someone mid-read.
+    transcriptWindowRevealed = true
     windowedTranscriptVisibleCount = fullRows.count
     let sourceRows = sourceRowsPayload
     NSLog(
@@ -8571,14 +8653,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // stuttered the reopen-snapshot fade). Idempotent: the resolver only fills nil fields.
     let mergedRows =
       isExplicitEmpty ? [] : rowsByAttachingReplyPreviews(mergedRowsPayload(from: effectiveRows))
-    let visibleRows = Self.rowsByInsertingDaySeparators(filterRowsForSearch(mergedRows))
+    let filteredRows = filterRowsForSearch(mergedRows)
+    // Stays the COMPLETE list even when the window is armed: the warm-transcript
+    // cache and the retained source payload below are both what older history is
+    // recovered from, so narrowing them here would make the withheld rows
+    // genuinely unreachable rather than merely unmounted.
+    let visibleRows = Self.rowsByInsertingDaySeparators(filteredRows)
     var retainedSourceRows = effectiveRows
     if effectiveRows.isEmpty, !visibleRows.isEmpty {
       // Engine authority supplied the effective transcript. Retain that full payload so
       // incremental history reveal and later route refreshes never fall back to raw [].
       retainedSourceRows = visibleRows
     }
-    let rowsToParse = windowedPayloadForParsing(visibleRows)
+    // Only what gets parsed, measured and mounted is bounded. Separators are
+    // re-inserted over the window rather than sliced out of the full run, so the
+    // topmost day group on screen keeps its own date header.
+    let windowedFiltered = windowedPayloadForParsing(filteredRows)
+    let rowsToParse =
+      windowedFiltered.count == filteredRows.count
+      ? visibleRows
+      : Self.rowsByInsertingDaySeparators(windowedFiltered)
     let nextScrollingDateLabels = Self.scrollingDateLabels(from: rowsToParse)
     let applyMergeDoneAt = ProcessInfo.processInfo.systemUptime
     let applyMergeMs = Int((applyMergeDoneAt - startedAt) * 1000)
@@ -10601,6 +10695,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     nextApplyBaseIsEngineAuthoritative = false
     windowedTranscriptSourceRows = nil
     windowedTranscriptVisibleCount = 0
+    // A new conversation opens bounded again; "revealed" is a property of the
+    // chat the user scrolled through, not of the view that rendered it.
+    transcriptWindowRevealed = false
     isRevealingOlderTranscriptRows = false
     pendingHistoryRevealAfterScroll = false
     resetOlderHistoryPaginationState(clearExhausted: true)

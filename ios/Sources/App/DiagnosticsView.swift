@@ -21,6 +21,8 @@ struct DiagnosticsView: View {
     VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineShadowCompareEnabled
   @State private var coreOrderAuthorityEnabled: Bool =
     VibeTimelineUserDefaultsFeatureFlags().flags.vibeTimelineCoreOrderAuthorityEnabled
+  @State private var transcriptWindowEnabled: Bool =
+    VibeTimelineUserDefaultsFeatureFlags().flags.vibeTranscriptWindowEnabled
 
   private let refreshTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -116,6 +118,23 @@ struct DiagnosticsView: View {
       } footer: {
         Text(
           "The preview screens run with the bridge off — they build their own core over a scratch chat. Shadow-compare watches your real 1:1 DMs and only writes to the log; reopen a chat after toggling it.\n\n\"Core orders the list\" is the first setting here that changes what you see: the core reorders the newest messages in a 1:1 DM, and nothing else. Turn it on only after shadow-compare has reported CLEAN — and if the order ever looks wrong, turn it off and reopen the chat."
+        )
+      }
+
+      Section {
+        Toggle("Bounded transcript window", isOn: $transcriptWindowEnabled)
+          .onChange(of: transcriptWindowEnabled) { _, on in
+            UserDefaults.standard.set(
+              on, forKey: VibeTimelineUserDefaultsFeatureFlags.transcriptWindowKey)
+            VibeLog.notice(
+              "transcript window \(on ? "ENABLED" : "disabled") (reopen a chat)",
+              category: "list")
+          }
+      } header: {
+        Text("Chat list")
+      } footer: {
+        Text(
+          "Mounts only the newest 200 messages of a conversation instead of every message ever sent, which is what the list does today for everything except agent DMs. Older messages are not dropped — scroll up and they load, using the same reveal path the list already had. This one is independent of the Rust core.\n\nThe log line to look for is \"transcript windowed\", with how many rows were shown and how many were withheld."
         )
       }
 

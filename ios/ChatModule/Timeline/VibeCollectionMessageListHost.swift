@@ -215,6 +215,34 @@ final class VibeCollectionMessageListHost: NSObject, VibeMessageListHost, VibeMe
   private var bodies: [String: String] = [:]
   private var details: [String: String] = [:]
 
+  /// Supplies the payload for a message the core has placed.
+  ///
+  /// **This is the entire seam between the core and UIKit**, and the division it
+  /// draws is the point of the whole migration:
+  ///
+  /// - the core decides *which* messages exist, in what *order*, and how *tall*
+  ///   each one is — measured once and frozen (§5.3)
+  /// - Swift decides what a message *contains*, because the parse and the
+  ///   decrypt already live there and moving them buys nothing
+  ///
+  /// Without this the host could only draw `VibeTimelineBubbleCell`, a plain
+  /// bubble it defines itself — which is why every flag in front of it stopped
+  /// at the preview screen. A real conversation needs agent turns, media, voice
+  /// waveforms, link previews, replies and reactions, and all of that already
+  /// exists in `ChatListCell`. Rebuilding it would be rewriting the app; the
+  /// list's problem was never how it *drew* a row, it was everything it did
+  /// around drawing one.
+  ///
+  /// Returning `nil` for a message id falls back to the placeholder bubble
+  /// rather than dropping the row, so a payload the adapter has not yet supplied
+  /// leaves a gap of the right height instead of a hole in the transcript.
+  var rowProvider: ((String) -> ChatListRow?)?
+
+  /// Configuration the chat applies to a real cell after `configure(row:)`.
+  /// Kept as a hook rather than parameters so this host never grows a second
+  /// copy of `ChatListView`'s per-row decoration rules.
+  var rowCellDecorator: ((ChatListCell, ChatListRow) -> Void)?
+
   private(set) var lastAppliedGeneration: UInt64?
   private(set) var appliedTransactions = 0
   private(set) var rejectedTransactions = 0
@@ -250,6 +278,13 @@ final class VibeCollectionMessageListHost: NSObject, VibeMessageListHost, VibeMe
     collectionView.dataSource = self
     collectionView.register(
       VibeTimelineBubbleCell.self, forCellWithReuseIdentifier: VibeTimelineBubbleCell.reuseId)
+    // The real chat cell, so this host can draw an actual conversation rather
+    // than the placeholder bubble. Registering both is what lets the preview
+    // screen and the production list share one host: the preview supplies no
+    // `rowProvider` and keeps the bubble; the chat supplies one and gets the
+    // cell it has always used.
+    collectionView.register(
+      ChatListCell.self, forCellWithReuseIdentifier: ChatListCell.reuseIdentifier)
     // Prefetching instantiates cells ahead of the visible range on its own
     // schedule, which fights the explicit "visible + at most two screens" budget
     // in §5.2. The budget is measurable; prefetch heuristics are not.
@@ -500,12 +535,33 @@ extension VibeCollectionMessageListHost: UICollectionViewDataSource {
   func collectionView(
     _ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath
   ) -> UICollectionViewCell {
-    let cell = collectionView.dequeueReusableCell(
-      withReuseIdentifier: VibeTimelineBubbleCell.reuseId, for: indexPath)
-    guard let bubble = cell as? VibeTimelineBubbleCell, items.indices.contains(indexPath.item) else {
-      return cell
+    guard items.indices.contains(indexPath.item) else {
+      return collectionView.dequeueReusableCell(
+        withReuseIdentifier: VibeTimelineBubbleCell.reuseId, for: indexPath)
     }
     let item = items[indexPath.item]
+
+    // Real conversation cell when an adapter has supplied the payload.
+    //
+    // Note what this method does NOT do, because it is the whole point: it does
+    // not measure, does not consult a height cache, and does not ask the cell
+    // what size it wants. The item's geometry was decided before mount and is
+    // frozen; this is drawing and nothing else. Every post-hoc height mover in
+    // the old list exists because that separation was never made.
+    if let row = rowProvider?(item.identity.messageId) {
+      let cell = collectionView.dequeueReusableCell(
+        withReuseIdentifier: ChatListCell.reuseIdentifier, for: indexPath)
+      if let listCell = cell as? ChatListCell {
+        listCell.configure(row: row, hiddenMessageId: nil)
+        rowCellDecorator?(listCell, row)
+        return listCell
+      }
+      return cell
+    }
+
+    let cell = collectionView.dequeueReusableCell(
+      withReuseIdentifier: VibeTimelineBubbleCell.reuseId, for: indexPath)
+    guard let bubble = cell as? VibeTimelineBubbleCell else { return cell }
     bubble.configure(
       with: item,
       text: bodies[item.identity.messageId] ?? "",
