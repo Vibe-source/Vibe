@@ -671,6 +671,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// installs the best of them underneath the cover, which is then removed — instantly,
   /// never faded — only once the real rows are laid out and positioned.
   private var defersPresentationSeedMountUnderRaster = false
+  /// Invalidates a pending covered-mount watchdog. Bumped whenever one is armed and
+  /// whenever the mount actually happens, so a second open cannot be mounted by the
+  /// previous open's timer.
+  private var coveredPresentationSeedMountToken: UInt64 = 0
   /// True only while the scheduled post-commit mount is building rows underneath a
   /// valid reopen raster. This is distinct from `defersPresentationSeedMountUnderRaster`:
   /// that flag means "do not mount yet", while this one means "mount the complete
@@ -7533,6 +7537,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// changes batch without animations into the seed.
   func setDefersTranscriptUpdatesForPresentation(_ value: Bool) {
     guard defersTranscriptUpdatesForPresentation != value else { return }
+    // The transition is over: this is where a raster-covered push pays for its mount,
+    // on an idle main thread instead of inside the slide. It has to happen *before* the
+    // flag flips — `installPresentationSeedIfNeeded` refuses to seed once presentation
+    // is no longer deferred, so a mount ordered after the assignment silently does
+    // nothing and the chat arrives empty behind its own raster.
+    if !value { mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED") }
     defersTranscriptUpdatesForPresentation = value
     guard !value else { return }
     if let stagedBottom = navigationPrestageSafeAreaBottom {
@@ -7661,25 +7671,66 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return hasTranscriptPixels
   }
 
-  /// Second half of a raster-covered push: one main-turn later — i.e. after the commit
-  /// that carries the slide's first frame — mount the best stashed seed under the cover.
-  /// The install positions and lays the rows out before it hands off, so the raster is
-  /// only removed (instantly, never faded) once the real list is final; the freeze then
-  /// arms so the rest of the transition animates one immutable transcript.
+  /// Second half of a raster-covered push: mount the best stashed seed under the cover,
+  /// **after the slide has finished**, not one main-turn into it.
+  ///
+  /// This used to be a plain `DispatchQueue.main.async`, which lands on the commit that
+  /// carries the slide's first frame. The mount is not small — a device run measured it
+  /// at 180 ms for 134 rows, of which 112 ms is configuring 22 `ChatListCell`s — so it
+  /// ran squarely inside a ~350 ms transition:
+  ///
+  /// ```
+  /// 11.345 viewWillAppear sinceTapMs=49          ← push begins
+  /// 11.386 seed-mount PUSH-COVERED rows=134
+  /// 11.582 presentation-seed totalMs=180         ← inside the animation
+  /// 11.912 viewDidAppear sinceTapMs=615
+  /// ```
+  ///
+  /// That is the reported "the push isn't smooth and swiping back doesn't follow my
+  /// finger": an interactive gesture is tracked on the main thread, and the main thread
+  /// was busy laying out a transcript nobody could see. The raster covering the push is
+  /// a pixel-exact photograph of this chat at this offset, so there is nothing to gain
+  /// by replacing it mid-slide — the user cannot tell the two apart, which is the whole
+  /// premise of capturing it.
+  ///
+  /// So the mount waits for `completeTranscriptPresentation()`, the host's viewDidAppear
+  /// signal, and the transition animates one static image over an idle main thread. The
+  /// timer is a watchdog, not the mechanism: if the push is cancelled or the host never
+  /// reports appearing, a raster with no list under it would be a chat frozen forever.
   private func scheduleCoveredPresentationSeedMount() {
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
-      self.defersPresentationSeedMountUnderRaster = false
-      // The push already completed (fast transition): the normal presentation-complete
-      // path owns the stash from here — consuming it now would only race that flush.
-      guard self.defersTranscriptUpdatesForPresentation, self.window != nil else { return }
-      self.isMountingPresentationSeedUnderRaster = true
-      defer { self.isMountingPresentationSeedUnderRaster = false }
-      var mounted = self.mountDeferredPresentationSeedNow(stage: "PUSH-COVERED")
-      if !mounted, self.rows.isEmpty {
-        mounted = self.mountSyncEngineTailSeedIfPossible(stage: "PUSH-COVERED-ENGINE-TAIL")
-      }
-      if mounted { self.freezesPresentationSeedDuringNavigation = true }
+    coveredPresentationSeedMountToken &+= 1
+    let token = coveredPresentationSeedMountToken
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+      guard let self, self.coveredPresentationSeedMountToken == token else { return }
+      guard self.defersPresentationSeedMountUnderRaster else { return }
+      NSLog(
+        "[ChatOpen] seed-mount WATCHDOG chat=%@ — transition never reported complete",
+        String(self.engineChatId.prefix(12)))
+      self.mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED-WATCHDOG")
+    }
+  }
+
+  /// Mounts the seed stashed under a reopen raster. Idempotent, and a no-op when the
+  /// push was not raster-covered.
+  ///
+  /// Called first thing on presentation-complete, **before** the engine reconcile that
+  /// follows it, so the raster is still up while the rows lay out and comes off only
+  /// once the real list is final. Removing it first is a blank frame.
+  private func mountCoveredPresentationSeedIfOwed(stage: String) {
+    guard defersPresentationSeedMountUnderRaster else { return }
+    defersPresentationSeedMountUnderRaster = false
+    coveredPresentationSeedMountToken &+= 1
+    guard window != nil else { return }
+    isMountingPresentationSeedUnderRaster = true
+    defer { isMountingPresentationSeedUnderRaster = false }
+    var mounted = mountDeferredPresentationSeedNow(stage: stage)
+    if !mounted, rows.isEmpty {
+      mounted = mountSyncEngineTailSeedIfPossible(stage: "\(stage)-ENGINE-TAIL")
+    }
+    // Only meaningful while the push is still running — on the watchdog path the
+    // transition is long over and there is nothing left to freeze against.
+    if mounted, defersTranscriptUpdatesForPresentation {
+      freezesPresentationSeedDuringNavigation = true
     }
   }
 
