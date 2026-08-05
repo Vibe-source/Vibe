@@ -68,13 +68,74 @@ defmodule Vibe.AI.Agent do
     %{
       name: "search_google",
       description:
-        "Search the web using Google. Returns relevant web results with titles, snippets, and URLs.",
+        "Search the web. Returns real source URLs with titles, snippets, relevance scores and " <>
+          "publication dates. This finds sources; it does NOT read them — use read_url to read " <>
+          "a result before relying on its specifics. Call this more than once when one query " <>
+          "cannot cover the question: search per sub-question, and search again to fill gaps.",
       input_schema: %{
         type: "object",
         properties: %{
-          query: %{type: "string", description: "Search query"}
+          query: %{
+            type: "string",
+            description:
+              "Search query. Use the words a publisher would use, not the words the user used."
+          },
+          max_results: %{
+            type: "integer",
+            description: "How many results to return. Default 6, max 12."
+          },
+          topic: %{
+            type: "string",
+            enum: ["general", "news", "finance"],
+            description:
+              "Search index to use. \"news\" for current events, \"finance\" for markets/tickers."
+          },
+          time_range: %{
+            type: "string",
+            enum: ["day", "week", "month", "year"],
+            description:
+              "Only return results published within this window. Use it whenever the answer " <>
+                "would be wrong if it were stale."
+          },
+          search_depth: %{
+            type: "string",
+            enum: ["basic", "advanced"],
+            description:
+              "\"advanced\" digs deeper and costs more latency. Use it for hard or technical " <>
+                "questions; \"basic\" (default) for everything else."
+          },
+          include_domains: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Restrict to these domains, e.g. [\"pubmed.ncbi.nlm.nih.gov\"]."
+          },
+          exclude_domains: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Exclude these domains."
+          }
         },
         required: ["query"]
+      }
+    },
+    %{
+      name: "read_url",
+      description:
+        "Read the actual text of one or more web pages you found with search_google (or that " <>
+          "the user pasted). Search gives you snippets; this gives you the page. Use it before " <>
+          "stating specifics — numbers, dates, versions, prices, recommendations, quotes — that " <>
+          "you only saw in a snippet.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          url: %{type: "string", description: "The page to read."},
+          urls: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Up to 3 pages to read in one call. Prefer this over 3 separate calls."
+          }
+        },
+        required: []
       }
     },
     %{
@@ -606,16 +667,7 @@ defmodule Vibe.AI.Agent do
   - If you can do it with search_music / search_google / analyze_* / get|update_current_agent_config
     / call_platform / etc., do that yourself. Do not wrap it in delegate_to_subagent.
 
-  HOW A TURN READS (this is the shape the UI renders):
-  intent line → tool steps (live notes) → short specific summary.
-  - Open with ONE short intent line (max ~12 words) saying what you are about to do, then
-    call the tool. Skip it only for a greeting or a one-word answer.
-  - Close with a summary that is SPECIFIC to this result. Name what you found (title,
-    version, artist, count, file name) — that is what makes the answer useful.
-  - NEVER reuse a sentence you have already used in this conversation. If your previous
-    reply said "Here it is again", you may not say it again. Vary the wording every turn.
-  - Do not narrate the tool machinery ("calling search_music") — the notes already show it.
-
+  #{Vibe.AI.AgenticPolicy.turn_shape()}
   CONTINUITY (READ BEFORE ANY TOOL CALL):
   - A "RECENT TURN MEMORY" section may appear at the end of this prompt listing what you
     produced in earlier turns (track title + id, file name, …). It is authoritative.
@@ -630,9 +682,13 @@ defmodule Vibe.AI.Agent do
   - That memory block is internal. Never quote it, never reproduce its format in a reply.
 
   CRITICAL TOOL USAGE RULES (AGENTIC LOOP):
-  1. TOOL-FIRST when action is clear: intent line, then call the tool immediately.
+  1. TOOL-FIRST when action is clear: opening beat, then call the tool immediately.
      - Prefer action over stalling. The UI shows live tool progress notes.
-     - Never write multiple paragraphs before a tool call.
+     - Keep each beat to one line — do not write paragraphs before a tool call.
+     - Do not ask the user for details you could look up, and do not ask for preferences
+       you do not yet need. Answer with a sensible default first, then offer to tailor it.
+       "I can do that, what are your goals?" is a wasted turn when you could have done the
+       work and asked the one question that actually changes the result.
 
   2. search_music: YOU handle music yourself. Use when user asks for songs, music, artists, albums, OR pastes a music link.
      - SOUNDCLOUD / YOUTUBE / music page URLs: pass the full URL as `query` (or `url`). The tool resolves it and the app sends a playable audio cell — do this immediately, do not only describe the link, and do NOT delegate to music_specialist.
@@ -651,9 +707,7 @@ defmodule Vibe.AI.Agent do
        (e.g. "Sent the 2012 live version — 9:21."). The playable cell is attached by the app.
      - You MAY name the title, artist and version. Do NOT paste URLs or links.
 
-  3. search_google: YOU handle web lookup yourself. Use when user needs current info, facts, or web lookup.
-     - ALWAYS provide the "query" parameter. Do not delegate one search to document_specialist.
-
+  3. #{Vibe.AI.AgenticPolicy.research()}
   4. analyze_image: YOU handle this yourself when user shares an image URL.
      - ALWAYS provide "image_url" parameter.
 
@@ -805,8 +859,9 @@ defmodule Vibe.AI.Agent do
 
   IMPORTANT:
   - Prefer direct tools. Subagents are for complex multi-part work, not default routing.
-  - Agentic loop: short intent → tool → READ the tool result → short specific summary.
-    Never end a turn with empty text after a tool ran.
+  - Agentic loop: beat → tools → READ the results → decide if you are actually done →
+    another round if you are not → specific answer. Never end a turn with empty text after
+    a tool ran, and never end one round deep on a question that needed three.
   - For music: you may name the track/version you sent; never paste URLs or links.
   - SHARE LINKS are the one exception to "never paste links": when a tool returns
     `public_link` / `share_url` for an agent, channel, or profile, that link IS the answer the
@@ -852,7 +907,13 @@ defmodule Vibe.AI.Agent do
     # 3 was too tight for a real agentic loop: resolve → fails → retry → answer is already 4
     # rounds, and hitting the cap used to surface as a hard error with the streamed text
     # thrown away. Depth exhaustion now returns the partial answer (see AgentRuntime.do_run).
-    max_depth = Keyword.get(opts, :max_depth, 6)
+    #
+    # 6 was still too tight once research became a real loop. A genuine research turn is
+    # plan+search (1) → read (2) → gap search (3) → read (4) → answer, and a single failed
+    # search plus its retry eats two of those. Depth is a runaway guard, not a budget: the
+    # model stops when it has the answer, and every round costs a provider call it would
+    # not make without a reason.
+    max_depth = Keyword.get(opts, :max_depth, 12)
     model_provider = Keyword.get(opts, :model_provider, "anthropic")
     model_id = Keyword.get(opts, :model_id, @claude_model)
     thinking_level = Keyword.get(opts, :thinking_level, "medium")
@@ -919,6 +980,15 @@ defmodule Vibe.AI.Agent do
   end
 
   defp with_turn_memory(system_prompt, _memory), do: system_prompt
+
+  @doc """
+  The built-in Vibe AI assistant's system prompt.
+
+  Exposed so tests can assert it still carries `Vibe.AI.AgenticPolicy` rather than a
+  drifted private copy — the three prompt builders diverging is exactly how the research
+  policy came to apply to the built-in assistant only.
+  """
+  def default_system_prompt, do: @system_prompt
 
   def available_tools do
     (@tools ++ GroupAgent.standalone_available_tools())
@@ -1169,7 +1239,8 @@ defmodule Vibe.AI.Agent do
   defp tool_running_label(tool_name, tool_input) do
     case tool_name do
       "search_music" -> music_progress_label(tool_input)
-      "search_google" -> "Searching the web…"
+      "search_google" -> search_progress_label(tool_input)
+      "read_url" -> read_progress_label(tool_input)
       "analyze_image" -> "Reading image…"
       "analyze_document" -> "Reading document…"
       "create_document" -> "Making file…"
@@ -1202,6 +1273,43 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # A research step that says WHAT it is looking at is the difference between a spinner and
+  # a agent you can follow. "Searching · training volume" beats "Searching the web…", and a
+  # read step naming the domain is how the user sees breadth ("it checked four sites").
+  defp search_progress_label(input) when is_map(input) do
+    case input["query"] do
+      query when is_binary(query) and query != "" -> "Searching · " <> clip_words(query, 26)
+      _ -> "Searching the web…"
+    end
+  end
+
+  defp search_progress_label(_input), do: "Searching the web…"
+
+  defp read_progress_label(input) when is_map(input) do
+    urls =
+      ([input["url"]] ++ List.wrap(input["urls"]))
+      |> Enum.filter(&is_binary/1)
+      |> Enum.reject(&(&1 == ""))
+
+    case urls do
+      [] -> "Reading page…"
+      [url] -> "Reading " <> label_domain(url)
+      list -> "Reading #{length(list)} pages…"
+    end
+  end
+
+  defp read_progress_label(_input), do: "Reading page…"
+
+  defp label_domain(url) do
+    case URI.parse(url) do
+      %URI{host: host} when is_binary(host) and host != "" ->
+        host |> String.replace_prefix("www.", "") |> clip_words(28)
+
+      _ ->
+        "page…"
+    end
+  end
+
   defp execute_single_tool(tool, callback, user_id, requester_user_id, chat_id, agent_id) do
     tool_name = tool["name"]
     tool_input = tool["input"] || %{}
@@ -1219,7 +1327,10 @@ defmodule Vibe.AI.Agent do
 
         tool_name == "search_google" ->
           on_step.("Reading results…")
-          Vibe.AI.Tools.Search.google(tool["input"])
+          Vibe.AI.Tools.Research.search(tool["input"])
+
+        tool_name == "read_url" ->
+          Vibe.AI.Tools.Research.read(tool["input"])
 
         tool_name == "analyze_image" ->
           Vibe.AI.Tools.Vision.analyze(tool["input"])
@@ -1540,6 +1651,40 @@ defmodule Vibe.AI.Agent do
     end
   end
 
+  # Research steps report breadth, because breadth is the thing the user is judging: "6
+  # results · 4 sites" says the agent actually looked around, "Web results in" says nothing.
+  defp tool_complete_label("search_google", _input, result) when is_map(result) do
+    if tool_result_error?(result) do
+      tool_failed_label("search_google")
+    else
+      count = result["count"] || length(List.wrap(result["results"]))
+      domains = result["domains"] |> List.wrap() |> length()
+
+      cond do
+        count == 0 -> "No results"
+        domains > 1 -> "#{count} results · #{domains} sites"
+        true -> "#{count} results"
+      end
+    end
+  end
+
+  defp tool_complete_label("read_url", _input, result) when is_map(result) do
+    if tool_result_error?(result) do
+      tool_failed_label("read_url")
+    else
+      case result["pages"] |> List.wrap() do
+        [page] ->
+          "Read " <> (page["domain"] || "page")
+
+        pages when pages != [] ->
+          "Read #{length(pages)} pages"
+
+        _ ->
+          "Page read"
+      end
+    end
+  end
+
   defp tool_complete_label(tool_name, _input, result) do
     if is_map(result) and tool_result_error?(result) do
       tool_failed_label(tool_name)
@@ -1561,6 +1706,7 @@ defmodule Vibe.AI.Agent do
   defp tool_done_label(tool_name) do
     case tool_name do
       "search_google" -> "Web results in"
+      "read_url" -> "Page read"
       "analyze_image" -> "Image read"
       "analyze_document" -> "Document read"
       "create_document" -> "File ready"
@@ -1597,6 +1743,7 @@ defmodule Vibe.AI.Agent do
     case to_string(tool_name) do
       "search_music" -> "No track found"
       "search_google" -> "Search failed"
+      "read_url" -> "Page unreadable"
       "list_my_agents" -> "Agents unavailable"
       "check_agent_username" -> "Name check failed"
       "create_agent" -> "Agent not created"
@@ -3083,7 +3230,11 @@ defmodule Vibe.AI.Agent do
   # id (`call_mcp_tool`) turns the whole set on, which keeps the existing
   # intersect-based channel policy meaningful without pinning tool names.
   defp filter_tools(enabled_tools, admin_mode, mcp_tools) do
-    allowed = MapSet.new(List.wrap(enabled_tools) |> Enum.map(&to_string/1))
+    allowed =
+      List.wrap(enabled_tools)
+      |> Enum.map(&to_string/1)
+      |> MapSet.new()
+      |> grant_reading_to_searchers()
 
     builtins =
       Enum.filter(available_tools(), fn tool ->
@@ -3095,6 +3246,18 @@ defmodule Vibe.AI.Agent do
       builtins ++ List.wrap(mcp_tools)
     else
       builtins
+    end
+  end
+
+  # If an agent may search the web it may read what it found. Search without reading is the
+  # configuration that produces confident answers from snippets, and every agent already in
+  # the database has an `enabled_tools` list written before `read_url` existed — gating it
+  # behind a separate toggle would leave all of them permanently snippet-bound.
+  defp grant_reading_to_searchers(allowed) do
+    if MapSet.member?(allowed, "search_google") do
+      MapSet.put(allowed, "read_url")
+    else
+      allowed
     end
   end
 

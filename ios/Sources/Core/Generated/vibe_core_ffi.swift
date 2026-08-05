@@ -463,6 +463,22 @@ fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -551,6 +567,30 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  */
 public protocol VibeCoreHandleProtocol : AnyObject {
     
+    /**
+     * Clears the chat transcript in the reducer (and publishes an empty/truncated window).
+     *
+     * Same class of event as [`Self::delete_message`]: the server soft-clears with
+     * `messages_cleared_at` / participant delete and never sends one frame per row.
+     * Without this, the engine drops every row, the core's next window puts them
+     * back, and Clear Chat looks broken once the list is core-authoritative.
+     *
+     * `before_ts_ms = None` wipes everything. `Some(ts)` keeps messages at/after `ts`
+     * (Telegram-style "clear before now").
+     */
+    func clearChat(chatId: String, beforeTsMs: Int64?, clearedAtMs: Int64) throws 
+    
+    /**
+     * Tells the core a message is gone.
+     *
+     * Deletion cannot arrive as a frame: the server sends an id and a scope, not a
+     * message, so `ingest_frame` has nothing to canonicalize. Without this the core
+     * keeps the row in its store and re-publishes it in the next window — which is
+     * exactly the "deleted cell comes back to the list" seen on device once the core
+     * became the list's content authority.
+     */
+    func deleteMessage(chatId: String, messageId: String, forEveryone: Bool, tombstoneMs: Int64) throws 
+    
     func flush(nowMs: Int64) throws 
     
     func ingestFrame(chatId: String, json: Data, source: VibeFfiSource, receivedAtMs: Int64) throws 
@@ -563,6 +603,18 @@ public protocol VibeCoreHandleProtocol : AnyObject {
     
     func pageBefore(chatId: String, nowMs: Int64) throws 
     
+    /**
+     * Publishes the window the consumer should be showing, leaving the cursor alone.
+     */
+    func refreshWindow(chatId: String, nowMs: Int64) throws 
+    
+    /**
+     * Re-anchors to the bottom and publishes the window. Chat open, not steady state.
+     *
+     * This **resets the scroll-back cursor**, which is correct when a reader arrives
+     * at a conversation and wrong on every subsequent tick. Steady-state readers want
+     * [`Self::refresh_window`].
+     */
     func requestWindow(chatId: String, nowMs: Int64) throws 
     
     func resync(chatId: String) throws 
@@ -626,13 +678,20 @@ open class VibeCoreHandle:
     }
     /**
      * Spawns the worker and returns immediately.
+     *
+     * `unwrapper` is the platform's private-key custody. Passing `None` leaves
+     * the core's deny-all default installed, which means **every hybrid envelope
+     * canonicalizes to `DECRYPTION_FAILED`** — correct for a diagnostic surface
+     * that only exercises ordering, and wrong for anything a user reads. A
+     * production caller passes one.
      */
-public convenience init(config: VibeFfiConfig, sink: VibeDeltaSink) {
+public convenience init(config: VibeFfiConfig, sink: VibeDeltaSink, unwrapper: VibeFfiKeyUnwrapper?) {
     let pointer =
         try! rustCall() {
     uniffi_vibe_core_ffi_fn_constructor_vibecorehandle_new(
         FfiConverterTypeVibeFfiConfig.lower(config),
-        FfiConverterTypeVibeDeltaSink.lower(sink),$0
+        FfiConverterTypeVibeDeltaSink.lower(sink),
+        FfiConverterOptionTypeVibeFfiKeyUnwrapper.lower(unwrapper),$0
     )
 }
     self.init(unsafeFromRawPointer: pointer)
@@ -648,6 +707,45 @@ public convenience init(config: VibeFfiConfig, sink: VibeDeltaSink) {
 
     
 
+    
+    /**
+     * Clears the chat transcript in the reducer (and publishes an empty/truncated window).
+     *
+     * Same class of event as [`Self::delete_message`]: the server soft-clears with
+     * `messages_cleared_at` / participant delete and never sends one frame per row.
+     * Without this, the engine drops every row, the core's next window puts them
+     * back, and Clear Chat looks broken once the list is core-authoritative.
+     *
+     * `before_ts_ms = None` wipes everything. `Some(ts)` keeps messages at/after `ts`
+     * (Telegram-style "clear before now").
+     */
+open func clearChat(chatId: String, beforeTsMs: Int64?, clearedAtMs: Int64)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibecorehandle_clear_chat(self.uniffiClonePointer(),
+        FfiConverterString.lower(chatId),
+        FfiConverterOptionInt64.lower(beforeTsMs),
+        FfiConverterInt64.lower(clearedAtMs),$0
+    )
+}
+}
+    
+    /**
+     * Tells the core a message is gone.
+     *
+     * Deletion cannot arrive as a frame: the server sends an id and a scope, not a
+     * message, so `ingest_frame` has nothing to canonicalize. Without this the core
+     * keeps the row in its store and re-publishes it in the next window — which is
+     * exactly the "deleted cell comes back to the list" seen on device once the core
+     * became the list's content authority.
+     */
+open func deleteMessage(chatId: String, messageId: String, forEveryone: Bool, tombstoneMs: Int64)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibecorehandle_delete_message(self.uniffiClonePointer(),
+        FfiConverterString.lower(chatId),
+        FfiConverterString.lower(messageId),
+        FfiConverterBool.lower(forEveryone),
+        FfiConverterInt64.lower(tombstoneMs),$0
+    )
+}
+}
     
 open func flush(nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_method_vibecorehandle_flush(self.uniffiClonePointer(),
@@ -699,6 +797,24 @@ open func pageBefore(chatId: String, nowMs: Int64)throws  {try rustCallWithError
 }
 }
     
+    /**
+     * Publishes the window the consumer should be showing, leaving the cursor alone.
+     */
+open func refreshWindow(chatId: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibecorehandle_refresh_window(self.uniffiClonePointer(),
+        FfiConverterString.lower(chatId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+    
+    /**
+     * Re-anchors to the bottom and publishes the window. Chat open, not steady state.
+     *
+     * This **resets the scroll-back cursor**, which is correct when a reader arrives
+     * at a conversation and wrong on every subsequent tick. Steady-state readers want
+     * [`Self::refresh_window`].
+     */
 open func requestWindow(chatId: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_method_vibecorehandle_request_window(self.uniffiClonePointer(),
         FfiConverterString.lower(chatId),
@@ -1067,6 +1183,768 @@ public func FfiConverterTypeVibeDeltaSink_lower(_ value: VibeDeltaSink) -> Unsaf
 
 
 /**
+ * Platform-side private-key custody.
+ *
+ * Implemented in Swift over the Keychain, in Kotlin over the Keystore. Invoked
+ * from the core's worker thread with no core state held, once per ingest batch.
+ *
+ * Implementations must return **exactly one slot per request, in order**:
+ * `Some(key)` for the first candidate that unwrapped, `None` when none did.
+ * They must not report *which* candidate opened — that leaks whether a message
+ * was sent or received to anything watching the boundary.
+ */
+public protocol VibeFfiKeyUnwrapper : AnyObject {
+    
+    /**
+     * Unwraps one batch. Never called per message.
+     */
+    func unwrapAesKeys(requests: [VibeFfiKeyRequest])  -> [Data?]
+    
+}
+
+/**
+ * Platform-side private-key custody.
+ *
+ * Implemented in Swift over the Keychain, in Kotlin over the Keystore. Invoked
+ * from the core's worker thread with no core state held, once per ingest batch.
+ *
+ * Implementations must return **exactly one slot per request, in order**:
+ * `Some(key)` for the first candidate that unwrapped, `None` when none did.
+ * They must not report *which* candidate opened — that leaks whether a message
+ * was sent or received to anything watching the boundary.
+ */
+open class VibeFfiKeyUnwrapperImpl:
+    VibeFfiKeyUnwrapper {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibeffikeyunwrapper(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibeffikeyunwrapper(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Unwraps one batch. Never called per message.
+     */
+open func unwrapAesKeys(requests: [VibeFfiKeyRequest]) -> [Data?] {
+    return try!  FfiConverterSequenceOptionData.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_method_vibeffikeyunwrapper_unwrap_aes_keys(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeVibeFfiKeyRequest.lower(requests),$0
+    )
+})
+}
+    
+
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceVibeFfiKeyUnwrapper {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    static var vtable: UniffiVTableCallbackInterfaceVibeFfiKeyUnwrapper = UniffiVTableCallbackInterfaceVibeFfiKeyUnwrapper(
+        unwrapAesKeys: { (
+            uniffiHandle: UInt64,
+            requests: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> [Data?] in
+                guard let uniffiObj = try? FfiConverterTypeVibeFfiKeyUnwrapper.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.unwrapAesKeys(
+                     requests: try FfiConverterSequenceTypeVibeFfiKeyRequest.lift(requests)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterSequenceOptionData.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterTypeVibeFfiKeyUnwrapper.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface VibeFfiKeyUnwrapper: handle missing in uniffiFree")
+            }
+        }
+    )
+}
+
+private func uniffiCallbackInitVibeFfiKeyUnwrapper() {
+    uniffi_vibe_core_ffi_fn_init_callback_vtable_vibeffikeyunwrapper(&UniffiCallbackInterfaceVibeFfiKeyUnwrapper.vtable)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiKeyUnwrapper: FfiConverter {
+    fileprivate static var handleMap = UniffiHandleMap<VibeFfiKeyUnwrapper>()
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeFfiKeyUnwrapper
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeFfiKeyUnwrapper {
+        return VibeFfiKeyUnwrapperImpl(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeFfiKeyUnwrapper) -> UnsafeMutableRawPointer {
+        guard let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: handleMap.insert(obj: value))) else {
+            fatalError("Cast to UnsafeMutableRawPointer failed")
+        }
+        return ptr
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiKeyUnwrapper {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeFfiKeyUnwrapper, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyUnwrapper_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeFfiKeyUnwrapper {
+    return try FfiConverterTypeVibeFfiKeyUnwrapper.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyUnwrapper_lower(_ value: VibeFfiKeyUnwrapper) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeFfiKeyUnwrapper.lower(value)
+}
+
+
+
+
+/**
+ * Read-only handle onto the shipped app's `messages` table.
+ *
+ * Opened `SQLITE_OPEN_READ_ONLY`. The app stays the sole writer; this exists so
+ * backfill can walk what is already on disk without a second source of truth.
+ */
+public protocol VibeLegacyStoreHandleProtocol : AnyObject {
+    
+    /**
+     * Total durable rows visible for `(user_id, chat_id)` in the legacy table.
+     */
+    func count(userId: String, chatId: String) throws  -> UInt64
+    
+    /**
+     * Message ids of the newest `limit` rows, ascending.
+     *
+     * Ids only, deliberately: this exists to compare the two tables, and
+     * hauling sealed payload bytes across the boundary to do it would copy the
+     * whole transcript to answer a question about ordering.
+     */
+    func newestMessageIds(userId: String, chatId: String, limit: UInt32) throws  -> [String]
+    
+}
+
+/**
+ * Read-only handle onto the shipped app's `messages` table.
+ *
+ * Opened `SQLITE_OPEN_READ_ONLY`. The app stays the sole writer; this exists so
+ * backfill can walk what is already on disk without a second source of truth.
+ */
+open class VibeLegacyStoreHandle:
+    VibeLegacyStoreHandleProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibelegacystorehandle(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibelegacystorehandle(pointer, $0) }
+    }
+
+    
+    /**
+     * Opens an existing database. A missing file is `NotFound`, never created.
+     */
+public static func `open`(path: String)throws  -> VibeLegacyStoreHandle {
+    return try  FfiConverterTypeVibeLegacyStoreHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibelegacystorehandle_open(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Total durable rows visible for `(user_id, chat_id)` in the legacy table.
+     */
+open func count(userId: String, chatId: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibelegacystorehandle_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * Message ids of the newest `limit` rows, ascending.
+     *
+     * Ids only, deliberately: this exists to compare the two tables, and
+     * hauling sealed payload bytes across the boundary to do it would copy the
+     * whole transcript to answer a question about ordering.
+     */
+open func newestMessageIds(userId: String, chatId: String, limit: UInt32)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibelegacystorehandle_newest_message_ids(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeLegacyStoreHandle: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeLegacyStoreHandle
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeLegacyStoreHandle {
+        return VibeLegacyStoreHandle(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeLegacyStoreHandle) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeLegacyStoreHandle {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeLegacyStoreHandle, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeLegacyStoreHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeLegacyStoreHandle {
+    return try FfiConverterTypeVibeLegacyStoreHandle.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeLegacyStoreHandle_lower(_ value: VibeLegacyStoreHandle) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeLegacyStoreHandle.lower(value)
+}
+
+
+
+
+/**
+ * Read-write handle onto the sealed core tables.
+ */
+public protocol VibeStoreHandleProtocol : AnyObject {
+    
+    /**
+     * Seals one batch of legacy rows into the core tables, newest-first.
+     *
+     * Call repeatedly until `done`. The resume cursor commits in the same
+     * transaction as the rows, so this is safe to interrupt at any point.
+     */
+    func backfillBatch(legacy: VibeLegacyStoreHandle, userId: String, chatId: String, sealer: VibeStoreSealerHandle, batchLimit: UInt32) throws  -> VibeFfiBackfillProgress
+    
+    /**
+     * Sealed row count for `(user_id, chat_id)`.
+     */
+    func count(userId: String, chatId: String) throws  -> UInt64
+    
+    /**
+     * Whether this address carries a tombstone.
+     */
+    func isTombstoned(userId: String, chatId: String, messageId: String) throws  -> Bool
+    
+    /**
+     * The durable load decision for a chat.
+     */
+    func loadState(userId: String, chatId: String) throws  -> VibeFfiChatLoadState
+    
+    /**
+     * Reads an opaque meta value. The store never interprets these bytes.
+     */
+    func metaGet(key: String) throws  -> Data?
+    
+    /**
+     * Writes an opaque meta value.
+     */
+    func metaSet(key: String, value: Data) throws 
+    
+    /**
+     * Message ids of the newest `limit` rows, ascending — the counterpart to
+     * [`VibeLegacyStoreHandle::newest_message_ids`], for comparing the two.
+     */
+    func newestMessageIds(userId: String, chatId: String, limit: UInt32) throws  -> [String]
+    
+    /**
+     * The page immediately after `after`, ascending. `None` → oldest page.
+     */
+    func pageAfter(userId: String, chatId: String, after: VibeFfiStoreCursor?, limit: UInt32) throws  -> [VibeFfiStoredRow]
+    
+    /**
+     * The page immediately before `before`, ascending. `None` → newest page.
+     */
+    func pageBefore(userId: String, chatId: String, before: VibeFfiStoreCursor?, limit: UInt32) throws  -> [VibeFfiStoredRow]
+    
+    /**
+     * Drops everything but the newest `keep_newest` rows. `0` clears the chat.
+     */
+    func prune(userId: String, chatId: String, keepNewest: UInt32) throws 
+    
+    /**
+     * Clears the resume cursor so the next batch restarts from the newest row.
+     */
+    func resetBackfillCursor(userId: String, chatId: String) throws 
+    
+    /**
+     * Persists the load decision. `NotLoaded` clears it.
+     */
+    func setLoadState(userId: String, chatId: String, state: VibeFfiChatLoadState) throws 
+    
+    /**
+     * Records tombstones for `ids`.
+     */
+    func tombstone(userId: String, chatId: String, ids: [String], atMs: Int64, forEveryone: Bool) throws 
+    
+    /**
+     * Upserts a batch under one exclusive transaction.
+     *
+     * Idempotent, and safe to kill mid-batch: a partial batch rolls back whole.
+     */
+    func upsert(userId: String, chatId: String, rows: [VibeFfiStoredRow]) throws 
+    
+}
+
+/**
+ * Read-write handle onto the sealed core tables.
+ */
+open class VibeStoreHandle:
+    VibeStoreHandleProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibestorehandle(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibestorehandle(pointer, $0) }
+    }
+
+    
+    /**
+     * Opens (or creates) the database and ensures the additive schema exists.
+     *
+     * Never touches the legacy `messages` table — that is the rollback surface.
+     */
+public static func `open`(path: String)throws  -> VibeStoreHandle {
+    return try  FfiConverterTypeVibeStoreHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibestorehandle_open(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Seals one batch of legacy rows into the core tables, newest-first.
+     *
+     * Call repeatedly until `done`. The resume cursor commits in the same
+     * transaction as the rows, so this is safe to interrupt at any point.
+     */
+open func backfillBatch(legacy: VibeLegacyStoreHandle, userId: String, chatId: String, sealer: VibeStoreSealerHandle, batchLimit: UInt32)throws  -> VibeFfiBackfillProgress {
+    return try  FfiConverterTypeVibeFfiBackfillProgress.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_backfill_batch(self.uniffiClonePointer(),
+        FfiConverterTypeVibeLegacyStoreHandle.lower(legacy),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterTypeVibeStoreSealerHandle.lower(sealer),
+        FfiConverterUInt32.lower(batchLimit),$0
+    )
+})
+}
+    
+    /**
+     * Sealed row count for `(user_id, chat_id)`.
+     */
+open func count(userId: String, chatId: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * Whether this address carries a tombstone.
+     */
+open func isTombstoned(userId: String, chatId: String, messageId: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_is_tombstoned(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterString.lower(messageId),$0
+    )
+})
+}
+    
+    /**
+     * The durable load decision for a chat.
+     */
+open func loadState(userId: String, chatId: String)throws  -> VibeFfiChatLoadState {
+    return try  FfiConverterTypeVibeFfiChatLoadState.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_load_state(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * Reads an opaque meta value. The store never interprets these bytes.
+     */
+open func metaGet(key: String)throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_meta_get(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),$0
+    )
+})
+}
+    
+    /**
+     * Writes an opaque meta value.
+     */
+open func metaSet(key: String, value: Data)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_meta_set(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),
+        FfiConverterData.lower(value),$0
+    )
+}
+}
+    
+    /**
+     * Message ids of the newest `limit` rows, ascending — the counterpart to
+     * [`VibeLegacyStoreHandle::newest_message_ids`], for comparing the two.
+     */
+open func newestMessageIds(userId: String, chatId: String, limit: UInt32)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_newest_message_ids(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * The page immediately after `after`, ascending. `None` → oldest page.
+     */
+open func pageAfter(userId: String, chatId: String, after: VibeFfiStoreCursor?, limit: UInt32)throws  -> [VibeFfiStoredRow] {
+    return try  FfiConverterSequenceTypeVibeFfiStoredRow.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_page_after(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterOptionTypeVibeFfiStoreCursor.lower(after),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * The page immediately before `before`, ascending. `None` → newest page.
+     */
+open func pageBefore(userId: String, chatId: String, before: VibeFfiStoreCursor?, limit: UInt32)throws  -> [VibeFfiStoredRow] {
+    return try  FfiConverterSequenceTypeVibeFfiStoredRow.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_page_before(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterOptionTypeVibeFfiStoreCursor.lower(before),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * Drops everything but the newest `keep_newest` rows. `0` clears the chat.
+     */
+open func prune(userId: String, chatId: String, keepNewest: UInt32)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_prune(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterUInt32.lower(keepNewest),$0
+    )
+}
+}
+    
+    /**
+     * Clears the resume cursor so the next batch restarts from the newest row.
+     */
+open func resetBackfillCursor(userId: String, chatId: String)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_reset_backfill_cursor(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),$0
+    )
+}
+}
+    
+    /**
+     * Persists the load decision. `NotLoaded` clears it.
+     */
+open func setLoadState(userId: String, chatId: String, state: VibeFfiChatLoadState)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_set_load_state(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterTypeVibeFfiChatLoadState.lower(state),$0
+    )
+}
+}
+    
+    /**
+     * Records tombstones for `ids`.
+     */
+open func tombstone(userId: String, chatId: String, ids: [String], atMs: Int64, forEveryone: Bool)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_tombstone(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterSequenceString.lower(ids),
+        FfiConverterInt64.lower(atMs),
+        FfiConverterBool.lower(forEveryone),$0
+    )
+}
+}
+    
+    /**
+     * Upserts a batch under one exclusive transaction.
+     *
+     * Idempotent, and safe to kill mid-batch: a partial batch rolls back whole.
+     */
+open func upsert(userId: String, chatId: String, rows: [VibeFfiStoredRow])throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibestorehandle_upsert(self.uniffiClonePointer(),
+        FfiConverterString.lower(userId),
+        FfiConverterString.lower(chatId),
+        FfiConverterSequenceTypeVibeFfiStoredRow.lower(rows),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeStoreHandle: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeStoreHandle
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeStoreHandle {
+        return VibeStoreHandle(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeStoreHandle) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeStoreHandle {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeStoreHandle, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeStoreHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeStoreHandle {
+    return try FfiConverterTypeVibeStoreHandle.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeStoreHandle_lower(_ value: VibeStoreHandle) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeStoreHandle.lower(value)
+}
+
+
+
+
+/**
  * Seals and opens rows under a platform-supplied store key.
  */
 public protocol VibeStoreSealerHandleProtocol : AnyObject {
@@ -1244,6 +2122,296 @@ public func FfiConverterTypeVibeStoreSealerHandle_lift(_ pointer: UnsafeMutableR
 #endif
 public func FfiConverterTypeVibeStoreSealerHandle_lower(_ value: VibeStoreSealerHandle) -> UnsafeMutableRawPointer {
     return FfiConverterTypeVibeStoreSealerHandle.lower(value)
+}
+
+
+/**
+ * Agent turn payload.
+ *
+ * `sealed` is the `arte1` runtime blob. It crosses as **opaque bytes**: the core
+ * never opened it and never could — the pairing key lives only on the phone.
+ */
+public struct VibeFfiAgent {
+    public var provider: String
+    public var taskId: String?
+    public var sessionId: String?
+    public var sealed: Data?
+    public var progress: [VibeFfiAgentNode]
+    public var isStreaming: Bool
+    public var elapsedMs: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(provider: String, taskId: String?, sessionId: String?, sealed: Data?, progress: [VibeFfiAgentNode], isStreaming: Bool, elapsedMs: Int64?) {
+        self.provider = provider
+        self.taskId = taskId
+        self.sessionId = sessionId
+        self.sealed = sealed
+        self.progress = progress
+        self.isStreaming = isStreaming
+        self.elapsedMs = elapsedMs
+    }
+}
+
+
+
+extension VibeFfiAgent: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiAgent, rhs: VibeFfiAgent) -> Bool {
+        if lhs.provider != rhs.provider {
+            return false
+        }
+        if lhs.taskId != rhs.taskId {
+            return false
+        }
+        if lhs.sessionId != rhs.sessionId {
+            return false
+        }
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        if lhs.progress != rhs.progress {
+            return false
+        }
+        if lhs.isStreaming != rhs.isStreaming {
+            return false
+        }
+        if lhs.elapsedMs != rhs.elapsedMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(provider)
+        hasher.combine(taskId)
+        hasher.combine(sessionId)
+        hasher.combine(sealed)
+        hasher.combine(progress)
+        hasher.combine(isStreaming)
+        hasher.combine(elapsedMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiAgent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiAgent {
+        return
+            try VibeFfiAgent(
+                provider: FfiConverterString.read(from: &buf), 
+                taskId: FfiConverterOptionString.read(from: &buf), 
+                sessionId: FfiConverterOptionString.read(from: &buf), 
+                sealed: FfiConverterOptionData.read(from: &buf), 
+                progress: FfiConverterSequenceTypeVibeFfiAgentNode.read(from: &buf), 
+                isStreaming: FfiConverterBool.read(from: &buf), 
+                elapsedMs: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiAgent, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.provider, into: &buf)
+        FfiConverterOptionString.write(value.taskId, into: &buf)
+        FfiConverterOptionString.write(value.sessionId, into: &buf)
+        FfiConverterOptionData.write(value.sealed, into: &buf)
+        FfiConverterSequenceTypeVibeFfiAgentNode.write(value.progress, into: &buf)
+        FfiConverterBool.write(value.isStreaming, into: &buf)
+        FfiConverterOptionInt64.write(value.elapsedMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiAgent_lift(_ buf: RustBuffer) throws -> VibeFfiAgent {
+    return try FfiConverterTypeVibeFfiAgent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiAgent_lower(_ value: VibeFfiAgent) -> RustBuffer {
+    return FfiConverterTypeVibeFfiAgent.lower(value)
+}
+
+
+/**
+ * One progress step of an agent turn.
+ */
+public struct VibeFfiAgentNode {
+    public var id: String
+    public var kind: String
+    public var label: String
+    public var detail: String?
+    public var isTerminal: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, kind: String, label: String, detail: String?, isTerminal: Bool) {
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.detail = detail
+        self.isTerminal = isTerminal
+    }
+}
+
+
+
+extension VibeFfiAgentNode: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiAgentNode, rhs: VibeFfiAgentNode) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.label != rhs.label {
+            return false
+        }
+        if lhs.detail != rhs.detail {
+            return false
+        }
+        if lhs.isTerminal != rhs.isTerminal {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(kind)
+        hasher.combine(label)
+        hasher.combine(detail)
+        hasher.combine(isTerminal)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiAgentNode: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiAgentNode {
+        return
+            try VibeFfiAgentNode(
+                id: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf), 
+                detail: FfiConverterOptionString.read(from: &buf), 
+                isTerminal: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiAgentNode, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterOptionString.write(value.detail, into: &buf)
+        FfiConverterBool.write(value.isTerminal, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiAgentNode_lift(_ buf: RustBuffer) throws -> VibeFfiAgentNode {
+    return try FfiConverterTypeVibeFfiAgentNode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiAgentNode_lower(_ value: VibeFfiAgentNode) -> RustBuffer {
+    return FfiConverterTypeVibeFfiAgentNode.lower(value)
+}
+
+
+/**
+ * Counts for one [`VibeStoreHandle::backfill_batch`] call — not cumulative.
+ */
+public struct VibeFfiBackfillProgress {
+    public var scanned: UInt64
+    public var written: UInt64
+    public var skipped: UInt64
+    public var done: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(scanned: UInt64, written: UInt64, skipped: UInt64, done: Bool) {
+        self.scanned = scanned
+        self.written = written
+        self.skipped = skipped
+        self.done = done
+    }
+}
+
+
+
+extension VibeFfiBackfillProgress: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiBackfillProgress, rhs: VibeFfiBackfillProgress) -> Bool {
+        if lhs.scanned != rhs.scanned {
+            return false
+        }
+        if lhs.written != rhs.written {
+            return false
+        }
+        if lhs.skipped != rhs.skipped {
+            return false
+        }
+        if lhs.done != rhs.done {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(scanned)
+        hasher.combine(written)
+        hasher.combine(skipped)
+        hasher.combine(done)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiBackfillProgress: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiBackfillProgress {
+        return
+            try VibeFfiBackfillProgress(
+                scanned: FfiConverterUInt64.read(from: &buf), 
+                written: FfiConverterUInt64.read(from: &buf), 
+                skipped: FfiConverterUInt64.read(from: &buf), 
+                done: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiBackfillProgress, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.scanned, into: &buf)
+        FfiConverterUInt64.write(value.written, into: &buf)
+        FfiConverterUInt64.write(value.skipped, into: &buf)
+        FfiConverterBool.write(value.done, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiBackfillProgress_lift(_ buf: RustBuffer) throws -> VibeFfiBackfillProgress {
+    return try FfiConverterTypeVibeFfiBackfillProgress.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiBackfillProgress_lower(_ value: VibeFfiBackfillProgress) -> RustBuffer {
+    return FfiConverterTypeVibeFfiBackfillProgress.lower(value)
 }
 
 
@@ -1554,6 +2722,244 @@ public func FfiConverterTypeVibeFfiDelta_lower(_ value: VibeFfiDelta) -> RustBuf
 
 
 /**
+ * One message's wrapped-key candidates, for the platform to try in order.
+ *
+ * `candidates` arrive in the **direction-dependent order the shipped client
+ * uses**: the reserved group slot first, then sender-slot-before-recipient for
+ * own messages and the reverse for peer messages. The platform must try them in
+ * the order given and must not reorder them — getting that wrong changes which
+ * historical messages open.
+ */
+public struct VibeFfiKeyRequest {
+    /**
+     * Correlation only. The platform must answer positionally, not by this id.
+     */
+    public var messageId: String
+    /**
+     * RSA-OAEP-SHA256 wrapped content keys, in try-order.
+     */
+    public var candidates: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Correlation only. The platform must answer positionally, not by this id.
+         */messageId: String, 
+        /**
+         * RSA-OAEP-SHA256 wrapped content keys, in try-order.
+         */candidates: [Data]) {
+        self.messageId = messageId
+        self.candidates = candidates
+    }
+}
+
+
+
+extension VibeFfiKeyRequest: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiKeyRequest, rhs: VibeFfiKeyRequest) -> Bool {
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        if lhs.candidates != rhs.candidates {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(messageId)
+        hasher.combine(candidates)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiKeyRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiKeyRequest {
+        return
+            try VibeFfiKeyRequest(
+                messageId: FfiConverterString.read(from: &buf), 
+                candidates: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiKeyRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageId, into: &buf)
+        FfiConverterSequenceData.write(value.candidates, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyRequest_lift(_ buf: RustBuffer) throws -> VibeFfiKeyRequest {
+    return try FfiConverterTypeVibeFfiKeyRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyRequest_lower(_ value: VibeFfiKeyRequest) -> RustBuffer {
+    return FfiConverterTypeVibeFfiKeyRequest.lower(value)
+}
+
+
+/**
+ * Media metadata. Never the pixels.
+ */
+public struct VibeFfiMedia {
+    /**
+     * The only addressing key. Signed-URL churn must not change it.
+     */
+    public var identity: String
+    public var remoteUrl: String?
+    public var fileName: String?
+    public var mime: String?
+    public var byteSize: Int64?
+    /**
+     * `None` means unknown — reserve, do not guess.
+     */
+    public var naturalSize: VibeFfiSize?
+    public var durationS: Double?
+    /**
+     * 0..=255 amplitude buckets.
+     */
+    public var waveform: Data
+    public var thumbnail: VibeFfiThumb?
+    public var envelope: VibeFfiMediaEnvelope
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The only addressing key. Signed-URL churn must not change it.
+         */identity: String, remoteUrl: String?, fileName: String?, mime: String?, byteSize: Int64?, 
+        /**
+         * `None` means unknown — reserve, do not guess.
+         */naturalSize: VibeFfiSize?, durationS: Double?, 
+        /**
+         * 0..=255 amplitude buckets.
+         */waveform: Data, thumbnail: VibeFfiThumb?, envelope: VibeFfiMediaEnvelope) {
+        self.identity = identity
+        self.remoteUrl = remoteUrl
+        self.fileName = fileName
+        self.mime = mime
+        self.byteSize = byteSize
+        self.naturalSize = naturalSize
+        self.durationS = durationS
+        self.waveform = waveform
+        self.thumbnail = thumbnail
+        self.envelope = envelope
+    }
+}
+
+
+
+extension VibeFfiMedia: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiMedia, rhs: VibeFfiMedia) -> Bool {
+        if lhs.identity != rhs.identity {
+            return false
+        }
+        if lhs.remoteUrl != rhs.remoteUrl {
+            return false
+        }
+        if lhs.fileName != rhs.fileName {
+            return false
+        }
+        if lhs.mime != rhs.mime {
+            return false
+        }
+        if lhs.byteSize != rhs.byteSize {
+            return false
+        }
+        if lhs.naturalSize != rhs.naturalSize {
+            return false
+        }
+        if lhs.durationS != rhs.durationS {
+            return false
+        }
+        if lhs.waveform != rhs.waveform {
+            return false
+        }
+        if lhs.thumbnail != rhs.thumbnail {
+            return false
+        }
+        if lhs.envelope != rhs.envelope {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identity)
+        hasher.combine(remoteUrl)
+        hasher.combine(fileName)
+        hasher.combine(mime)
+        hasher.combine(byteSize)
+        hasher.combine(naturalSize)
+        hasher.combine(durationS)
+        hasher.combine(waveform)
+        hasher.combine(thumbnail)
+        hasher.combine(envelope)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiMedia: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiMedia {
+        return
+            try VibeFfiMedia(
+                identity: FfiConverterString.read(from: &buf), 
+                remoteUrl: FfiConverterOptionString.read(from: &buf), 
+                fileName: FfiConverterOptionString.read(from: &buf), 
+                mime: FfiConverterOptionString.read(from: &buf), 
+                byteSize: FfiConverterOptionInt64.read(from: &buf), 
+                naturalSize: FfiConverterOptionTypeVibeFfiSize.read(from: &buf), 
+                durationS: FfiConverterOptionDouble.read(from: &buf), 
+                waveform: FfiConverterData.read(from: &buf), 
+                thumbnail: FfiConverterOptionTypeVibeFfiThumb.read(from: &buf), 
+                envelope: FfiConverterTypeVibeFfiMediaEnvelope.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiMedia, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.identity, into: &buf)
+        FfiConverterOptionString.write(value.remoteUrl, into: &buf)
+        FfiConverterOptionString.write(value.fileName, into: &buf)
+        FfiConverterOptionString.write(value.mime, into: &buf)
+        FfiConverterOptionInt64.write(value.byteSize, into: &buf)
+        FfiConverterOptionTypeVibeFfiSize.write(value.naturalSize, into: &buf)
+        FfiConverterOptionDouble.write(value.durationS, into: &buf)
+        FfiConverterData.write(value.waveform, into: &buf)
+        FfiConverterOptionTypeVibeFfiThumb.write(value.thumbnail, into: &buf)
+        FfiConverterTypeVibeFfiMediaEnvelope.write(value.envelope, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMedia_lift(_ buf: RustBuffer) throws -> VibeFfiMedia {
+    return try FfiConverterTypeVibeFfiMedia.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMedia_lower(_ value: VibeFfiMedia) -> RustBuffer {
+    return FfiConverterTypeVibeFfiMedia.lower(value)
+}
+
+
+/**
  * One row, flattened for rendering.
  *
  * `struct_excessive_bools` is allowed deliberately. The lint's advice — collapse
@@ -1606,6 +3012,11 @@ public struct VibeFfiMessage {
     public var hasAgent: Bool
     public var hasService: Bool
     public var isEdited: Bool
+    public var media: VibeFfiMedia?
+    public var reply: VibeFfiReply?
+    public var agent: VibeFfiAgent?
+    public var service: VibeFfiService?
+    public var editedAtMs: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1631,7 +3042,7 @@ public struct VibeFfiMessage {
         /**
          * FNV-1a over the rendered fields. A renderer can skip a reconfigure when
          * this is unchanged.
-         */contentHash: UInt64, hasMedia: Bool, hasReply: Bool, hasAgent: Bool, hasService: Bool, isEdited: Bool) {
+         */contentHash: UInt64, hasMedia: Bool, hasReply: Bool, hasAgent: Bool, hasService: Bool, isEdited: Bool, media: VibeFfiMedia?, reply: VibeFfiReply?, agent: VibeFfiAgent?, service: VibeFfiService?, editedAtMs: Int64?) {
         self.messageId = messageId
         self.clientMessageId = clientMessageId
         self.tsMs = tsMs
@@ -1652,6 +3063,11 @@ public struct VibeFfiMessage {
         self.hasAgent = hasAgent
         self.hasService = hasService
         self.isEdited = isEdited
+        self.media = media
+        self.reply = reply
+        self.agent = agent
+        self.service = service
+        self.editedAtMs = editedAtMs
     }
 }
 
@@ -1719,6 +3135,21 @@ extension VibeFfiMessage: Equatable, Hashable {
         if lhs.isEdited != rhs.isEdited {
             return false
         }
+        if lhs.media != rhs.media {
+            return false
+        }
+        if lhs.reply != rhs.reply {
+            return false
+        }
+        if lhs.agent != rhs.agent {
+            return false
+        }
+        if lhs.service != rhs.service {
+            return false
+        }
+        if lhs.editedAtMs != rhs.editedAtMs {
+            return false
+        }
         return true
     }
 
@@ -1743,6 +3174,11 @@ extension VibeFfiMessage: Equatable, Hashable {
         hasher.combine(hasAgent)
         hasher.combine(hasService)
         hasher.combine(isEdited)
+        hasher.combine(media)
+        hasher.combine(reply)
+        hasher.combine(agent)
+        hasher.combine(service)
+        hasher.combine(editedAtMs)
     }
 }
 
@@ -1773,7 +3209,12 @@ public struct FfiConverterTypeVibeFfiMessage: FfiConverterRustBuffer {
                 hasReply: FfiConverterBool.read(from: &buf), 
                 hasAgent: FfiConverterBool.read(from: &buf), 
                 hasService: FfiConverterBool.read(from: &buf), 
-                isEdited: FfiConverterBool.read(from: &buf)
+                isEdited: FfiConverterBool.read(from: &buf), 
+                media: FfiConverterOptionTypeVibeFfiMedia.read(from: &buf), 
+                reply: FfiConverterOptionTypeVibeFfiReply.read(from: &buf), 
+                agent: FfiConverterOptionTypeVibeFfiAgent.read(from: &buf), 
+                service: FfiConverterOptionTypeVibeFfiService.read(from: &buf), 
+                editedAtMs: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -1798,6 +3239,11 @@ public struct FfiConverterTypeVibeFfiMessage: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasAgent, into: &buf)
         FfiConverterBool.write(value.hasService, into: &buf)
         FfiConverterBool.write(value.isEdited, into: &buf)
+        FfiConverterOptionTypeVibeFfiMedia.write(value.media, into: &buf)
+        FfiConverterOptionTypeVibeFfiReply.write(value.reply, into: &buf)
+        FfiConverterOptionTypeVibeFfiAgent.write(value.agent, into: &buf)
+        FfiConverterOptionTypeVibeFfiService.write(value.service, into: &buf)
+        FfiConverterOptionInt64.write(value.editedAtMs, into: &buf)
     }
 }
 
@@ -1814,6 +3260,91 @@ public func FfiConverterTypeVibeFfiMessage_lift(_ buf: RustBuffer) throws -> Vib
 #endif
 public func FfiConverterTypeVibeFfiMessage_lower(_ value: VibeFfiMessage) -> RustBuffer {
     return FfiConverterTypeVibeFfiMessage.lower(value)
+}
+
+
+/**
+ * Reply-to reference, with the quoted preview.
+ */
+public struct VibeFfiReply {
+    public var messageId: String
+    public var authorUserId: String?
+    public var previewText: String
+    public var previewThumb: VibeFfiThumb?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(messageId: String, authorUserId: String?, previewText: String, previewThumb: VibeFfiThumb?) {
+        self.messageId = messageId
+        self.authorUserId = authorUserId
+        self.previewText = previewText
+        self.previewThumb = previewThumb
+    }
+}
+
+
+
+extension VibeFfiReply: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiReply, rhs: VibeFfiReply) -> Bool {
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        if lhs.authorUserId != rhs.authorUserId {
+            return false
+        }
+        if lhs.previewText != rhs.previewText {
+            return false
+        }
+        if lhs.previewThumb != rhs.previewThumb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(messageId)
+        hasher.combine(authorUserId)
+        hasher.combine(previewText)
+        hasher.combine(previewThumb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiReply: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiReply {
+        return
+            try VibeFfiReply(
+                messageId: FfiConverterString.read(from: &buf), 
+                authorUserId: FfiConverterOptionString.read(from: &buf), 
+                previewText: FfiConverterString.read(from: &buf), 
+                previewThumb: FfiConverterOptionTypeVibeFfiThumb.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiReply, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageId, into: &buf)
+        FfiConverterOptionString.write(value.authorUserId, into: &buf)
+        FfiConverterString.write(value.previewText, into: &buf)
+        FfiConverterOptionTypeVibeFfiThumb.write(value.previewThumb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiReply_lift(_ buf: RustBuffer) throws -> VibeFfiReply {
+    return try FfiConverterTypeVibeFfiReply.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiReply_lower(_ value: VibeFfiReply) -> RustBuffer {
+    return FfiConverterTypeVibeFfiReply.lower(value)
 }
 
 
@@ -1889,6 +3420,500 @@ public func FfiConverterTypeVibeFfiSealedBody_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeVibeFfiSealedBody_lower(_ value: VibeFfiSealedBody) -> RustBuffer {
     return FfiConverterTypeVibeFfiSealedBody.lower(value)
+}
+
+
+/**
+ * Structured service notice.
+ */
+public struct VibeFfiService {
+    public var kind: String
+    public var title: String
+    public var subtitle: String?
+    public var chips: [VibeFfiServiceChip]
+    public var eventThreadId: String?
+    public var foldedCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: String, title: String, subtitle: String?, chips: [VibeFfiServiceChip], eventThreadId: String?, foldedCount: UInt32) {
+        self.kind = kind
+        self.title = title
+        self.subtitle = subtitle
+        self.chips = chips
+        self.eventThreadId = eventThreadId
+        self.foldedCount = foldedCount
+    }
+}
+
+
+
+extension VibeFfiService: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiService, rhs: VibeFfiService) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.subtitle != rhs.subtitle {
+            return false
+        }
+        if lhs.chips != rhs.chips {
+            return false
+        }
+        if lhs.eventThreadId != rhs.eventThreadId {
+            return false
+        }
+        if lhs.foldedCount != rhs.foldedCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(title)
+        hasher.combine(subtitle)
+        hasher.combine(chips)
+        hasher.combine(eventThreadId)
+        hasher.combine(foldedCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiService: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiService {
+        return
+            try VibeFfiService(
+                kind: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                subtitle: FfiConverterOptionString.read(from: &buf), 
+                chips: FfiConverterSequenceTypeVibeFfiServiceChip.read(from: &buf), 
+                eventThreadId: FfiConverterOptionString.read(from: &buf), 
+                foldedCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiService, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.subtitle, into: &buf)
+        FfiConverterSequenceTypeVibeFfiServiceChip.write(value.chips, into: &buf)
+        FfiConverterOptionString.write(value.eventThreadId, into: &buf)
+        FfiConverterUInt32.write(value.foldedCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiService_lift(_ buf: RustBuffer) throws -> VibeFfiService {
+    return try FfiConverterTypeVibeFfiService.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiService_lower(_ value: VibeFfiService) -> RustBuffer {
+    return FfiConverterTypeVibeFfiService.lower(value)
+}
+
+
+/**
+ * A decision chip on a service notice.
+ */
+public struct VibeFfiServiceChip {
+    public var id: String
+    public var label: String
+    public var style: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, label: String, style: String) {
+        self.id = id
+        self.label = label
+        self.style = style
+    }
+}
+
+
+
+extension VibeFfiServiceChip: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiServiceChip, rhs: VibeFfiServiceChip) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.label != rhs.label {
+            return false
+        }
+        if lhs.style != rhs.style {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(label)
+        hasher.combine(style)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiServiceChip: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiServiceChip {
+        return
+            try VibeFfiServiceChip(
+                id: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf), 
+                style: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiServiceChip, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.style, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiServiceChip_lift(_ buf: RustBuffer) throws -> VibeFfiServiceChip {
+    return try FfiConverterTypeVibeFfiServiceChip.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiServiceChip_lower(_ value: VibeFfiServiceChip) -> RustBuffer {
+    return FfiConverterTypeVibeFfiServiceChip.lower(value)
+}
+
+
+/**
+ * Natural pixel size of a media asset.
+ *
+ * `None` on the owning field means **unknown**, and the renderer must reserve a
+ * frame it will not later change. Guessing square and correcting after decode is
+ * the list-shift bug this whole boundary exists to end.
+ */
+public struct VibeFfiSize {
+    public var width: UInt32
+    public var height: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(width: UInt32, height: UInt32) {
+        self.width = width
+        self.height = height
+    }
+}
+
+
+
+extension VibeFfiSize: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiSize, rhs: VibeFfiSize) -> Bool {
+        if lhs.width != rhs.width {
+            return false
+        }
+        if lhs.height != rhs.height {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(width)
+        hasher.combine(height)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiSize: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiSize {
+        return
+            try VibeFfiSize(
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiSize, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiSize_lift(_ buf: RustBuffer) throws -> VibeFfiSize {
+    return try FfiConverterTypeVibeFfiSize.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiSize_lower(_ value: VibeFfiSize) -> RustBuffer {
+    return FfiConverterTypeVibeFfiSize.lower(value)
+}
+
+
+/**
+ * Position in the total order, for paging.
+ */
+public struct VibeFfiStoreCursor {
+    public var tsMs: Int64
+    public var messageId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tsMs: Int64, messageId: String) {
+        self.tsMs = tsMs
+        self.messageId = messageId
+    }
+}
+
+
+
+extension VibeFfiStoreCursor: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiStoreCursor, rhs: VibeFfiStoreCursor) -> Bool {
+        if lhs.tsMs != rhs.tsMs {
+            return false
+        }
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tsMs)
+        hasher.combine(messageId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiStoreCursor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiStoreCursor {
+        return
+            try VibeFfiStoreCursor(
+                tsMs: FfiConverterInt64.read(from: &buf), 
+                messageId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiStoreCursor, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.tsMs, into: &buf)
+        FfiConverterString.write(value.messageId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiStoreCursor_lift(_ buf: RustBuffer) throws -> VibeFfiStoreCursor {
+    return try FfiConverterTypeVibeFfiStoreCursor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiStoreCursor_lower(_ value: VibeFfiStoreCursor) -> RustBuffer {
+    return FfiConverterTypeVibeFfiStoreCursor.lower(value)
+}
+
+
+/**
+ * One sealed row, exactly as it sits in `core_messages_v1`.
+ *
+ * `sealed_body` and `seal_nonce` are opaque ciphertext. Nothing on this side of
+ * the boundary inspects them; open them with [`VibeStoreSealerHandle::open`].
+ */
+public struct VibeFfiStoredRow {
+    public var messageId: String
+    public var tsMs: Int64
+    public var flags: Int64
+    public var sealedBody: Data
+    public var sealNonce: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(messageId: String, tsMs: Int64, flags: Int64, sealedBody: Data, sealNonce: Data) {
+        self.messageId = messageId
+        self.tsMs = tsMs
+        self.flags = flags
+        self.sealedBody = sealedBody
+        self.sealNonce = sealNonce
+    }
+}
+
+
+
+extension VibeFfiStoredRow: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiStoredRow, rhs: VibeFfiStoredRow) -> Bool {
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        if lhs.tsMs != rhs.tsMs {
+            return false
+        }
+        if lhs.flags != rhs.flags {
+            return false
+        }
+        if lhs.sealedBody != rhs.sealedBody {
+            return false
+        }
+        if lhs.sealNonce != rhs.sealNonce {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(messageId)
+        hasher.combine(tsMs)
+        hasher.combine(flags)
+        hasher.combine(sealedBody)
+        hasher.combine(sealNonce)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiStoredRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiStoredRow {
+        return
+            try VibeFfiStoredRow(
+                messageId: FfiConverterString.read(from: &buf), 
+                tsMs: FfiConverterInt64.read(from: &buf), 
+                flags: FfiConverterInt64.read(from: &buf), 
+                sealedBody: FfiConverterData.read(from: &buf), 
+                sealNonce: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiStoredRow, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageId, into: &buf)
+        FfiConverterInt64.write(value.tsMs, into: &buf)
+        FfiConverterInt64.write(value.flags, into: &buf)
+        FfiConverterData.write(value.sealedBody, into: &buf)
+        FfiConverterData.write(value.sealNonce, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiStoredRow_lift(_ buf: RustBuffer) throws -> VibeFfiStoredRow {
+    return try FfiConverterTypeVibeFfiStoredRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiStoredRow_lower(_ value: VibeFfiStoredRow) -> RustBuffer {
+    return FfiConverterTypeVibeFfiStoredRow.lower(value)
+}
+
+
+/**
+ * A thumbnail reference. Never bytes — the platform resolves `identity` against
+ * its media vault.
+ */
+public struct VibeFfiThumb {
+    public var identity: String
+    public var size: VibeFfiSize?
+    public var placeholder: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identity: String, size: VibeFfiSize?, placeholder: String?) {
+        self.identity = identity
+        self.size = size
+        self.placeholder = placeholder
+    }
+}
+
+
+
+extension VibeFfiThumb: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiThumb, rhs: VibeFfiThumb) -> Bool {
+        if lhs.identity != rhs.identity {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        if lhs.placeholder != rhs.placeholder {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identity)
+        hasher.combine(size)
+        hasher.combine(placeholder)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiThumb: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiThumb {
+        return
+            try VibeFfiThumb(
+                identity: FfiConverterString.read(from: &buf), 
+                size: FfiConverterOptionTypeVibeFfiSize.read(from: &buf), 
+                placeholder: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiThumb, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.identity, into: &buf)
+        FfiConverterOptionTypeVibeFfiSize.write(value.size, into: &buf)
+        FfiConverterOptionString.write(value.placeholder, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiThumb_lift(_ buf: RustBuffer) throws -> VibeFfiThumb {
+    return try FfiConverterTypeVibeFfiThumb.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiThumb_lower(_ value: VibeFfiThumb) -> RustBuffer {
+    return FfiConverterTypeVibeFfiThumb.lower(value)
 }
 
 
@@ -1991,6 +4016,83 @@ public func FfiConverterTypeVibeFfiWindow_lift(_ buf: RustBuffer) throws -> Vibe
 public func FfiConverterTypeVibeFfiWindow_lower(_ value: VibeFfiWindow) -> RustBuffer {
     return FfiConverterTypeVibeFfiWindow.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Three states, because "loaded and empty" and "never loaded" must not collapse.
+ *
+ * Collapsing them is what made dormant chats open blank: an empty row array
+ * read as "no history yet" instead of "history is known to be empty".
+ */
+
+public enum VibeFfiChatLoadState {
+    
+    case notLoaded
+    case knownEmpty
+    case loaded
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiChatLoadState: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiChatLoadState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiChatLoadState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .notLoaded
+        
+        case 2: return .knownEmpty
+        
+        case 3: return .loaded
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: VibeFfiChatLoadState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .notLoaded:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .knownEmpty:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .loaded:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiChatLoadState_lift(_ buf: RustBuffer) throws -> VibeFfiChatLoadState {
+    return try FfiConverterTypeVibeFfiChatLoadState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiChatLoadState_lower(_ value: VibeFfiChatLoadState) -> RustBuffer {
+    return FfiConverterTypeVibeFfiChatLoadState.lower(value)
+}
+
+
+
+extension VibeFfiChatLoadState: Equatable, Hashable {}
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -2198,6 +4300,12 @@ public enum VibeFfiError {
      */
     case Internal(detail: String
     )
+    /**
+     * A store operation failed. `detail` comes from `VibeStoreError`, which is
+     * shape-only by construction — never a path, SQL text, id, or payload.
+     */
+    case Store(detail: String
+    )
 }
 
 
@@ -2221,6 +4329,9 @@ public struct FfiConverterTypeVibeFfiError: FfiConverterRustBuffer {
         case 3: return .ShutDown
         case 4: return .WorkerUnavailable
         case 5: return .Internal(
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 6: return .Store(
             detail: try FfiConverterString.read(from: &buf)
             )
 
@@ -2256,6 +4367,11 @@ public struct FfiConverterTypeVibeFfiError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(5))
             FfiConverterString.write(detail, into: &buf)
             
+        
+        case let .Store(detail):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(detail, into: &buf)
+            
         }
     }
 }
@@ -2268,6 +4384,92 @@ extension VibeFfiError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How the bytes behind a media reference are protected.
+ *
+ * `key_ref` is the per-message media key. It crosses deliberately: the platform
+ * performs the media decrypt (file I/O is not the core's job), and it cannot do
+ * that without the key. This is the same key the shipped client already carries
+ * inside the message payload — no new exposure.
+ */
+
+public enum VibeFfiMediaEnvelope {
+    
+    case plain
+    case gcm1(keyRef: String
+    )
+    case stream2(keyRef: String, segmentLen: UInt32
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiMediaEnvelope: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiMediaEnvelope
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiMediaEnvelope {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .plain
+        
+        case 2: return .gcm1(keyRef: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .stream2(keyRef: try FfiConverterString.read(from: &buf), segmentLen: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: VibeFfiMediaEnvelope, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .plain:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .gcm1(keyRef):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(keyRef, into: &buf)
+            
+        
+        case let .stream2(keyRef,segmentLen):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(keyRef, into: &buf)
+            FfiConverterUInt32.write(segmentLen, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMediaEnvelope_lift(_ buf: RustBuffer) throws -> VibeFfiMediaEnvelope {
+    return try FfiConverterTypeVibeFfiMediaEnvelope.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMediaEnvelope_lower(_ value: VibeFfiMediaEnvelope) -> RustBuffer {
+    return FfiConverterTypeVibeFfiMediaEnvelope.lower(value)
+}
+
+
+
+extension VibeFfiMediaEnvelope: Equatable, Hashable {}
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -2666,6 +4868,30 @@ extension VibeFfiSource: Equatable, Hashable {}
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionFloat: FfiConverterRustBuffer {
     typealias SwiftType = Float?
 
@@ -2682,6 +4908,30 @@ fileprivate struct FfiConverterOptionFloat: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterFloat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionDouble: FfiConverterRustBuffer {
+    typealias SwiftType = Double?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterDouble.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterDouble.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2714,6 +4964,322 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiKeyUnwrapper: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiKeyUnwrapper?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiKeyUnwrapper.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiKeyUnwrapper.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiAgent: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiAgent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiAgent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiAgent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiMedia: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiMedia?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiMedia.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiMedia.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiReply: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiReply?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiReply.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiReply.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiService: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiService?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiService.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiService.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiSize: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiSize?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiSize.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiSize.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiStoreCursor: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiStoreCursor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiStoreCursor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiStoreCursor.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVibeFfiThumb: FfiConverterRustBuffer {
+    typealias SwiftType = VibeFfiThumb?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeFfiThumb.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeFfiThumb.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeVibeFfiAgentNode: FfiConverterRustBuffer {
+    typealias SwiftType = [VibeFfiAgentNode]
+
+    public static func write(_ value: [VibeFfiAgentNode], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeVibeFfiAgentNode.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [VibeFfiAgentNode] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [VibeFfiAgentNode]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeVibeFfiAgentNode.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeVibeFfiKeyRequest: FfiConverterRustBuffer {
+    typealias SwiftType = [VibeFfiKeyRequest]
+
+    public static func write(_ value: [VibeFfiKeyRequest], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeVibeFfiKeyRequest.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [VibeFfiKeyRequest] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [VibeFfiKeyRequest]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeVibeFfiKeyRequest.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeVibeFfiMessage: FfiConverterRustBuffer {
     typealias SwiftType = [VibeFfiMessage]
 
@@ -2731,6 +5297,56 @@ fileprivate struct FfiConverterSequenceTypeVibeFfiMessage: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeVibeFfiMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeVibeFfiServiceChip: FfiConverterRustBuffer {
+    typealias SwiftType = [VibeFfiServiceChip]
+
+    public static func write(_ value: [VibeFfiServiceChip], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeVibeFfiServiceChip.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [VibeFfiServiceChip] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [VibeFfiServiceChip]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeVibeFfiServiceChip.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeVibeFfiStoredRow: FfiConverterRustBuffer {
+    typealias SwiftType = [VibeFfiStoredRow]
+
+    public static func write(_ value: [VibeFfiStoredRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeVibeFfiStoredRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [VibeFfiStoredRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [VibeFfiStoredRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeVibeFfiStoredRow.read(from: &buf))
         }
         return seq
     }
@@ -2761,6 +5377,31 @@ fileprivate struct FfiConverterSequenceTypeVibeFfiOp: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data?]
+
+    public static func write(_ value: [Data?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -2775,6 +5416,12 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_vibe_core_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_clear_chat() != 26894) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_delete_message() != 50005) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_flush() != 42977) {
         return InitializationResult.apiChecksumMismatch
@@ -2794,7 +5441,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_page_before() != 38376) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_request_window() != 17582) {
+    if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_refresh_window() != 24994) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_request_window() != 44876) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_resync() != 55857) {
@@ -2815,13 +5465,70 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_method_vibedeltasink_on_error() != 23322) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vibe_core_ffi_checksum_method_vibeffikeyunwrapper_unwrap_aes_keys() != 53855) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibelegacystorehandle_count() != 49553) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibelegacystorehandle_newest_message_ids() != 9496) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_backfill_batch() != 23420) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_count() != 10396) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_is_tombstoned() != 13640) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_load_state() != 11164) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_meta_get() != 14147) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_meta_set() != 30137) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_newest_message_ids() != 15906) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_page_after() != 51297) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_page_before() != 13079) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_prune() != 59863) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_reset_backfill_cursor() != 57793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_set_load_state() != 39214) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_tombstone() != 8001) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_upsert() != 5634) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vibe_core_ffi_checksum_method_vibestoresealerhandle_open() != 61777) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibestoresealerhandle_seal() != 31435) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vibe_core_ffi_checksum_constructor_vibecorehandle_new() != 26463) {
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibecorehandle_new() != 18647) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibelegacystorehandle_open() != 15415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibestorehandle_open() != 40680) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_constructor_vibestoresealerhandle_new() != 34813) {
@@ -2829,6 +5536,7 @@ private var initializationResult: InitializationResult = {
     }
 
     uniffiCallbackInitVibeDeltaSink()
+    uniffiCallbackInitVibeFfiKeyUnwrapper()
     return InitializationResult.ok
 }()
 

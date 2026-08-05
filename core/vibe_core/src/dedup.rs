@@ -59,16 +59,45 @@ pub fn is_running_mirror_id(message_id: &str) -> bool {
     message_id.contains("running-mirror")
 }
 
+/// Strips the daemon's instruction preamble from a transcript user turn.
+///
+/// The bridge prepends "Vibe bridge startup prepared these instruction files…
+/// User task:\n<text>" to every prompt before handing it to the CLI. The CLI
+/// transcript records the *full* prompt, so re-ingesting that transcript as
+/// history would show the preamble in the user's own bubble.
+///
+/// Gated on the exact prefix so an ordinary message that happens to contain
+/// "User task:" is untouched. Port of `ChatEngine.strippedBridgeInstructionPreamble`.
+pub fn strip_bridge_instruction_preamble(text: &str) -> &str {
+    const PREAMBLE_PREFIX: &str = "Vibe bridge startup prepared these instruction files";
+    const TASK_MARKER: &str = "User task:";
+    if !text.starts_with(PREAMBLE_PREFIX) {
+        return text;
+    }
+    match text.find(TASK_MARKER) {
+        Some(at) => text[at + TASK_MARKER.len()..].trim(),
+        None => text,
+    }
+}
+
 /// Comparable form of a mirrored prompt.
 ///
-/// The daemon prefixes a prompt with an attachment preamble ("The user attached
-/// …\n\n"), so an image-carrying prompt would not match its own sent row without
-/// stripping it.
+/// Strips **both** daemon-added preambles, in the order the shipped client
+/// strips them: the instruction-files preamble first, then the attachment
+/// pointer ("The user attached N image file(s)…\n\n"). Two prompts are the same
+/// send when their comparable forms match.
+///
+/// Order matters and the attachment check runs on the *already instruction-
+/// stripped* body: a prompt that carries both preambles would otherwise keep the
+/// attachment pointer, fail to match its own sent row, and render as a duplicate
+/// bubble. Port of `ChatEngine.bridgeMirrorComparableText`.
 pub fn bridge_mirror_comparable_text(text: &str) -> &str {
-    let body = text
-        .strip_prefix("The user attached ")
-        .and_then(|_| text.split_once("\n\n").map(|(_, rest)| rest))
-        .unwrap_or(text);
+    let body = strip_bridge_instruction_preamble(text);
+    let body = if body.starts_with("The user attached ") {
+        body.split_once("\n\n").map_or(body, |(_, rest)| rest)
+    } else {
+        body
+    };
     body.trim()
 }
 
@@ -278,6 +307,64 @@ mod tests {
 
     fn text_msg(id: &str, ts: i64, is_me: bool, text: &str) -> VibeMessageSnapshotV1 {
         VibeMessageSnapshotV1::text_message("chat", id, ts, "u1", is_me, text)
+    }
+
+    /// The exact preamble the daemon prepends, as the shipped client matches it.
+    const INSTRUCTION_PREAMBLE: &str =
+        "Vibe bridge startup prepared these instruction files for you.\nUser task:\n";
+
+    #[test]
+    fn instruction_preamble_is_stripped() {
+        let raw = format!("{INSTRUCTION_PREAMBLE}fix the login bug");
+        assert_eq!(bridge_mirror_comparable_text(&raw), "fix the login bug");
+    }
+
+    #[test]
+    fn both_preambles_strip_in_the_shipped_order() {
+        // The case the single-strip implementation got wrong: a prompt carrying
+        // an attachment *and* the instruction block kept the attachment pointer
+        // and therefore never matched its own sent row.
+        let raw = format!(
+            "{INSTRUCTION_PREAMBLE}The user attached 2 image file(s) to this message.\n\nlook at these"
+        );
+        assert_eq!(bridge_mirror_comparable_text(&raw), "look at these");
+    }
+
+    #[test]
+    fn attachment_preamble_alone_still_strips() {
+        let raw = "The user attached 1 image file(s) to this message.\n\nwhat is this";
+        assert_eq!(bridge_mirror_comparable_text(raw), "what is this");
+    }
+
+    #[test]
+    fn ordinary_text_mentioning_the_marker_is_untouched() {
+        // Gated on the exact prefix, so a normal message that happens to say
+        // "User task:" keeps every character.
+        let raw = "here is my User task: ship it";
+        assert_eq!(bridge_mirror_comparable_text(raw), raw);
+    }
+
+    #[test]
+    fn preamble_prefix_without_the_marker_is_left_alone() {
+        let raw = "Vibe bridge startup prepared these instruction files and stopped";
+        assert_eq!(bridge_mirror_comparable_text(raw), raw);
+    }
+
+    #[test]
+    fn a_mirror_carrying_both_preambles_dedups_against_the_real_send() {
+        // End-to-end: the parity bug as it would have reached a user — two
+        // bubbles for one prompt.
+        let sent = text_msg("srv-1", 1_000, true, "look at these");
+        let mirror = text_msg(
+            "bridge-1",
+            2_000,
+            true,
+            &format!(
+                "{INSTRUCTION_PREAMBLE}The user attached 2 image file(s) to this message.\n\nlook at these"
+            ),
+        );
+        let dropped = dedup_mirrored_prompt(&[sent, mirror]);
+        assert!(dropped.contains("bridge-1"));
     }
 
     fn agent_msg(

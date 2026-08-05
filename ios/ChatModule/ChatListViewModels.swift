@@ -501,6 +501,19 @@ struct ChatListRow {
   }
 
   let kind: Kind
+  /// Stable identity for this row, for as long as it is the same message.
+  ///
+  /// **Never random.** The previous fallback was `UUID().uuidString` whenever the
+  /// payload arrived without a `key`, which looks harmless and is not: identity
+  /// is what `ChatTimelineLayout` keys its height memo by, so a row with a fresh
+  /// identity on every parse can never be found in the memo, is re-measured on
+  /// every rebuild forever, and is treated as a brand-new row by every diff.
+  ///
+  /// On device that showed as `[TimelineLayout] REBUILD 80ms … measured=1386
+  /// reused=0` — a layout whose entire design is "only re-ask about rows it has
+  /// not seen" re-asking about all of them, ~80ms at a time, repeatedly, some of
+  /// it under the reader's finger. Every derivation below is a pure function of
+  /// the payload, so the same row always yields the same string.
   let key: String
   let label: String
   let text: String
@@ -522,6 +535,21 @@ struct ChatListRow {
   /// User id of the author referenced by the reply preview (quoted original).
   /// Used to resolve that author's banner palette for the compact preview only.
   let replyPreviewUserId: String?
+
+  /// The row is a reply whose quoted preview has not been resolved yet.
+  ///
+  /// The reply chip is worth roughly 46pt, and it arrives with enrichment rather than
+  /// with the message. A height measured in this state is a guess that WILL change —
+  /// the same category as a square-fallback media height — so it must not be trusted
+  /// or written to disk. Agent rows are excluded because they never render a reply
+  /// band at all and their reply fields flip nil↔value forever, which is exactly why
+  /// `==` already ignores them.
+  var hasUnresolvedReplyPreview: Bool {
+    guard !isAgentMessage, let replyToId, !replyToId.isEmpty else { return false }
+    let hasTitle = !(replyPreviewTitle ?? "").isEmpty
+    let hasText = !(replyPreviewText ?? "").isEmpty
+    return !hasTitle && !hasText
+  }
   let reactionEmoji: String?
   let shape: BubbleShape
   let messageType: String
@@ -645,7 +673,19 @@ struct ChatListRow {
     }
     // Sealed Claude/Codex image blobs (or durable thumbs after reopen) ride on
     // messages that must render as media, not bare text.
-    if !agentBridgeAttachmentsEnc.isEmpty || !attachmentThumbnailsB64.isEmpty {
+    //
+    // Explicitly NOT for `messageType == "file"`. A PDF ships a page thumbnail, and a
+    // thumbnail is decoration inside the document plate — not a reason to render the whole
+    // row as a photograph. Worse, whether that thumb is populated depends on which
+    // pipeline produced the row (warm snapshot, engine, durable cache), so the same
+    // message came back `.media` on one pass and `.document` on the next. The two render
+    // at different heights, and a row whose KIND is unstable has a height that oscillates
+    // forever: device run 2026-08-04, chat 47157fce5863, key 8-16f4a794ac1d, correcting
+    // `was=412 now=612` on one open and `was=612 now=412` on the next, visibly, every
+    // time. A genuine image sent as a file is still caught below by `inferredImage`, which
+    // reads the file name and url rather than the presence of a thumb.
+    if messageType != "file", !agentBridgeAttachmentsEnc.isEmpty || !attachmentThumbnailsB64.isEmpty
+    {
       return .media
     }
     let inferredVideo = isVideoMediaReference(mediaUrl: mediaUrl, fileName: fileName)
@@ -702,13 +742,68 @@ struct ChatListRow {
     return normalized == "sending" || normalized == "pending"
   }
 
+  /// Derives `key` from the payload, deterministically, in every case.
+  ///
+  /// The order is by decreasing confidence, and each step is something that does
+  /// not change while the row is the same row:
+  ///
+  /// 1. the key the sender supplied (`ChatEngine` emits `"m-<messageId>"`);
+  /// 2. the message id, which is what a supplied key is built from anyway;
+  /// 3. the client id, for an outgoing row the server has not acknowledged yet —
+  ///    it survives exactly until the real id arrives, which is the moment the
+  ///    row legitimately becomes a different row;
+  /// 4. the day label, for separators;
+  /// 5. a hash of the payload's identifying fields.
+  ///
+  /// Step 5 is the important one. It replaces a random UUID, and the difference
+  /// is that two parses of the same content now agree. A hash can collide where
+  /// a UUID cannot — but a collision means two rows the payload describes
+  /// identically, which the reader could not tell apart either, whereas the UUID
+  /// guaranteed a miss for *every* row that reached this branch.
+  private static func stableKey(raw: [String: Any], kindRaw: String) -> String {
+    func text(_ value: Any?) -> String? {
+      guard let string = value as? String else { return nil }
+      let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let supplied = text(raw["key"]) { return supplied }
+
+    let message = raw["message"] as? [String: Any]
+    if let id = text(message?["id"]) ?? text(raw["id"]) { return "m-\(id)" }
+    if let clientId = text(message?["clientId"]) ?? text(raw["clientId"]) {
+      return "c-\(clientId)"
+    }
+    if kindRaw == "day", let label = text(raw["label"]) { return "day-\(label)" }
+
+    // Last resort. Hash the fields that identify a row rather than the whole
+    // payload: status, upload progress and read receipts all mutate on a row
+    // that is still the same row, and folding them in would mint a new identity
+    // every time a checkmark changed — reintroducing the bug this replaces.
+    //
+    // FNV-1a and not `Hasher`. Swift seeds `Hasher` randomly per process, so it
+    // is stable within a launch and different on the next one — and row heights
+    // are persisted to disk under these keys, so a per-launch identity would
+    // hand every relaunch a cold height table while looking correct in testing.
+    let identifying = [
+      kindRaw,
+      text(message?["senderId"]) ?? text(raw["senderUserId"]) ?? "",
+      text(message?["createdAt"]) ?? text(raw["timestamp"]) ?? "",
+      text(message?["content"]) ?? text(raw["text"]) ?? "",
+      text(message?["mediaUrl"]) ?? "",
+    ].joined(separator: "\u{1}")
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in identifying.utf8 {
+      hash ^= UInt64(byte)
+      hash = hash &* 0x0000_0100_0000_01b3
+    }
+    return "h-\(String(hash, radix: 36))"
+  }
+
   init?(raw: [String: Any]) {
     guard let kindRaw = raw["kind"] as? String else {
       return nil
     }
-    let keyValue =
-      (raw["key"] as? String)?.isEmpty == false ? (raw["key"] as? String)! : UUID().uuidString
-    key = keyValue
+    key = Self.stableKey(raw: raw, kindRaw: kindRaw)
 
     if kindRaw == "day" {
       kind = .day

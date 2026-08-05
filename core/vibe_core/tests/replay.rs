@@ -3,7 +3,10 @@
 
 mod common;
 
-use common::{drive, event_from, reducer, reducer_for, text_event, window_ids, CHAT, ME, PEER, T0};
+use common::{
+    bounded_reducer, drive, event_from, reducer, reducer_for, text_event, unbounded_reducer,
+    window_ids, CHAT, ME, PEER, T0,
+};
 
 use vibe_core::delta::apply_ops;
 use vibe_core::fixtures::{self, VibeFixtureKind};
@@ -155,7 +158,7 @@ fn generations_are_contiguous_and_a_gap_recovers_through_reset() {
 
 #[test]
 fn a_reset_window_is_a_full_replacement_the_consumer_can_adopt_blind() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     drive(
         &mut r,
         (0..500)
@@ -992,9 +995,41 @@ fn a_terminal_agent_frame_retires_the_live_row_marker() {
 // Windowing
 // ---------------------------------------------------------------------------
 
+/// What "unbounded" means, for the callers that ask for it: the window is the store,
+/// `page_before` reports no movement, and a new arrival extends the same window rather
+/// than sliding it. Not the shipping default — see `VibeWindowPolicy::default`.
+#[test]
+fn an_unbounded_reducer_mounts_the_whole_conversation_and_never_pages() {
+    let mut r = unbounded_reducer();
+    drive(
+        &mut r,
+        (0..1_000)
+            .map(|i| text_event(&format!("m{i:04}"), T0 + i, PEER, "x"))
+            .collect(),
+        9_000,
+    );
+    let window = r.current_window(CHAT).unwrap();
+    assert_eq!(window.messages.len(), 1_000);
+    assert_eq!(window.messages.first().unwrap().message_id, "m0000");
+    assert_eq!(window.messages.last().unwrap().message_id, "m0999");
+    assert!(!window.bounds.has_more_before);
+    assert!(!window.bounds.has_more_after);
+
+    // Nothing left to page to, in either direction.
+    assert!(r.page_before(CHAT, 9_100).unwrap().is_none());
+    assert!(r.page_after(CHAT, 9_200).unwrap().is_none());
+
+    // A new message extends the window; it does not push the oldest one out.
+    drive(&mut r, vec![text_event("m1000", T0 + 1_000, PEER, "x")], 9_300);
+    let grown = r.current_window(CHAT).unwrap();
+    assert_eq!(grown.messages.len(), 1_001);
+    assert_eq!(grown.messages.first().unwrap().message_id, "m0000");
+    assert_eq!(grown.messages.last().unwrap().message_id, "m1000");
+}
+
 #[test]
 fn scroll_back_prepends_and_never_deletes() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     drive(
         &mut r,
         (0..1_000)
@@ -1029,7 +1064,7 @@ fn scroll_back_prepends_and_never_deletes() {
 
 #[test]
 fn jump_to_message_then_return_to_the_bottom() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     drive(
         &mut r,
         (0..2_000)
@@ -1074,7 +1109,7 @@ fn jump_to_message_then_return_to_the_bottom() {
 
 #[test]
 fn a_store_change_outside_the_window_emits_bounds_without_row_ops() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     drive(
         &mut r,
         (0..1_000)

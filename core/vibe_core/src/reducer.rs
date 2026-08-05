@@ -1507,7 +1507,11 @@ fn unread_state_ref(state: &ChatState, own_user_id: &str) -> VibeUnreadState {
     let mut count = 0u32;
     let mut first_unread_id = None;
     for m in state.messages.iter().skip(start) {
-        if m.author.is_me || (!own_user_id.is_empty() && m.author.user_id == own_user_id) {
+        // Case-insensitive id compare — see `canonical::resolve_is_me`. Byte-exact
+        // here would count the user's own messages as unread.
+        if m.author.is_me
+            || (!own_user_id.is_empty() && m.author.user_id.eq_ignore_ascii_case(own_user_id))
+        {
             continue;
         }
         if m.flags.contains(VibeMessageFlags::HIDDEN_FROM_TRANSCRIPT) {

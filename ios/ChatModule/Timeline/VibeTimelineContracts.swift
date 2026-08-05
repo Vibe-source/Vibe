@@ -579,14 +579,24 @@ enum VibeRenderSnapshotValidator {
     if !snapshot.contentHeight.isFinite || snapshot.contentHeight < 0 {
       return .failure(.invalidContentHeight(snapshot.contentHeight))
     }
-    if !snapshot.items.isEmpty,
-       !VibeTimelineWindowPolicy.isValidActiveWindow(snapshot.items.count)
-    {
-      // Allow undersized windows during cold open / partial pages; only reject oversize.
-      if snapshot.items.count > VibeTimelineWindowPolicy.activeWindowRange.upperBound {
-        return .failure(.windowOutOfPolicy(count: snapshot.items.count))
-      }
-    }
+    // No window-size check. How many rows a host is willing to mount is that host's
+    // policy, not a property of whether a snapshot is well-formed — and treating it as
+    // validity is what silently disabled the core on every real conversation.
+    //
+    // This used to reject anything over `activeWindowRange.upperBound` (300). The Rust
+    // window then went unbounded and this did not follow, so from that moment every
+    // snapshot for a chat with more than 300 messages failed here, `apply(snapshot:)`
+    // never ran, the host's generation stayed 0, and every subsequent transaction was
+    // fenced. Device run 2026-08-04:
+    //   adapter FAILURE snapshot rejected failure=windowOutOfPolicy(count: 999)
+    //   host TRANSACTION-FENCED base=1 held=0 — resync owed
+    // repeating for the life of the chat. The core was doing all of its work and none
+    // of it reached the screen, and nothing said so until the adapter's diagnostic was
+    // routed to the console.
+    //
+    // A host that genuinely wants a bounded model still enforces its own bound and
+    // trims to it — see `VibeTimelineReferenceHost.trimIfNeeded`. That is the right
+    // place for it: the host knows what it can afford, the snapshot does not.
 
     var seen = Set<String>()
     var previousOrder: VibeOrderKey?

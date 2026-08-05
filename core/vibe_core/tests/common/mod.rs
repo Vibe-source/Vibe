@@ -50,6 +50,28 @@ pub fn reducer() -> VibeTimelineReducer {
     reducer_for(VibeChatClass::DirectMessage)
 }
 
+/// A reducer with the bounded window policy — same as [`reducer`], named for the tests
+/// that are specifically about paging and tail eviction so their intent survives any
+/// future change to what the default is.
+pub fn bounded_reducer() -> VibeTimelineReducer {
+    reducer()
+}
+
+/// A reducer whose window has **no ceiling**: the mounted set is the whole store.
+///
+/// Not the shipping default. A bounded window is what keeps the renderer's commit
+/// constant-cost; this exists for callers that genuinely want everything mounted, and
+/// for the tests that pin what unbounded means.
+pub fn unbounded_reducer() -> VibeTimelineReducer {
+    let mut r = VibeTimelineReducer::new(VibeCoreConfig {
+        own_user_id: ME.to_string(),
+        window_policy: vibe_core::window::VibeWindowPolicy::unbounded(),
+        ..VibeCoreConfig::default()
+    });
+    r.set_chat_profile(CHAT, VibeChatProfile::default());
+    r
+}
+
 pub fn reducer_for(class: VibeChatClass) -> VibeTimelineReducer {
     let mut r = VibeTimelineReducer::new(config());
     r.set_chat_profile(

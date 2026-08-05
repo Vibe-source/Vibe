@@ -19,6 +19,10 @@ struct VibeTimelineMetrics: Equatable {
   var metaHeight: CGFloat = 13
   var maxBubbleWidthFraction: CGFloat = 0.78
   var minRowHeight: CGFloat = 28
+  /// Width the inline clock + delivery ticks occupy on the last text line.
+  var inlineMetaWidth: CGFloat = 52
+  /// Gap between the end of the text and the inline meta.
+  var inlineMetaGap: CGFloat = 8
 
   /// Height reserved for media whose natural size is not yet known.
   ///
@@ -88,6 +92,9 @@ final class VibeRowMeasurementCache {
   /// real chat this must be zero — a non-zero count means the core is laying out rows
   /// it cannot actually size, and the heights on screen are fiction.
   private(set) var placeholderMeasurements = 0
+  /// Rows whose height is an estimate rather than a measurement. Nothing may
+  /// freeze one — see ``measure(_:revision:)``.
+  private(set) var placeholderIds: Set<String> = []
 
   var metrics: VibeTimelineMetrics = .default
 
@@ -117,10 +124,36 @@ final class VibeRowMeasurementCache {
   func forgetAll() { rows.removeAll(keepingCapacity: true) }
 
   /// Frozen geometry for a settled row: measured on first sight, reused forever.
+  ///
+  /// With one exception, and it is the exception that decides whether the core can ever
+  /// size a real chat. A row first seen before the list mounted its rows has no
+  /// `rowProvider` answer, so it is sized by ``placeholderMeasure(_:revision:)`` — and
+  /// this cache then reused that guess forever, because a placeholder was stored exactly
+  /// like a measurement. The core mounts its window during the push, when the
+  /// presentation seed is still stashed, so on a real chat that is *every* row: device
+  /// run 2026-08-04, `geometry DIFFERS … differed=9 worst core=42.0 list=34.0` — nine of
+  /// nine rows, permanently frozen at a font-and-a-box guess, and nothing in the app
+  /// would ever measure them again.
+  ///
+  /// `measure` already records those ids in `placeholderIds`, and `coreFrozenHeight`
+  /// already refuses them, so the guess was never *rendered* — it simply meant the core's
+  /// geometry could never become usable, which reads in the log as a permanent 8pt
+  /// disagreement and blocks the flip that seam exists for. Retry once the provider can
+  /// answer; a real measurement is still taken once and frozen, which is the invariant
+  /// this cache is actually defending.
   func settledGeometry(for message: VibeFfiMessage) -> VibeMeasuredRow {
     if let hit = rows[message.messageId] {
-      reuses += 1
-      return hit
+      // A real measurement is taken once and frozen. That is the invariant.
+      guard placeholderIds.contains(message.messageId) else {
+        reuses += 1
+        return hit
+      }
+      // A guess is only worth replacing once the provider can actually answer —
+      // otherwise re-running the same estimate on every window buys nothing.
+      guard rowProvider?(message.messageId) != nil else {
+        reuses += 1
+        return hit
+      }
     }
     let measured = measure(message, revision: 1)
     rows[message.messageId] = measured
@@ -145,8 +178,20 @@ final class VibeRowMeasurementCache {
     if let row = rowProvider?(message.messageId),
       let height = VibeRowMetrics.mainThreadHeight(row: row, rowWidth: width)
     {
+      placeholderIds.remove(message.messageId)
       return measuredFromRealRow(height: height, revision: revision)
     }
+    // Remember that this row's height is a guess.
+    //
+    // A placeholder is a font-and-a-box estimate, and the list must never freeze
+    // one: at first mount the list holds only its seed rows, so `rowProvider`
+    // answers `nil` for almost everything and every row would freeze at the
+    // estimate. Measured on device 2026-08-03 — 102 of 118 rows frozen at 55pt
+    // against a real 34pt, which is a visible shift on a settled transcript.
+    //
+    // Cleared as soon as a real measurement lands, so a row is only untrusted for
+    // as long as it is actually unmeasured.
+    placeholderIds.insert(message.messageId)
     placeholderMeasurements += 1
     return placeholderMeasure(message, revision: revision)
   }
@@ -226,9 +271,31 @@ final class VibeRowMeasurementCache {
       contentWidth = max(contentWidth, replyFrame.width)
     }
 
-    contentHeight += metrics.metaHeight
-    let metaFrame = CGRect(
-      x: 0, y: contentHeight - metrics.metaHeight, width: contentWidth, height: metrics.metaHeight)
+    // The meta (clock + ticks) sits on the LAST TEXT LINE when there is room beside it,
+    // and only takes its own line when there is not. Reserving a line unconditionally
+    // over-measured every short row by exactly `metaHeight` + its share of padding:
+    // device run 2026-08-03 reported `core=55.0 list=34.0` on all 200 rows of a chat
+    // whose bubbles are one word long. A renderer that draws the meta inline and a
+    // measurer that stacks it can never agree, and this is the measurer's error.
+    let metaWidth = metrics.inlineMetaWidth
+    let fitsInline =
+      !message.hasMedia
+      && textFrame.height > 0
+      && textFrame.height <= ceil(font.lineHeight) + 1
+      && textFrame.width + metrics.inlineMetaGap + metaWidth <= textWidth
+    let metaFrame: CGRect
+    if fitsInline {
+      metaFrame = CGRect(
+        x: textFrame.maxX + metrics.inlineMetaGap,
+        y: textFrame.maxY - metrics.metaHeight,
+        width: metaWidth, height: metrics.metaHeight)
+      contentWidth = max(contentWidth, metaFrame.maxX)
+    } else {
+      contentHeight += metrics.metaHeight
+      metaFrame = CGRect(
+        x: 0, y: contentHeight - metrics.metaHeight, width: contentWidth,
+        height: metrics.metaHeight)
+    }
 
     let bubbleWidth = min(maxBubble, contentWidth + metrics.bubblePaddingH * 2)
     let rowHeight = max(
@@ -525,6 +592,10 @@ final class VibeTimelineHost {
     (cache.measurements, cache.reuses, cache.invalidations, cache.placeholderMeasurements)
   }
 
+  /// Message ids whose height is an estimate. A consumer that freezes heights must
+  /// exclude these — an estimate frozen as if it were a measurement is a shift.
+  var placeholderMessageIds: Set<String> { cache.placeholderIds }
+
   // MARK: Mount
 
   /// Mounts a full window. Used for first paint, reopen, and trait changes.
@@ -537,9 +608,45 @@ final class VibeTimelineHost {
     }
     pendingMountWindow = nil
     resyncOutstanding = false
+    // The same window, mounted twice.
+    //
+    // A chat open publishes one window when the driver is armed and another when the
+    // engine reconcile lands, and on a chat that changed nothing in between they are the
+    // same generation over the same message ids. The second mount then rebuilds every
+    // render item, re-records every body and re-publishes an identical snapshot — device
+    // run 2026-08-04, chat 176cdf92eec5: two `host MOUNT gen=2 rows=1000` inside 180ms of
+    // an open that was already one continuous main-thread stall.
+    //
+    // `themeOrTrait` is exempt because that is precisely the case where the content is
+    // unchanged and the render must be rebuilt anyway.
+    if reason != .themeOrTrait, generation != 0, window.generation == generation,
+      applied.count == window.messages.count,
+      !zip(applied, window.messages).contains(where: { $0.identity.messageId != $1.messageId })
+    {
+      onDiagnostic?(
+        "mount skipped: window already applied",
+        ["chat": chatId, "gen": String(generation), "reason": reason.rawValue])
+      return
+    }
     // Anything already queued describes a window that is about to be replaced.
     // Committing it after the mount would apply stale ops to fresh state.
     committer.cancelPending()
+
+    // Decrypt health for this window, and the reason it is logged here rather
+    // than off the render snapshot: `VibeRenderItem` carries geometry and paint,
+    // never text, so by the time a snapshot exists there is nothing left to ask.
+    // This is the one place that sees what the core actually opened.
+    //
+    // `failed > 0` means the key seam refused — locked Keychain, a message sealed
+    // to another device, or (the bug this exists to catch) no unwrapper installed
+    // at all, in which case *every* row fails and the core is ordering messages it
+    // cannot read.
+    let failedFlag: UInt32 = 1 << 8  // VibeMessageFlags::DECRYPTION_FAILED
+    let failed = window.messages.filter { $0.flags & failedFlag != 0 }.count
+    let empty = window.messages.filter { $0.text.isEmpty && !$0.hasMedia }.count
+    NSLog(
+      "[VibeCore] window chat=%@ rows=%d decryptFailed=%d emptyNoMedia=%d",
+      String(chatId.prefix(12)), window.messages.count, failed, empty)
 
     let items = window.messages.map { factory.settledItem($0) }
     for message in window.messages { recordBody(message) }

@@ -163,6 +163,9 @@ defmodule Vibe.AI.AgenticEventShape do
     tool = to_string(tool)
 
     cond do
+      # read_url is a WEB step, not a file read. The "read" kind means "a file operation
+      # whose target is a path" to the client, which would render a URL as an edited file.
+      tool == "read_url" -> "web"
       String.contains?(tool, "music") -> "music"
       String.contains?(tool, "image") || String.contains?(tool, "vision") -> "image"
       String.contains?(tool, "search") -> "web"

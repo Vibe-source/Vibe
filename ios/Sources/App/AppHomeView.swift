@@ -7431,7 +7431,7 @@ final class ChatHomeNativeListController: UIViewController, UITableViewDataSourc
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-    ChatListView.prewarmWallpaperSnapshots(
+    ChatWallpaperView.prewarm(
       rawAppearance: ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark),
       size: view.bounds.size,
       scale: view.window?.screen.scale ?? UIScreen.main.scale
@@ -10489,6 +10489,12 @@ final class ChatConversationController: UIViewController {
   /// retires stale CLI/team state even if a terminal stream frame was missed.
   private var bridgeStatusPollTask: Task<Void, Never>?
 
+  /// Destination bounds handed over by `prepareForNavigationPush` before the view exists,
+  /// so `loadView` can size it before `viewDidLoad` seeds anything. See that method — a
+  /// seed measured at width 0 cannot hit the prepared-height store and sizes the whole
+  /// transcript by estimate.
+  private var prestagedInitialBounds: CGRect?
+
   /// The isolated full-screen agent runtime surface (Claude/Codex), hosted as a child VC
   /// over `mainView` when this DM's Default view is Agent or the user taps "See progress".
   /// It owns its full bounds + its own header (no nesting under the chat header → no clip /
@@ -10517,7 +10523,32 @@ final class ChatConversationController: UIViewController {
   /// window-attached is important: collection cells do not materialize correctly in a
   /// detached 0x0 hierarchy, while index 0 remains fully covered by Home.
   func prepareForNavigationPush(in navigationController: UINavigationController) {
+    // Phase stamps for the agent open. The total was 208-254ms against 24-46ms for an
+    // ordinary chat, and a single number cannot say which half to attack: loading the
+    // view, the first layout of 150 rows, or the seed mount inside `finish…`.
+    let t0 = ProcessInfo.processInfo.systemUptime
+    // Size the view BEFORE loading it.
+    //
+    // `loadViewIfNeeded()` runs `viewDidLoad`, which applies the route, binds the engine
+    // and stashes the seed. All of that used to happen while the view was still 0x0 —
+    // `[ZeroBounds] cover-show self=0x0 cv=0x0` on every open. The cost is not cosmetic:
+    // prepared heights are keyed by (row, WIDTH), so at width 0 every lookup misses. A
+    // device trace showed a chat with 1,368 cached heights reporting
+    // `sizing=estimated trust=0 cacheHit=0 storeMiss=1031 width=0` — it had the heights
+    // and used none of them, sized 1,386 rows by estimate, and then moved the whole list
+    // when the real heights arrived. That is the shift.
+    //
+    // The destination bounds are known here, so hand them over first and let the seed
+    // measure at final width.
+    let destinationBounds = navigationController.view.bounds
+    if isViewLoaded {
+      view.frame = destinationBounds
+    } else {
+      prestagedInitialBounds = destinationBounds
+    }
     loadViewIfNeeded()
+    view.frame = destinationBounds
+    let tLoad = ProcessInfo.processInfo.systemUptime
 
     let destinationSafeBottom = max(
       navigationController.view.safeAreaInsets.bottom,
@@ -10525,7 +10556,6 @@ final class ChatConversationController: UIViewController {
     )
     mainView.setNavigationPrestageSafeAreaBottom(destinationSafeBottom)
     mainView.beginNavigationPushPrestaging()
-    view.frame = navigationController.view.bounds
     view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     view.isHidden = true
     navigationController.view.insertSubview(view, at: 0)
@@ -10534,17 +10564,36 @@ final class ChatConversationController: UIViewController {
       view.layoutIfNeeded()
       mainView.layoutIfNeeded()
     }
+    let tLayout = ProcessInfo.processInfo.systemUptime
 
     mainView.finishNavigationPushPrestaging()
+    let tFinish = ProcessInfo.processInfo.systemUptime
     view.isHidden = false
-    UIView.performWithoutAnimation {
-      view.layoutIfNeeded()
-      mainView.layoutIfNeeded()
-    }
+    NSLog(
+      "[AgentOpen] prestage-phases loadView=%dms firstLayout=%dms finishPrestage=%dms total=%dms",
+      Int((tLoad - t0) * 1000), Int((tLayout - tLoad) * 1000),
+      Int((tFinish - tLayout) * 1000), Int((tFinish - t0) * 1000))
+    // One layout pass before the push, not two.
+    //
+    // `finishNavigationPushPrestaging` already lays the destination out — that is its
+    // job — and this second `layoutIfNeeded` pair re-ran the whole thing to catch the
+    // `isHidden` flip, which changes no geometry. On the agent surface that means laying
+    // out tall streaming-text turns twice (a device trace shows one at
+    // `bounds=332x1511`), and all of it happens *before* `pushViewController` is called:
+    // measured at 208-254ms of a completely dead tap, against 27-46ms for an ordinary
+    // chat. Visibility is not geometry; the frames are already correct.
   }
 
   override var preferredStatusBarStyle: UIStatusBarStyle {
     return isDark ? .lightContent : .darkContent
+  }
+
+  override func loadView() {
+    super.loadView()
+    // Before viewDidLoad, so the seed it triggers measures at the destination width.
+    if let prestagedInitialBounds {
+      view.frame = prestagedInitialBounds
+    }
   }
 
   override func viewDidLoad() {
@@ -10560,6 +10609,16 @@ final class ChatConversationController: UIViewController {
       mainView.topAnchor.constraint(equalTo: view.topAnchor),
       mainView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
     ])
+    // Resolve those constraints NOW, while the frame from `loadView` is known and before
+    // anything below applies the route. A constraint that has not been solved leaves
+    // `mainView` — and the collection view inside it — at 0x0, which is precisely the
+    // state the seed used to run in. One pass here replaces the estimate-everything
+    // seed with a measured one.
+    if prestagedInitialBounds != nil {
+      UIView.performWithoutAnimation {
+        view.layoutIfNeeded()
+      }
+    }
 
     mainView.onNativeEvent.handler = { [weak self] payload in
       self?.handleNativeEvent(payload)
@@ -10613,6 +10672,10 @@ final class ChatConversationController: UIViewController {
     // contract on every return (including an interactive pop that completes).
     navigationController?.setNavigationBarHidden(true, animated: false)
     mainView.setEngineStateUpdatesSuspended(false)
+    // Back on screen — bounds and safe area are honest again, so let the insets follow
+    // them. Deliberately does not force a recompute; the layout pass that is about to
+    // happen anyway does it with the right numbers.
+    mainView.setGeometryFrozenForDismissal(false)
     logLifecycle("viewWillAppear")
     logVisualState("viewWillAppear", force: true)
     // If this DM's Default view is Agent, mount the isolated agent surface NOW so it rides this
@@ -10701,6 +10764,11 @@ final class ChatConversationController: UIViewController {
     // reconnect cannot rebuild iOS 26 glass effects inside the outgoing view.
     // viewWillAppear resumes with one forced catch-up snapshot.
     mainView.setEngineStateUpdatesSuspended(true)
+    // Hold the transcript's insets still for the duration of the dismissal. An
+    // interactive swipe feeds this view changing bounds and a changing bottom safe area
+    // the whole way out, and every one of those recomputes the composer height and the
+    // list's bottom inset — invisible on the way out, a jump on the way back.
+    mainView.setGeometryFrozenForDismissal(true)
     // Capture while the transcript is still on screen (drawHierarchy needs live
     // content) — this bitmap becomes the next open's first frame.
     mainView.captureReopenSnapshot()
@@ -16481,6 +16549,7 @@ final class ChatAgentConversationController: UIViewController {
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
     navigationController?.setNavigationBarHidden(true, animated: false)
+    mainView.setGeometryFrozenForDismissal(false)
   }
 
   /// Stage the local persisted agent transcript at the real destination bounds before
@@ -16543,6 +16612,9 @@ final class ChatAgentConversationController: UIViewController {
 
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
+    // See the note on the other chat host: an interactive pop drifts the composer
+    // height, and the transcript inherits it as a gap on the next open.
+    mainView.setGeometryFrozenForDismissal(true)
     mainView.captureReopenSnapshot()
   }
 

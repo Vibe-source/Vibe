@@ -448,6 +448,19 @@ fn resolve_message_id(raw: &Map<String, Value>, is_saved_messages: bool) -> Opti
     )
 }
 
+/// Whether this frame was authored by us.
+///
+/// The id comparison is **ASCII-case-insensitive**, and has to be. These are
+/// RFC 4122 UUIDs, where case carries no meaning — but the platform is not
+/// consistent about it: iOS `ChatEngine.currentUserIdLocked()` upper-cases the
+/// configured id before handing it over, while server frames carry `senderId`
+/// lower-cased. A byte-exact compare therefore answered "not me" for every
+/// message the user sent.
+///
+/// Device run 2026-08-03: `own_user_id = "CFAC3A0D-…"`, frames carrying
+/// `"cfac3a0d-…"`, and `height-audit … flipped=[status=99, isMe=99]` — 99 of 119
+/// of the user's own messages re-rendered as the peer's the moment core rows took
+/// over from engine rows.
 fn resolve_is_me(raw: &Map<String, Value>, own_user_id: &str) -> bool {
     if let Some(v) = pick_bool(raw, &["isMe", "is_me", "isOwn", "outgoing"]) {
         return v;
@@ -467,7 +480,7 @@ fn resolve_is_me(raw: &Map<String, Value>, own_user_id: &str) -> bool {
             "from",
         ],
     )
-    .is_some_and(|id| id == own_user_id)
+    .is_some_and(|id| id.eq_ignore_ascii_case(own_user_id))
 }
 
 fn resolve_status(raw: &Map<String, Value>) -> VibeDisplayStatus {
@@ -975,6 +988,30 @@ mod tests {
             aead,
             unwrapper,
         }
+    }
+
+    /// The platform upper-cases the configured user id; the server lower-cases
+    /// `senderId`. A byte-exact compare made every message the user sent render as
+    /// the peer's — observed on device 2026-08-03 as 99 of 119 rows flipping.
+    #[test]
+    fn authorship_ignores_uuid_case() {
+        let aead = VibeDenyAllAead;
+        let unwrap = VibeDenyAllKeyUnwrapper;
+        let uppercased = VibeCanonicalContext {
+            chat_id: "chat-1",
+            own_user_id: "CFAC3A0D-C764-473C-9940-33FCA418834A",
+            is_saved_messages: false,
+            aead: &aead,
+            unwrapper: &unwrap,
+        };
+
+        let mine = br#"{"id":"m1","chat_id":"chat-1","senderId":"cfac3a0d-c764-473c-9940-33fca418834a","timestamp":5,"encrypted_content":"{\"text\":\"hi\"}"}"#;
+        let theirs = br#"{"id":"m2","chat_id":"chat-1","senderId":"7486c619-3d97-4067-afd6-662fb13f6dd5","timestamp":6,"encrypted_content":"{\"text\":\"hi\"}"}"#;
+
+        let a = canonicalize_frame(mine, &uppercased).unwrap();
+        let b = canonicalize_frame(theirs, &uppercased).unwrap();
+        assert!(a.messages[0].author.is_me, "own message must resolve as mine");
+        assert!(!b.messages[0].author.is_me, "peer message must stay the peer's");
     }
 
     #[test]

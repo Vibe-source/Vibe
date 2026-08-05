@@ -1550,7 +1550,17 @@ let bubbleTailOverhang: CGFloat = 7.8
 let bubbleTailBottomOverhang: CGFloat = 0.5
 
 private let bubbleMessageFont = UIFont.systemFont(ofSize: 16)
-private let bubbleMetaFont = UIFont.systemFont(ofSize: 10, weight: .medium)
+/// Monospaced digits, and that is load-bearing rather than typographic taste.
+///
+/// The timestamp is part of the bubble's minimum width (`measuredTextWidth(row.timestamp,
+/// …)`), and in the proportional system font `1` is roughly two points narrower than the
+/// other digits. So "18:11" measures narrower than "17:04", and a column of identical
+/// one-word messages came out at visibly different widths — a ragged left edge down the
+/// whole transcript that no amount of layout work could explain, because the layout was
+/// faithfully rendering two different widths. Fixed digit advance makes every timestamp
+/// of the same length the same width, which makes the bubble width a function of the
+/// message instead of the minute it was sent.
+private let bubbleMetaFont = UIFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
 private let bubbleMetaStatusFont = UIFont.systemFont(ofSize: 11, weight: .semibold)
 private let bubbleMetaInlineSpacing: CGFloat = 4.0
 private let bubbleMetaItemGap: CGFloat = 2.0
@@ -2776,6 +2786,21 @@ private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
   if let cached = cachedNaturalMediaSize(for: row.mediaUrl) {
     return cached
   }
+  // The local file this row renders from, if the memo knows that address instead. One
+  // photo has several urls (remote, signed, vault path, container file) and the sizing
+  // path must recognise the size whichever one it was learned under.
+  if let local = row.localMediaUrl, !local.isEmpty,
+    let cachedLocal = cachedNaturalMediaSize(for: local)
+  {
+    return cachedLocal
+  }
+  if let local = row.localMediaUrl, !local.isEmpty,
+    let identity = chatMediaNaturalSizeIdentity(local),
+    let stored = ChatMediaNaturalSizeStore.shared.size(for: identity)
+  {
+    cacheNaturalMediaSize(stored, for: row.mediaUrl)
+    return stored
+  }
   // Remembered from a previous launch. Without this, a photo whose payload carries no
   // dimensions was sized as a square on EVERY cold launch, because the two sources above are
   // in-memory only and the one below only answers for local files.
@@ -2825,7 +2850,16 @@ private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
 /// The decode that resolves an image fills the memo, so this flips true exactly then.
 func chatMediaNaturalAspectIsKnownInMemory(for row: ChatListRow) -> Bool {
   if let mw = row.mediaWidth, let mh = row.mediaHeight, mw > 1.0, mh > 1.0 { return true }
-  return cachedNaturalMediaSize(for: row.mediaUrl) != nil
+  if cachedNaturalMediaSize(for: row.mediaUrl) != nil { return true }
+  // The local url the cell rendered from, when it differs from the row's. Same reason
+  // `reportNaturalMediaSizeIfNeeded` records under both — the two addresses for one photo
+  // are the whole bug, and a memo that answers for one of them must answer for the row.
+  if let local = row.localMediaUrl, !local.isEmpty,
+    cachedNaturalMediaSize(for: local) != nil
+  {
+    return true
+  }
+  return false
 }
 
 /// Which source answered `resolvedMediaNaturalSize` — the single decision behind a media row's
@@ -9481,6 +9515,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// music playback + the player-sheet list on the chat that actually owns the message.
   var hostChatId: String = ""
 
+  /// Stopwatch marks for the phase that turned out to dominate a chat open, and that no
+  /// previous census could see.
+  ///
+  /// Swift runs every stored-property initializer BEFORE `super.init` returns, so a timer
+  /// started at the top of `init(frame:)` has already missed the construction of all ~90
+  /// subviews. That is why the section census read 1.2ms while `dequeueReusableCell`
+  /// measured 5-6ms per row on device (`[CellCost] cellForItem … dequeue=5.5`): the
+  /// missing 4ms is spent before the initializer body starts.
+  ///
+  /// Declaration order is the execution order, so a `let` placed between two groups of
+  /// properties times the group above it. These are four `systemUptime` reads per cell and
+  /// they answer the only open question left about mount cost: which cluster to make lazy.
+  private let clkPropertiesBegan = ProcessInfo.processInfo.systemUptime
+
   let bubbleView = BubbleBackgroundView()
   let tailView = BubbleTailView()
 
@@ -9504,7 +9552,46 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let messageLabel = AgentStreamingLabel()
   // The real interleaved step/narration/diff renderer, bubble-shelled — the live content
   // for a 1:1 agent turn (see bubbleUsesAgentTurnContent).
-  private let agentTurnContentView = VibeAgentTurnContentView()
+  /// Built the first time an agent turn is rendered — see ``agentTurnContentView``.
+  private var _agentTurnContentView: VibeAgentTurnContentView?
+  /// The interleaved step/narration/diff panel for a 1:1 agent turn. 462us to construct,
+  /// and the most expensive single thing in the cell after the text view.
+  ///
+  /// It is used only by agent turns, which in a human conversation is none of the rows,
+  /// so building one per cell was the largest pure waste in the mount. Same rule as
+  /// ``agentActionBarView``: reads through `_agentTurnContentView?` wherever the intent is
+  /// to hide, reset, measure-if-present or animate-if-present, and through this property
+  /// only where the panel is genuinely about to render.
+  private var agentTurnContentView: VibeAgentTurnContentView {
+    if let existing = _agentTurnContentView { return existing }
+    let view = VibeAgentTurnContentView()
+    view.clipsToBounds = true
+    view.onStepTap = { [weak self] nodeId in
+      guard let self, let row = self.row, let messageId = row.messageId else { return }
+      self.onAgentAction?(["type": "toggleAgentStep", "messageId": messageId, "nodeId": nodeId])
+    }
+    view.onOpenSubagent = { [weak self] nodeId in
+      guard let self, let row = self.row, let messageId = row.messageId else { return }
+      self.onAgentAction?(["type": "openAgentSubagent", "messageId": messageId, "nodeId": nodeId])
+    }
+    view.onToggleRuntimeExpand = { [weak self] in
+      guard let self, let row = self.row, let messageId = row.messageId else { return }
+      self.onAgentAction?(["type": "toggleAgentRuntime", "messageId": messageId])
+    }
+    view.onReviewTapped = { [weak self] in
+      guard let self, let row = self.row, let messageId = row.messageId else { return }
+      self.onAgentAction?(["type": "agentReviewTapped", "messageId": messageId])
+    }
+    view.onFileTapped = { [weak self] _ in
+      guard let self, let row = self.row, let messageId = row.messageId else { return }
+      self.onAgentAction?(["type": "agentReviewTapped", "messageId": messageId])
+    }
+    // Above the plain text label and below the media host, which is where the eager
+    // version sat in the initializer's subview order.
+    contentView.insertSubview(view, aboveSubview: messageLabel)
+    _agentTurnContentView = view
+    return view
+  }
   private var agentTurnState = AgentTurnBubbleState()
   // Reconfigure gate for agentTurnContentView: `layoutSubviews` runs on every scroll
   // tick / pin adjustment, but `configure(row:)` re-parses the FULL progress payload
@@ -9517,7 +9604,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var lastAgentTurnConfiguredStyle: UIUserInterfaceStyle = .unspecified
   private let richTextView = BubbleRichTextView()
   private let replyPreviewView = BubbleReplyPreviewView()
-  private let linkPreviewView = BubbleLinkPreviewView()
+  /// Built the first time a row carries a link preview — see ``linkPreviewView``.
+  private var _linkPreviewView: BubbleLinkPreviewView?
+  /// The link-preview card. 156us to construct, needed by the rare message that has a URL.
+  ///
+  /// Same contract as ``agentTurnContentView`` and ``agentActionBarView``: hiding,
+  /// resetting, zeroing a frame and reading visibility all go through
+  /// `_linkPreviewView?`; only rendering a preview goes through this.
+  private var linkPreviewView: BubbleLinkPreviewView {
+    if let existing = _linkPreviewView { return existing }
+    let view = BubbleLinkPreviewView()
+    view.applyAppearance(appearance, isMe: row?.isMe ?? false)
+    // Directly above the reply preview, matching the eager initializer's subview order.
+    contentView.insertSubview(view, aboveSubview: replyPreviewView)
+    _linkPreviewView = view
+    return view
+  }
+  /// Everything above: bubble plate, tail, text/rich-text, reply + link previews.
+  private let clkPropsAfterBubble = ProcessInfo.processInfo.systemUptime
   private let mediaContainerView = UIView()
   private let mediaPlaceholderBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
   private let mediaPlaceholderTintView = UIView()
@@ -9546,6 +9650,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     label: "chat.media.grid-decode", qos: .userInitiated)
   private let mediaProgressSpinner = UIActivityIndicatorView(style: .medium)
   private let mediaProgressSizeLabel = UILabel()
+  /// Everything above: the whole media cluster — image/video host, blur, Lottie, voice
+  /// waveform, badges, progress ring, spinner. A text bubble uses none of it.
+  private let clkPropsAfterMedia = ProcessInfo.processInfo.systemUptime
   private let inlineAttachmentView = UIView()
   private let inlineAttachmentIconView = UIImageView()
   private let inlineAttachmentTitleLabel = UILabel()
@@ -9557,6 +9664,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let statusImageView = UIImageView()
   private let statusLabel = UILabel()
   private let pendingStatusView = ChatPendingStatusView()
+  /// Everything above: inline attachment plate and the meta row (time, edited, pinned,
+  /// status glyph).
+  private let clkPropsAfterMeta = ProcessInfo.processInfo.systemUptime
   private let retryButton = UIButton(type: .system)
   private let agentRegenerateButton = UIButton(type: .system)
   // "View agent" side button on completed agent bubbles — opens the native
@@ -9577,7 +9687,30 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var tallContentAnimationGeneration: UInt = 0
   private let notSentIndicator = UIImageView()
   private var notSentIndicatorShown = false
-  private let agentActionBarView = ChatNativeAgentActionBarView()
+  /// Built the first time a row actually needs it — see ``agentActionBarView``.
+  private var _agentActionBarView: ChatNativeAgentActionBarView?
+  /// The action bar under an `agent_actions` row: 319us to construct, and needed by a
+  /// vanishingly small fraction of messages.
+  ///
+  /// Every cell used to build one. In a thousand-row transcript of ordinary text that is
+  /// 319ms spent on a control nobody will see, paid again on every mount. The three heavy
+  /// optional subviews (this, the agent turn panel, the link preview) together account for
+  /// ~940us of a ~3.6ms cell.
+  ///
+  /// The rule that makes laziness actually pay: **hiding must not build**. Touching this
+  /// property creates the view, so every `isHidden = true` / reset path uses
+  /// `_agentActionBarView?` instead. A single stray `agentActionBarView.isHidden = true`
+  /// in a reset path would construct one for every cell and give back nothing.
+  private var agentActionBarView: ChatNativeAgentActionBarView {
+    if let existing = _agentActionBarView { return existing }
+    let view = ChatNativeAgentActionBarView()
+    view.onNativeEvent = { [weak self] payload in
+      self?.onAgentAction?(payload)
+    }
+    contentView.addSubview(view)
+    _agentActionBarView = view
+    return view
+  }
   private let serviceActionBarView = ChatServiceActionBarView()
   private let dayLabel = UILabel()
   private let reactionPillView = UIView()
@@ -9696,6 +9829,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// shows as empty air above it). The host drops that row's cached/persisted height and
   /// re-measures; see the report in `layoutSubviews`.
   var onSlotHeightMismatch: ((String, CGFloat) -> Void)?
+  /// Everything above: buttons, action bars, day pill, reaction pill, selection circle,
+  /// and the callback slots. Last stored property — `init(frame:)` starts after this.
+  private let clkPropsEnded = ProcessInfo.processInfo.systemUptime
 
   /// One-shot construction cost census. Every subview below is a stored `let`, so a plain
   /// text bubble pays for a blur view, an AVPlayerLayer, a Lottie view and the whole
@@ -9711,6 +9847,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       NSLog("[CellCost] %@ %.0fus", label, us)
     }
     timeUs("ChatListCell(WHOLE)") { _ = ChatListCell(frame: .zero) }
+    // The three every cell pays for unconditionally. `stored properties … bubble+text`
+    // measures 2,489us on device while the optional views inside that same group add up
+    // to ~660us, so ~1.8ms belongs to these — and none of them were in this census, which
+    // is why the missing time looked like "multiplicity" rather than three named types.
+    // A view that every message needs cannot be made lazy, so it has to be made cheaper,
+    // and that starts with knowing which of the three it is.
+    timeUs("BubbleBackgroundView") { _ = BubbleBackgroundView(frame: .zero) }
+    timeUs("BubbleTailView") { _ = BubbleTailView() }
+    timeUs("AgentStreamingLabel") { _ = AgentStreamingLabel() }
     timeUs("VibeAgentTurnContentView") { _ = VibeAgentTurnContentView() }
     timeUs("UIVisualEffectView(blur)") {
       _ = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
@@ -9729,8 +9874,34 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     timeUs("UILabel") { _ = UILabel() }
   }
 
+  /// Per-section cost of building one cell, averaged over the first `initCensusSamples`
+  /// cells and printed once.
+  ///
+  /// `logConstructionCostCensus` times each subview *type* once, which cannot explain the
+  /// total: the whole cell measures ~8,700us while every type it names adds up to ~1,300.
+  /// The missing 7ms is multiplicity — dozens of labels, image views and containers, and
+  /// 73 `addSubview` calls — and a per-type census is structurally unable to attribute it.
+  /// Lazy conversion has to know which *cluster* to start with, so this measures the
+  /// clusters as the initializer actually builds them.
+  ///
+  /// The stamps cost four `systemUptime` reads on the first 20 cells and nothing after.
+  private static var initCensusSamples = 0
+  private static var initCensusBase: Double = 0
+  private static var initCensusMedia: Double = 0
+  private static var initCensusAttachmentMeta: Double = 0
+  private static var initCensusAgent: Double = 0
+  // The stored-property phase, which runs before `init(frame:)` and is where the missing
+  // milliseconds actually are. Same four groups, timed by the `clkProps*` marks.
+  private static var propCensusBubble: Double = 0
+  private static var propCensusMedia: Double = 0
+  private static var propCensusMeta: Double = 0
+  private static var propCensusRest: Double = 0
+  private static var propCensusSuperInit: Double = 0
+
   override init(frame: CGRect) {
     super.init(frame: frame)
+    let censusActive = Self.initCensusSamples < 20
+    let t0 = censusActive ? ProcessInfo.processInfo.systemUptime : 0
 
     clipsToBounds = false
     contentView.clipsToBounds = false
@@ -9742,10 +9913,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(forwardedFromHeader)
     forwardedFromHeader.isHidden = true
     contentView.addSubview(messageLabel)
-    contentView.addSubview(agentTurnContentView)
     contentView.addSubview(richTextView)
     contentView.addSubview(replyPreviewView)
-    contentView.addSubview(linkPreviewView)
+    let tBase = censusActive ? ProcessInfo.processInfo.systemUptime : 0
     contentView.addSubview(mediaContainerView)
     // Image/video host first; soft material blur sits ABOVE still pixels (Telegram
     // transfer look) but below progress ring / play chrome.
@@ -9770,6 +9940,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaBorderLayer.fillColor = UIColor.clear.cgColor
     mediaBorderLayer.isHidden = true
     mediaContainerView.layer.addSublayer(mediaBorderLayer)
+    let tMedia = censusActive ? ProcessInfo.processInfo.systemUptime : 0
     inlineAttachmentView.addSubview(inlineAttachmentIconView)
     inlineAttachmentView.addSubview(inlineAttachmentTitleLabel)
     inlineAttachmentView.addSubview(inlineAttachmentSubtitleLabel)
@@ -9781,6 +9952,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     metaContainerView.addSubview(statusImageView)
     metaContainerView.addSubview(statusLabel)
     metaContainerView.addSubview(pendingStatusView)
+    let tAttachmentMeta = censusActive ? ProcessInfo.processInfo.systemUptime : 0
     contentView.addSubview(dayLabel)
     contentView.addSubview(serviceActionBarView)
     serviceActionBarView.isHidden = true
@@ -9792,30 +9964,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(agentRegenerateButton)
     contentView.addSubview(agentViewButton)
     contentView.addSubview(notSentIndicator)
-    contentView.addSubview(agentActionBarView)
-    agentActionBarView.onNativeEvent = { [weak self] payload in
-      self?.onAgentAction?(payload)
-    }
-    agentTurnContentView.onStepTap = { [weak self] nodeId in
-      guard let self, let row = self.row, let messageId = row.messageId else { return }
-      self.onAgentAction?(["type": "toggleAgentStep", "messageId": messageId, "nodeId": nodeId])
-    }
-    agentTurnContentView.onOpenSubagent = { [weak self] nodeId in
-      guard let self, let row = self.row, let messageId = row.messageId else { return }
-      self.onAgentAction?(["type": "openAgentSubagent", "messageId": messageId, "nodeId": nodeId])
-    }
-    agentTurnContentView.onToggleRuntimeExpand = { [weak self] in
-      guard let self, let row = self.row, let messageId = row.messageId else { return }
-      self.onAgentAction?(["type": "toggleAgentRuntime", "messageId": messageId])
-    }
-    agentTurnContentView.onReviewTapped = { [weak self] in
-      guard let self, let row = self.row, let messageId = row.messageId else { return }
-      self.onAgentAction?(["type": "agentReviewTapped", "messageId": messageId])
-    }
-    agentTurnContentView.onFileTapped = { [weak self] _ in
-      guard let self, let row = self.row, let messageId = row.messageId else { return }
-      self.onAgentAction?(["type": "agentReviewTapped", "messageId": messageId])
-    }
+    // `agentActionBarView` is built and wired on first use, not here.
+    // `agentTurnContentView` is built and wired on first use, not here.
 
     contentView.addSubview(reactionPillView)
     reactionPillView.addSubview(reactionLabel)
@@ -9961,13 +10111,29 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     pendingStatusView.isHidden = true
     statusLabel.font = bubbleMetaStatusFont
     statusLabel.textAlignment = .center
+    // Resend: a glyph in the margin, not a badge.
+    //
+    // It used to be a 28pt disc with a saturated red plate behind an oversized
+    // `arrow.clockwise` — a control loud enough for a destructive confirmation, drawn
+    // once per failed row. A run that fails does not fail once, so the transcript filled
+    // its left margin with a column of red buttons that outweighed the messages beside
+    // them and read as damage rather than as "tap to send this again".
+    //
+    // This is the same treatment `agentRegenerateButton` already uses for the equivalent
+    // gesture (borderless, icon-only, sized to the meta row, tinted rather than filled),
+    // so the two "do it again" affordances in the transcript now look like each other.
+    // The failure itself is still stated by the "!" in the bubble's meta row; this is
+    // only the action.
     retryButton.isHidden = true
-    retryButton.tintColor = UIColor(red: 1.0, green: 0.48, blue: 0.48, alpha: 1.0)
-    retryButton.backgroundColor = UIColor(red: 1.0, green: 0.48, blue: 0.48, alpha: 0.14)
-    retryButton.layer.cornerCurve = .continuous
-    retryButton.layer.cornerRadius = 14
-    retryButton.setImage(UIImage(systemName: "arrow.clockwise"), for: .normal)
-    retryButton.imageView?.contentMode = .scaleAspectFit
+    retryButton.tintColor = UIColor(red: 0.98, green: 0.42, blue: 0.40, alpha: 0.92)
+    retryButton.backgroundColor = .clear
+    retryButton.layer.cornerRadius = 0
+    retryButton.setImage(
+      UIImage(
+        systemName: "arrow.counterclockwise",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 13.0, weight: .semibold)),
+      for: .normal)
+    retryButton.imageView?.contentMode = .center
     retryButton.addTarget(self, action: #selector(handleRetryTap), for: .touchUpInside)
 
     // Agent regenerate — same side-of-bubble placement as the error retry
@@ -10005,10 +10171,18 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     notSentIndicator.isUserInteractionEnabled = true
     notSentIndicator.addGestureRecognizer(
       UITapGestureRecognizer(target: self, action: #selector(handleNotSentTap)))
-    notSentIndicator.tintColor = UIColor(red: 1.0, green: 0.31, blue: 0.29, alpha: 1.0)
+    // An outline mark, not a filled disc.
+    //
+    // `exclamationmark.circle.fill` at 17pt semibold is a solid saturated red plate, and
+    // it is drawn once per failed row. On a transcript where a whole run failed — 512
+    // consecutive rows, which is exactly what the stranded-pending repair surfaces — the
+    // margin becomes a column of red discs shouting at the reader about something they
+    // already know. Failure is a state, not an alarm: the same information reads fine as
+    // a light outline glyph, and it stops competing with the message content beside it.
+    notSentIndicator.tintColor = UIColor(red: 0.98, green: 0.42, blue: 0.40, alpha: 0.92)
     notSentIndicator.image = UIImage(
-      systemName: "exclamationmark.circle.fill",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 17.0, weight: .semibold))
+      systemName: "exclamationmark.circle",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.5, weight: .medium))
 
     dayLabel.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
     dayLabel.textAlignment = .center
@@ -10033,10 +10207,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tailView.isHidden = true
     // agentSenderLabel removed
     messageLabel.isHidden = true
-    agentTurnContentView.isHidden = true
+    _agentTurnContentView?.isHidden = true
     richTextView.isHidden = true
     replyPreviewView.isHidden = true
-    linkPreviewView.isHidden = true
+    _linkPreviewView?.isHidden = true
     mediaContainerView.isHidden = true
     mediaPrimaryIconView.isHidden = true
     mediaVoiceButtonView.isHidden = true
@@ -10056,7 +10230,37 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusLabel.isHidden = true
     dayLabel.isHidden = true
     reactionPillView.isHidden = true
-    agentActionBarView.isHidden = true
+    _agentActionBarView?.isHidden = true
+
+    guard censusActive else { return }
+    let tEnd = ProcessInfo.processInfo.systemUptime
+    Self.initCensusBase += tBase - t0
+    Self.initCensusMedia += tMedia - tBase
+    Self.initCensusAttachmentMeta += tAttachmentMeta - tMedia
+    Self.initCensusAgent += tEnd - tAttachmentMeta
+    Self.propCensusBubble += clkPropsAfterBubble - clkPropertiesBegan
+    Self.propCensusMedia += clkPropsAfterMedia - clkPropsAfterBubble
+    Self.propCensusMeta += clkPropsAfterMeta - clkPropsAfterMedia
+    Self.propCensusRest += clkPropsEnded - clkPropsAfterMeta
+    Self.propCensusSuperInit += t0 - clkPropsEnded
+    Self.initCensusSamples += 1
+    guard Self.initCensusSamples == 20 else { return }
+    let n = 20.0
+    let us = { (total: Double) in total * 1_000_000 / n }
+    NSLog(
+      "[CellCost] init sections (avg of 20) base=%.0fus media=%.0fus attachment+meta=%.0fus agent+buttons+config=%.0fus TOTAL=%.0fus",
+      us(Self.initCensusBase), us(Self.initCensusMedia), us(Self.initCensusAttachmentMeta),
+      us(Self.initCensusAgent),
+      us(
+        Self.initCensusBase + Self.initCensusMedia + Self.initCensusAttachmentMeta
+          + Self.initCensusAgent))
+    NSLog(
+      "[CellCost] stored properties (avg of 20) bubble+text=%.0fus media=%.0fus attachment+meta=%.0fus rest=%.0fus super.init=%.0fus TOTAL=%.0fus",
+      us(Self.propCensusBubble), us(Self.propCensusMedia), us(Self.propCensusMeta),
+      us(Self.propCensusRest), us(Self.propCensusSuperInit),
+      us(
+        Self.propCensusBubble + Self.propCensusMedia + Self.propCensusMeta
+          + Self.propCensusRest + Self.propCensusSuperInit))
   }
 
   /// The pinned header date currently REPRESENTS this separator, so fade the in-list
@@ -10281,7 +10485,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       alpha: appearance.isDark ? 0.18 : 0.10
     )
     replyPreviewView.applyAppearance(appearance, isMe: isCurrentRowMe)
-    linkPreviewView.applyAppearance(appearance, isMe: isCurrentRowMe)
+    _linkPreviewView?.applyAppearance(appearance, isMe: isCurrentRowMe)
     updateInlineVideoAudioIcon()
     updateMediaPlaceholderVisibility()
     setNeedsLayout()
@@ -10471,7 +10675,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     self.skipRemoteMediaLoad = skipRemoteMediaLoad
     self.preferredLocalMediaURLOverride = preferredLocalMediaURLOverride
-    agentActionBarView.isHidden = true
+    _agentActionBarView?.isHidden = true
     agentRegenerateButton.isHidden = true
     agentViewButton.isHidden = true
 
@@ -10483,15 +10687,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       richTextView.reset()
       resetAgentTurnContent()
       replyPreviewView.reset()
-      linkPreviewView.reset()
+      _linkPreviewView?.reset()
       dayLabel.isHidden = true
       bubbleView.isHidden = true
       tailView.isHidden = true
       messageLabel.isHidden = true
-      agentTurnContentView.isHidden = true
+      _agentTurnContentView?.isHidden = true
       richTextView.isHidden = true
       replyPreviewView.isHidden = true
-      linkPreviewView.isHidden = true
+      _linkPreviewView?.isHidden = true
       mediaContainerView.isHidden = true
       inlineAttachmentView.isHidden = true
       metaContainerView.isHidden = true
@@ -10501,7 +10705,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressSpinner.stopAnimating()
       mediaProgressOverlayView.isHidden = true
       mediaProgressSizeLabel.isHidden = true
-      agentActionBarView.isHidden = isGhostHidden
+      _agentActionBarView?.isHidden = isGhostHidden
       if !isGhostHidden {
         _ = agentActionBarView.configure(
           row: row,
@@ -10520,16 +10724,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       resetAgentTurnContent()
       richTextView.reset()
       replyPreviewView.reset()
-      linkPreviewView.reset()
+      _linkPreviewView?.reset()
       dayLabel.text = row.label
       dayLabel.isHidden = false
       bubbleView.isHidden = true
       tailView.isHidden = true
       messageLabel.isHidden = true
-      agentTurnContentView.isHidden = true
+      _agentTurnContentView?.isHidden = true
       richTextView.isHidden = true
       replyPreviewView.isHidden = true
-      linkPreviewView.isHidden = true
+      _linkPreviewView?.isHidden = true
       mediaContainerView.isHidden = true
       inlineAttachmentView.isHidden = true
       metaContainerView.isHidden = true
@@ -10556,22 +10760,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         richTextView.reset()
         resetAgentTurnContent()
         replyPreviewView.reset()
-        linkPreviewView.reset()
+        _linkPreviewView?.reset()
         dayLabel.text = dividerText
         dayLabel.isHidden = false
         bubbleView.isHidden = true
         tailView.isHidden = true
         messageLabel.isHidden = true
-        agentTurnContentView.isHidden = true
+        _agentTurnContentView?.isHidden = true
         richTextView.isHidden = true
         replyPreviewView.isHidden = true
-        linkPreviewView.isHidden = true
+        _linkPreviewView?.isHidden = true
         mediaContainerView.isHidden = true
         inlineAttachmentView.isHidden = true
         metaContainerView.isHidden = true
         reactionPillView.isHidden = true
         retryButton.isHidden = true
-        agentActionBarView.isHidden = true
+        _agentActionBarView?.isHidden = true
         if liveActions.isEmpty {
           serviceActionBarView.isHidden = true
           serviceActionBarView.configure(actions: [], appearance: appearance)
@@ -10601,16 +10805,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         richTextView.reset()
         resetAgentTurnContent()
         replyPreviewView.reset()
-        linkPreviewView.reset()
+        _linkPreviewView?.reset()
         dayLabel.attributedText = agentErrorNoticeAttributedText(message: errorText)
         dayLabel.isHidden = false
         bubbleView.isHidden = true
         tailView.isHidden = true
         messageLabel.isHidden = true
-        agentTurnContentView.isHidden = true
+        _agentTurnContentView?.isHidden = true
         richTextView.isHidden = true
         replyPreviewView.isHidden = true
-        linkPreviewView.isHidden = true
+        _linkPreviewView?.isHidden = true
         mediaContainerView.isHidden = true
         inlineAttachmentView.isHidden = true
         metaContainerView.isHidden = true
@@ -10619,7 +10823,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         agentRegenerateButton.isHidden = true
         agentViewButton.isHidden = true
         notSentIndicator.isHidden = true
-        agentActionBarView.isHidden = true
+        _agentActionBarView?.isHidden = true
         serviceActionBarView.isHidden = true
         mediaProgressSpinner.stopAnimating()
         mediaProgressOverlayView.isHidden = true
@@ -10643,13 +10847,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         || !(row.visualKind == .text || hasMediaCaptionLayout(row)) || usesBlockLayout
       // The old simplified preview is fully retired (see bubbleUsesAgentTurnContent) —
       // always hidden now; agentTurnContentView carries the real interleaved feed.
-      agentTurnContentView.isHidden = isGhostHidden || !usesAgentTurnContent
-      if agentTurnContentView.isHidden {
+      // Read through the optional: this line runs for every message in the transcript,
+      // and touching the panel property here would build one per cell — undoing the
+      // laziness entirely while looking like a plain visibility assignment.
+      if usesAgentTurnContent && !isGhostHidden {
+        agentTurnContentView.isHidden = false
+      } else {
+        _agentTurnContentView?.isHidden = true
         resetAgentTurnContent()
       }
       richTextView.isHidden = isGhostHidden || usesAgentTurnContent || !usesBlockLayout
       replyPreviewView.isHidden = isGhostHidden || !showsReplyPreview
-      linkPreviewView.isHidden = isGhostHidden || usesAgentTurnContent || previewURL == nil
+      // Runs for every message row — read through the optional so a transcript with no
+      // links never builds a single preview card.
+      if previewURL != nil && !isGhostHidden && !usesAgentTurnContent {
+        linkPreviewView.isHidden = false
+      } else {
+        _linkPreviewView?.isHidden = true
+      }
       if !usesAgentTurnContent
         && (row.messageType == "typing" || row.messageType == "agent_progress_tree")
       {
@@ -10702,8 +10917,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
       // "Not sent" indicator on a failed outgoing message — sits in the me-side
       // margin and slides in once when the failure first appears.
+      // `isDeliveryFailed` is the row's own verdict; `status == "error"` is the send
+      // pipeline's. They disagree often enough that the transcript used to show a bare
+      // arrow button with no failure mark, or a mark with no way to act on it. Either one
+      // means this message did not go out.
       let showsNotSent =
-        !isGhostHidden && !selectionMode && row.isMe && row.isDeliveryFailed
+        !isGhostHidden && !selectionMode && row.isMe
+        && (row.isDeliveryFailed || row.status?.lowercased() == "error")
       let wasNotSentVisible = !notSentIndicator.isHidden
       notSentIndicator.isHidden = !showsNotSent
       if !showsNotSent {
@@ -10740,10 +10960,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           isStreaming: row.isAgentMessage && row.isStreamingText && row.messageType != "typing"
         )
       }
-      if let previewURL, !linkPreviewView.isHidden {
+      if let previewURL, _linkPreviewView?.isHidden == false {
         linkPreviewView.configure(url: previewURL, appearance: appearance, isMe: row.isMe)
       } else {
-        linkPreviewView.reset()
+        _linkPreviewView?.reset()
       }
       if !replyPreviewView.isHidden {
         replyPreviewView.configure(
@@ -10898,10 +11118,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Use full opacity — visibility is controlled by isHidden, not alpha.
       // This eliminates the 0→1 opacity flicker that plagued updates.
       messageLabel.alpha = 1.0
-      agentTurnContentView.alpha = 1.0
+      _agentTurnContentView?.alpha = 1.0
       richTextView.alpha = 1.0
       replyPreviewView.alpha = 1.0
-      linkPreviewView.alpha = 1.0
+      _linkPreviewView?.alpha = 1.0
       inlineAttachmentView.alpha = 1.0
       mediaContainerView.alpha = 1.0
       metaContainerView.alpha = 0.72
@@ -10913,10 +11133,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       savedTailHiddenBeforeExtraction = tailView.isHidden
       savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
       savedMessageAlphaBeforeExtraction = messageLabel.alpha
-      savedAgentTurnContentAlphaBeforeExtraction = agentTurnContentView.alpha
+      savedAgentTurnContentAlphaBeforeExtraction = _agentTurnContentView?.alpha ?? 1.0
       savedRichTextAlphaBeforeExtraction = richTextView.alpha
       savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
-      savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
+      savedLinkPreviewAlphaBeforeExtraction = _linkPreviewView?.alpha ?? 1.0
       savedInlineAttachmentAlphaBeforeExtraction = inlineAttachmentView.alpha
       savedMediaAlphaBeforeExtraction = mediaContainerView.alpha
       savedMetaAlphaBeforeExtraction = metaContainerView.alpha
@@ -10974,12 +11194,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     richTextView.reset()
     richTextView.isHidden = true
     resetAgentTurnContent()
-    agentTurnContentView.isHidden = true
-    agentTurnContentView.alpha = 1.0
+    _agentTurnContentView?.isHidden = true
+    _agentTurnContentView?.alpha = 1.0
     replyPreviewView.reset()
     replyPreviewView.isHidden = true
-    linkPreviewView.reset()
-    linkPreviewView.isHidden = true
+    _linkPreviewView?.reset()
+    _linkPreviewView?.isHidden = true
     mediaVideoInfoBadgeView.isHidden = true
     mediaVideoAudioIconView.isHidden = true
     mediaVideoAudioIconView.image = nil
@@ -11025,7 +11245,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     notSentIndicator.transform = .identity
     notSentIndicator.alpha = 1.0
     notSentIndicatorShown = false
-    agentActionBarView.isHidden = true
+    _agentActionBarView?.isHidden = true
     renderedStatusKey = nil
     renderedStatusGlyph = nil
     isContextMenuExtracted = false
@@ -11060,7 +11280,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// renders NOTHING, so a "row unchanged → skip configure" decision would leave the
   /// bubble permanently empty when the same row becomes visible again.
   private func resetAgentTurnContent() {
-    agentTurnContentView.reset()
+    _agentTurnContentView?.reset()
     lastAgentTurnConfiguredRow = nil
     lastAgentTurnConfiguredWidth = -1.0
     lastAgentTurnConfiguredState = nil
@@ -11113,7 +11333,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     richTextView.clipsToBounds = false
     // Agent turns: ALWAYS clip. A stale layout height (common after live→settle or
     // bridge-restart history upsert) must never paint the body over the next cell.
-    agentTurnContentView.clipsToBounds = true
+    _agentTurnContentView?.clipsToBounds = true
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
@@ -11146,7 +11366,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     if row.messageType == "agent_actions" {
-      agentTurnContentView.frame = .zero
+      _agentTurnContentView?.frame = .zero
       // Selection chrome only opens space on the leading edge for *them* rows.
       // "Me" bubbles stay trailing-pinned — no whole-list shift.
       let selectionInset =
@@ -11160,7 +11380,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           height: 36.0
         )
       )
-      agentTurnContentView.frame = .zero
+      _agentTurnContentView?.frame = .zero
       return
     }
 
@@ -11400,10 +11620,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     if metrics.isMediaLayout {
       let hasMediaCaption = hasMediaCaptionLayout(row) && metrics.textHeight > 0.0 && !isFullBleed
-      agentTurnContentView.frame = .zero
+      _agentTurnContentView?.frame = .zero
       richTextView.frame = .zero
       replyPreviewView.frame = .zero
-      linkPreviewView.frame = .zero
+      _linkPreviewView?.frame = .zero
       let mediaFrame: CGRect
       if isFullBleed {
         mediaFrame = pixelAlignedRect(bubbleFrame.insetBy(dx: -0.6, dy: -0.6))
@@ -11525,7 +11745,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       inlineAttachmentView.frame = .zero
       clearTallCollapseFadeMask(on: messageLabel)
       clearTallCollapseFadeMask(on: richTextView)
-      clearTallCollapseFadeMask(on: agentTurnContentView)
+      _agentTurnContentView.map { clearTallCollapseFadeMask(on: $0) }
     } else {
       mediaContainerView.frame = .zero
       let bubbleTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
@@ -11535,7 +11755,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         clearTallCollapseFadeMask(on: messageLabel)
         clearTallCollapseFadeMask(on: richTextView)
         replyPreviewView.frame = .zero
-        linkPreviewView.frame = .zero
+        _linkPreviewView?.frame = .zero
         inlineAttachmentView.frame = .zero
         metaContainerView.frame = .zero
         // Match the tighter agent-turn insets used by measureMessageBubbleLayout so the
@@ -11600,12 +11820,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         applyTallCollapseFadeMask(to: agentTurnContentView, enabled: agentNeedsFade)
 
       } else if metrics.hasInlineAttachment {
-        agentTurnContentView.frame = .zero
+        _agentTurnContentView?.frame = .zero
         richTextView.frame = .zero
         clearTallCollapseFadeMask(on: messageLabel)
         clearTallCollapseFadeMask(on: richTextView)
-        clearTallCollapseFadeMask(on: agentTurnContentView)
-        linkPreviewView.frame = .zero
+        _agentTurnContentView.map { clearTallCollapseFadeMask(on: $0) }
+        _linkPreviewView?.frame = .zero
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
         var contentY = bubbleFrame.minY + bubbleTopPadding
         if metrics.hasReplyPreview {
@@ -11658,7 +11878,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           height: 15.0
         )
       } else if metrics.usesBottomMetaLayout {
-        agentTurnContentView.frame = .zero
+        _agentTurnContentView?.frame = .zero
         let contentX = bubbleFrame.minX + bubbleHorizontalPadding
         var contentY = bubbleFrame.minY + bubbleTopPadding
 
@@ -11675,7 +11895,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         } else {
           replyPreviewView.frame = .zero
         }
-        clearTallCollapseFadeMask(on: agentTurnContentView)
+        _agentTurnContentView.map { clearTallCollapseFadeMask(on: $0) }
         // Visible body height inside the (possibly morphing) plate — full text is taller
         // when collapsed; soft mask fades the cut instead of hard-clipping glyphs.
         let textBodyMaxHeight: CGFloat = {
@@ -11756,11 +11976,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             )
           )
         } else {
-          linkPreviewView.frame = .zero
+          _linkPreviewView?.frame = .zero
         }
 
         let metaTop = metrics.hasLinkPreview
-          ? linkPreviewView.frame.maxY + bubbleMetaTopSpacing
+          ? (_linkPreviewView?.frame.maxY ?? textBottom) + bubbleMetaTopSpacing
           : textBottom + bubbleMetaTopSpacing
         // Meta (time / sent) is ALWAYS trailing — RTL included. Telegram keeps the ✓ at
         // the bubble's right edge and leads the body instead; mirroring the meta to the
@@ -11776,9 +11996,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         )
         metaContainerView.frame = metaFrame
       } else {
-        agentTurnContentView.frame = .zero
+        _agentTurnContentView?.frame = .zero
         richTextView.frame = .zero
-        linkPreviewView.frame = .zero
+        _linkPreviewView?.frame = .zero
         inlineAttachmentView.frame = .zero
 
         if metrics.hasReplyPreview {
@@ -11840,21 +12060,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       height: reactionFrame.height
     )
 
-    let retrySize: CGFloat = 28.0
+    // Glyph box is 22pt (the touch target is grown separately below); it centres on the
+    // bubble the way the "not sent" mark does, rather than hanging off its bottom corner
+    // — bottom-aligning it against a one-line bubble put it visually below the row.
+    let retrySize: CGFloat = 22.0
     if retryButton.isHidden {
       retryButton.frame = .zero
     } else {
-      let retryX = row.isMe
-        ? max(8.0, bubbleFrame.minX - retrySize - 7.0)
-        : min(bounds.width - retrySize - 8.0, bubbleFrame.maxX + 7.0)
+      let retryX =
+        row.isMe
+        ? max(6.0, bubbleFrame.minX - retrySize - 6.0)
+        : min(bounds.width - retrySize - 6.0, bubbleFrame.maxX + 6.0)
       let retryY = min(
-        max(4.0, bubbleFrame.maxY - retrySize - 5.0),
-        max(4.0, bounds.height - retrySize - 2.0)
+        max(2.0, bubbleFrame.midY - retrySize / 2.0),
+        max(2.0, bounds.height - retrySize - 2.0)
       )
       retryButton.frame = pixelAlignedRect(
         CGRect(x: retryX, y: retryY, width: retrySize, height: retrySize)
       )
-      retryButton.layer.cornerRadius = retrySize * 0.5
     }
 
     if agentRegenerateButton.isHidden {
@@ -11894,9 +12117,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     } else {
       // Outgoing (me) bubbles are trailing-aligned: place the "!" just left of the
       // bubble's leading edge, vertically centered on it (iMessage "not delivered").
-      let notSentSize: CGFloat = 20.0
-      let notSentX = max(6.0, bubbleFrame.minX - notSentSize - 6.0)
-      let notSentY = max(4.0, bubbleFrame.midY - notSentSize / 2.0)
+      //
+      // The glyph reads at 16pt and the box is 30pt, because this is now the only way to
+      // resend a failed message and a 16pt target is under half of Apple's 44pt minimum.
+      // `contentMode = .center` means the extra space is pure touch area — the mark looks
+      // identical, it is just no longer something you have to aim at.
+      let notSentGlyph: CGFloat = 16.0
+      let notSentSize: CGFloat = 30.0
+      let notSentX = max(2.0, bubbleFrame.minX - notSentGlyph - 6.0 - (notSentSize - notSentGlyph) / 2.0)
+      let notSentY = max(0.0, bubbleFrame.midY - notSentSize / 2.0)
       notSentIndicator.frame = pixelAlignedRect(
         CGRect(x: notSentX, y: notSentY, width: notSentSize, height: notSentSize)
       )
@@ -11968,7 +12197,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// The translation compensates for UIView's center-based transform so the text's top
   /// edge stays fixed; only the lower edge breathes with the height transition.
   func animateTallBubbleInnerContent(expanding: Bool, duration: TimeInterval) {
-    let bodyViews = [messageLabel, richTextView, agentTurnContentView].filter {
+    let bodyViews = (([messageLabel, richTextView] as [UIView]) + [_agentTurnContentView].compactMap { $0 as UIView? }).filter {
       !$0.isHidden && $0.bounds.width > 1.0 && $0.bounds.height > 1.0
     }
     guard !bodyViews.isEmpty else { return }
@@ -12027,7 +12256,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   private func resetTallBubbleInnerContentAnimation() {
     tallContentAnimationGeneration &+= 1
-    for view in [messageLabel, richTextView, agentTurnContentView] {
+    for view in (([messageLabel, richTextView] as [UIView]) + [_agentTurnContentView].compactMap { $0 as UIView? }) {
       view.layer.removeAnimation(forKey: "transform")
       view.transform = .identity
     }
@@ -13563,6 +13792,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let size = image.size
     guard size.width > 1.0, size.height > 1.0 else { return }
     cacheNaturalMediaSize(size, for: mediaURL)
+    // Teach it under the ROW's url as well, because that is the one the sizing path asks
+    // with — and it is frequently not this one.
+    //
+    // `mediaURL` here is whatever the cell actually loaded: a local file in the container,
+    // a vault path, a signed URL. `resolvedMediaNaturalSize` looks the size up by
+    // `row.mediaUrl`. When those two normalize to different identities the durable store
+    // records a size nobody ever asks for, and the row is forecast as a SQUARE on every
+    // single open, forever. Device run 2026-08-04, chat 47157fce5863: the store had 23
+    // entries and `seed-forecast squareMedia=5` on every reopen, each one correcting
+    // `was=412 now=612` — a 200pt jump under the reader's thumb, repeatedly, for photos
+    // the app had already measured many times.
+    if let rowMediaURL = row.mediaUrl, rowMediaURL != mediaURL {
+      cacheNaturalMediaSize(size, for: rowMediaURL)
+    }
     let sizeKey = "\(mediaURL)|\(Int(size.width.rounded()))x\(Int(size.height.rounded()))"
     if lastReportedMediaSizeKey == sizeKey {
       return
@@ -14656,8 +14899,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       break
     }
 
-    let showRetry = newStatus == "error" && !isGhostHidden
-    retryButton.isHidden = !showRetry
+    // No second affordance. A failed outgoing message is marked by `notSentIndicator` —
+    // the red "!" in the margin that every messaging app uses and that this transcript
+    // already drew for `isDeliveryFailed` — and tapping that mark is what offers to send
+    // it again. The extra arrow button beside it said the same thing twice, in a louder
+    // voice, in the same six points of margin.
+    retryButton.isHidden = true
 
     // Animate on the glyph the user can actually see changing, not on the raw status.
     // sent → delivered now draws the identical single tick, and popping it again there
@@ -14770,10 +15017,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         savedTailHiddenBeforeExtraction = tailView.isHidden
         savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
         savedMessageAlphaBeforeExtraction = messageLabel.alpha
-        savedAgentTurnContentAlphaBeforeExtraction = agentTurnContentView.alpha
+        savedAgentTurnContentAlphaBeforeExtraction = _agentTurnContentView?.alpha ?? 1.0
         savedRichTextAlphaBeforeExtraction = richTextView.alpha
         savedReplyPreviewAlphaBeforeExtraction = replyPreviewView.alpha
-        savedLinkPreviewAlphaBeforeExtraction = linkPreviewView.alpha
+        savedLinkPreviewAlphaBeforeExtraction = _linkPreviewView?.alpha ?? 1.0
         savedInlineAttachmentAlphaBeforeExtraction = inlineAttachmentView.alpha
         savedMediaAlphaBeforeExtraction = mediaContainerView.alpha
         savedMetaAlphaBeforeExtraction = metaContainerView.alpha
@@ -14784,10 +15031,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       reactionPillView.isHidden = true
       // Keep text/media/meta rendering alive for snapshot correctness, but hide them.
       messageLabel.alpha = 0.0
-      agentTurnContentView.alpha = 0.0
+      _agentTurnContentView?.alpha = 0.0
       richTextView.alpha = 0.0
       replyPreviewView.alpha = 0.0
-      linkPreviewView.alpha = 0.0
+      _linkPreviewView?.alpha = 0.0
       inlineAttachmentView.alpha = 0.0
       mediaContainerView.alpha = 0.0
       metaContainerView.alpha = 0.0
@@ -14801,10 +15048,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tailView.isHidden = savedTailHiddenBeforeExtraction
     reactionPillView.isHidden = savedReactionHiddenBeforeExtraction
     messageLabel.alpha = savedMessageAlphaBeforeExtraction
-    agentTurnContentView.alpha = savedAgentTurnContentAlphaBeforeExtraction
+    _agentTurnContentView?.alpha = savedAgentTurnContentAlphaBeforeExtraction
     richTextView.alpha = savedRichTextAlphaBeforeExtraction
     replyPreviewView.alpha = savedReplyPreviewAlphaBeforeExtraction
-    linkPreviewView.alpha = savedLinkPreviewAlphaBeforeExtraction
+    _linkPreviewView?.alpha = savedLinkPreviewAlphaBeforeExtraction
     inlineAttachmentView.alpha = savedInlineAttachmentAlphaBeforeExtraction
     mediaContainerView.alpha = savedMediaAlphaBeforeExtraction
     metaContainerView.alpha = savedMetaAlphaBeforeExtraction
@@ -15165,8 +15412,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !messageLabel.isHidden {
       contentRect = contentRect.union(messageLabel.frame)
     }
-    if !agentTurnContentView.isHidden {
-      contentRect = contentRect.union(agentTurnContentView.frame)
+    if let panel = _agentTurnContentView, !panel.isHidden {
+      contentRect = contentRect.union(panel.frame)
     }
     if !richTextView.isHidden {
       contentRect = contentRect.union(richTextView.frame)
@@ -15174,8 +15421,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !replyPreviewView.isHidden {
       contentRect = contentRect.union(replyPreviewView.frame)
     }
-    if !linkPreviewView.isHidden {
-      contentRect = contentRect.union(linkPreviewView.frame)
+    if let preview = _linkPreviewView, !preview.isHidden {
+      contentRect = contentRect.union(preview.frame)
     }
     if !mediaContainerView.isHidden {
       contentRect = contentRect.union(mediaContainerView.frame)
@@ -15214,10 +15461,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard let row, row.kind == .message, row.visualKind == .text,
       !row.isAgentMessage,
       !messageLabel.isHidden,
-      agentTurnContentView.isHidden,
+      _agentTurnContentView?.isHidden ?? true,
       richTextView.isHidden,
       replyPreviewView.isHidden,
-      linkPreviewView.isHidden,
+      _linkPreviewView?.isHidden ?? true,
       inlineAttachmentView.isHidden,
       mediaContainerView.isHidden,
       let attributed = messageLabel.attributedText,
@@ -15466,7 +15713,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let messageWasHidden = messageLabel.isHidden
     let richTextWasHidden = richTextView.isHidden
     let replyWasHidden = replyPreviewView.isHidden
-    let previewWasHidden = linkPreviewView.isHidden
+    let previewWasHidden = _linkPreviewView?.isHidden ?? true
     let mediaWasHidden = mediaContainerView.isHidden
     let attachmentWasHidden = inlineAttachmentView.isHidden
     let metaWasHidden = metaContainerView.isHidden
@@ -15477,7 +15724,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     messageLabel.isHidden = true
     richTextView.isHidden = true
     replyPreviewView.isHidden = true
-    linkPreviewView.isHidden = true
+    _linkPreviewView?.isHidden = true
     mediaContainerView.isHidden = true
     inlineAttachmentView.isHidden = true
     metaContainerView.isHidden = true
@@ -15501,7 +15748,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       messageLabel.isHidden = messageWasHidden
       richTextView.isHidden = richTextWasHidden
       replyPreviewView.isHidden = replyWasHidden
-      linkPreviewView.isHidden = previewWasHidden
+      _linkPreviewView?.isHidden = previewWasHidden
       mediaContainerView.isHidden = mediaWasHidden
       inlineAttachmentView.isHidden = attachmentWasHidden
       metaContainerView.isHidden = metaWasHidden

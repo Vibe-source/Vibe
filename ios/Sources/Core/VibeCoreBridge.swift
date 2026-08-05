@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Swift-side owner of the Rust timeline core.
 ///
@@ -56,26 +57,106 @@ enum VibeCoreBridge {
   private static let queue = DispatchQueue(label: "com.vibegram.core.bridge")
   private static var handle: VibeCoreHandle?
 
-  /// Constructs the core if it is not already up. Idempotent.
+  /// Resolves the RSA private key for the core's key-unwrap seam.
   ///
-  /// Returns `nil` when the switch is off, so callers cannot accidentally spin
-  /// up a worker thread in a production build.
-  @discardableResult
-  static func startIfEnabled(ownUserId: String) -> VibeCoreHandle? {
-    guard isEnabled else { return nil }
-    return queue.sync {
+  /// Set once by whoever owns the Keychain session (the engine). Left `nil`, the
+  /// core runs with no way to open an envelope and every encrypted row
+  /// canonicalizes to the decryption-failure state — the same thing the shipped
+  /// client shows when the Keychain is locked. That is fail-closed on purpose: a
+  /// core that cannot get a key must render nothing rather than guess.
+  ///
+  /// A closure rather than a stored `SecKey` because the key is TTL-cached and
+  /// dropped on logout; capturing one here would outlive the lifetime its owner
+  /// chose for it.
+  ///
+  /// Defaults to the box the engine publishes into, so the seam is wired without
+  /// any caller having to remember to wire it. Overridable for tests.
+  static var privateKeyProvider: (() -> SecKey?)? = { VibeCorePrivateKeyBox.shared.current() }
+
+  /// Routes core callbacks to whoever is showing that chat.
+  private static let router = VibeCoreRouter()
+
+  /// The **one** core for the process. Idempotent.
+  ///
+  /// # Why one and not one per chat
+  ///
+  /// The reducer is keyed by chat internally and holds the tombstones, id
+  /// aliases, settle slots and generations for all of them. A second handle is a
+  /// second reducer with a second set of all of that — two cores that disagree
+  /// about the same conversation, which is worse than no core. It also means two
+  /// worker threads and two copies of every window.
+  ///
+  /// `ownUserId` is taken from the first caller and pinned. It decides
+  /// `author.is_me` and the direction-dependent key-candidate order, so a later
+  /// caller passing a different id would silently change how earlier chats
+  /// decrypt. A genuine identity change is a logout, which tears this down.
+  /// An empty id is refused rather than pinned.
+  ///
+  /// `own_user_id` decides `author.is_me`, and a frame that carries `senderId`
+  /// rather than an explicit `isMe` resolves it by comparing against this. Pinned
+  /// empty, every such frame becomes "not me" — while store-restored rows, which
+  /// do carry `isMe`, stay correct. The same conversation then renders one way
+  /// from one ingest source and the other way from the other, and the transcript
+  /// visibly changes sides. Observed on device 2026-08-03.
+  ///
+  /// It is reachable because the first caller is whichever comes first, and at
+  /// launch that is the engine's store-restore ingest — which runs before a chat
+  /// surface exists and passes `currentUserIdLocked() ?? ""`. Returning `nil` here
+  /// costs that one ingest and lets the next caller, with a real id, bring the
+  /// core up correctly. Pinning the empty string would be wrong for the process
+  /// lifetime.
+  static func sharedCore(ownUserId: String) -> VibeCoreHandle? {
+    queue.sync {
       if let handle { return handle }
+      guard !ownUserId.isEmpty else {
+        NSLog("[VibeCore] core NOT started — ownUserId empty (would render every row as peer)")
+        return nil
+      }
       let config = VibeFfiConfig(
         ownUserId: ownUserId,
         // One display frame at 120 Hz. Stream sources coalesce up to this
         // barrier; everything else is an immediate barrier.
         flushFrameIntervalMs: 8
       )
-      let created = VibeCoreHandle(config: config, sink: VibeCoreDeltaSink())
+      // The key seam. Without it the core holds `VibeDenyAllKeyUnwrapper` and
+      // cannot open a single envelope — it would order rows it cannot read.
+      let unwrapper = VibeKeychainKeyUnwrapper { privateKeyProvider?() }
+      let created = VibeCoreHandle(config: config, sink: router, unwrapper: unwrapper)
       handle = created
-      VibeLog.info("[VibeCore] started worker ownUserId=\(ownUserId.isEmpty ? "<empty>" : "set")")
+      // NSLog, not VibeLog: which identity the core pinned is the first thing to
+      // check when the transcript renders on the wrong side, and it has to be
+      // visible in a plain device log.
+      NSLog(
+        "[VibeCore] core up ownUserId=%@ keySeam=%@",
+        String(ownUserId.prefix(8)),
+        privateKeyProvider == nil ? "ABSENT (fail-closed)" : "wired")
       return created
     }
+  }
+
+  /// The running core, without starting one.
+  ///
+  /// Ingest sites use this: the engine should feed a core that a surface has
+  /// already brought up, never spin one up as a side effect of a network reply.
+  static var runningCore: VibeCoreHandle? {
+    queue.sync { handle }
+  }
+
+  /// Subscribes a surface to one chat's window and deltas.
+  ///
+  /// Callbacks arrive on the Rust worker thread. Observers hop themselves —
+  /// hopping here would put a main-queue dispatch between the worker and every
+  /// consumer, including ones that do not need it.
+  static func addObserver(
+    chatId: String,
+    onWindow: @escaping (VibeFfiWindow) -> Void,
+    onDelta: @escaping (VibeFfiDelta) -> Void
+  ) {
+    router.register(chatId: chatId, onWindow: onWindow, onDelta: onDelta)
+  }
+
+  static func removeObserver(chatId: String) {
+    router.unregister(chatId: chatId)
   }
 
   /// Flushes and quiesces. Call from `didEnterBackground`.
@@ -116,7 +197,9 @@ enum VibeCoreBridge {
     queue.async {
       let probe = VibeCoreProbeSink()
       let config = VibeFfiConfig(ownUserId: "self-test", flushFrameIntervalMs: 0)
-      let probeHandle = VibeCoreHandle(config: config, sink: probe)
+      // No unwrapper: the probe frame is plaintext, and the self-test is checking
+      // that the link, the worker and the callback boundary work — not crypto.
+      let probeHandle = VibeCoreHandle(config: config, sink: probe, unwrapper: nil)
 
       let chatId = "self-test-chat"
       let frame = """
@@ -207,28 +290,52 @@ enum VibeCoreBridge {
   }
 }
 
-/// Receives deltas from the Rust worker thread.
+/// Fans core callbacks out to the surface showing that chat.
+///
+/// One core serves every chat, so its single sink has to demultiplex. Routing by
+/// `chatId` is what lets the reducer stay shared while each surface only ever
+/// sees its own conversation.
 ///
 /// Every callback arrives on the core's worker thread, never the main thread.
-/// While the bridge is dark this only counts and logs; when P4 lands, this is
-/// where a delta is handed to the render host — and it must hop to main there,
-/// not here, so the worker is never blocked by UIKit.
-private final class VibeCoreDeltaSink: VibeDeltaSink {
+/// Observers hop themselves before touching UIKit — the worker is single-threaded
+/// and a slow observer is backpressure on every other chat.
+private final class VibeCoreRouter: VibeDeltaSink {
+  private let lock = NSLock()
+  private var windowObservers: [String: (VibeFfiWindow) -> Void] = [:]
+  private var deltaObservers: [String: (VibeFfiDelta) -> Void] = [:]
+
+  func register(
+    chatId: String,
+    onWindow: @escaping (VibeFfiWindow) -> Void,
+    onDelta: @escaping (VibeFfiDelta) -> Void
+  ) {
+    lock.lock()
+    windowObservers[chatId] = onWindow
+    deltaObservers[chatId] = onDelta
+    lock.unlock()
+  }
+
+  func unregister(chatId: String) {
+    lock.lock()
+    windowObservers.removeValue(forKey: chatId)
+    deltaObservers.removeValue(forKey: chatId)
+    lock.unlock()
+  }
+
   func onDelta(delta: VibeFfiDelta) {
-    let opCount: Int
-    switch delta.body {
-    case .ops(let ops): opCount = ops.count
-    case .reset(let window): opCount = window.messages.count
-    }
-    VibeLog.debug(
-      "[VibeCore] delta chat=\(delta.chatId) gen=\(delta.baseGeneration)->\(delta.generation) ops=\(opCount)"
-    )
+    lock.lock()
+    let observer = deltaObservers[delta.chatId]
+    lock.unlock()
+    // No observer is normal: the core keeps reducing chats nobody is looking at,
+    // which is exactly what makes reopening one instant.
+    observer?(delta)
   }
 
   func onWindow(window: VibeFfiWindow) {
-    VibeLog.debug(
-      "[VibeCore] window chat=\(window.chatId) rows=\(window.messages.count) total=\(window.bounds.totalKnown)"
-    )
+    lock.lock()
+    let observer = windowObservers[window.chatId]
+    lock.unlock()
+    observer?(window)
   }
 
   func onError(message: String) {

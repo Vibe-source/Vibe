@@ -32,28 +32,51 @@
 //! [`VibeFfiError::Internal`]. A core panic must degrade to "this chat falls back
 //! to the Swift path", never take down the host app.
 //!
+//! # The store is a second object, and it *is* synchronous
+//!
+//! [`store::VibeStoreHandle`] wraps SQLite, and its reads block the calling
+//! thread — there is no worker thread behind it. That is not a relaxation of the
+//! rule above: the rule protects the *reducer*, whose purity is what makes
+//! replay and the soak tests mean anything, and the store is deliberately not
+//! part of it. The reducer still never opens a file.
+//!
+//! The obligation moves to the caller instead: **the store must be called from a
+//! background queue.** Swapping a stall on `ChatEngine.syncOnQueue` for a stall
+//! on a SQLite read would be no progress at all, so the Swift wrapper refuses
+//! main-thread calls loudly rather than serving them.
+//!
 //! # What this crate never does
 //!
-//! Custody a private key, perform RSA, touch the network, touch SQLite, or open
-//! an agent runtime payload.
+//! Custody a private key, perform RSA, touch the network, or open an agent
+//! runtime payload.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 
+use crate::unwrap::VibeForeignKeyUnwrapper;
 use vibe_core::reducer::{VibeCoreConfig, VibeTimelineReducer};
-use vibe_core::types::{VibeCoreEventV1, VibeEventBody, VibeTimelineAnchor, VibeTimelineDeltaV1};
+use vibe_core::types::{
+    VibeCoreEventV1, VibeEventBody, VibeEventSource, VibeTimelineAnchor, VibeTimelineDeltaV1,
+};
 use vibe_core::VibeCoreError;
 
 pub mod seal;
+pub mod store;
 pub mod types;
+pub mod unwrap;
 
 pub use seal::{VibeFfiSealedBody, VibeStoreSealerHandle, VIBE_STORE_KEY_LEN};
+pub use store::{
+    VibeFfiBackfillProgress, VibeFfiChatLoadState, VibeFfiStoreCursor, VibeFfiStoredRow,
+    VibeLegacyStoreHandle, VibeStoreHandle,
+};
 pub use types::{
     VibeFfiDelta, VibeFfiDisplayStatus, VibeFfiMessage, VibeFfiMessageKind, VibeFfiOp,
     VibeFfiSource, VibeFfiWindow,
 };
+pub use unwrap::{VibeFfiKeyRequest, VibeFfiKeyUnwrapper};
 
 uniffi::setup_scaffolding!();
 
@@ -76,6 +99,9 @@ pub enum VibeFfiError {
     /// Invariant violation, or a caught panic. The platform must disable the
     /// core for this chat and fall back to Swift.
     Internal { detail: String },
+    /// A store operation failed. `detail` comes from `VibeStoreError`, which is
+    /// shape-only by construction — never a path, SQL text, id, or payload.
+    Store { detail: String },
 }
 
 impl std::fmt::Display for VibeFfiError {
@@ -86,6 +112,7 @@ impl std::fmt::Display for VibeFfiError {
             Self::ShutDown => f.write_str("handle shut down"),
             Self::WorkerUnavailable => f.write_str("worker unavailable"),
             Self::Internal { detail } => write!(f, "internal: {detail}"),
+            Self::Store { detail } => write!(f, "store: {detail}"),
         }
     }
 }
@@ -175,7 +202,28 @@ enum VibeCoreCommand {
     Flush {
         now_ms: i64,
     },
+    /// A local or remote deletion. Not a frame — there is no server payload for a
+    /// row that no longer exists, so it cannot ride `IngestFrame`.
+    DeleteMessage {
+        chat_id: String,
+        message_id: String,
+        for_everyone: bool,
+        tombstone_ms: i64,
+    },
+    /// Wipe the transcript for a chat (Clear Chat). Same reason as `DeleteMessage`:
+    /// there is no message frame for a bulk clear, so it cannot ride `IngestFrame`.
+    /// `before_ts_ms = None` clears everything; `Some(ts)` keeps rows at/after `ts`.
+    ClearChat {
+        chat_id: String,
+        before_ts_ms: Option<i64>,
+        cleared_at_ms: i64,
+    },
     RequestWindow {
+        chat_id: String,
+        now_ms: i64,
+    },
+    /// Publish the current window **without** moving the anchor or the cursor.
+    RefreshWindow {
         chat_id: String,
         now_ms: i64,
     },
@@ -206,12 +254,26 @@ pub struct VibeCoreHandle {
 #[uniffi::export]
 impl VibeCoreHandle {
     /// Spawns the worker and returns immediately.
+    ///
+    /// `unwrapper` is the platform's private-key custody. Passing `None` leaves
+    /// the core's deny-all default installed, which means **every hybrid envelope
+    /// canonicalizes to `DECRYPTION_FAILED`** — correct for a diagnostic surface
+    /// that only exercises ordering, and wrong for anything a user reads. A
+    /// production caller passes one.
     #[uniffi::constructor]
-    pub fn new(config: VibeFfiConfig, sink: Arc<dyn VibeDeltaSink>) -> Arc<Self> {
+    pub fn new(
+        config: VibeFfiConfig,
+        sink: Arc<dyn VibeDeltaSink>,
+        unwrapper: Option<Arc<dyn VibeFfiKeyUnwrapper>>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel();
         let core_config = VibeCoreConfig {
             own_user_id: config.own_user_id,
             flush_frame_interval_ms: config.flush_frame_interval_ms,
+            unwrapper: match unwrapper {
+                Some(foreign) => Arc::new(VibeForeignKeyUnwrapper::new(foreign)),
+                None => Arc::new(vibe_core::VibeDenyAllKeyUnwrapper),
+            },
             ..VibeCoreConfig::default()
         };
         let join = std::thread::Builder::new()
@@ -264,9 +326,69 @@ impl VibeCoreHandle {
         guarded("flush", || self.submit(VibeCoreCommand::Flush { now_ms }))
     }
 
+    /// Tells the core a message is gone.
+    ///
+    /// Deletion cannot arrive as a frame: the server sends an id and a scope, not a
+    /// message, so `ingest_frame` has nothing to canonicalize. Without this the core
+    /// keeps the row in its store and re-publishes it in the next window — which is
+    /// exactly the "deleted cell comes back to the list" seen on device once the core
+    /// became the list's content authority.
+    pub fn delete_message(
+        &self,
+        chat_id: String,
+        message_id: String,
+        for_everyone: bool,
+        tombstone_ms: i64,
+    ) -> Result<(), VibeFfiError> {
+        guarded("delete_message", || {
+            self.submit(VibeCoreCommand::DeleteMessage {
+                chat_id,
+                message_id,
+                for_everyone,
+                tombstone_ms,
+            })
+        })
+    }
+
+    /// Clears the chat transcript in the reducer (and publishes an empty/truncated window).
+    ///
+    /// Same class of event as [`Self::delete_message`]: the server soft-clears with
+    /// `messages_cleared_at` / participant delete and never sends one frame per row.
+    /// Without this, the engine drops every row, the core's next window puts them
+    /// back, and Clear Chat looks broken once the list is core-authoritative.
+    ///
+    /// `before_ts_ms = None` wipes everything. `Some(ts)` keeps messages at/after `ts`
+    /// (Telegram-style "clear before now").
+    pub fn clear_chat(
+        &self,
+        chat_id: String,
+        before_ts_ms: Option<i64>,
+        cleared_at_ms: i64,
+    ) -> Result<(), VibeFfiError> {
+        guarded("clear_chat", || {
+            self.submit(VibeCoreCommand::ClearChat {
+                chat_id,
+                before_ts_ms,
+                cleared_at_ms,
+            })
+        })
+    }
+
+    /// Re-anchors to the bottom and publishes the window. Chat open, not steady state.
+    ///
+    /// This **resets the scroll-back cursor**, which is correct when a reader arrives
+    /// at a conversation and wrong on every subsequent tick. Steady-state readers want
+    /// [`Self::refresh_window`].
     pub fn request_window(&self, chat_id: String, now_ms: i64) -> Result<(), VibeFfiError> {
         guarded("request_window", || {
             self.submit(VibeCoreCommand::RequestWindow { chat_id, now_ms })
+        })
+    }
+
+    /// Publishes the window the consumer should be showing, leaving the cursor alone.
+    pub fn refresh_window(&self, chat_id: String, now_ms: i64) -> Result<(), VibeFfiError> {
+        guarded("refresh_window", || {
+            self.submit(VibeCoreCommand::RefreshWindow { chat_id, now_ms })
         })
     }
 
@@ -391,7 +513,8 @@ fn run_command(
                 source.into(),
                 VibeEventBody::RawFrame { json },
             ));
-            emit(&reducer.poll_deltas(received_at_ms), sink);
+            let deltas = reducer.poll_deltas(received_at_ms);
+            emit(reducer, &deltas, sink);
         }
         VibeCoreCommand::IngestFrames {
             chat_id,
@@ -405,9 +528,46 @@ fn run_command(
                 source.into(),
                 VibeEventBody::RawFrames { json_array },
             ));
-            emit(&reducer.poll_deltas(received_at_ms), sink);
+            let deltas = reducer.poll_deltas(received_at_ms);
+            emit(reducer, &deltas, sink);
         }
-        VibeCoreCommand::Flush { now_ms } => emit(&reducer.flush(now_ms), sink),
+        VibeCoreCommand::Flush { now_ms } => {
+            let deltas = reducer.flush(now_ms);
+            emit(reducer, &deltas, sink);
+        }
+        VibeCoreCommand::DeleteMessage {
+            chat_id,
+            message_id,
+            for_everyone,
+            tombstone_ms,
+        } => {
+            reducer.ingest(VibeCoreEventV1::new(
+                chat_id,
+                tombstone_ms,
+                VibeEventSource::Local,
+                VibeEventBody::Delete {
+                    message_id,
+                    for_everyone,
+                    tombstone_ms,
+                },
+            ));
+            let deltas = reducer.poll_deltas(tombstone_ms);
+            emit(reducer, &deltas, sink);
+        }
+        VibeCoreCommand::ClearChat {
+            chat_id,
+            before_ts_ms,
+            cleared_at_ms,
+        } => {
+            reducer.ingest(VibeCoreEventV1::new(
+                chat_id,
+                cleared_at_ms,
+                VibeEventSource::Local,
+                VibeEventBody::ChatCleared { before_ts_ms },
+            ));
+            let deltas = reducer.poll_deltas(cleared_at_ms);
+            emit(reducer, &deltas, sink);
+        }
         VibeCoreCommand::RequestWindow { chat_id, now_ms } => {
             match reducer.window(&chat_id, VibeTimelineAnchor::bottom(), now_ms) {
                 Ok(result) => {
@@ -419,35 +579,92 @@ fn run_command(
                 Err(e) => sink.on_error(VibeFfiError::from(e).to_string()),
             }
         }
+        VibeCoreCommand::RefreshWindow { chat_id, now_ms } => {
+            let deltas = reducer.flush(now_ms);
+            let already_published = deltas.iter().any(|d| d.chat_id == chat_id);
+            emit(reducer, &deltas, sink);
+            // The caller asked for the window it should be showing, so silence is not
+            // an acceptable answer for "nothing changed" — a reader that missed one
+            // publish would stay wrong forever. But the flush above may have just
+            // published this chat, and a second identical window is one more full row
+            // rebuild on the platform side for no new information.
+            if !already_published {
+                match reducer.current_window(&chat_id) {
+                    Ok(window) => sink.on_window(VibeFfiWindow::from(&window)),
+                    Err(e) => sink.on_error(VibeFfiError::from(e).to_string()),
+                }
+            }
+        }
         VibeCoreCommand::PageBefore { chat_id, now_ms } => {
             match reducer.page_before(&chat_id, now_ms) {
-                Ok(Some(delta)) => sink.on_delta(VibeFfiDelta::from(&delta)),
+                Ok(Some(delta)) => {
+                    sink.on_delta(VibeFfiDelta::from(&delta));
+                    publish_window(reducer, &chat_id, sink);
+                }
                 Ok(None) => {}
                 Err(e) => sink.on_error(VibeFfiError::from(e).to_string()),
             }
         }
         VibeCoreCommand::PageAfter { chat_id, now_ms } => {
             match reducer.page_after(&chat_id, now_ms) {
-                Ok(Some(delta)) => sink.on_delta(VibeFfiDelta::from(&delta)),
+                Ok(Some(delta)) => {
+                    sink.on_delta(VibeFfiDelta::from(&delta));
+                    publish_window(reducer, &chat_id, sink);
+                }
                 Ok(None) => {}
                 Err(e) => sink.on_error(VibeFfiError::from(e).to_string()),
             }
         }
         VibeCoreCommand::Resync { chat_id } => match reducer.resync(&chat_id) {
-            Ok(delta) => sink.on_delta(VibeFfiDelta::from(&delta)),
+            Ok(delta) => {
+                sink.on_delta(VibeFfiDelta::from(&delta));
+                publish_window(reducer, &chat_id, sink);
+            }
             Err(e) => sink.on_error(VibeFfiError::from(e).to_string()),
         },
         VibeCoreCommand::Suspend => {
             // A flush barrier so nothing pending is lost if the process is
             // suspended or killed before the next command arrives.
-            emit(&reducer.flush(i64::MAX), sink);
+            let deltas = reducer.flush(i64::MAX);
+            emit(reducer, &deltas, sink);
         }
         VibeCoreCommand::Shutdown => {}
     }
 }
 
-fn emit(deltas: &[VibeTimelineDeltaV1], sink: &Arc<dyn VibeDeltaSink>) {
+/// Publishes deltas **and** the window each one landed in.
+///
+/// A delta is a geometry instruction; the window is the row payload. The platform
+/// renders from the window, so a delta that never becomes a window is a change the
+/// screen never sees — a delete that leaves the row on screen, a page that never
+/// widens the transcript. Before this, the only publisher of a window was
+/// `request_window`, which **resets the anchor and the cursor**: the list polled it
+/// on every engine reconcile, and every poll threw away whatever `page_before` had
+/// just done. Device run 2026-08-04: six consecutive scroll-back pages, `engine=480`,
+/// core stuck at `rows=200` on the newest messages, top of the list unreachable.
+fn emit(
+    reducer: &VibeTimelineReducer,
+    deltas: &[VibeTimelineDeltaV1],
+    sink: &Arc<dyn VibeDeltaSink>,
+) {
     for delta in deltas {
         sink.on_delta(VibeFfiDelta::from(delta));
+    }
+    // One window per chat, however many deltas it produced: the window is a
+    // snapshot of the settled state, so publishing it twice sends the same bytes
+    // and one full row payload per chat is the whole budget worth spending here.
+    let mut published: Vec<&str> = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        if published.contains(&delta.chat_id.as_str()) {
+            continue;
+        }
+        published.push(delta.chat_id.as_str());
+        publish_window(reducer, &delta.chat_id, sink);
+    }
+}
+
+fn publish_window(reducer: &VibeTimelineReducer, chat_id: &str, sink: &Arc<dyn VibeDeltaSink>) {
+    if let Ok(window) = reducer.current_window(chat_id) {
+        sink.on_window(VibeFfiWindow::from(&window));
     }
 }

@@ -2800,12 +2800,49 @@ final class ChatNativeStreamingTextLabel: UITextView {
     return nil
   }
 
+  /// TextKit 1, deliberately, and this is the most expensive line in the message list.
+  ///
+  /// Every bubble in every chat owns one of these, and a device census put its
+  /// construction at 517us — against 40us for the bubble plate, 46us for the tail and 6us
+  /// for a `UILabel`. It is 20% of the whole cell, paid on every mount, because
+  /// `UITextView()` on iOS 16+ builds a TextKit 2 `NSTextLayoutManager` stack: viewport
+  /// layout, element providers, the lot. None of which this view uses — it renders one
+  /// attributed string into a fixed width and never scrolls.
+  ///
+  /// `usingTextLayoutManager: false` asks for the TextKit 1 `NSLayoutManager` path
+  /// instead, which is the older and much cheaper object graph and is exactly what this
+  /// class was written against (`textContainer.widthTracksTextView`, the `layoutManager`
+  /// glyph enumeration in the reveal code). Keeping the TextKit 2 stack was never a
+  /// decision — it is what the plain initializer started returning.
+  ///
+  /// If this ever needs to move back to TextKit 2, the reveal path's layout-manager use
+  /// has to be ported first; `[CellCost] AgentStreamingLabel` is the number to watch.
   convenience init() {
-    self.init(frame: .zero, textContainer: nil)
+    // Build the TextKit 1 stack by hand and hand it to the designated initializer.
+    //
+    // `UITextView(usingTextLayoutManager: false)` expresses the same intent in one line
+    // and crashed the app on the first cell mount (SIGSEGV during `seed-mount`): that
+    // initializer is not overridden here, so delegating to it from a subclass convenience
+    // init re-enters this very initializer and overflows the stack. Supplying a container
+    // that already has an `NSLayoutManager` is the documented way to ask for TextKit 1 and
+    // goes through `init(frame:textContainer:)`, which this class does override.
+    let storage = NSTextStorage()
+    let layoutManager = NSLayoutManager()
+    let container = NSTextContainer(
+      size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+    layoutManager.addTextContainer(container)
+    storage.addLayoutManager(layoutManager)
+    self.init(frame: .zero, textContainer: container)
   }
 
   override init(frame: CGRect, textContainer: NSTextContainer?) {
     super.init(frame: frame, textContainer: textContainer)
+    configureForBubbleRendering()
+  }
+
+  /// Shared by both initializers. The TextKit-1 path above cannot call
+  /// `init(frame:textContainer:)`, so this is the setup both must run.
+  private func configureForBubbleRendering() {
     isEditable = false
     isScrollEnabled = false
     isSelectable = false

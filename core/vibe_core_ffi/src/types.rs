@@ -8,24 +8,29 @@
 //! Swift binding start dictating the shape of the reduction. The conversion cost
 //! is one pass per *commit*, not per cell, so it does not matter.
 //!
-//! # These are deliberately a flattened subset
+//! # Flattened where it helps, complete where it must be
 //!
-//! The renderer needs what it draws: identity, order, author, kind, text,
-//! flags, delivery. It does not need the core's internal nesting. Flattening
-//! here keeps the generated Swift value types small and keeps the per-window
-//! allocation count down — a 300-message window is already ~3,000 allocations
-//! and must never run on the main thread.
+//! The scalar columns — identity, order, author, kind, text, flags, delivery —
+//! are flattened rather than nested, which keeps the generated Swift value types
+//! small and the per-window allocation count down. A 300-message window is
+//! already ~3,000 allocations and must never be built on the main thread.
 //!
-//! Anything not yet mirrored (media geometry, agent nodes, service nodes,
-//! reply detail) is exposed as a boolean presence flag rather than silently
-//! dropped, so a consumer can tell the difference between "absent" and "not
-//! carried across this boundary yet". Fields are appended, never repurposed,
-//! per the evolution rule in §4.3 of the refactor doc.
+//! Media, reply, agent and service ride as **full optional records**. They were
+//! presence booleans while this boundary only served an order comparison; a
+//! renderer that builds real rows needs the detail, and a boolean cannot size a
+//! bubble. The booleans are retained alongside them — appended, never
+//! repurposed, per the evolution rule in §4.3 of the refactor doc — so a consumer
+//! that only asks "is there media" does not marshal the record to find out.
+//!
+//! Still deliberately absent: media and thumbnail **bytes**. A
+//! [`VibeFfiThumb`] carries a vault identity and the platform resolves the
+//! pixels (C2).
 
 use vibe_core::types::{
-    VibeDisplayStatus, VibeEventSource, VibeMessageKind, VibeMessageSnapshotV1,
-    VibeTimelineDeltaBodyV1, VibeTimelineDeltaV1, VibeTimelineOpV1, VibeTimelineWindowV1,
-    VibeWindowBounds,
+    VibeAgentProgressNode, VibeAgentRef, VibeDisplayStatus, VibeEventSource, VibeMediaEnvelope,
+    VibeMediaRef, VibeMessageKind, VibeMessageSnapshotV1, VibeReplyRef, VibeServiceChip,
+    VibeServiceNode, VibeSize, VibeThumbHandle, VibeTimelineDeltaBodyV1, VibeTimelineDeltaV1,
+    VibeTimelineOpV1, VibeTimelineWindowV1, VibeWindowBounds,
 };
 
 /// Which ingest source a frame arrived on. Mirrors [`VibeEventSource`].
@@ -112,6 +117,224 @@ impl From<VibeDisplayStatus> for VibeFfiDisplayStatus {
     }
 }
 
+/// Natural pixel size of a media asset.
+///
+/// `None` on the owning field means **unknown**, and the renderer must reserve a
+/// frame it will not later change. Guessing square and correcting after decode is
+/// the list-shift bug this whole boundary exists to end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl From<VibeSize> for VibeFfiSize {
+    fn from(s: VibeSize) -> Self {
+        Self {
+            width: s.width,
+            height: s.height,
+        }
+    }
+}
+
+/// A thumbnail reference. Never bytes — the platform resolves `identity` against
+/// its media vault.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiThumb {
+    pub identity: String,
+    pub size: Option<VibeFfiSize>,
+    pub placeholder: Option<String>,
+}
+
+impl From<&VibeThumbHandle> for VibeFfiThumb {
+    fn from(t: &VibeThumbHandle) -> Self {
+        Self {
+            identity: t.identity.clone(),
+            size: t.size.map(Into::into),
+            placeholder: t.placeholder.clone(),
+        }
+    }
+}
+
+/// How the bytes behind a media reference are protected.
+///
+/// `key_ref` is the per-message media key. It crosses deliberately: the platform
+/// performs the media decrypt (file I/O is not the core's job), and it cannot do
+/// that without the key. This is the same key the shipped client already carries
+/// inside the message payload — no new exposure.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum VibeFfiMediaEnvelope {
+    Plain,
+    Gcm1 { key_ref: String },
+    Stream2 { key_ref: String, segment_len: u32 },
+}
+
+impl From<&VibeMediaEnvelope> for VibeFfiMediaEnvelope {
+    fn from(e: &VibeMediaEnvelope) -> Self {
+        match e {
+            VibeMediaEnvelope::Plain => Self::Plain,
+            VibeMediaEnvelope::Gcm1 { key_ref } => Self::Gcm1 {
+                key_ref: key_ref.clone(),
+            },
+            VibeMediaEnvelope::Stream2 {
+                key_ref,
+                segment_len,
+            } => Self::Stream2 {
+                key_ref: key_ref.clone(),
+                segment_len: *segment_len,
+            },
+        }
+    }
+}
+
+/// Media metadata. Never the pixels.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VibeFfiMedia {
+    /// The only addressing key. Signed-URL churn must not change it.
+    pub identity: String,
+    pub remote_url: Option<String>,
+    pub file_name: Option<String>,
+    pub mime: Option<String>,
+    pub byte_size: Option<i64>,
+    /// `None` means unknown — reserve, do not guess.
+    pub natural_size: Option<VibeFfiSize>,
+    pub duration_s: Option<f64>,
+    /// 0..=255 amplitude buckets.
+    pub waveform: Vec<u8>,
+    pub thumbnail: Option<VibeFfiThumb>,
+    pub envelope: VibeFfiMediaEnvelope,
+}
+
+impl From<&VibeMediaRef> for VibeFfiMedia {
+    fn from(m: &VibeMediaRef) -> Self {
+        Self {
+            identity: m.identity.clone(),
+            remote_url: m.remote_url.clone(),
+            file_name: m.file_name.clone(),
+            mime: m.mime.clone(),
+            byte_size: m.byte_size,
+            natural_size: m.natural_size.map(Into::into),
+            duration_s: m.duration_s,
+            waveform: m.waveform.clone(),
+            thumbnail: m.thumbnail.as_ref().map(Into::into),
+            envelope: (&m.envelope).into(),
+        }
+    }
+}
+
+/// Reply-to reference, with the quoted preview.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VibeFfiReply {
+    pub message_id: String,
+    pub author_user_id: Option<String>,
+    pub preview_text: String,
+    pub preview_thumb: Option<VibeFfiThumb>,
+}
+
+impl From<&VibeReplyRef> for VibeFfiReply {
+    fn from(r: &VibeReplyRef) -> Self {
+        Self {
+            message_id: r.message_id.clone(),
+            author_user_id: r.author_user_id.clone(),
+            preview_text: r.preview.text.clone(),
+            preview_thumb: r.preview_media.as_ref().map(Into::into),
+        }
+    }
+}
+
+/// One progress step of an agent turn.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiAgentNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub detail: Option<String>,
+    pub is_terminal: bool,
+}
+
+impl From<&VibeAgentProgressNode> for VibeFfiAgentNode {
+    fn from(n: &VibeAgentProgressNode) -> Self {
+        Self {
+            id: n.id.clone(),
+            kind: n.kind.clone(),
+            label: n.label.clone(),
+            detail: n.detail.clone(),
+            is_terminal: n.is_terminal,
+        }
+    }
+}
+
+/// Agent turn payload.
+///
+/// `sealed` is the `arte1` runtime blob. It crosses as **opaque bytes**: the core
+/// never opened it and never could — the pairing key lives only on the phone.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VibeFfiAgent {
+    pub provider: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub sealed: Option<Vec<u8>>,
+    pub progress: Vec<VibeFfiAgentNode>,
+    pub is_streaming: bool,
+    pub elapsed_ms: Option<i64>,
+}
+
+impl From<&VibeAgentRef> for VibeFfiAgent {
+    fn from(a: &VibeAgentRef) -> Self {
+        Self {
+            provider: a.provider.clone(),
+            task_id: a.task_id.clone(),
+            session_id: a.session_id.clone(),
+            sealed: a.sealed.as_ref().map(|b| b.as_bytes().to_vec()),
+            progress: a.progress.iter().map(Into::into).collect(),
+            is_streaming: a.is_streaming,
+            elapsed_ms: a.elapsed_ms,
+        }
+    }
+}
+
+/// A decision chip on a service notice.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiServiceChip {
+    pub id: String,
+    pub label: String,
+    pub style: String,
+}
+
+impl From<&VibeServiceChip> for VibeFfiServiceChip {
+    fn from(c: &VibeServiceChip) -> Self {
+        Self {
+            id: c.id.clone(),
+            label: c.label.clone(),
+            style: c.style.clone(),
+        }
+    }
+}
+
+/// Structured service notice.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiService {
+    pub kind: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub chips: Vec<VibeFfiServiceChip>,
+    pub event_thread_id: Option<String>,
+    pub folded_count: u32,
+}
+
+impl From<&VibeServiceNode> for VibeFfiService {
+    fn from(s: &VibeServiceNode) -> Self {
+        Self {
+            kind: s.kind.clone(),
+            title: s.title.clone(),
+            subtitle: s.subtitle.clone(),
+            chips: s.chips.iter().map(Into::into).collect(),
+            event_thread_id: s.event_thread_id.clone(),
+            folded_count: s.folded_count,
+        }
+    }
+}
+
 /// One row, flattened for rendering.
 ///
 /// `struct_excessive_bools` is allowed deliberately. The lint's advice — collapse
@@ -148,13 +371,21 @@ pub struct VibeFfiMessage {
     /// FNV-1a over the rendered fields. A renderer can skip a reconfigure when
     /// this is unchanged.
     pub content_hash: u64,
-    // Presence flags for detail this boundary does not carry yet. Explicit, so
-    // "not mirrored" is never mistaken for "absent".
+    // Presence flags. Retained rather than replaced by the records below: the
+    // evolution rule is append-never-repurpose, and a consumer that only needs
+    // "is there media" should not pay to marshal the whole record to find out.
     pub has_media: bool,
     pub has_reply: bool,
     pub has_agent: bool,
     pub has_service: bool,
     pub is_edited: bool,
+    // The detail itself. Appended once the renderer needed to build a real row
+    // rather than compare orderings.
+    pub media: Option<VibeFfiMedia>,
+    pub reply: Option<VibeFfiReply>,
+    pub agent: Option<VibeFfiAgent>,
+    pub service: Option<VibeFfiService>,
+    pub edited_at_ms: Option<i64>,
 }
 
 impl From<&VibeMessageSnapshotV1> for VibeFfiMessage {
@@ -180,6 +411,11 @@ impl From<&VibeMessageSnapshotV1> for VibeFfiMessage {
             has_agent: m.agent.is_some(),
             has_service: m.service.is_some(),
             is_edited: m.edit.is_some(),
+            media: m.media.as_ref().map(Into::into),
+            reply: m.reply.as_ref().map(Into::into),
+            agent: m.agent.as_ref().map(Into::into),
+            service: m.service.as_ref().map(Into::into),
+            edited_at_ms: m.edit.map(|e| e.edited_at_ms),
         }
     }
 }

@@ -580,6 +580,23 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     collectionView.isScrollEnabled = true
   }
 
+  /// Open the hold menu for a specific message, without a hold.
+  ///
+  /// The "not sent" mark needs to offer Resend and Delete, and those already live in this
+  /// menu with the lift, the backdrop and the blur behind them. Routing the tap here
+  /// instead of putting up a `UIAlertController` means one presentation for one idea:
+  /// the actions available on a message are the ones in its menu.
+  func openContextMenuForMessage(_ messageId: String) {
+    guard customContextMenuOverlay == nil else { return }
+    guard let index = rows.firstIndex(where: { $0.messageId == messageId }) else { return }
+    let indexPath = IndexPath(item: index, section: 0)
+    guard collectionView.cellForItem(at: indexPath) is ChatListCell else { return }
+    // Route through the point-based entry so there is exactly one code path that opens
+    // this menu, and it stays the one the long press uses.
+    let frame = collectionView.layoutAttributesForItem(at: indexPath)?.frame ?? .zero
+    openContextMenu(at: CGPoint(x: frame.midX, y: frame.midY))
+  }
+
   private func openContextMenu(at point: CGPoint) {
     guard customContextMenuOverlay == nil else { return }
     guard let indexPath = collectionView.indexPathForItem(at: point),
@@ -649,7 +666,8 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
       showEditAction: showEditAction,
-      restrictSavingContent: restrictSavingContent
+      restrictSavingContent: restrictSavingContent,
+      failedSendOnly: showResendAction
     )
     overlay.delegate = self
 
@@ -966,6 +984,24 @@ private struct ChatBubbleFragmentCapture {
 }
 
 extension ChatListView {
+  /// Delete a message from somewhere other than the hold menu.
+  ///
+  /// The hold menu path hands over a bubble capture so the plate can animate out of the
+  /// menu it was lifted into. A tap on the "not sent" mark has no such lift and no menu —
+  /// there is nothing to hand over — so this finds the live cell and lets the deletion
+  /// take its own snapshot, which is the same fallback `executeMessageDeletion` already
+  /// uses when a capture is missing.
+  func performMessageDeletion(
+    messageId: String, row: ChatListRow, chatId: String, deleteForEveryone: Bool
+  ) {
+    let cell = rows.firstIndex(where: { $0.messageId == messageId })
+      .flatMap { collectionView.cellForItem(at: IndexPath(item: $0, section: 0)) }
+      as? ChatListCell
+    executeMessageDeletion(
+      messageId: messageId, row: row, cell: cell, deletionMaterial: nil, chatId: chatId,
+      deleteForEveryone: deleteForEveryone)
+  }
+
   private func executeMessageDeletion(
     messageId: String,
     row: ChatListRow,
@@ -1020,46 +1056,27 @@ extension ChatListView {
     // 120 ms visual lead before engine deletion triggers collection reflow
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
       [weak self, weak cell, weak activeFragments] in
-      let result = ChatEngine.shared.deleteMessage([
-        "chatId": normalizedChatId,
-        "messageId": messageId,
-        "forEveryone": deleteForEveryone,
-      ])
-      let accepted = (result["accepted"] as? Bool) == true
-      NSLog(
-        "[DeleteTrace] UI result chat=%@ mid=%@ scope=%@ accepted=%@ capture=%@ reason=%@",
-        normalizedChatId,
-        messageId,
-        deleteForEveryone ? "everyone" : "me",
-        accepted ? "Y" : "N",
-        capture == nil ? "N" : "Y",
-        String(describing: result["reason"] ?? "-")
-      )
+      // Tell the core first, on the main actor, while the fragments are still in the
+      // air. The core's window is what the list renders; a delete it never hears
+      // about comes straight back on the next publish.
+      self?.coreEngineDidDeleteMessage(id: messageId, forEveryone: deleteForEveryone)
 
-      guard accepted else {
-        // Restore hidden cell and clean up fragments on deletion failure
-        cell?.contentView.alpha = 1
-        activeFragments?.removeFromSuperview()
-
-        let reason = String(describing: result["reason"] ?? "")
-        let message: String
-        switch reason {
-        case "no_native_socket", "chat_not_joined":
-          message = "Chat is reconnecting. Try again in a moment."
-        case "delete_disabled_in_blackout":
-          message = "Deletion is unavailable in relay-only mode."
-        case "invalid_payload":
-          message = "Couldn't identify this message."
-        case "saved_messages_not_ready":
-          message = "Saved Messages is still preparing. Try again in a moment."
-        default:
-          message = "Couldn't delete this message right now."
-        }
-        self?.onNativeEvent([
-          "type": "agentToast",
-          "message": message,
+      // `deleteMessage` blocks on the engine's serial queue — 99ms on device, landing
+      // exactly on the frame the disintegration animation is drawing. The result is
+      // only needed to decide whether to show a failure toast, so nothing about it
+      // belongs on the main thread.
+      DispatchQueue.global(qos: .userInitiated).async {
+        let result = ChatEngine.shared.deleteMessage([
+          "chatId": normalizedChatId,
+          "messageId": messageId,
+          "forEveryone": deleteForEveryone,
         ])
-        return
+        DispatchQueue.main.async {
+          self?.finishMessageDeletion(
+            result: result, chatId: normalizedChatId, messageId: messageId,
+            deleteForEveryone: deleteForEveryone, hadCapture: capture != nil,
+            cell: cell, fragments: activeFragments)
+        }
       }
     }
 
@@ -1073,6 +1090,56 @@ extension ChatListView {
       cell.contentView.alpha = 1
       NSLog("[DeleteTrace] visibility safety restore mid=%@", messageId)
     }
+  }
+
+  /// Reports the engine's answer once it comes back off the engine queue.
+  ///
+  /// Split out so the blocking call can run off the main thread: the only thing the
+  /// result decides is whether to un-hide the cell and raise a toast, and both of
+  /// those are cheap main-thread work that can happen a queue hop later.
+  private func finishMessageDeletion(
+    result: [String: Any],
+    chatId: String,
+    messageId: String,
+    deleteForEveryone: Bool,
+    hadCapture: Bool,
+    cell: ChatListCell?,
+    fragments: ChatBubbleFragmentDisintegrationView?
+  ) {
+    let accepted = (result["accepted"] as? Bool) == true
+    NSLog(
+      "[DeleteTrace] UI result chat=%@ mid=%@ scope=%@ accepted=%@ capture=%@ reason=%@",
+      chatId,
+      messageId,
+      deleteForEveryone ? "everyone" : "me",
+      accepted ? "Y" : "N",
+      hadCapture ? "Y" : "N",
+      String(describing: result["reason"] ?? "-")
+    )
+    guard !accepted else { return }
+
+    // Restore hidden cell and clean up fragments on deletion failure
+    cell?.contentView.alpha = 1
+    fragments?.removeFromSuperview()
+
+    let reason = String(describing: result["reason"] ?? "")
+    let message: String
+    switch reason {
+    case "no_native_socket", "chat_not_joined":
+      message = "Chat is reconnecting. Try again in a moment."
+    case "delete_disabled_in_blackout":
+      message = "Deletion is unavailable in relay-only mode."
+    case "invalid_payload":
+      message = "Couldn't identify this message."
+    case "saved_messages_not_ready":
+      message = "Saved Messages is still preparing. Try again in a moment."
+    default:
+      message = "Couldn't delete this message right now."
+    }
+    onNativeEvent([
+      "type": "agentToast",
+      "message": message,
+    ])
   }
 
   private func deletionFragmentBudget(for row: ChatListRow) -> Int {

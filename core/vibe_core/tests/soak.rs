@@ -43,6 +43,30 @@ fn reducer() -> VibeTimelineReducer {
     r
 }
 
+/// The bounded 150…300 policy, asked for explicitly.
+///
+/// The shipping default has no ceiling — a bounded window was experienced as a scroll
+/// limit and was removed. The tests below that exercise paging and tail eviction are
+/// testing that machinery, not the default, so they say so.
+fn bounded_reducer() -> VibeTimelineReducer {
+    reducer()
+}
+
+fn bounded_policy() -> VibeWindowPolicy {
+    VibeWindowPolicy::default()
+}
+
+/// No ceiling: everything the store holds stays mounted. Not the shipping default.
+fn unbounded_reducer() -> VibeTimelineReducer {
+    let mut r = VibeTimelineReducer::new(VibeCoreConfig {
+        own_user_id: ME.to_string(),
+        window_policy: VibeWindowPolicy::unbounded(),
+        ..VibeCoreConfig::default()
+    });
+    r.set_chat_profile(CHAT, VibeChatProfile::default());
+    r
+}
+
 fn text_frame(i: usize) -> VibeCoreEventV1 {
     let ts = T0 + i as i64 * 1_000;
     VibeCoreEventV1::new(
@@ -76,8 +100,8 @@ fn seed(r: &mut VibeTimelineReducer, count: usize) {
 
 #[test]
 fn every_query_and_delta_stays_bounded_as_the_store_grows() {
-    let policy = VibeWindowPolicy::default();
-    let mut r = reducer();
+    let policy = bounded_policy();
+    let mut r = bounded_reducer();
     seed(&mut r, CI_STORE_SIZE);
 
     let window = r.current_window(CHAT).unwrap();
@@ -125,7 +149,7 @@ fn every_query_and_delta_stays_bounded_as_the_store_grows() {
 
 #[test]
 fn scroll_back_over_a_large_store_never_emits_a_delete() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     seed(&mut r, CI_STORE_SIZE);
 
     for _ in 0..40 {
@@ -146,7 +170,7 @@ fn scroll_back_over_a_large_store_never_emits_a_delete() {
 
 #[test]
 fn retained_window_state_is_flat_under_sustained_ingest() {
-    let mut r = reducer();
+    let mut r = bounded_reducer();
     seed(&mut r, 2_000);
 
     let baseline = r.current_window(CHAT).unwrap().messages.len();
@@ -163,6 +187,45 @@ fn retained_window_state_is_flat_under_sustained_ingest() {
     }
 }
 
+/// Removing the ceiling removes the window bound. It must NOT remove the delta bound.
+///
+/// This is the guarantee that actually protects the renderer, and it is the one the
+/// unbounded default has to keep: a window is published once, but a delta is applied on
+/// every incoming message, and a delta whose size tracked the store would put a
+/// 12,000-row commit on the main thread for one arriving message. Ops stay proportional
+/// to what changed, not to how much history exists.
+#[test]
+fn an_unbounded_window_still_emits_deltas_proportional_to_the_change() {
+    let mut r = unbounded_reducer();
+    seed(&mut r, CI_STORE_SIZE);
+
+    let window = r.current_window(CHAT).unwrap();
+    assert_eq!(window.messages.len(), CI_STORE_SIZE, "the window is the store");
+    assert!(!window.bounds.has_more_before);
+    assert!(!window.bounds.has_more_after);
+
+    let mut largest_delta_ops = 0usize;
+    for second in 0..20 {
+        for k in 0..EVENTS_PER_SECOND {
+            let i = CI_STORE_SIZE + second * EVENTS_PER_SECOND + k;
+            r.ingest(text_frame(i));
+        }
+        let now = T0 + (CI_STORE_SIZE + second * EVENTS_PER_SECOND) as i64 * 1_000;
+        for delta in r.flush(now) {
+            largest_delta_ops = largest_delta_ops.max(delta.ops().len());
+        }
+    }
+    assert!(
+        largest_delta_ops <= EVENTS_PER_SECOND * 2,
+        "a delta scaled with the store rather than the change: {largest_delta_ops}"
+    );
+    assert_eq!(
+        r.current_window(CHAT).unwrap().messages.len(),
+        CI_STORE_SIZE + 20 * EVENTS_PER_SECOND,
+        "every ingested message stays mounted"
+    );
+}
+
 /// The board's 100k / 20–50 events-per-second benchmark.
 ///
 /// Ignored by default: it seeds 100,000 messages, which is seconds of work in
@@ -173,8 +236,8 @@ fn retained_window_state_is_flat_under_sustained_ingest() {
 #[test]
 #[ignore = "slow: seeds 100k messages; run with --ignored"]
 fn hundred_thousand_message_benchmark() {
-    let policy = VibeWindowPolicy::default();
-    let mut r = reducer();
+    let policy = bounded_policy();
+    let mut r = bounded_reducer();
 
     let seed_start = Instant::now();
     seed(&mut r, STORE_SIZE);

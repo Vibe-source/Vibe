@@ -17,15 +17,42 @@ use crate::types::{
 
 /// Active-window policy.
 ///
-/// Board contract: 150…300 messages, default 200, and at most two preload
+/// The bounded form is 150…300 messages, default 200, plus at most two preload
 /// screens instantiated by the renderer (which is the renderer's rule, not this
-/// crate's).
+/// crate's). It is still available — [`VibeWindowPolicy::try_new`] builds one and
+/// enforces that envelope — but it is **no longer the default**.
+///
+/// # Why the default is unbounded
+///
+/// A bounded window is a scroll limit, and the product decision is that this app has
+/// none. Every version of the bounded window was experienced as a wall: at the cap the
+/// window slid, so a drag to the top replaced the rows instead of extending them.
+///
+/// Telegram bounds its window — `historyMessageCount = 90` in `ChatHistoryListNode`,
+/// and scrolling issues a new anchor rather than growing the view — and gets away with
+/// it because its list is its own: `ListViewItem.nodeConfiguredForParams(async:…)`
+/// computes each row's layout on a background queue and leaves the main thread nothing
+/// but a cheap `apply`. Their cap exists to bound *node* count, not row count.
+///
+/// We cannot split layout from commit that way inside `UICollectionView`, so the cap
+/// bought us nothing that the reader did not pay for in wall. What actually made a
+/// large mounted set expensive here was the renderer recomputing every row's position
+/// on every commit — `UICollectionViewFlowLayout.prepare()` is O(total items). That is
+/// fixed on the platform side by a layout that keeps a cumulative offset table and
+/// recomputes only from the first changed row, fed by heights this crate already
+/// measured off the main thread. With an O(changed) commit, mounting the whole
+/// transcript costs what mounting a window used to.
+///
+/// So: no ceiling here, and the constant-cost commit is preserved where it actually
+/// lives — in the renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VibeWindowPolicy {
     pub min_len: u32,
+    /// `u32::MAX` means "no ceiling": the window is the whole store. See
+    /// [`VibeWindowPolicy::is_unbounded`].
     pub max_len: u32,
     pub default_len: u32,
-    /// How many messages one scroll-back page adds.
+    /// How many messages one scroll-back page adds. Ignored when unbounded.
     pub page_size: u32,
 }
 
@@ -54,12 +81,7 @@ impl std::error::Error for VibeWindowPolicyError {}
 
 impl Default for VibeWindowPolicy {
     fn default() -> Self {
-        Self {
-            min_len: 150,
-            max_len: 300,
-            default_len: 200,
-            page_size: 50,
-        }
+        Self::unbounded()
     }
 }
 
@@ -68,6 +90,21 @@ impl VibeWindowPolicy {
     pub const CONTRACT_MIN: u32 = 150;
     /// Upper bound of the frozen contract.
     pub const CONTRACT_MAX: u32 = 300;
+
+    /// No ceiling: the window is always the entire store, and paging is a no-op.
+    pub fn unbounded() -> Self {
+        Self {
+            min_len: 0,
+            max_len: u32::MAX,
+            default_len: 0,
+            page_size: 1,
+        }
+    }
+
+    /// Whether this policy has no ceiling.
+    pub fn is_unbounded(&self) -> bool {
+        self.max_len == u32::MAX
+    }
 
     pub fn try_new(
         min_len: u32,
@@ -135,6 +172,14 @@ impl VibeWindowCursor {
             self.len = 0;
             return self;
         }
+        // No ceiling: the window is the store. There is no head to move, so there is
+        // nothing for a scroll-back page to do and nothing a new arrival can push out.
+        if policy.is_unbounded() {
+            self.follow_tail = true;
+            self.start = 0;
+            self.len = total;
+            return self;
+        }
         // The live window is never smaller than the default: a chat that grew
         // from one message to two hundred must show all of them, not stay
         // pinned at whatever size it was first clamped to. Paging can push the
@@ -155,6 +200,11 @@ impl VibeWindowCursor {
     /// Scroll-back. Grows toward the max ceiling first, then walks the window
     /// backwards and stops following the tail.
     pub fn paged_before(mut self, total: usize, policy: VibeWindowPolicy) -> Self {
+        // Everything is already in the window. Returning `self` unchanged is what makes
+        // `page_before` report "nothing moved" and emit no delta.
+        if policy.is_unbounded() {
+            return self.clamped(total, policy);
+        }
         let page = policy.page_size as usize;
         let max = policy.max_len as usize;
         if self.len < max {
@@ -174,6 +224,9 @@ impl VibeWindowCursor {
 
     /// Scroll forward. Re-arms tail following once the window reaches the end.
     pub fn paged_after(mut self, total: usize, policy: VibeWindowPolicy) -> Self {
+        if policy.is_unbounded() {
+            return self.clamped(total, policy);
+        }
         let page = policy.page_size as usize;
         if self.follow_tail {
             return self.clamped(total, policy);
@@ -276,6 +329,16 @@ pub fn cursor_for_index(
     index: usize,
     resolution: VibeAnchorResolution,
 ) -> VibeWindowCursor {
+    // Unbounded: every anchor resolves to the same window — all of it. The anchor still
+    // matters to the renderer (it decides where to scroll), it just no longer decides
+    // which rows exist.
+    if policy.is_unbounded() {
+        return VibeWindowCursor {
+            follow_tail: true,
+            start: 0,
+            len: total,
+        };
+    }
     let len = (policy.default_len as usize).min(total);
     match resolution {
         VibeAnchorResolution::PinnedBottom | VibeAnchorResolution::Empty => VibeWindowCursor {
@@ -368,24 +431,33 @@ mod tests {
 
         let p = VibeWindowPolicy::default();
         assert_eq!((p.min_len, p.max_len, p.default_len), (150, 300, 200));
+        assert!(!p.is_unbounded(), "the default policy is bounded");
+        assert!(VibeWindowPolicy::unbounded().is_unbounded());
     }
 
+    /// The default is a window over the whole store, at any size, forever.
+    ///
+    /// This replaces `window_is_bounded_no_matter_how_large_the_store_is`. The cap it
+    /// guarded is gone on purpose: every bounded window was experienced as a scroll
+    /// limit, because at the ceiling a drag to the top *replaced* rows instead of
+    /// extending them.
     #[test]
-    fn window_is_bounded_no_matter_how_large_the_store_is() {
-        let policy = VibeWindowPolicy::default();
-        let cursor = VibeWindowCursor::default().clamped(100_000, policy);
-        assert_eq!(cursor.len, 200);
-        assert_eq!(cursor.start, 99_800);
-
-        let mut c = cursor;
-        for _ in 0..100 {
-            c = c.paged_before(100_000, policy);
-            assert!(c.len <= policy.max_len as usize);
+    fn the_default_window_is_the_whole_store_and_paging_is_inert() {
+        let policy = VibeWindowPolicy::unbounded();
+        for total in [1_usize, 12, 300, 1_000, 100_000] {
+            let c = VibeWindowCursor::default().clamped(total, policy);
+            assert_eq!((c.start, c.len), (0, total), "total={total}");
+            assert!(c.follow_tail);
+            // Paging cannot move a window that already covers everything, and an
+            // unmoved cursor is what makes `page_before` emit no delta at all.
+            assert_eq!(c.paged_before(total, policy), c, "total={total}");
+            assert_eq!(c.paged_after(total, policy), c, "total={total}");
         }
-        assert_eq!(c.len, 300);
-        assert!(c.start < 99_800);
+        let empty = VibeWindowCursor::default().clamped(0, policy);
+        assert_eq!((empty.start, empty.len), (0, 0));
     }
 
+    /// The bounded policy still works for any caller that asks for one.
     #[test]
     fn paging_before_then_after_re_arms_tail_following() {
         let policy = VibeWindowPolicy::default();
@@ -401,6 +473,28 @@ mod tests {
         }
         assert!(c.follow_tail);
         assert_eq!(c.end(), total);
+    }
+
+    /// A bounded window's scroll-back must still reach the start of a large store.
+    #[test]
+    fn paging_before_walks_a_large_store_to_its_first_message() {
+        let policy = VibeWindowPolicy::default();
+        let total = 1_000;
+        let mut c = VibeWindowCursor::default().clamped(total, policy);
+        assert_eq!(c.start, total - policy.default_len as usize);
+
+        let mut previous = c.start;
+        let mut pages = 0;
+        while c.start > 0 {
+            c = c.paged_before(total, policy);
+            pages += 1;
+            assert!(c.start < previous || c.len > policy.default_len as usize);
+            assert!(c.len <= policy.max_len as usize);
+            previous = c.start;
+            assert!(pages < 100, "paging stalled at start={}", c.start);
+        }
+        assert_eq!(c.start, 0);
+        assert!(!c.follow_tail);
     }
 
     #[test]
@@ -494,6 +588,15 @@ mod tests {
         assert!(!c.follow_tail);
     }
 
+    /// Unbounded: a jump changes where the renderer scrolls, never which rows exist.
+    #[test]
+    fn jumping_to_a_message_unbounded_keeps_the_whole_store_mounted() {
+        let policy = VibeWindowPolicy::unbounded();
+        let c = cursor_for_index(10_000, policy, 5_000, VibeAnchorResolution::ExactId);
+        assert_eq!((c.start, c.len), (0, 10_000));
+        assert!(c.follow_tail);
+    }
+
     #[test]
     fn bounds_report_more_in_both_directions() {
         let messages = store(1_000);
@@ -503,6 +606,19 @@ mod tests {
         assert!(b.has_more_before);
         assert!(b.has_more_after);
         assert_eq!(b.window_len, 200);
+        assert_eq!(b.total_known, 1_000);
+    }
+
+    /// Nothing is ever off-window, so nothing is ever "more".
+    #[test]
+    fn unbounded_bounds_never_report_more_in_either_direction() {
+        let messages = store(1_000);
+        let policy = VibeWindowPolicy::unbounded();
+        let c = cursor_for_index(1_000, policy, 500, VibeAnchorResolution::ExactId);
+        let b = bounds_for(&messages, c, 1_000);
+        assert!(!b.has_more_before);
+        assert!(!b.has_more_after);
+        assert_eq!(b.window_len, 1_000);
         assert_eq!(b.total_known, 1_000);
     }
 }

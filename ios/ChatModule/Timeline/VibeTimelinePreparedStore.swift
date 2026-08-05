@@ -74,10 +74,19 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
   /// accumulate transcripts nothing will open.
   private static let maxChats = 8
 
-  /// Ceiling on rows measured per chat. The core's own window is 200 and the list
-  /// seeds a full window, so this covers a whole open; past it the marginal row is
-  /// off-screen by thousands of points and its height is not what anyone is looking at.
-  private static let maxRows = 200
+  /// Ceiling on rows kept prepared per chat. A memory guard, nothing more.
+  ///
+  /// This was 200, justified by "the core's own window is 200". That has not been true
+  /// since the core window went unbounded (`core/vibe_core/src/window.rs`), and the stale
+  /// cap had a consequence nobody could see from here: a 1,386-row chat could never be
+  /// more than 14% prepared, no matter how many times it was opened. Every pass measured
+  /// the same newest 200 rows and the rest stayed permanently unmeasured — which is what
+  /// `storeHit=361 storeMiss=1031` was reporting, and why the seed fell back to
+  /// estimating rows whose heights were sitting on disk.
+  ///
+  /// Heights are a `String` key and a few floats, so 4,000 rows across 8 chats is a couple
+  /// of megabytes. The measurement is off-main and, since `prepare` merges, incremental.
+  private static let maxRows = 4000
 
   private let lock = NSLock()
   private var byChat: [String: Prepared] = [:]
@@ -191,21 +200,57 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     let started = ProcessInfo.processInfo.systemUptime
     // The cap is enforced here rather than at the async wrapper so no entry point can
     // bypass it. Newest rows are the ones a chat opens on, so a transcript longer than
-    // the window keeps its tail; past it a row is thousands of points off screen and its
-    // height is not what anyone is looking at.
+    // the cap keeps its tail.
     let rows = rows.count > Self.maxRows ? Array(rows.suffix(Self.maxRows)) : rows
 
-    let measured = VibeRowMetrics.measuredBatch(rows: rows, rowWidth: width)
-    var rowsByKey: [String: ChatListRow] = [:]
-    rowsByKey.reserveCapacity(measured.byKey.count)
-    for row in rows where measured.byKey[row.key] != nil { rowsByKey[row.key] = row }
+    // Measure only what is not already measured at this width, and MERGE.
+    //
+    // This used to measure every row it was handed and then overwrite the chat's entry
+    // outright. Both halves were wrong. Overwriting meant a pass could only ever lose
+    // coverage it already had, so a long transcript never accumulated — the device log
+    // showed `rows=200 sized=200 ms=204` on pass after pass, re-measuring the identical
+    // 200 rows for 200ms each time while the other ~1,100 rows stayed unmeasured
+    // forever. Opening the chat again could not help; there was no path by which it ever
+    // became more prepared.
+    //
+    // A width change is different: every stored height was measured against the old
+    // width and is now wrong, so that case starts clean rather than merging.
+    let existing: Prepared? = {
+      lock.lock()
+      defer { lock.unlock() }
+      guard let entry = byChat[chatId], abs(entry.width - width) <= 0.5 else { return nil }
+      return entry
+    }()
+
+    let pending = rows.filter { existing?.heightsByKey[$0.key] == nil }
+    let measured = VibeRowMetrics.measuredBatch(rows: pending, rowWidth: width)
+
+    var heightsByKey = existing?.heightsByKey ?? [:]
+    var rowsByKey = existing?.rowsByKey ?? [:]
+    var deferredKeys = existing?.deferredKeys ?? []
+    for row in pending where measured.byKey[row.key] != nil {
+      heightsByKey[row.key] = measured.byKey[row.key]
+      rowsByKey[row.key] = row
+    }
+    deferredKeys.formUnion(measured.deferredKeys)
+    // A row that measured cleanly this time is no longer deferred.
+    deferredKeys.subtract(pending.map(\.key).filter { measured.byKey[$0] != nil })
+
+    // Ordering follows the rows just handed over — that is the live transcript order —
+    // but heights carried in from earlier passes stay usable for rows outside it.
+    let orderedKeys = rows.map(\.key)
+    let liveKeys = Set(orderedKeys)
+    heightsByKey = heightsByKey.filter { liveKeys.contains($0.key) }
+    rowsByKey = rowsByKey.filter { liveKeys.contains($0.key) }
+    deferredKeys = deferredKeys.intersection(liveKeys)
+
     let prepared = Prepared(
       chatId: chatId,
       width: width,
-      orderedKeys: rows.map(\.key),
-      heightsByKey: measured.byKey,
+      orderedKeys: orderedKeys,
+      heightsByKey: heightsByKey,
       rowsByKey: rowsByKey,
-      deferredKeys: Set(measured.deferredKeys),
+      deferredKeys: deferredKeys,
       preparedAt: ProcessInfo.processInfo.systemUptime,
       measureMs: Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
     )
@@ -228,9 +273,13 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     let total = preparations
     lock.unlock()
 
+    // `sized` is cumulative coverage, `fresh` is what this pass actually measured. Both
+    // are needed: the old line printed only a count that happened to equal the cap on
+    // every pass, which read as healthy while coverage never moved.
     NSLog(
-      "[VibeCore] prepared chat=%@ rows=%d sized=%d deferred=%d width=%.0f ms=%d reason=%@ total=%d",
+      "[VibeCore] prepared chat=%@ rows=%d sized=%d fresh=%d carried=%d deferred=%d width=%.0f ms=%d reason=%@ total=%d",
       String(chatId.prefix(12)), rows.count, prepared.heightsByKey.count,
+      pending.count, (existing?.heightsByKey.count ?? 0),
       prepared.deferredKeys.count, width, prepared.measureMs, reason, total)
     return prepared
   }

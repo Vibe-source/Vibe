@@ -233,23 +233,29 @@ struct VibeTimelineUserDefaultsFeatureFlags: VibeTimelineFeatureFlagProviding {
     let orderAuthority =
       defaults.object(forKey: Self.coreOrderAuthorityKey) as? Bool ?? false
 
-    // Debug arms it, release does not — the same split shadow comparison uses.
+    // OFF everywhere, debug included. This one reaches the screen, and what it put
+    // there was a scroll wall.
     //
-    // This one *does* reach the screen, so the asymmetry needs justifying: the
-    // rows it withholds are not lost, they are the ones the user has to scroll
-    // up to reach, and the reveal path that restores them is already shipping
-    // code driven by the same scroll handler. The failure mode is "older history
-    // arrives on scroll instead of being pre-mounted", which is how every large
-    // transcript in every messaging app behaves. Leaving it default-off in debug
-    // would mean the cap is only ever exercised by someone who remembered to
-    // flip a switch, which is how the machinery got to be inert in the first
-    // place.
-    let transcriptWindowDefault: Bool
-    #if DEBUG
-      transcriptWindowDefault = true
-    #else
-      transcriptWindowDefault = false
-    #endif
+    // It was armed in debug on the theory that withheld rows are "merely unmounted"
+    // and arrive on scroll like every other messaging app. Two things were wrong with
+    // that. The reveal is not a slide, it is a one-shot re-apply of the whole
+    // transcript — `history-window REVEAL … visible=1079 of 1079` then a 879-row batch
+    // insert — so reaching older history costs a multi-hundred-millisecond main-thread
+    // stall and a visible content-size jump, not a scroll. And the seed path never
+    // asked the window at all: a cold open mounted the full 979 rows, the first engine
+    // flush clamped to 200, and the difference was deleted as zombies
+    // (`reconcile ZOMBIES removed=779`, contentH 36230→7439) before the background
+    // drain re-inserted them page by page. The cap therefore paid the full mount cost
+    // AND charged the reader a wall for it.
+    //
+    // The cost it was hiding is fixed at the source: `ChatTimelineLayout` memoizes
+    // heights by row identity, and `setRows` no longer runs an O(previous × parsed)
+    // scan per apply. Mount the transcript.
+    //
+    // The machinery below (`windowedTranscriptSourceRows`, the reveal path) is left
+    // wired and reachable through this key, so a genuinely pathological transcript can
+    // still be bounded from the debug menu without restoring the default.
+    let transcriptWindowDefault = false
     let transcriptWindow =
       defaults.object(forKey: Self.transcriptWindowKey) as? Bool ?? transcriptWindowDefault
 

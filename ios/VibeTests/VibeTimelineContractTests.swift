@@ -639,8 +639,16 @@ final class VibeRenderSnapshotValidatorTests: XCTestCase {
       XCTFail("expected windowItemCountMismatch")
     }
 
-    // Oversized window (>300) must fail policy.
-    let oversizedItems = (0..<301).map { makeSettledItem(id: "o-\($0)", rank: UInt64($0)) }
+    // A large window is VALID. This asserted the opposite — anything over 300 was a
+    // validation failure — and that is what disabled the core on every real chat once
+    // the window went unbounded: the snapshot was rejected, so the host never mounted,
+    // so every later transaction was fenced against generation 0.
+    //
+    // How many rows a host will mount is the host's policy and it enforces its own
+    // (see `testAnOversizedSnapshotIsTrimmedByABoundedHost`). Well-formedness is what
+    // this validator is for, and a thousand correctly-ordered unique rows are well
+    // formed.
+    let oversizedItems = (0..<1_001).map { makeSettledItem(id: "o-\($0)", rank: UInt64($0)) }
     let oversized = VibeRenderSnapshot(
       chatId: TimelineTestIDs.chat,
       generation: 1,
@@ -648,10 +656,8 @@ final class VibeRenderSnapshotValidatorTests: XCTestCase {
       items: oversizedItems,
       contentHeight: oversizedItems.reduce(0) { $0 + $1.size.height }
     )
-    if case .failure(.windowOutOfPolicy(let count)) = VibeRenderSnapshotValidator.validate(oversized) {
-      XCTAssertEqual(count, 301)
-    } else {
-      XCTFail("expected windowOutOfPolicy")
+    if case .failure(let failure) = VibeRenderSnapshotValidator.validate(oversized) {
+      XCTFail("a 1,001-row snapshot must validate; got \(failure)")
     }
   }
 
@@ -1282,7 +1288,15 @@ final class VibeTimelineReferenceHostTests: XCTestCase {
     XCTAssertEqual(host.debugGeometryMap().count, 200)
   }
 
-  func testRejectsOversizedSnapshotAtomically() {
+  /// A host that wants a bounded model **trims** to its bound; it does not reject the
+  /// conversation.
+  ///
+  /// This asserted rejection, and the shared snapshot validator enforced it for every
+  /// host — including the real one, which is unbounded. The result was that a chat with
+  /// more than 300 messages had every snapshot thrown away before it could mount, so the
+  /// core ran and rendered nothing. Bounding is a host's own decision and it is made by
+  /// trimming, which is what `trimIfNeeded` has always done.
+  func testAnOversizedSnapshotIsTrimmedByABoundedHost() {
     let host = VibeTimelineReferenceHost(activeWindowCount: 200)
     let items = (0..<301).map { makeSettledItem(id: "o-\($0)", rank: UInt64($0)) }
     let snapshot = VibeRenderSnapshot(
@@ -1295,16 +1309,13 @@ final class VibeTimelineReferenceHostTests: XCTestCase {
       items: items,
       contentHeight: items.reduce(0) { $0 + $1.size.height }
     )
-    let result = host.tryApply(snapshot: snapshot, reason: .debug)
-    if case .failure(.snapshotValidation(.windowOutOfPolicy(count: 301))) = result {
-      // expected
-    } else {
-      XCTFail("expected oversized-window rejection, got \(String(describing: result))")
+    if case .failure(let failure) = host.tryApply(snapshot: snapshot, reason: .debug) {
+      return XCTFail("a bounded host must trim, not reject; got \(failure)")
     }
-    XCTAssertFalse(host.hasCommittedModel)
-    XCTAssertEqual(host.instantiatedItemCount, 0)
-    XCTAssertEqual(host.failedApplyCount, 1)
-    XCTAssertEqual(host.successfulApplyCount, 0)
+    XCTAssertTrue(host.hasCommittedModel)
+    XCTAssertEqual(host.instantiatedItemCount, 200, "trimmed to the host's own bound")
+    XCTAssertEqual(host.failedApplyCount, 0)
+    XCTAssertEqual(host.successfulApplyCount, 1)
   }
 
   // MARK: Failure atomicity

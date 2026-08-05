@@ -179,8 +179,15 @@ final class VibeCoreListPreviewModel: ObservableObject {
     }
     self.sink = sink
 
+    // Its own handle, deliberately not `VibeCoreBridge.sharedCore`: this screen
+    // feeds adversarial synthetic fixtures — scrambled timestamps, duplicate ids —
+    // and those must never land in the reducer that serves real conversations.
+    // `unwrapper: nil` for the same reason the fixtures are plaintext: there is
+    // nothing here to decrypt, and a probe screen has no business holding the
+    // Keychain seam.
     handle = VibeCoreHandle(
-      config: VibeFfiConfig(ownUserId: ownUserId, flushFrameIntervalMs: 8), sink: sink)
+      config: VibeFfiConfig(ownUserId: ownUserId, flushFrameIntervalMs: 8), sink: sink,
+      unwrapper: nil)
     refreshStats()
   }
 

@@ -84,14 +84,14 @@ defmodule Vibe.AI.AgentRuntime do
 
     case result do
       {:ok, reply} ->
-        {:ok, join_beats(accumulated_text, reply), config.state}
+        {:ok, join_beats(accumulated_text, reply), served_by(config, next_provider_state)}
 
       {:tool_use, tool_calls, partial_response, partial_text} ->
         callback = config.callback || fn _event -> :ok end
         {tool_results, next_state} = config.execute_tools.(tool_calls, config.state, callback)
 
         if Map.get(next_state, :terminal_status) == "waiting_for_user" do
-          {:ok, accumulated_text <> partial_text, next_state}
+          {:ok, accumulated_text <> partial_text, served_by(%{config | state: next_state}, next_provider_state)}
         else
           do_run(
             messages ++
@@ -111,8 +111,67 @@ defmodule Vibe.AI.AgentRuntime do
     end
   end
 
+  # Which model ACTUALLY answered — not which one was requested. Production ran for an
+  # unknown stretch with an out-of-credit Anthropic key, so every Claude selection was
+  # silently served by OpenAI and nothing said so: the picked model looked like the reason
+  # the agent behaved badly. The caller (and the diagnostics export) can now tell the
+  # difference between "this model is weak" and "this model never ran".
+  defp served_by(%Config{} = config, provider_state) do
+    {provider, model} =
+      case Map.get(provider_state, :selected) do
+        :openai -> {"openai", Map.get(provider_state, :served_model) || openai_model(config)}
+        _ -> {"anthropic", config.model}
+      end
+
+    config.state
+    |> Map.put(:served_provider, provider)
+    |> Map.put(:served_model, model)
+    |> Map.put(:requested_model, config.model)
+    |> Map.put(:substituted?, model != config.model)
+  end
+
+  @doc """
+  One completion via the OpenAI Responses API, returned in Anthropic's *decoded response*
+  shape: `%{"content" => blocks, "stop_reason" => "tool_use" | "end_turn"}`.
+
+  `Vibe.AI.GroupAgent` has its own Anthropic-shaped tool loop and, unlike this module, no
+  provider fallback at all — a non-200 from Anthropic was simply `{:error, "API error:
+  400"}`. Measured 2026-08-05, the production Anthropic key was out of credit, which meant
+  every group and channel agent turn failed outright while the DM assistant kept working
+  through its fallback. Rather than duplicate provider handling there, that loop borrows
+  this and keeps parsing the one shape it already understands.
+  """
+  def anthropic_shaped_openai_completion(messages, %Config{} = config) do
+    case System.get_env("OPENAI_API_KEY") do
+      key when is_binary(key) and key != "" ->
+        config =
+          %{config | stream_text?: false}
+          |> apply_openai_environment()
+          |> preserve_effort_across_fallback()
+
+        case request_openai_completion_stream(messages, config, key) do
+          {:ok, text} ->
+            {:ok,
+             %{
+               "content" => [%{"type" => "text", "text" => text}],
+               "stop_reason" => "end_turn"
+             }}
+
+          {:tool_use, _tool_calls, content_blocks, _partial_text} ->
+            {:ok, %{"content" => content_blocks, "stop_reason" => "tool_use"}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      _ ->
+        {:error, "OPENAI_API_KEY not configured"}
+    end
+  end
+
   defp request_completion_stream(messages, %Config{} = config, %{selected: :openai} = state) do
-    {request_openai_completion_stream(messages, config, state.openai_api_key), state}
+    {request_openai_completion_stream(messages, config, state.openai_api_key),
+     Map.put(state, :served_model, openai_model(config))}
   end
 
   defp request_completion_stream(messages, %Config{} = config, provider_state) do
@@ -157,17 +216,72 @@ defmodule Vibe.AI.AgentRuntime do
 
       {{:error, claude_reason}, provider_state}
     else
+      config = preserve_effort_across_fallback(config)
+
       Logger.warning(
         "[#{config.request_label}] Claude unavailable; falling back to " <>
-          "#{config.openai_fallback_model}: #{inspect(claude_reason)}"
+          "#{config.openai_fallback_model} at effort=#{config.openai_reasoning_effort}: " <>
+          inspect(claude_reason)
       )
 
       result =
         request_openai_completion_stream(messages, config, provider_state.openai_api_key)
 
-      {result, %{provider_state | selected: :openai}}
+      {result,
+       provider_state
+       |> Map.put(:selected, :openai)
+       |> Map.put(:served_model, config.openai_fallback_model)}
     end
   end
+
+  # Falling back must not silently demote the turn. Measured 2026-08-05 against production:
+  # the ANTHROPIC key was out of credit, so EVERY turn fell through to this path — and the
+  # fallback hardcoded `gpt-5.6-luna` at the default `medium` effort. A user who picked
+  # Fable at `max` was served the cheapest model at middling effort with nothing in the UI
+  # saying so, which is exactly how "the agent is not agentic on some models" happens.
+  #
+  # Map the requested Claude tier onto the closest OpenAI one and carry the effort across,
+  # clamped to what the substitute actually supports. An explicit
+  # OPENAI_AGENT_FALLBACK_MODEL still wins — that override exists to pin a model during an
+  # incident.
+  defp preserve_effort_across_fallback(%Config{} = config) do
+    model =
+      case nonblank_environment("OPENAI_AGENT_FALLBACK_MODEL") do
+        pinned when is_binary(pinned) -> config.openai_fallback_model
+        _ -> equivalent_openai_model(config.model) || config.openai_fallback_model
+      end
+
+    effort =
+      case nonblank_environment("OPENAI_AGENT_FALLBACK_REASONING_EFFORT") do
+        pinned when is_binary(pinned) -> config.openai_reasoning_effort
+        _ -> supported_effort(model, config.thinking_level) || config.openai_reasoning_effort
+      end
+
+    %{config | openai_fallback_model: model, openai_reasoning_effort: effort}
+  end
+
+  defp equivalent_openai_model(claude_model) when is_binary(claude_model) do
+    case claude_model do
+      "claude-fable-5" -> "gpt-5.6-sol"
+      "claude-opus-4-8" -> "gpt-5.6-sol"
+      "claude-sonnet-5" -> "gpt-5.6-terra"
+      _ -> "gpt-5.6-luna"
+    end
+  end
+
+  defp equivalent_openai_model(_claude_model), do: nil
+
+  defp supported_effort(model, requested) when is_binary(requested) do
+    case Vibe.AI.ModelRegistry.thinking_levels("openai", model) do
+      levels when is_list(levels) ->
+        if requested in levels, do: requested, else: List.last(levels)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp supported_effort(_model, _requested), do: nil
 
   defp request_claude_completion_stream(messages, %Config{} = config, api_key) do
     body = messages |> claude_request_payload(config) |> Jason.encode!()

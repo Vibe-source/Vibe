@@ -2995,7 +2995,20 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     } else {
+      // DM / contact / agent profile: Clear Chat (for me, or for both when the
+      // host presents the confirmation sheet) + Block. Clear Chat is the one
+      // destructive that keeps the conversation identity and only wipes history.
       ChatProfileSwiftUISection(fill: rowFill) {
+        Button(role: .destructive) { onAction("clearChat") } label: {
+          ChatProfileSwiftUIRow(
+            title: "Clear Chat",
+            titleColor: .red,
+            separatorColor: separatorColor,
+            isLast: false
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
         Button { onAction("block") } label: {
           ChatProfileSwiftUIRow(
             title: "Block Contact",
@@ -6810,6 +6823,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       onNativeEvent(["type": "profileContactAction", "action": action])
     case "addToEmergency":
       onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
+    case "clearChat":
+      // Same event the chat-header / UIKit menu already emit. Host presents
+      // "Clear just for me" vs "Clear for me and …" and drives engine + core.
+      onNativeEvent(["type": "headerMenuAction", "action": "clearChat"])
     case "block":
       onNativeEvent(["type": "profileContactAction", "action": "block"])
     case "editGroup", "leaveGroup", "deleteGroup":

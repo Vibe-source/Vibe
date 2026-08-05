@@ -78,6 +78,8 @@ public final class ChatContextMenuOverlay: UIView {
 
   // Reaction picker pill
   private let reactionPicker: ReactionPickerView
+  /// Suppresses the emoji row entirely — see the failed-send note in `init`.
+  private var hidesReactionPicker = false
 
   // Action menu card
   private let contextMenu: ContextMenuView
@@ -104,7 +106,8 @@ public final class ChatContextMenuOverlay: UIView {
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
     showEditAction: Bool = false,
-    restrictSavingContent: Bool = false
+    restrictSavingContent: Bool = false,
+    failedSendOnly: Bool = false
   ) {
     self.messageId = messageId
     self.bubbleSnapshot = bubbleSnapshot
@@ -144,8 +147,13 @@ public final class ChatContextMenuOverlay: UIView {
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
       showEditAction: showEditAction,
-      restrictSavingContent: restrictSavingContent
+      restrictSavingContent: restrictSavingContent,
+      failedSendOnly: failedSendOnly
     )
+    // No reactions on a message that was never delivered — there is nobody on the other
+    // end to have reacted to, and a picker above a two-item menu is most of the chrome
+    // for none of the meaning.
+    self.hidesReactionPicker = failedSendOnly
 
     super.init(frame: .zero)
 
@@ -173,7 +181,8 @@ public final class ChatContextMenuOverlay: UIView {
     reactionPicker.delegate = self
     let pickerSize = reactionPicker.intrinsicContentSize
     reactionPicker.frame = CGRect(origin: .zero, size: pickerSize)
-    addSubview(reactionPicker)
+    reactionPicker.isHidden = hidesReactionPicker
+    if !hidesReactionPicker { addSubview(reactionPicker) }
 
     // 4. Context menu (below or above bubble)
     contextMenu.alpha = 0
@@ -232,10 +241,11 @@ public final class ChatContextMenuOverlay: UIView {
     let safeLeft: CGFloat = 16
     let safeRight = bounds.width - 16
 
-    // Measure reaction picker
-    let pickerSize = reactionPicker.intrinsicContentSize
+    // Measure reaction picker. Zero height and zero gap when it is suppressed, so the
+    // menu sits against the bubble instead of leaving a hole where the emoji row was.
+    let pickerSize = hidesReactionPicker ? .zero : reactionPicker.intrinsicContentSize
     let pickerHeight = pickerSize.height
-    let pickerGap: CGFloat = 8
+    let pickerGap: CGFloat = hidesReactionPicker ? 0 : 8
 
     // Measure context menu
     let menuWidth: CGFloat = min(220, bounds.width - 32)
@@ -785,7 +795,8 @@ final class ContextMenuView: UIView {
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
     showEditAction: Bool = false,
-    restrictSavingContent: Bool = false
+    restrictSavingContent: Bool = false,
+    failedSendOnly: Bool = false
   ) {
     self.messageId = messageId
     var resolvedActions: [ActionItem] = [
@@ -833,7 +844,20 @@ final class ContextMenuView: UIView {
           id: "select", title: "Select", iconName: "checkmark.circle", isDestructive: false)
       )
     }
-    self.actions = resolvedActions
+    // A message that never left the device has exactly two things you can do with it.
+    //
+    // Reply, Pin, Copy, Forward and Select all address a message that EXISTS for the
+    // other person; offering them on a failed send is offering to act on something that
+    // is not there. Send it again, or throw it away. Replaces the whole list rather than
+    // filtering it, so the order is deliberate instead of whatever survived.
+    self.actions =
+      failedSendOnly
+      ? [
+        ActionItem(
+          id: "resend", title: "Resend", iconName: "arrow.clockwise", isDestructive: false),
+        ActionItem(id: "delete", title: "Delete", iconName: "trash", isDestructive: true),
+      ]
+      : resolvedActions
     self.glassView = makeChatContextLiquidGlassView(
       style: appearance.isDark ? .systemMaterialDark : .systemMaterial,
       cornerRadius: 24,

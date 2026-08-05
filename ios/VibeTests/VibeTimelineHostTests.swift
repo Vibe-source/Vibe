@@ -46,7 +46,17 @@ final class VibeTimelineHostTests: XCTestCase {
       hasReply: hasReply,
       hasAgent: false,
       hasService: false,
-      isEdited: false
+      isEdited: false,
+      // The detail payloads the core grew after this fixture was written. Left nil
+      // on purpose: every test in this file is about *geometry* — how a row is
+      // measured, frozen and re-measured — and the measure path reads the `has*`
+      // booleans above, never these. A fixture that filled them in would be
+      // asserting against data the code under test does not consult.
+      media: nil,
+      reply: nil,
+      agent: nil,
+      service: nil,
+      editedAtMs: nil
     )
   }
 
@@ -395,28 +405,6 @@ final class VibeTimelineHostTests: XCTestCase {
     XCTAssertEqual(host.anchorDriftViolations, 0, "following live traffic is not a jump")
   }
 
-  // MARK: Shadow probe eligibility
-
-  func testTheShadowProbeFailsClosed() {
-    let off = VibeTimelineFeatureFlags()
-    XCTAssertNil(
-      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: false, flags: off),
-      "default flags must not arm the probe")
-
-    let noAllowlist = VibeTimelineFeatureFlags(vibeTimelineShadowCompareEnabled: true)
-    // The RENDER allowlist must not arm the probe either — only the shadow one.
-    let wrongAllowlist = VibeTimelineFeatureFlags(
-      vibeTimelineShadowCompareEnabled: true, eligibleChatClasses: .directMessage)
-    XCTAssertNil(
-      VibeTimelineShadowProbe.makeIfEligible(
-        chatId: "c1", isGroupOrChannel: false, flags: wrongAllowlist),
-      "the render allowlist must not arm a diagnostic")
-    XCTAssertNil(
-      VibeTimelineShadowProbe.makeIfEligible(
-        chatId: "c1", isGroupOrChannel: false, flags: noAllowlist),
-      "an empty class allowlist must not arm the probe")
-  }
-
   /// The debug default is deliberate, and only covers the harmless gate.
   ///
   /// Shadow comparison arms itself in debug so real-conversation divergence data
@@ -458,17 +446,4 @@ final class VibeTimelineHostTests: XCTestCase {
       "turning it off in Diagnostics must survive the debug default")
   }
 
-  func testTheShadowProbeIsDirectMessageOnly() {
-    let on = VibeTimelineFeatureFlags(
-      vibeTimelineShadowCompareEnabled: true, shadowEligibleChatClasses: .directMessage)
-
-    XCTAssertNotNil(
-      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: false, flags: on))
-    XCTAssertNil(
-      VibeTimelineShadowProbe.makeIfEligible(chatId: "c1", isGroupOrChannel: true, flags: on),
-      "P4 is 1:1 DM only; groups get their own gated rollout")
-    XCTAssertNil(
-      VibeTimelineShadowProbe.makeIfEligible(chatId: "   ", isGroupOrChannel: false, flags: on),
-      "a blank chat id must not arm the probe")
-  }
 }

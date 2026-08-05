@@ -34,6 +34,24 @@ final class VibeDeviceDriver {
     sleepMs(1_200)
   }
 
+  /// Attaches to an app that is already running, instead of starting it.
+  ///
+  /// There is no way to stream a physical device's log from a test: `devicectl`
+  /// has no console subcommand that attaches to a running process, and
+  /// `log stream` does not reach the device. What does work is launching the app
+  /// separately with `devicectl device process launch --console`, which holds a
+  /// console attached for as long as that process lives — and then *not*
+  /// relaunching it here, because a relaunch kills the process the console is
+  /// attached to and the log stops mid-test.
+  ///
+  /// `activate()` foregrounds the existing process and connects to it, so the
+  /// gestures and the log come from the same run.
+  func attach() {
+    app.activate()
+    _ = app.wait(for: .runningForeground, timeout: 20)
+    sleepMs(800)
+  }
+
   func messageListDebugValue() -> String {
     let list = app.collectionViews["chat.messages"]
     return list.value as? String ?? "<missing>"

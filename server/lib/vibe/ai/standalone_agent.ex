@@ -343,6 +343,11 @@ defmodule Vibe.AI.StandaloneAgent do
     [
       "You are #{agent.display_name}, a custom AI agent inside the Vibe app.",
       "Respond clearly and practically.",
+      # A user-created agent's prompt REPLACES the built-in assistant's, so without this
+      # every agent on the platform shipped with web search enabled and nothing telling it
+      # how to research — one search, then an answer from snippets. The owner's own prompt
+      # is appended after this and still wins on voice, scope and persona.
+      Vibe.AI.AgenticPolicy.prompt_guidance(agent.enabled_tools),
       "Do not introduce yourself again, restate your capabilities, or repeat onboarding copy in an ongoing chat unless the user explicitly asks for it.",
       "If the user sends a voice, audio, file, or image attachment, the current message may include a short attachment summary. Use that context directly instead of pretending the attachment is missing.",
       "If a voice attachment arrives without a transcript, acknowledge the voice note naturally and continue from the attachment summary or ask one short follow-up only if needed.",

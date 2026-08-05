@@ -101,12 +101,21 @@ final class TranscriptWindowFlagTests: XCTestCase {
     return VibeTimelineUserDefaultsFeatureFlags(defaults: defaults).flags
   }
 
-  func testTheWindowArmsItselfInDebug() {
-    #if DEBUG
-      XCTAssertTrue(flags().vibeTranscriptWindowEnabled)
-    #else
-      XCTAssertFalse(flags().vibeTranscriptWindowEnabled)
-    #endif
+  /// The transcript mounts whole unless someone asks otherwise — in every
+  /// configuration, debug included.
+  ///
+  /// This asserted the opposite until the debug default was measured on device: the
+  /// cap withheld 779 of 979 rows on open, then charged an 879-row batch insert to
+  /// give them back. A row limit is a debug-menu tool now, never a default.
+  func testTheWindowIsOffUnlessAskedFor() {
+    XCTAssertFalse(flags().vibeTranscriptWindowEnabled)
+  }
+
+  func testAnExplicitTrueWins() {
+    let resolved = flags {
+      $0.set(true, forKey: VibeTimelineUserDefaultsFeatureFlags.transcriptWindowKey)
+    }
+    XCTAssertTrue(resolved.vibeTranscriptWindowEnabled)
   }
 
   func testAnExplicitFalseWins() {

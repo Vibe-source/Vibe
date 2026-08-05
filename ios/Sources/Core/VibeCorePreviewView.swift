@@ -304,7 +304,9 @@ final class VibeCorePreviewModel: ObservableObject {
     self.sink = sink
 
     let config = VibeFfiConfig(ownUserId: ownUserId, flushFrameIntervalMs: 0)
-    handle = VibeCoreHandle(config: config, sink: sink)
+    // Isolated from `VibeCoreBridge.sharedCore` on purpose — see the grading
+    // fixtures below. `unwrapper: nil`: nothing here is encrypted.
+    handle = VibeCoreHandle(config: config, sink: sink, unwrapper: nil)
     status = "core started"
     VibeLog.notice(
       "preview core started", category: "core",

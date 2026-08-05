@@ -107,7 +107,10 @@ impl VibeReceiptState {
         let readers: Vec<(&VibeReceiptKind, &i64)> = self
             .per_reader
             .iter()
-            .filter(|(reader, _)| reader.as_str() != own_user_id)
+            // Case-insensitive: the platform upper-cases the configured id and the
+            // server lower-cases receipt readers, so a byte-exact compare would
+            // count our own read receipt as a peer's and mark our messages read.
+            .filter(|(reader, _)| !reader.as_str().eq_ignore_ascii_case(own_user_id))
             .map(|(_, (kind, at))| (kind, at))
             .collect();
 

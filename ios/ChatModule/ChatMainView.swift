@@ -183,7 +183,9 @@ public final class ChatMainView: UIView,
   private let profileTitleLabel = UILabel()
   private let profileSubtitleLabel = UILabel()
 
-  private let rootWallpaperLayer = CAGradientLayer()
+  /// The one and only chat wallpaper. Owns gradient, pattern, mask, theme and raster —
+  /// see `ChatWallpaperView`. The list used to carry a second copy of all of this.
+  private let wallpaperView = ChatWallpaperView()
   private let pagesHost = UIView()
   private let chatPage = UIView()
   // The DM-level agent runtime view (Claude/Codex) is hosted FULL-SCREEN by the owning
@@ -431,7 +433,7 @@ public final class ChatMainView: UIView,
       defer { layoutMarkAt = now }
       return Int((now - layoutMarkAt) * 1000)
     }
-    rootWallpaperLayer.frame = bounds
+    wallpaperView.frame = bounds
     layoutChrome()
     let chromeMs = layoutPhaseMs()
     layoutPages()
@@ -524,6 +526,12 @@ public final class ChatMainView: UIView,
     if defersEngineStateRefreshes == value { return }
     defersEngineStateRefreshes = value
     VibeDebugLog.log("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
+  }
+
+  /// Freeze the transcript's geometry while this chat is off (or leaving) the screen.
+  /// See `ChatListView.setGeometryFrozenForDismissal`.
+  func setGeometryFrozenForDismissal(_ frozen: Bool) {
+    chatListView.setGeometryFrozenForDismissal(frozen)
   }
 
   func setEngineStateUpdatesSuspended(_ suspended: Bool) {
@@ -1182,13 +1190,25 @@ public final class ChatMainView: UIView,
   private func configureView() {
     backgroundColor = .clear
 
-    layer.insertSublayer(rootWallpaperLayer, at: 0)
+    // Behind every page. The chat page deliberately extends up under the header, so the
+    // wallpaper has to cover more than the list's own box — which is the other reason it
+    // belongs here and not inside the list.
+    insertSubview(wallpaperView, at: 0)
+    // Cells sample this raster for the frosted backdrop behind bubbles; when it changes
+    // (theme switch, resize) the visible ones have to rebind.
+    wallpaperView.onSnapshotChanged = { [weak self] in
+      guard let self else { return }
+      self.chatListView.wallpaperSnapshotDidChange()
+    }
 
     addSubview(pagesHost)
     pagesHost.clipsToBounds = false
 
     pagesHost.addSubview(chatPage)
     chatPage.addSubview(chatListView)
+    // Read-only: the list borrows the raster for bubble backdrops and for the reopen
+    // cover's base layer. It owns no wallpaper of its own.
+    chatListView.wallpaperSource = wallpaperView
     chatPage.addSubview(pinnedBannerView)
     pinnedBannerView.isHidden = true
     pinnedBannerView.alpha = 0.0
@@ -1229,6 +1249,16 @@ public final class ChatMainView: UIView,
     profilePage.addSubview(profileMembersNode)
     profilePage.isHidden = true
     profilePage.alpha = 0
+    // Same implicit-animation trap as rootWallpaperLayer above.
+    for layer in [
+      profileWallpaperLayer, profileWallpaperPatternLayer, profileWallpaperPatternMaskLayer,
+    ] as [CALayer] {
+      layer.actions = [
+        "position": NSNull(), "bounds": NSNull(), "frame": NSNull(),
+        "contents": NSNull(), "opacity": NSNull(), "hidden": NSNull(),
+        "colors": NSNull(), "locations": NSNull(),
+      ]
+    }
     profileWallpaperPatternLayer.mask = profileWallpaperPatternMaskLayer
     profileWallpaperPatternMaskLayer.contentsGravity = .resizeAspectFill
     profileWallpaperPatternMaskLayer.contentsScale = UIScreen.main.scale
@@ -4171,11 +4201,8 @@ public final class ChatMainView: UIView,
       ? UIColor(white: 1.0, alpha: 0.06) : UIColor(white: 0.0, alpha: 0.04)
 
     backgroundColor = .clear
-    rootWallpaperLayer.isHidden = appearance.backgroundMode == "transparent"
-    rootWallpaperLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
-    rootWallpaperLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
-    rootWallpaperLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
-    rootWallpaperLayer.opacity = Float(max(0.0, min(1.0, appearance.wallpaperOpacity)))
+    // Gradient, pattern, mask and raster all live in the wallpaper view now.
+    wallpaperView.apply(appearance)
     // Glass contentViews stay clear — system light/dark tint is on UIGlassEffect / mask only.
     // Do NOT use wallpaper or bubble colors here (that recolored chrome with list content).
     backGlassView.contentView.backgroundColor = .clear

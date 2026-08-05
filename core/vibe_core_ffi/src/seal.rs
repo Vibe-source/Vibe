@@ -127,6 +127,25 @@ impl VibeStoreSealerHandle {
     }
 }
 
+/// Lets the store's backfill loop seal rows without knowing how sealing works.
+///
+/// `None` means "skip this row", and a sealing failure maps to exactly that: a
+/// row that cannot be sealed must never be persisted in the clear, and must not
+/// abort the batch either — backfill walks thousands of legacy rows and one bad
+/// payload is a data condition, not a reason to stop migrating the chat.
+impl vibe_core_store::VibeRowSealer for VibeStoreSealerHandle {
+    fn seal(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        payload: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let sealed = self.inner.seal(user_id, chat_id, message_id, payload).ok()?;
+        Some((sealed.sealed_body, sealed.seal_nonce))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

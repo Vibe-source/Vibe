@@ -21,6 +21,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
     appDelegateUITrace("AppDelegate didFinishLaunching")
+    // Before anything else that could block: the launch path is itself a suspect, and a
+    // watchdog installed after the slow part cannot see it.
+    VibeMainThreadWatchdog.shared.start()
     // Bring up persistent diagnostics FIRST so any error during launch is captured
     // and a crash from the previous session is surfaced. See Shared/VibeLog.swift.
     let info = Bundle.main.infoDictionary
@@ -31,6 +34,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
       "app": "\(appVersion) (\(appBuild))",
       "os": "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
     ])
+    // Proves the Rust store's whole path (seal → write → page → unseal) against
+    // the real on-disk database before anything asks it to hold real rows. Runs
+    // on its own background queue, so it costs the launch path nothing.
+    VibeCoreStoreBridge.runSelfTest()
     // Giphy SDK key for native GIF panel (Info.plist / env GIPHY_API_KEY).
     ChatGifPanelConfig.shared.reloadFromEnvironment()
     // Packet mesh is now opt-in (default direct). Downgrade any legacy

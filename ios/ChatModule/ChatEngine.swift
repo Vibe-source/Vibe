@@ -450,6 +450,16 @@ final class ChatEngine {
   /// queue behind engine work. Published from ``postChangeLocked``; see
   /// ``ChatEngineUIMirror`` for why the direction is inverted.
   let uiMirror = ChatEngineUIMirror()
+
+  /// Decrypted Home previews, so laying out the chat list never waits on a decrypt.
+  ///
+  /// The decrypt inside it is Swift today only because the FFI does not expose the
+  /// core's. `VibeKeyUnwrapper` (`core/vibe_core/src/crypto.rs:222`) and
+  /// `envelope.open` (`core/vibe_core/src/envelope.rs:147`) both exist; what is missing
+  /// is the UniFFI callback interface and `VibeKeychainKeyUnwrapper` on this side. When
+  /// those land, only ``homePreviewTextLocked`` changes — the async shape here is
+  /// already what the core requires, because the core has no synchronous read API at all.
+  let homePreviewMemo = ChatEngineHomePreviewMemo()
   private var agentProgressByChatId: [String: AgentProgressState] = [:]
   // Last time this chat's transcript showed a RUNNING agent turn (ms). A watch-mirrored
   // session (e.g. one running in the IDE) re-pushes its whole transcript every watch
@@ -674,8 +684,23 @@ final class ChatEngine {
   private let keyTTL: TimeInterval = 300
   private let chatHistoryCacheKeyPrefix = "vibe.ios.chatHistory.rows.v1"
   private let chatHistoryFetchLimit = 100
-  private let chatOlderHistoryFetchLimit = 60
-  private let chatHistoryCacheRowLimit = 120
+  /// How many rows one older-history page pulls out of SQLite.
+  ///
+  /// Was 60, which is why a conversation that has been on this device for months still
+  /// opened like a brand-new one: the restore painted a bounded slice and everything
+  /// above it arrived as a stream of 60-row pages, each its own commit, each its own
+  /// visible shift, on every single open. The rows were already on disk the whole time —
+  /// the pipeline just refused to read them.
+  ///
+  /// A local SQLite read is not the network. Pulling a thousand rows costs one query and
+  /// a JSON decode per row on the engine queue; the reason to page at all was the
+  /// renderer's O(mounted) commit, and that is now O(changed).
+  private let chatOlderHistoryFetchLimit = 2_000
+  /// Rows the restore paints from disk on open.
+  ///
+  /// Was 120. That single number is what made every open feel cold: 120 rows on screen
+  /// and the rest of a three-month transcript dribbling in behind it.
+  private let chatHistoryCacheRowLimit = 2_000
   /// Durable SQLite store behind restore/store/clearCachedHistoryRowsLocked.
   /// Only touched on `queue` (the store is not internally synchronized).
   private let messageStore = ChatMessageStore()
@@ -840,11 +865,21 @@ final class ChatEngine {
         // tail is the duplication. Dropping is safe in the sense that matters — every
         // one of them is unsent, and an unsent duplicate is not a message anyone is
         // waiting on.
-        if keptIds.count > Self.maxQueuedOutboundReplay {
-          let dropped = keptIds.count - Self.maxQueuedOutboundReplay
-          let survivors = Array(keptIds.prefix(Self.maxQueuedOutboundReplay))
-          for id in keptIds.dropFirst(Self.maxQueuedOutboundReplay) {
+        if keptIds.count > Self.maxHealedOutboundQueue {
+          let dropped = keptIds.count - Self.maxHealedOutboundQueue
+          let survivors = Array(keptIds.prefix(Self.maxHealedOutboundQueue))
+          for id in keptIds.dropFirst(Self.maxHealedOutboundQueue) {
             restoredDrafts.removeValue(forKey: id)
+            // Resolve the STATUS too, in the same breath as dropping the draft.
+            //
+            // This used to drop the draft alone, and that is how 512 rows in one chat
+            // ended up showing a clock that nothing on earth was going to clear: the
+            // message still said `pending`, the thing that makes a pending message
+            // eventually send was gone, and no code compared the two. A row is not
+            // "queued" because its status string says so — it is queued because a draft
+            // exists. When the draft goes, the status is a lie, and it must be corrected
+            // here rather than left for someone to notice months later.
+            upsertLocalStatusLocked(chatId: chatId, messageId: id, status: "error")
           }
           keptIds = survivors
           healedFanOutDrafts += dropped
@@ -1499,12 +1534,47 @@ final class ChatEngine {
     return snapshot
   }
 
+  /// Last status published, readable without entering the engine queue.
+  private let publishedStatusLock = NSLock()
+  private var publishedStatus: [String: Any]?
+
+  /// Connection/transport status. Same contract as `getChatRows`: the main thread reads
+  /// the last published snapshot and asks for a refresh rather than waiting for one.
+  ///
+  /// This is a pure read of a dictionary the engine already maintains, and yet it blocked
+  /// the main thread for 299ms in a device session — not because building the snapshot is
+  /// slow, but because getting *to* it means queueing behind a send or a decrypt.
+  /// `ChatsViewModel` polls it while Home is on screen, so that cost lands squarely on
+  /// scrolling.
   func getStatus() -> [String: Any] {
-    syncOnQueue { statusSnapshotLocked() }
+    if Thread.isMainThread {
+      publishedStatusLock.lock()
+      let published = publishedStatus
+      publishedStatusLock.unlock()
+      if let published {
+        queue.async { [weak self] in
+          guard let self else { return }
+          self.publishStatus(self.statusSnapshotLocked())
+        }
+        return published
+      }
+    }
+    return syncOnQueue {
+      let snapshot = statusSnapshotLocked()
+      publishStatus(snapshot)
+      return snapshot
+    }
   }
 
   func getTransportStatus() -> [String: Any] {
-    syncOnQueue { statusSnapshotLocked() }
+    getStatus()
+  }
+
+  /// Records the current status for the lock-free read above. Engine queue only.
+  private func publishStatus(_ snapshot: [String: Any]) {
+    publishedStatusLock.lock()
+    publishedStatus = snapshot
+    publishedStatusLock.unlock()
   }
 
   func resolveURLForOpen(_ raw: String?) -> String? {
@@ -3015,9 +3085,52 @@ final class ChatEngine {
   /// across view-detach/background (only dropped by New Chat / logout), so the chat view
   /// can keep the session's rows visible even when its own per-instance loaded-session id
   /// was reset by a rebind — the root cause of the feed collapsing to empty on foreground.
+  /// Live bridge session ids, readable without entering the engine queue.
+  private let publishedBridgeSessionLock = NSLock()
+  private var publishedBridgeSessionIds: [String: String] = [:]
+  private var publishedBridgeSessionsReady = false
+
+  /// The live bridge session for a chat, if any.
+  ///
+  /// Reads a single dictionary value — and blocked the main thread for 160ms on device,
+  /// because getting to that value means queueing behind whatever the engine is doing.
+  /// `ChatListView` asks in ten places, several of them on render paths, so the cost
+  /// lands directly on the list. Same contract as `getChatRows` and `getStatus`: main
+  /// reads the last published map and asks for a refresh instead of waiting for one.
+  ///
+  /// `publishedBridgeSessionsReady` is what keeps this honest — an empty map before the
+  /// first publish is not the same statement as "this chat has no live session", and
+  /// answering nil from it would silently drop a live agent feed. Until the engine has
+  /// published once, main takes the blocking path exactly as before.
   func liveBridgeSessionId(chatId rawChatId: String) -> String? {
     guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
-    return syncOnQueue { liveBridgeSessionIngestByChatId[chatId]?.sessionId }
+    if Thread.isMainThread {
+      publishedBridgeSessionLock.lock()
+      let ready = publishedBridgeSessionsReady
+      let published = publishedBridgeSessionIds[chatId]
+      publishedBridgeSessionLock.unlock()
+      if ready {
+        queue.async { [weak self] in self?.publishBridgeSessionIds() }
+        return published
+      }
+    }
+    return syncOnQueue {
+      publishBridgeSessionIds()
+      return liveBridgeSessionIngestByChatId[chatId]?.sessionId
+    }
+  }
+
+  /// Snapshots the live-session map for the lock-free read above. Engine queue only.
+  private func publishBridgeSessionIds() {
+    var snapshot: [String: String] = [:]
+    snapshot.reserveCapacity(liveBridgeSessionIngestByChatId.count)
+    for (chatId, ingest) in liveBridgeSessionIngestByChatId {
+      snapshot[chatId] = ingest.sessionId
+    }
+    publishedBridgeSessionLock.lock()
+    publishedBridgeSessionIds = snapshot
+    publishedBridgeSessionsReady = true
+    publishedBridgeSessionLock.unlock()
   }
 
   /// A chat that had a bridge history session loaded just (re)joined its topic — either
@@ -3726,7 +3839,37 @@ final class ChatEngine {
         return ["accepted": false, "reason": "invalid_message"]
       }
       canceledOutboundMessageIds.remove(messageId)
-      guard let draft = pendingOutboundDraftsByMessageId[messageId] else {
+      // Rebuild the draft when the in-memory one is gone, which is the ONLY case a user
+      // ever actually retries.
+      //
+      // `pendingOutboundDraftsByMessageId` is memory plus a persisted mirror, and the
+      // mirror is cleared on logout, chat wipes and a dozen other paths. Meanwhile
+      // `sweepOrphanedPendingLocked` exists specifically to find pending rows with no
+      // draft and mark them `error` "so it can be retried" — and then this guard refused
+      // every one of them with `missing_draft`. A failed message showed a retry
+      // affordance that could not work, which is exactly what a person reports as
+      // "resend does nothing".
+      //
+      // The draft was never anything but the original send payload, and the message
+      // itself is still in the store with its text, its chat and its reply target. So
+      // rebuild it from the row rather than declaring the send unrecoverable. Media is
+      // deliberately excluded: its bytes may be long gone from the cache, and silently
+      // re-sending a caption without its picture is worse than saying no.
+      let draft: [String: Any]
+      if let existing = pendingOutboundDraftsByMessageId[messageId] {
+        draft = existing
+      } else if let rebuilt = rebuildOutboundDraftFromStoredRowLocked(
+        chatId: chatId, messageId: messageId)
+      {
+        NSLog(
+          "[ChatEngine] retry REBUILT draft chatId=%@ messageId=%@ — in-memory draft was gone",
+          String((chatId ?? "-").prefix(12)), String(messageId.prefix(12)))
+        pendingOutboundDraftsByMessageId[messageId] = rebuilt
+        draft = rebuilt
+      } else {
+        NSLog(
+          "[ChatEngine] retry REFUSED chatId=%@ messageId=%@ — no draft and no re-sendable row",
+          String((chatId ?? "-").prefix(12)), String(messageId.prefix(12)))
         return ["accepted": false, "reason": "missing_draft", "messageId": messageId]
       }
       let resolvedChatId = chatId ?? normalizedString(draft["chatId"] ?? draft["chat_id"]) ?? ""
@@ -4202,6 +4345,12 @@ final class ChatEngine {
         var finalFileName = fileName
         var finalFileSize = fileSize
         var finalMediaKey = mediaKey
+        // Same "final" contract as the four above: the caller's value when it had one,
+        // otherwise recovered from the uploaded bytes below. These three are what shape
+        // the recipient's bubble before the media arrives.
+        var finalWidth = width
+        var finalHeight = height
+        var finalThumbnailBase64 = thumbnailBase64
         var localEffectivePayload = effectivePayload
         var localOptimisticRow = optimisticRow
 
@@ -4310,7 +4459,47 @@ final class ChatEngine {
                 remoteURL: uploadResult.remoteUrl,
                 mediaKey: finalMediaKey
               )
-            } else if ["voice", "audio", "music"].contains(type) {
+            }
+
+            // Dimensions and the micro-thumb are the ONLY things that let the recipient
+            // shape and paint this bubble before the bytes arrive. Missing both, the cell
+            // takes the square fallback (see ChatListViewCells) and paints a blank box,
+            // then resizes when the real image decodes — a photo-sized shift on the
+            // recipient, every time.
+            //
+            // Both come from reading the picked file at compose time, so when that read
+            // fails they are BOTH nil together, and every `if let` downstream omits them
+            // in silence. Nothing errors; the recipient just gets a black square. The
+            // bytes are in hand right here — the upload just read them — so recover from
+            // the file. They ride inside the same envelope as everything else (sealed to
+            // `friendPublicKey`, dual-wrapped so both parties can open it), so this adds
+            // nothing to what the server can see.
+            if ["image", "gif"].contains(type),
+              finalWidth == nil || finalHeight == nil || finalThumbnailBase64 == nil
+            {
+              let localPath: String? = {
+                if let url = URL(string: localMediaUrl), url.isFileURL { return url.path }
+                return localMediaUrl.hasPrefix("/") ? localMediaUrl : nil
+              }()
+              if let localPath {
+                if finalWidth == nil || finalHeight == nil,
+                  let headerSize = chatMediaImageHeaderSize(atPath: localPath),
+                  headerSize.width > 1.0, headerSize.height > 1.0
+                {
+                  finalWidth = Int64(headerSize.width)
+                  finalHeight = Int64(headerSize.height)
+                }
+                if finalThumbnailBase64 == nil, let image = UIImage(contentsOfFile: localPath) {
+                  finalThumbnailBase64 = chatMicroThumbnailJPEGBase64(from: image)
+                }
+              }
+              NSLog(
+                "[MediaDims] type=%@ dims=%@ thumb=%@ local=%@",
+                type, (finalWidth != nil && finalHeight != nil) ? "Y" : "MISSING",
+                finalThumbnailBase64 != nil ? "Y" : "MISSING", localPath ?? "<not-a-file>")
+            }
+
+            if ["voice", "audio", "music"].contains(type) {
               // Voice used to be seeded from `applyExternalVoicePlaybackIfNeeded` — a
               // CELL method, so it only ran if a materialized cell happened to be handed
               // playback state during the ~1.5s window between upload-complete and the
@@ -4542,12 +4731,14 @@ final class ChatEngine {
         if let latitude { fullPayloadBase["latitude"] = latitude }
         if let longitude { fullPayloadBase["longitude"] = longitude }
         if let duration { fullPayloadBase["duration"] = duration }
-        if let width { fullPayloadBase["width"] = width }
-        if let height { fullPayloadBase["height"] = height }
+        if let finalWidth { fullPayloadBase["width"] = finalWidth }
+        if let finalHeight { fullPayloadBase["height"] = finalHeight }
         if let replyToId { fullPayloadBase["replyToId"] = replyToId }
         if let contact { fullPayloadBase["contact"] = contact }
         if let caption { fullPayloadBase["caption"] = caption }
-        if let thumbnailBase64 { fullPayloadBase["thumbnailBase64"] = thumbnailBase64 }
+        if let finalThumbnailBase64 {
+          fullPayloadBase["thumbnailBase64"] = finalThumbnailBase64
+        }
         if let viewOnce { fullPayloadBase["viewOnce"] = viewOnce }
         if let isVideoNote { fullPayloadBase["isVideoNote"] = isVideoNote }
         if let waveform { fullPayloadBase["waveform"] = waveform }
@@ -5307,6 +5498,11 @@ final class ChatEngine {
       client.leave(topic: chatTopic(for: chatId))
     }
 
+    // Timeline core is a second reader of the same transcript. Wipe it with the
+    // same semantics as the engine or a core-authoritative list will repaint the
+    // history we just deleted.
+    feedCoreClearChatLocked(chatId: chatId)
+
     appendJournalLocked(event: journalEvent, payload: ["chatId": chatId])
     state["updatedAt"] = nowMs()
     postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
@@ -5639,6 +5835,14 @@ final class ChatEngine {
     }
   }
 
+  /// Records the rows a chat currently has, for the lock-free main-thread read in
+  /// `getChatRows`. Always called from the engine queue, where `merged` was produced.
+  private func publishChatRows(_ merged: [[String: Any]], for chatId: String) {
+    publishedChatRowsLock.lock()
+    publishedChatRowsByChat[chatId] = merged
+    publishedChatRowsLock.unlock()
+  }
+
   func getLiveMessageRow(_ payload: [String: Any]) -> [String: Any]? {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     let messageId = normalizedString(payload["messageId"] ?? payload["message_id"])
@@ -5656,13 +5860,49 @@ final class ChatEngine {
     }
   }
 
+  /// Last result published for each chat, readable without entering the engine queue.
+  /// See the fast path in `getChatRows`.
+  private let publishedChatRowsLock = NSLock()
+  private var publishedChatRowsByChat: [String: [[String: Any]]] = [:]
+
   func getChatRows(_ payload: [String: Any]) -> [[String: Any]] {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     guard let chatId else { return [] }
+    // The main thread never waits for this queue.
+    //
+    // `syncOnQueue` puts the caller behind whatever the engine is doing — a send, an E2E
+    // decrypt, a SQLite write — and the callers here are UI. A device session measured 53
+    // main-thread stalls in `getChatRows`, the worst at 623ms, which is most of the
+    // remaining "the list feels laggy": Home re-projects on every `chatMessageChanged`,
+    // and every one of those blocked the thread that was drawing the scroll.
+    //
+    // So a main-thread read answers from the last published result and asks for a refresh
+    // instead of waiting for one. The snapshot is at most one engine turn old, and every
+    // consumer already re-reads on the change notification that follows — which is the
+    // same guarantee they had before, since the value could go stale the instant the
+    // queue released them anyway.
+    //
+    // The first read of a chat has nothing published and falls through to the blocking
+    // path, so a cold open is exactly as correct as it was.
+    if Thread.isMainThread {
+      publishedChatRowsLock.lock()
+      let published = publishedChatRowsByChat[chatId]
+      publishedChatRowsLock.unlock()
+      if let published {
+        queue.async { [weak self] in
+          guard let self else { return }
+          _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
+          self.restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
+          self.publishChatRows(self.mergedChatRowsLocked(chatId: chatId), for: chatId)
+        }
+        return published
+      }
+    }
     return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
       restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
       let merged = mergedChatRowsLocked(chatId: chatId)
+      publishChatRows(merged, for: chatId)
       // [EmptyTrace] The view pulls its rows here. Log when this returns EMPTY — that's the
       // "list jumps to empty" moment. The live/hist breakdown says WHERE the content went:
       // live=0 & hist=0 → both stores wiped (a reset), live=0 & hist>0 → merge/filter drop.
@@ -5678,25 +5918,86 @@ final class ChatEngine {
     }
   }
 
+  /// Home's decrypted last-message preview. **Never blocks the main thread.**
+  ///
+  /// This used to be `syncOnQueue { buildHistoryRowsLocked(...) }` — an E2E decrypt, on
+  /// the caller's thread, behind the engine's serial queue — and Home calls it once per
+  /// visible row while laying out. A device run on 2026-08-03 measured the result:
+  ///
+  /// ```
+  /// syncOnQueue blocked main thread for 772ms at makeHomePreviewText(_:)
+  /// main-thread-stall blockedMs=31504 context=ChatHomeNativeListController apply nextRows=15
+  /// ```
+  ///
+  /// Fifteen rows, each waiting on a queue that was busy sending, and Home frozen for
+  /// half a minute. Two of the four measured scroll costs in
+  /// `docs/production-timeline-core-refactor.md` §0 meet on this one line: per-row
+  /// decrypt during parse, and `queue.sync` from main.
+  ///
+  /// So it answers from a memo and never waits. A miss returns `nil` — the caller
+  /// already has a chain of fallbacks for exactly that — and schedules the decrypt off
+  /// the main thread. When it lands, Home is told, and the next render has the text.
+  ///
+  /// Deterministic by message id, so the memo cannot go stale in a way that matters: an
+  /// edit mints a new content hash and therefore a new key.
   func makeHomePreviewText(_ payload: [String: Any]) -> String? {
-    syncOnQueue {
-      let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? "home_preview"
-      guard
-        let row = buildHistoryRowsLocked(chatId: chatId, rawMessages: [payload]).first,
-        let message = row["message"] as? [String: Any]
-      else {
-        return nil
-      }
-      if (message["decryptionFailed"] as? Bool) == true {
-        return nil
-      }
-      guard let text = normalizedString(message["plainContent"] ?? message["text"]),
-        !isLikelyHybridCiphertext(text)
-      else {
-        return nil
-      }
-      return text
+    guard let cacheKey = Self.homePreviewCacheKey(payload) else { return nil }
+    if let memo = homePreviewMemo.value(for: cacheKey) { return memo }
+    schedulePreviewDecrypt(cacheKey: cacheKey, payload: payload)
+    return nil
+  }
+
+  /// Computes one preview off the main thread and publishes it.
+  ///
+  /// In-flight keys are tracked so fifteen rows re-rendering while the first decrypt is
+  /// running cannot queue fifteen copies of the same work — the render loop would
+  /// otherwise re-ask on every pass and each pass would schedule again.
+  private func schedulePreviewDecrypt(cacheKey: String, payload: [String: Any]) {
+    guard homePreviewMemo.beginIfNotInFlight(cacheKey) else { return }
+    queue.async { [weak self] in
+      guard let self else { return }
+      let text = self.homePreviewTextLocked(payload)
+      self.homePreviewMemo.finish(cacheKey, value: text)
+      // Only a *found* preview is worth a redraw. Publishing a miss would tell Home to
+      // re-render, which re-asks, which finds the memo holding nil and returns the same
+      // fallback text it already drew — a wakeup per undecryptable row, forever.
+      guard text != nil else { return }
+      self.postChangeLocked(
+        reason: "chatPreviewDecrypted", userInfo: ["cacheKey": cacheKey])
     }
+  }
+
+  /// The original body, now only ever reached on the engine queue.
+  private func homePreviewTextLocked(_ payload: [String: Any]) -> String? {
+    let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? "home_preview"
+    guard
+      let row = buildHistoryRowsLocked(chatId: chatId, rawMessages: [payload]).first,
+      let message = row["message"] as? [String: Any]
+    else {
+      return nil
+    }
+    if (message["decryptionFailed"] as? Bool) == true {
+      return nil
+    }
+    guard let text = normalizedString(message["plainContent"] ?? message["text"]),
+      !isLikelyHybridCiphertext(text)
+    else {
+      return nil
+    }
+    return text
+  }
+
+  /// Identity of a preview: the message, plus enough of its ciphertext that an edit
+  /// cannot be served from the memo of the version before it.
+  private static func homePreviewCacheKey(_ payload: [String: Any]) -> String? {
+    let id =
+      (payload["messageId"] as? String) ?? (payload["message_id"] as? String)
+      ?? (payload["id"] as? String)
+    guard let id, !id.isEmpty else { return nil }
+    let body =
+      (payload["encryptedContent"] as? String) ?? (payload["encrypted_content"] as? String)
+      ?? (payload["content"] as? String) ?? (payload["text"] as? String) ?? ""
+    return "\(id)|\(body.count)|\(body.suffix(16))"
   }
 
   func typingUserIds(chatId: String?) -> [String] {
@@ -5758,9 +6059,53 @@ final class ChatEngine {
   /// Returns true only if native chat history has been successfully fetched
   /// from the server for this chatId. Used by ChatListView to decide whether
   /// native rows can fully replace JS rows.
+  /// Per-chat history flags, readable without entering the engine queue.
+  ///
+  /// The fifth and sixth members of the same family as `getChatRows`, `getStatus` and
+  /// `liveBridgeSessionId`: a set-membership test that costs nothing to compute and
+  /// 115ms to *reach*, because reaching it means queueing behind a send or a decrypt.
+  /// One snapshot serves both flags, refreshed whenever a queued call passes through.
+  ///
+  /// `ready` distinguishes "published: this chat is not loading" from "nothing has been
+  /// published yet", which are different answers and must not both come back as false.
+  private struct PublishedChatFlags {
+    var loaded = false
+    var loading = false
+  }
+  private let publishedChatFlagsLock = NSLock()
+  private var publishedChatFlags: [String: PublishedChatFlags] = [:]
+  private var publishedChatFlagsReady = false
+
+  private func publishChatFlags(for chatId: String) {
+    var flags = PublishedChatFlags()
+    flags.loaded = historyFullyLoadedChats.contains(chatId)
+    flags.loading =
+      historyLoadingChats.contains(chatId) || historyLoadingOlderChats.contains(chatId)
+    publishedChatFlagsLock.lock()
+    publishedChatFlags[chatId] = flags
+    publishedChatFlagsReady = true
+    publishedChatFlagsLock.unlock()
+  }
+
+  private func publishedChatFlags(for chatId: String) -> PublishedChatFlags? {
+    publishedChatFlagsLock.lock()
+    defer { publishedChatFlagsLock.unlock() }
+    guard publishedChatFlagsReady else { return nil }
+    return publishedChatFlags[chatId] ?? PublishedChatFlags()
+  }
+
   func isChatHistoryLoaded(chatId: String) -> Bool {
-    syncOnQueue {
+    if Thread.isMainThread, let flags = publishedChatFlags(for: chatId) {
+      queue.async { [weak self] in
+        guard let self else { return }
+        _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
+        self.publishChatFlags(for: chatId)
+      }
+      return flags.loaded
+    }
+    return syncOnQueue {
       _ = restoreCachedHistoryRowsLocked(chatId: chatId)
+      publishChatFlags(for: chatId)
       return historyFullyLoadedChats.contains(chatId)
     }
   }
@@ -5768,9 +6113,15 @@ final class ChatEngine {
   /// True while a history fetch (initial or older page) is in flight for this chat.
   /// Drives the chat header "Updating" phase (synced with Home list updates).
   func isChatHistoryLoading(chatId: String) -> Bool {
-    syncOnQueue {
-      guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
-      return historyLoadingChats.contains(chatId) || historyLoadingOlderChats.contains(chatId)
+    guard let normalized = normalizedString(chatId), !normalized.isEmpty else { return false }
+    if Thread.isMainThread, let flags = publishedChatFlags(for: normalized) {
+      queue.async { [weak self] in self?.publishChatFlags(for: normalized) }
+      return flags.loading
+    }
+    return syncOnQueue {
+      publishChatFlags(for: normalized)
+      return historyLoadingChats.contains(normalized)
+        || historyLoadingOlderChats.contains(normalized)
     }
   }
 
@@ -7539,6 +7890,10 @@ final class ChatEngine {
       for chatId in self.openChatChannels.keys {
         self.joinNativeChatTopicIfNeededLocked(chatId: chatId)
       }
+      self.expireStaleQueuedOutboundLocked(trigger: "socket_open")
+      // Pending bubbles with no draft behind them can only be resolved here — the
+      // queue-walking paths cannot see a message the queue has forgotten.
+      self.sweepOrphanedPendingLocked(trigger: "socket_open")
       let queuedChats = Array(self.pendingOutboundQueueByChat.keys)
       for chatId in queuedChats {
         self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "socket_open")
@@ -7781,6 +8136,7 @@ final class ChatEngine {
             self.nativeJoinedChatIds.insert(chatId)
             self.appendJournalLocked(event: "native-chat-joined", payload: ["chatId": chatId])
             self.flushPendingAgentBridgeHistoryRequestsLocked(chatId: chatId)
+            self.sweepOrphanedPendingLocked(trigger: "chat_joined")
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "chat_joined")
             // Resume the live tail for a bridge session this chat had loaded: the topic is
             // freshly (re)joined after a view re-attach or background reconnect, so re-arm
@@ -9065,6 +9421,11 @@ final class ChatEngine {
     cachedDecryptPrivateKeyPem = pem
     cachedDecryptPrivateKey = key
     cachedDecryptKeyTimestamp = Date()
+    // Hand the resolved key to the Rust core's unwrap seam. Pushed from this
+    // queue rather than pulled from the core's worker thread — a worker that
+    // blocked on this queue to read a key would be the `syncOnQueue`-from-another
+    // -thread stall the core exists to retire. See `VibeCorePrivateKeyBox`.
+    VibeCorePrivateKeyBox.shared.publish(key)
     return key
   }
 
@@ -9268,6 +9629,42 @@ final class ChatEngine {
     return patchedRows
   }
 
+  /// `mergedChatRowsLocked` PICKS the live row over the history row for any id present in
+  /// both — it does not merge them. That is fine only while every producer of a live row is
+  /// as rich as the history builder, and they have not been: the socket path resolved agent
+  /// identity from the top-level payload only, while `buildHistoryRowsLocked` also reads
+  /// `metadata`. The poor copy then shadowed the rich one and 48 agent rows in a plain DM
+  /// silently rendered as text, changing `type` and every cached height with it.
+  ///
+  /// The builders agree now, so this should never fire. It stays as the failsafe for the
+  /// other live-row producers (stream frames, bridge ingest, synthetic rows), because the
+  /// failure is invisible — no error, just a transcript that quietly downgrades and a list
+  /// that walks. If `[AgentDowngrade]` ever appears, a producer has drifted again.
+  private func liveRowPreservingAgentIdentityLocked(
+    live: [String: Any], history: [String: Any], messageId: String
+  ) -> [String: Any] {
+    guard var liveMessage = live["message"] as? [String: Any],
+      let historyMessage = history["message"] as? [String: Any],
+      (historyMessage["isAgentMessage"] as? Bool) == true,
+      (liveMessage["isAgentMessage"] as? Bool) != true
+    else { return live }
+    for key in [
+      "isAgentMessage", "agentName", "agentId", "agentUserId", "agentUsername",
+      "plainContent", "text", "type",
+    ] where liveMessage[key] == nil || liveMessage[key] is NSNull {
+      if let value = historyMessage[key] { liveMessage[key] = value }
+    }
+    // `isAgentMessage` is the flag whose absence defines this downgrade, so set it even
+    // when the live row carries an explicit `false`.
+    liveMessage["isAgentMessage"] = true
+    NSLog(
+      "[AgentDowngrade] live row lost agent identity id=%@ — restored from history",
+      String(messageId.suffix(12)))
+    var restored = live
+    restored["message"] = liveMessage
+    return restored
+  }
+
   private func mergedChatRowsLocked(chatId: String) -> [[String: Any]] {
     let historyRows = historyRowsByChat[chatId] ?? []
     let liveRows = liveMessageRowsByChat[chatId] ?? [:]
@@ -9282,7 +9679,14 @@ final class ChatEngine {
         continue
       }
       guard !deletedIds.contains(messageId) else { continue }
-      mergedById[messageId] = rowAdoptingSettleSlotTs(liveRows[messageId] ?? row, messageId: messageId)
+      let chosen: [String: Any]
+      if let live = liveRows[messageId] {
+        chosen = liveRowPreservingAgentIdentityLocked(
+          live: live, history: row, messageId: messageId)
+      } else {
+        chosen = row
+      }
+      mergedById[messageId] = rowAdoptingSettleSlotTs(chosen, messageId: messageId)
     }
 
     for (messageId, row) in liveRows {
@@ -10098,6 +10502,7 @@ final class ChatEngine {
     deletedMessageIdsByChat[chatId] = deleted
     deleteCachedHistoryMessageLocked(chatId: chatId, messageId: messageId)
     storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    feedCoreDeleteLocked(chatId: chatId, messageId: messageId)
   }
 
   /// Delete persistence must not depend on there being another row to write.
@@ -10346,6 +10751,11 @@ final class ChatEngine {
     guard let messageId = normalizedString(payload["id"] ?? payload["message_id"]) else {
       return nil
     }
+    // Same rule as the history page: the core reads the frame the server sent,
+    // not Swift's interpretation of it. `.chatTopic` rather than `.historyPage`
+    // because the source drives the core's flush barrier and its dedup rules.
+    feedCoreRawFramesLocked(chatId: chatId, rawMessages: [payload], source: .chatTopic)
+
     let fromId = normalizedString(payload["fromId"] ?? payload["from_id"])
     let encryptedContent = normalizedString(
       payload["encryptedContent"] ?? payload["encrypted_content"])
@@ -10358,25 +10768,59 @@ final class ChatEngine {
     let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
     let encryptedLooksHybrid = isLikelyHybridCiphertext(encryptedContent)
 
-    // Detect agent messages by fromId or explicit flag
+    // Detect agent messages by fromId or explicit flag.
+    //
+    // These MUST resolve from `metadata` as well as the top level, exactly like
+    // `buildHistoryRowsLocked` does (see `rawAgentId`/`rawAgentName` there). The server
+    // puts agent identity in `metadata` for some deliveries, and this builder used to look
+    // only at the top level — so the same message produced a RICH row through the history
+    // path and a POOR one through this path: no `isAgentMessage`, no agentName/agentId, no
+    // plainContent, and a different `type`.
+    //
+    // That asymmetry is not cosmetic, because `mergedChatRowsLocked` prefers the LIVE row
+    // over the history row for any id present in both. So the poor copy shadows the rich
+    // one and the transcript silently downgrades 48 agent rows to plain text. Measured on
+    // chat 47157fce5863 (Mahiro — a normal DM that contains agent messages, so it never
+    // takes the `agentChatMode` protected path):
+    //
+    //   parse reuse-MISS count=55 of=59 fields=[message.agentId=48, message.agentName=48,
+    //     message.isAgentMessage=48, message.plainContent=48, message.type=39]
+    //   height-audit stale=41 of 48 shifted=14 dh=-421
+    //     flipped=[plainContent=41, agentName=41, agentId=41, ...]
+    //   [ListShift] MOVED row=c-40b4fcbe9614 … ×17, ~420pt total
+    //
+    // The warm snapshot seeds the rich rows, this path replaces them with poor ones, every
+    // cached height is invalidated at once, and the list walks under the reader.
+    let rawMetadataForAgentFields = payload["metadata"] as? [String: Any]
+    let agentName = firstNormalizedString(
+      payload["agentName"], payload["agent_name"],
+      rawMetadataForAgentFields?["agentName"], rawMetadataForAgentFields?["agent_name"])
+    let agentId = firstNormalizedString(
+      payload["agentId"], payload["agent_id"],
+      rawMetadataForAgentFields?["agentId"], rawMetadataForAgentFields?["agent_id"])
     let isAgentMessage =
       (payload["isAgentMessage"] as? Bool == true)
       || (payload["is_agent_message"] as? Bool == true)
+      || (rawMetadataForAgentFields?["isAgentMessage"] as? Bool == true)
+      || (rawMetadataForAgentFields?["is_agent_message"] as? Bool == true)
       || (normalizedString(fromId)?.lowercased() == Self.agentUserId)
-      || normalizedString(payload["agentId"] ?? payload["agent_id"]) != nil
-      || normalizedString(payload["agentName"] ?? payload["agent_name"]) != nil
+      || agentId != nil
+      || agentName != nil
       || (rawMediaUrl?.lowercased().contains("/uploads/agent-docs/") == true)
       || (rawMediaUrl?.lowercased().contains("/api/agent/document/") == true)
-    let plainContent =
-      normalizedString(payload["plainContent"] ?? payload["plain_content"] ?? payload["plaintext"])
-    let agentName = normalizedString(payload["agentName"] ?? payload["agent_name"])
-    let agentId = normalizedString(payload["agentId"] ?? payload["agent_id"])
+    let plainContent = firstNormalizedString(
+      payload["plainContent"], payload["plain_content"], payload["plaintext"],
+      rawMetadataForAgentFields?["plainContent"], rawMetadataForAgentFields?["plain_content"])
     let agentUserId =
-      normalizedString(payload["agentUserId"] ?? payload["agent_user_id"])
+      firstNormalizedString(
+        payload["agentUserId"], payload["agent_user_id"],
+        rawMetadataForAgentFields?["agentUserId"], rawMetadataForAgentFields?["agent_user_id"])
       ?? (isAgentMessage ? fromId : nil)
-    let agentUsername = normalizedString(
-      payload["agentUsername"] ?? payload["agent_username"]
-        ?? payload["agentHandle"] ?? payload["agent_handle"])
+    let agentUsername = firstNormalizedString(
+      payload["agentUsername"], payload["agent_username"],
+      payload["agentHandle"], payload["agent_handle"],
+      rawMetadataForAgentFields?["agentUsername"], rawMetadataForAgentFields?["agent_username"],
+      rawMetadataForAgentFields?["agentHandle"], rawMetadataForAgentFields?["agent_handle"])
 
     let hadEncryptedContent = encryptedContent != nil && !encryptedContent!.isEmpty
     let decryptedText: String = {
@@ -11166,6 +11610,144 @@ final class ChatEngine {
     )
   }
 
+  /// Answers "why is this row still showing a clock?" for a whole chat at once.
+  ///
+  /// A row renders pending purely from its stored `status`. Nothing about that string
+  /// says whether the send is still *going* to happen — that depends on an outbound
+  /// draft existing and being in this chat's replay queue. A message whose status says
+  /// pending but which has no draft is not in flight and never will be: it is a
+  /// permanent clock, and the only way to tell the two apart from the outside is to ask
+  /// here.
+  ///
+  /// `queue.async`, never `syncOnQueue` — a diagnostic that blocks the main thread to
+  /// explain a rendering problem has become one. It logs and returns nothing.
+  func logPendingSendDiagnostics(chatId: String, pendingMessageIds: [String]) {
+    guard !pendingMessageIds.isEmpty else { return }
+    queue.async { [weak self] in
+      guard let self else { return }
+      let queued = Set(self.pendingOutboundQueueByChat[chatId] ?? [])
+      var withDraft = 0
+      var inReplayQueue = 0
+      var orphaned: [String] = []
+      for id in pendingMessageIds {
+        if self.pendingOutboundDraftsByMessageId[id] != nil {
+          withDraft += 1
+        } else {
+          orphaned.append(id)
+        }
+        if queued.contains(id) { inReplayQueue += 1 }
+      }
+      NSLog(
+        "[PendingAudit] chat=%@ pending=%d withDraft=%d inReplayQueue=%d orphaned=%d orphanSample=[%@]",
+        String(chatId.prefix(12)), pendingMessageIds.count, withDraft, inReplayQueue,
+        orphaned.count,
+        orphaned.prefix(6).map { String($0.prefix(12)) }.joined(separator: ","))
+      guard !orphaned.isEmpty else { return }
+      self.resolveStrandedPendingLocked(chatId: chatId, messageIds: orphaned)
+    }
+  }
+
+  /// Turns a row that can never send back into a row the user can act on.
+  ///
+  /// A message renders a pending clock from its stored `status` alone. Whether it will
+  /// *actually* send depends on a completely separate thing — an outbound draft. Those
+  /// two can disagree, and when they do the row is stranded: a clock forever, no retry,
+  /// no error, no way for the user to even know it failed. Device session 2026-08-04
+  /// found 512 of them in one chat, every one from a fan-out heal that removed drafts
+  /// without correcting statuses.
+  ///
+  /// Fixing that one site is not enough, which is why this exists separately. Any path
+  /// that drops a draft — a heal, a stale-age expiry, a crash between writing the status
+  /// and persisting the draft — produces the same stranded row, and new ones can be
+  /// written at any time. This is the backstop that makes the *class* of bug
+  /// self-correcting rather than the one instance of it: no draft means not queued,
+  /// not queued means it is not going to send, and a message that is not going to send
+  /// is failed. Failed is honest, shows a Retry, and is recoverable by the user.
+  ///
+  /// Never sends anything. Re-dispatching messages the user typed weeks ago into a
+  /// conversation that has moved on is a worse outcome than showing them as failed.
+  private func resolveStrandedPendingLocked(chatId: String, messageIds: [String]) {
+    guard !messageIds.isEmpty else { return }
+    // Write every status first, notify ONCE at the end.
+    //
+    // The first version of this posted a `messageStatusChanged` per message, the way
+    // every single-message send path does. At 512 messages that is 512 notifications,
+    // each one waking `ChatConversationController.engineChanged` into a full
+    // `getChatRows` on the main thread. Measured on device 2026-08-04: a **10.11 second**
+    // main-thread freeze immediately after the resolve, with the stall sampler naming it
+    // outright — `context=ChatConversationController engineChanged
+    // reason=messageStatusChanged`, `hint=likely-blocking-wait`. A fix for a stuck clock
+    // that freezes the app for ten seconds is not a fix.
+    //
+    // Per-message notifications are correct for a per-message event. This is a bulk
+    // repair, and the list only needs to be told once that it changed.
+    for messageId in messageIds {
+      upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
+    }
+    // …and again on disk, because the line above only writes memory.
+    //
+    // `localStatusIndex` is declared `= [:]` and is never restored, so a status written
+    // through it survives exactly as long as the process. The row itself renders from
+    // the persisted payload's `status` field, which still said `pending`. Device
+    // sessions 2026-08-04: the resolve reported "RESOLVED 512" on one launch and then
+    // found the identical 512 on the next, because nothing had actually changed —
+    // a fix that only repaired the copy nobody reads on cold start.
+    let persisted = persistStrandedResolutionLocked(chatId: chatId, messageIds: messageIds)
+    appendJournalLocked(
+      event: "native-pending-stranded-resolved",
+      payload: ["chatId": chatId, "count": messageIds.count])
+    postChangeLocked(
+      reason: "chatMessageChanged",
+      userInfo: ["chatId": chatId, "action": "updated"])
+    NSLog(
+      "[PendingAudit] chat=%@ RESOLVED %d stranded rows → failed, %d rewritten on disk (no draft existed, so nothing was ever going to send them)",
+      String(chatId.prefix(12)), messageIds.count, persisted)
+  }
+
+  /// Rewrites the stored `status` of stranded rows so the repair survives a relaunch.
+  ///
+  /// One batched transaction for the whole set. `upsertMessages` already wraps its
+  /// entries in `BEGIN IMMEDIATE`, so 512 rows cost one commit, not 512 — which matters
+  /// because this runs on the engine queue and the main thread blocks on that queue
+  /// through `syncOnQueue`.
+  ///
+  /// Returns how many rows were actually rewritten, so the log can distinguish "repaired
+  /// on disk" from "said it repaired something".
+  private func persistStrandedResolutionLocked(chatId: String, messageIds: [String]) -> Int {
+    guard let userId = chatHistoryCacheUserIdLocked(), messageStore.isAvailable else { return 0 }
+    let targets = Set(messageIds)
+    // A generous read: the stranded set can be anywhere in the transcript, and this runs
+    // once per chat open only when there is something wrong to fix.
+    let payloads = messageStore.recentMessagePayloads(
+      userId: userId, chatId: chatId, limit: max(targets.count * 4, 2_000))
+    var entries: [(messageId: String, ts: Int64, payload: Data)] = []
+    entries.reserveCapacity(targets.count)
+    for data in payloads {
+      guard
+        var row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+        let messageId = messageId(fromRow: row),
+        targets.contains(messageId)
+      else { continue }
+      // The row shape is nested exactly as the list reads it — the status the bubble
+      // renders lives at `message.status`, not at the top level. Writing the top-level
+      // key instead would leave the clock on screen while the log claimed a repair.
+      if var message = row["message"] as? [String: Any] {
+        message["status"] = "error"
+        row["message"] = message
+      } else {
+        row["status"] = "error"
+      }
+      guard
+        JSONSerialization.isValidJSONObject(row),
+        let rewritten = try? JSONSerialization.data(withJSONObject: row, options: [])
+      else { continue }
+      entries.append((messageId, messageTimestampMs(fromRow: row), rewritten))
+    }
+    guard !entries.isEmpty else { return 0 }
+    messageStore.upsertMessages(userId: userId, chatId: chatId, entries: entries)
+    return entries.count
+  }
+
   private func queueOutboundDraftLocked(
     chatId: String, messageId: String, payload: [String: Any], reason: String
   ) {
@@ -11200,6 +11782,15 @@ final class ChatEngine {
       // bridgeQueuedReplayMaxAgeMs. Lives in the draft so it dies with it;
       // bridge drafts are never persisted (see persistOutboundStateLocked).
       payload["__bridgeQueuedAtMs"] = nowMs()
+    }
+    // Every draft is stamped, bridge or not. An ordinary send that has sat in the
+    // queue for hours must not auto-dispatch the moment the blocker clears: the
+    // user typed it in a conversation that has since moved on, and delivering it
+    // silently later is a worse outcome than showing it as failed. Absent stamp
+    // reads as stale — that is deliberate, so drafts persisted before this existed
+    // are expired rather than delivered.
+    if payload["__queuedAtMs"] == nil {
+      payload["__queuedAtMs"] = nowMs()
     }
     pendingOutboundDraftsByMessageId[messageId] = payload
     var ids = pendingOutboundQueueByChat[chatId] ?? []
@@ -11414,6 +12005,80 @@ final class ChatEngine {
   /// is a fan-out, not a backlog.
   private static let maxQueuedOutboundReplay = 500
 
+  /// How long a queued send stays eligible for automatic dispatch.
+  ///
+  /// Past this it fails visibly instead. A send is a promise to deliver soon; a
+  /// draft that surfaces hours later arrives in a conversation that has moved on,
+  /// and the user has no idea it went. Fifteen minutes covers a tunnel, a lift and
+  /// a flaky handover — the cases a queue is actually for.
+  private static let queuedOutboundReplayMaxAgeMs = 15 * 60 * 1000
+
+  /// How many drafts a restored queue may keep.
+  ///
+  /// Strictly **below** ``maxQueuedOutboundReplay`` on purpose. The heal used to
+  /// trim to exactly that ceiling, and the replay guard refuses only when the
+  /// queue is *past* it — so a healed queue landed on precisely the one size the
+  /// runaway guard could never refuse, and replayed all 500 on every trigger. Two
+  /// constants that must not be equal, so they are no longer the same constant.
+  private static let maxHealedOutboundQueue = 100
+
+  /// Gap between outbox dispatches, per chat.
+  ///
+  /// The queue drains one draft per tick. 400ms is slow enough that a hundred-draft
+  /// backlog is background work the main thread never sees, and fast enough that a
+  /// normal offline burst (a handful of messages) is gone before the user notices.
+  private static let outboundDrainIntervalMs = 400
+
+  /// Automatic attempts per draft before it is failed rather than retried.
+  private static let outboundDrainMaxAttempts = 3
+
+  /// The one draft each chat currently has in flight. The whole no-fan-out property.
+  private var outboundDrainInFlightByChat: [String: String] = [:]
+  private var outboundDrainAttemptsByMessageId: [String: Int] = [:]
+
+  /// Fails every queued send that has outlived ``queuedOutboundReplayMaxAgeMs``,
+  /// across all chats, whether or not a replay runs.
+  ///
+  /// A pending bubble must always reach a terminal state. Expiry used to live only
+  /// inside ``scheduleReplayQueuedOutboundLocked``, which meant three ways to sit
+  /// pending forever: no trigger ever fired for that chat; the queue was past
+  /// ``maxQueuedOutboundReplay`` so the runaway guard returned before the expiry
+  /// ran; or the draft was still listed in `nativePendingMessagePushRefs` and the
+  /// loop skipped it. Observed on device 2026-08-03 — a send from 18:36 still
+  /// showing the pending clock at 19:32, an hour later, with a newer message in
+  /// the same chat already delivered.
+  ///
+  /// The draft itself is kept, so tap-to-retry still works. Only the promise of
+  /// automatic delivery is withdrawn.
+  private func expireStaleQueuedOutboundLocked(trigger: String) {
+    let now = Int64(nowMs())
+    var expiredByChat: [String: [String]] = [:]
+    for (chatId, ids) in pendingOutboundQueueByChat {
+      for messageId in ids {
+        guard let draft = pendingOutboundDraftsByMessageId[messageId] else { continue }
+        let queuedAtMs = parseLongValue(draft["__queuedAtMs"]) ?? 0
+        // A missing stamp counts as stale: those drafts predate the stamp and are
+        // exactly the ones that must never dispatch now.
+        guard queuedAtMs <= 0 || now - queuedAtMs > Int64(Self.queuedOutboundReplayMaxAgeMs)
+        else { continue }
+        expiredByChat[chatId, default: []].append(messageId)
+      }
+    }
+    guard !expiredByChat.isEmpty else { return }
+    for (chatId, messageIds) in expiredByChat {
+      for messageId in messageIds {
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
+        removeQueuedOutboundDraftLocked(chatId: chatId, messageId: messageId, dropDraft: false)
+      }
+      NSLog(
+        "[ChatEngine] expireStaleQueuedOutbound chatId=%@ trigger=%@ count=%d — older than %dms, failed instead of left pending",
+        String(chatId.prefix(12)), trigger, messageIds.count, Self.queuedOutboundReplayMaxAgeMs)
+      appendJournalLocked(
+        event: "native-outgoing-queue-expired",
+        payload: ["chatId": chatId, "count": messageIds.count, "trigger": trigger])
+    }
+  }
+
   private func scheduleReplayQueuedOutboundLocked(chatId: String, trigger: String) {
     if isBuiltInAgentChatId(chatId) {
       dropQueuedOutboundForChatLocked(chatId: chatId, reason: "built_in_agent_replay_\(trigger)")
@@ -11421,6 +12086,10 @@ final class ChatEngine {
     }
     let ids = pendingOutboundQueueByChat[chatId] ?? []
     guard !ids.isEmpty else { return }
+
+    // Stale drafts leave before anything is dispatched, on every trigger. A queued send
+    // that has outlived the promise is failed visibly, never delivered late.
+    expireStaleQueuedOutboundLocked(trigger: trigger)
     // Runaway guard. A replay that re-queues instead of re-sending turns this into an
     // exponential fan-out — measured at 3,310 drafts for one message on 2026-08-03,
     // with the main thread blocked 31s until the watchdog killed the app.
@@ -11439,10 +12108,12 @@ final class ChatEngine {
         payload: ["chatId": chatId, "count": ids.count, "trigger": trigger])
       return
     }
+
     NSLog(
       "[ChatEngine] scheduleReplayQueuedOutboundLocked chatId=%@ trigger=%@ count=%d", chatId,
       trigger, ids.count)
     var drafts: [[String: Any]] = []
+    var expiredIds: [String] = []
     for messageId in ids {
       if nativePendingMessagePushRefs.values.contains(where: {
         $0.chatId == chatId && $0.messageId == messageId
@@ -11450,6 +12121,23 @@ final class ChatEngine {
         continue
       }
       guard let draft = pendingOutboundDraftsByMessageId[messageId] else { continue }
+      // Expire stale drafts instead of dispatching them.
+      //
+      // A queued send is a promise to deliver *soon*. Once it has sat for longer
+      // than a user would wait, silently delivering it is worse than failing it:
+      // the conversation has moved on, and on 2026-08-03 a queue of drafts that
+      // had been stuck for a day drained the moment a peer key resolved, sending
+      // ~100 duplicates of one message to a real person.
+      //
+      // A missing stamp counts as stale on purpose — drafts persisted before the
+      // stamp existed are exactly the ones that must not be dispatched now. The
+      // draft is kept (out of the queue it never auto-sends) so tap-to-retry
+      // still works; only the automatic dispatch is refused.
+      let queuedAtMs = parseLongValue(draft["__queuedAtMs"]) ?? 0
+      if queuedAtMs <= 0 || Int64(nowMs()) - queuedAtMs > Int64(Self.queuedOutboundReplayMaxAgeMs) {
+        expiredIds.append(messageId)
+        continue
+      }
       if let provider = bridgeProviderForOutboundDraftLocked(draft, fallbackChatId: chatId) {
         // Bridge-agent drafts only auto-send while they're fresh (connection
         // warm-up). Anything older — e.g. the app sat backgrounded — fails
@@ -11467,19 +12155,228 @@ final class ChatEngine {
       }
       drafts.append(draft)
     }
+    if !expiredIds.isEmpty {
+      // Out of the queue and visibly failed. Leaving them queued would re-run this
+      // check on every trigger forever; marking them `error` is what tells the user
+      // these never went, instead of them discovering it when the peer replies to a
+      // message from yesterday.
+      for messageId in expiredIds {
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
+        removeQueuedOutboundDraftLocked(chatId: chatId, messageId: messageId, dropDraft: false)
+      }
+      NSLog(
+        "[ChatEngine] scheduleReplayQueuedOutboundLocked EXPIRED chatId=%@ trigger=%@ count=%d — older than %dms, failed instead of sent",
+        String(chatId.prefix(12)), trigger, expiredIds.count, Self.queuedOutboundReplayMaxAgeMs)
+      appendJournalLocked(
+        event: "native-outgoing-replay-expired",
+        payload: ["chatId": chatId, "count": expiredIds.count, "trigger": trigger])
+    }
+
     guard !drafts.isEmpty else { return }
+
+    // Resolve the peer key ONCE for the batch, and skip the whole replay if it is
+    // not there.
+    //
+    // Every draft here is a 1:1 send in the same chat, so they share one peer and
+    // one key. Without that key not one of them can be sent: each reaches the
+    // `missing_friend_key` branch of `sendMessage`, re-queues itself, emits a
+    // status change and a delta, and schedules another key fetch. Replaying 500
+    // drafts therefore did 500 rounds of that and drained nothing — and since the
+    // queue survived, the next trigger did it again. That is the flood that killed
+    // the app on 2026-08-03 (`sendMessage queued reason=missing_friend_key` ×500,
+    // per trigger, forever).
+    //
+    // This queue is not drained by replaying it. It is drained when the key lands,
+    // and `scheduleFriendPublicKeyFetchLocked` already replays on success — so
+    // deferring here loses no send and costs one key resolution instead of 500.
+    let hasNonPeerDraft = drafts.contains { draft in
+      (draft["isGroup"] as? Bool) == true
+        || (draft["isGroupOrChannel"] as? Bool) == true
+        || normalizedString(draft["peerAgentId"] ?? draft["peer_agent_id"]) != nil
+    }
+    if !hasNonPeerDraft, chatId != "saved_messages",
+      !isVolatileBridgeAgentChatLocked(chatId: chatId),
+      resolveFriendPublicKeyLocked(chatId: chatId, peerUserIdHint: nil) == nil
+    {
+      NSLog(
+        "[ChatEngine] scheduleReplayQueuedOutboundLocked DEFERRED chatId=%@ trigger=%@ count=%d — no peer key; fetching once instead of replaying",
+        String(chatId.prefix(12)), trigger, drafts.count)
+      appendJournalLocked(
+        event: "native-outgoing-replay-deferred",
+        payload: ["chatId": chatId, "count": drafts.count, "trigger": trigger])
+      scheduleFriendPublicKeyFetchLocked(
+        chatId: chatId, peerUserIdHint: nil, trigger: "replay_\(trigger)")
+      return
+    }
+
+    // ONE draft, oldest first, and nothing else until it settles.
+    //
+    // This used to dispatch the whole batch in a loop. That is the shape that put 692
+    // messages on the server for one send (2026-08-03, chat 176cdf92eec5, a doubling
+    // pattern 3, 4, 8, 16, 32, 60, 84): every draft that failed on a missing key
+    // re-queued itself, each re-queue fired another trigger, and each trigger replayed
+    // the whole grown batch again. A loop over a queue that a failure can grow is a
+    // multiplier no per-draft bound can make safe.
+    //
+    // Serial drain cannot multiply. The head of the queue is dispatched, the rest wait,
+    // and the next tick is scheduled on a timer rather than on the result — so a draft
+    // that fails and re-queues occupies the same one slot it already had instead of
+    // adding one. A hundred-draft backlog drains in a hundred ticks of background work
+    // and is invisible to the main thread, which is the other half of what a queue this
+    // size has to guarantee.
+    guard outboundDrainInFlightByChat[chatId] == nil else { return }
+    guard let draft = drafts.first,
+      let draftId = normalizedString(draft["messageId"] ?? draft["message_id"])
+    else { return }
+
+    // A draft that will not go is failed rather than retried forever. Without this a
+    // permanently unsendable message (revoked key, deleted peer) reoccupies the drain
+    // slot on every trigger and no other queued message ever gets a turn.
+    let attempts = (outboundDrainAttemptsByMessageId[draftId] ?? 0) + 1
+    outboundDrainAttemptsByMessageId[draftId] = attempts
+    guard attempts <= Self.outboundDrainMaxAttempts else {
+      NSLog(
+        "[ChatEngine] outbox EXHAUSTED chatId=%@ id=%@ attempts=%d — failed instead of retried",
+        String(chatId.prefix(12)), String(draftId.suffix(12)), attempts)
+      upsertLocalStatusLocked(chatId: chatId, messageId: draftId, status: "error")
+      removeQueuedOutboundDraftLocked(chatId: chatId, messageId: draftId, dropDraft: false)
+      outboundDrainAttemptsByMessageId.removeValue(forKey: draftId)
+      return
+    }
+
+    outboundDrainInFlightByChat[chatId] = draftId
+    NSLog(
+      "[ChatEngine] outbox DRAIN chatId=%@ id=%@ attempt=%d queued=%d trigger=%@",
+      String(chatId.prefix(12)), String(draftId.suffix(12)), attempts, drafts.count, trigger)
     appendJournalLocked(
       event: "native-outgoing-replay-scheduled",
       payload: [
         "chatId": chatId,
         "count": drafts.count,
         "trigger": trigger,
+        "messageId": draftId,
+        "attempt": attempts,
       ])
     DispatchQueue.global(qos: .utility).async { [weak self] in
       guard let self else { return }
-      for draft in drafts {
-        _ = self.sendMessage(draft)
+      _ = self.sendMessage(draft)
+      // Paced, not immediate: the interval is what turns a backlog into background
+      // work instead of a burst, and what keeps a draft that instantly re-queues from
+      // spinning this loop at full speed.
+      self.queue.asyncAfter(deadline: .now() + .milliseconds(Self.outboundDrainIntervalMs)) {
+        [weak self] in
+        guard let self else { return }
+        // Cleared here rather than on the send's result: a send has several ways to
+        // end (ack, error, silent re-queue) and a slot released on only some of them
+        // is a queue that wedges on the others.
+        self.outboundDrainInFlightByChat.removeValue(forKey: chatId)
+        // Delivered — forget the attempt count so a future send of a *different*
+        // message is not judged by this one's history.
+        if !(self.pendingOutboundQueueByChat[chatId]?.contains(draftId) ?? false) {
+          self.outboundDrainAttemptsByMessageId.removeValue(forKey: draftId)
+        }
+        self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "drain_tick")
       }
+    }
+  }
+
+  /// Gives an orphaned pending bubble a terminal state.
+  ///
+  /// A message can show the pending clock with **no draft behind it**: the queue entry
+  /// was consumed, dropped or never restored, while `localStatusIndex` still says
+  /// `sending`. Nothing then ever moves it — expiry walks the queue, and the queue no
+  /// longer knows about this message. That is how a screen full of "Test" from
+  /// yesterday still showed the clock today, hours after every retry path had given up
+  /// on it.
+  ///
+  /// Cheap by construction: one pass over `localStatusIndex`, which holds only messages
+  /// with a non-terminal local status, and only entries past the age limit are touched.
+  /// Reconstruct a send payload for a message that is still in the transcript but whose
+  /// outbound draft no longer exists.
+  ///
+  /// Only ever produces a plain text send. Media messages carry local file references and
+  /// sealed blobs that may no longer be on disk, and a re-send that quietly drops the
+  /// attachment would be a worse outcome than refusing — so those return nil and the
+  /// caller reports the refusal.
+  private func rebuildOutboundDraftFromStoredRowLocked(
+    chatId: String?, messageId targetMessageId: String
+  ) -> [String: Any]? {
+    // Named `targetMessageId` so the `messageId(fromRow:)` helper below is still callable
+    // — a parameter called `messageId` shadows it into a String.
+    let messageId = targetMessageId
+    let resolvedChatId: String? = {
+      if let chatId, !chatId.isEmpty { return chatId }
+      return liveMessageRowsByChat.first(where: { $0.value[messageId] != nil })?.key
+    }()
+    guard let resolvedChatId, !resolvedChatId.isEmpty else { return nil }
+    // Live rows first, then history — and history is where these actually are.
+    //
+    // `liveMessageRowsByChat` holds this session's traffic. A stranded send is by
+    // definition from an earlier session, so it has long since moved into the history
+    // rows, and looking only at the live table refused every message a person would ever
+    // want to retry (`retry REFUSED … no re-sendable row`, on messages plainly visible in
+    // the transcript).
+    let row: [String: Any]? =
+      liveMessageRowsByChat[resolvedChatId]?[messageId]
+      ?? (historyRowsByChat[resolvedChatId] ?? []).first {
+        self.messageId(fromRow: $0) == targetMessageId
+      }
+    guard let row else { return nil }
+    // Rows are envelopes: `["kind": "message", "key": …, "message": [ … ]]`. Reading
+    // `isMe` / `text` / `type` off the outer dictionary finds nothing at all, which is a
+    // silent refusal rather than an error — every field comes back nil and the guards
+    // below decline a message that was perfectly re-sendable.
+    guard let message = row["message"] as? [String: Any] else { return nil }
+    guard (message["isMe"] as? Bool) ?? false else { return nil }
+    let type = normalizedString(message["type"] ?? message["messageType"]) ?? "text"
+    guard type == "text" else { return nil }
+    let text = normalizedString(message["text"] ?? message["content"]) ?? ""
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    var draft: [String: Any] = [
+      "chatId": resolvedChatId,
+      "messageId": messageId,
+      "text": text,
+      "type": "text",
+    ]
+    if let replyToId = normalizedString(row["replyToId"] ?? row["reply_to_id"]) {
+      draft["replyToId"] = replyToId
+    }
+    if let peerUserId = chatPeerUserIdsByChatId[resolvedChatId] {
+      draft["peerUserId"] = peerUserId
+    }
+    return draft
+  }
+
+  private func sweepOrphanedPendingLocked(trigger: String) {
+    let now = Int64(nowMs())
+    var strandedByChat: [String: [String]] = [:]
+    for (chatId, statuses) in localStatusIndex {
+      for (messageId, status) in statuses where status == "sending" || status == "pending" {
+        // Still queued, or a push is genuinely in flight — the normal paths own it.
+        if pendingOutboundQueueByChat[chatId]?.contains(messageId) == true { continue }
+        if nativePendingMessagePushRefs.values.contains(where: {
+          $0.chatId == chatId && $0.messageId == messageId
+        }) { continue }
+        // Age from the row itself: an orphan has no draft, so there is no
+        // `__queuedAtMs` to read.
+        let tsMs = liveMessageRowsByChat[chatId]?[messageId].flatMap {
+          parseLongValue($0["timestampMs"] ?? $0["timestamp_ms"])
+        } ?? 0
+        guard tsMs <= 0 || now - tsMs > Int64(Self.queuedOutboundReplayMaxAgeMs) else { continue }
+        strandedByChat[chatId, default: []].append(messageId)
+      }
+    }
+    guard !strandedByChat.isEmpty else { return }
+    for (chatId, messageIds) in strandedByChat {
+      for messageId in messageIds {
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "error")
+      }
+      NSLog(
+        "[ChatEngine] outbox STRANDED chatId=%@ trigger=%@ count=%d — pending with no draft, failed so it can be retried",
+        String(chatId.prefix(12)), trigger, messageIds.count)
+      appendJournalLocked(
+        event: "native-outgoing-stranded-swept",
+        payload: ["chatId": chatId, "count": messageIds.count, "trigger": trigger])
     }
   }
 
@@ -12222,6 +13119,23 @@ final class ChatEngine {
     historyRowsByChat[chatId] = restoredRows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.insert(chatId)
+    // Feed the core from the store too, not just from the network.
+    //
+    // Without this the core starves on exactly the launch that matters. A warm
+    // relaunch restores from SQLite and logs `loadChatHistory SKIP … reason=
+    // restored_fresh_ttl` — the network fetch never runs, so the network-side
+    // ingest hooks never fire and the core holds zero rows for a chat the user is
+    // looking at. Observed on device 2026-08-03: `driver ARMED` with no window
+    // behind it.
+    //
+    // The inner `message` dict is what goes over, not the row wrapper: rows are
+    // `{kind, key, message:{…}}` and `canonical.rs` reads server-frame keys. That
+    // dict keeps `encryptedContent` alongside the opened text, so the core opens
+    // the envelope itself rather than trusting Swift's copy.
+    feedCoreRawFramesLocked(
+      chatId: chatId,
+      rawMessages: restoredRows.compactMap { $0["message"] as? [String: Any] },
+      source: .storeRestore)
     NSLog(
       "[HistoryStore] restore HIT chat=%@ rows=%d (painted from local store, no network)",
       String(chatId.prefix(12)), restoredRows.count)
@@ -12353,6 +13267,20 @@ final class ChatEngine {
     if !skipPrune {
       messageStore.pruneChat(userId: userId, chatId: chatId)
     }
+    // The Rust store mirrors this same choke, for the same reason. It writes only
+    // to its own additive `core_*` tables and nothing reads them yet, so a failure
+    // here cannot affect what the list renders — it can only fail to migrate.
+    // All three calls hop to the store's own queue immediately; none run here.
+    //
+    // Backfill is the one-time historical catch-up; `mirrorRows` is what keeps
+    // the two tables in step afterwards, because backfill's cursor completes and
+    // can never see a row that arrives after it. Same serial queue, so the
+    // historical walk always lands before the increments that follow it.
+    VibeCoreStoreBridge.backfillChat(userId: userId, chatId: chatId)
+    VibeCoreStoreBridge.mirrorRows(
+      userId: userId, chatId: chatId, entries: entries,
+      keepNewest: skipPrune ? 0 : UInt32(ChatMessageStore.prunedChatRowLimit))
+    VibeCoreStoreBridge.verifyAgainstLegacy(userId: userId, chatId: chatId)
     return entries.count
   }
 
@@ -12414,7 +13342,14 @@ final class ChatEngine {
           String(chatId.prefix(12)), before)
       }
       messageStore.deleteChat(userId: userId, chatId: chatId)
+      // Same wipe for the sealed core tables. Without this, a later core-store read
+      // would resurrect history the engine just deleted.
+      VibeCoreStoreBridge.clearChat(userId: userId, chatId: chatId)
     }
+    // Heights measured for rows that no longer exist would open the next visit
+    // with wrong content-size / jump targets.
+    VibeTimelinePreparedStore.shared.invalidate(chatId: chatId)
+    ChatListView.clearWarmTranscriptSnapshot(chatId: chatId)
     guard let cacheKey = chatHistoryCacheKeyLocked(chatId: chatId) else { return }
     UserDefaults.standard.removeObject(forKey: cacheKey)
     UserDefaults.standard.synchronize()
@@ -13007,6 +13942,15 @@ final class ChatEngine {
           (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any]
         }.filter { !isTransientStreamRow($0) }
         let existingCount = historyRowsByChat[chatId]?.count ?? 0
+        // Page the core back in step with the list. The core serves a bounded
+        // window over its own store, and this store page is the only place the
+        // older rows exist — without this the core stays at its opening window
+        // while the list grows, the coverage gate refuses on every scroll-back,
+        // and the transcript flips between core rows and engine rows mid-scroll.
+        feedCoreRawFramesLocked(
+          chatId: chatId,
+          rawMessages: olderRows.compactMap { $0["message"] as? [String: Any] },
+          source: .storeRestore)
         let (rows, delta) = ingestHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
         historyRowsByChat[chatId] = rows
         historyLoadingOlderChats.remove(chatId)
@@ -13168,6 +14112,9 @@ final class ChatEngine {
         }
 
         let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
+        // Same reason as the store branch above: the core pages back with the list.
+        self.feedCoreRawFramesLocked(
+          chatId: chatId, rawMessages: messagesArray, source: .historyPage)
         let (rows, delta) = self.ingestHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
         self.historyRowsByChat[chatId] = rows
         _ = self.persistHistoryRowsToStoreLocked(
@@ -13404,6 +14351,108 @@ final class ChatEngine {
     }.resume()
   }
 
+  /// Hands raw server frames to the Rust core.
+  ///
+  /// Called from the ingest paths, on the engine queue, with the frames exactly as
+  /// received.
+  ///
+  /// **Starts the core if the gate is open**, rather than waiting for a chat
+  /// surface to bring one up. Ingest happens at launch — the store restore runs
+  /// long before any chat is opened — so a core that only exists once a surface
+  /// arms it misses the entire transcript and then reports an empty window for a
+  /// chat the user is reading. Gated on the render-path flag so a build with the
+  /// core off pays neither a worker thread nor the ingest.
+  ///
+  /// Best-effort by design. A rejected frame is counted inside the core and the
+  /// Swift path is unaffected — during the migration the core is a second reader
+  /// of the same bytes, and a core that cannot keep up must never delay a message
+  /// the user is waiting for.
+  private func feedCoreRawFramesLocked(
+    chatId: String, rawMessages: [[String: Any]], source: VibeFfiSource
+  ) {
+    guard !rawMessages.isEmpty else { return }
+    guard VibeTimelineUserDefaultsFeatureFlags.isDirectMessageRenderPathEnabled() else { return }
+    guard let core = VibeCoreBridge.sharedCore(ownUserId: currentUserIdLocked() ?? "") else {
+      return
+    }
+    guard JSONSerialization.isValidJSONObject(rawMessages),
+      let json = try? JSONSerialization.data(withJSONObject: rawMessages)
+    else {
+      VibeLog.warning(
+        "core ingest skipped — page is not JSON-serializable", category: "core",
+        metadata: ["chat": String(chatId.prefix(12)), "rows": String(rawMessages.count)])
+      return
+    }
+    let now = Int64(Date().timeIntervalSince1970 * 1000)
+    do {
+      try core.ingestFrames(
+        chatId: chatId, jsonArray: json, source: source, receivedAtMs: now)
+      // What went in, so "the core has 7 rows for a 55-message chat" can be read as
+      // either "it was never fed" or "it dropped them". Without this the two are
+      // indistinguishable and the next step is a guess.
+      NSLog(
+        "[VibeCore] fed chat=%@ frames=%d source=%@",
+        String(chatId.prefix(12)), rawMessages.count, String(describing: source))
+    } catch {
+      VibeLog.warning(
+        "core ingest rejected", category: "core",
+        metadata: [
+          "chat": String(chatId.prefix(12)), "error": String(describing: error),
+        ])
+    }
+  }
+
+  /// Tells the core a message is gone.
+  ///
+  /// The core is fed *frames*, and a deletion has no frame — the server sends an id
+  /// and a scope, never a message — so there was no path by which the core could
+  /// learn about one. That was invisible while the core only reported geometry, and
+  /// became a user-visible bug the moment its window became the list's content: the
+  /// engine dropped the row, the core's next publish put it straight back, and the
+  /// deleted cell reappeared on screen (device run 2026-08-04, `sqlite=999→998` while
+  /// `authority LIVE rows=200` still carried the row).
+  ///
+  /// Hooked at ``markLiveMessageDeletedLocked(chatId:messageId:)`` because that is the
+  /// one funnel every delete path already passes through — optimistic send, server
+  /// `message-deleted`, pending-push failure and history reconciliation alike.
+  private func feedCoreDeleteLocked(chatId: String, messageId: String) {
+    guard VibeTimelineUserDefaultsFeatureFlags.isDirectMessageRenderPathEnabled() else { return }
+    guard let core = VibeCoreBridge.sharedCore(ownUserId: currentUserIdLocked() ?? "") else {
+      return
+    }
+    // Scope is not carried here and does not need to be: a tombstone is a tombstone
+    // as far as this device's transcript is concerned, and "delete for me" and
+    // "delete for everyone" both mean the row leaves *this* window.
+    try? core.deleteMessage(
+      chatId: chatId, messageId: messageId, forEveryone: true,
+      tombstoneMs: Int64(Date().timeIntervalSince1970 * 1000))
+  }
+
+  /// Tells the core the whole chat was cleared (Clear Chat for me / for both).
+  ///
+  /// Same class of bug as ``feedCoreDeleteLocked``: clear is not a frame, so without
+  /// an explicit command the reducer's window keeps every row and the list paints
+  /// them back after the engine and SQLite are empty.
+  private func feedCoreClearChatLocked(chatId: String) {
+    // Always try: Clear Chat must empty the core even when the DM render-path flag
+    // is off, because a later open that arms the flag would otherwise restore a
+    // non-empty window from the still-live reducer.
+    guard let core = VibeCoreBridge.sharedCore(ownUserId: currentUserIdLocked() ?? "") else {
+      return
+    }
+    let now = Int64(Date().timeIntervalSince1970 * 1000)
+    do {
+      try core.clearChat(chatId: chatId, beforeTsMs: nil, clearedAtMs: now)
+      NSLog("[VibeCore] clear chat=%@", String(chatId.prefix(12)))
+    } catch {
+      VibeLog.warning(
+        "core clear rejected", category: "core",
+        metadata: [
+          "chat": String(chatId.prefix(12)), "error": String(describing: error),
+        ])
+    }
+  }
+
   private func applyChatHistoryResponseLocked(chatId: String, data: Data) {
     guard let object = try? JSONSerialization.jsonObject(with: data) else {
       appendJournalLocked(
@@ -13432,6 +14481,14 @@ final class ChatEngine {
         ])
       return
     }
+
+    // Hand the page to the Rust core **before** Swift canonicalizes it. These are
+    // the bytes as the server sent them, which is what `VibeCoreEventV1::RawFrames`
+    // is specified to carry — the core does its own alias resolution, envelope
+    // open, media fold and dedup from the original frame. Feeding it Swift's
+    // already-normalized output instead would make the core a re-parser of a parse
+    // and leave the divergence it exists to remove.
+    feedCoreRawFramesLocked(chatId: chatId, rawMessages: messagesArray, source: .historyPage)
 
     let remoteRows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
     if let response = object as? [String: Any] {
@@ -14033,9 +15090,21 @@ final class ChatEngine {
 
     let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
     if elapsedMs > 50 {
+      // `callSite` is the ENGINE method that blocked — always `getChatRows` — which
+      // cannot say who asked for it. Every ChatListView caller is already off-main, so
+      // the blocker is somewhere else entirely, and 53 of these in one session (up to
+      // 623ms) makes finding it the single biggest remaining main-thread item. The frames
+      // only cost anything on a stall that has already happened.
+      let callers = Thread.callStackSymbols.dropFirst(2).prefix(8)
+        .map { symbol -> String in
+          // Keep the demangled symbol, drop the address/module columns.
+          let parts = symbol.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+          return parts.count >= 4 ? String(parts[3].prefix(70)) : symbol
+        }
+        .joined(separator: " ← ")
       NSLog(
-        "[ChatEngine][MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for %dms at %@",
-        elapsedMs, callSite)
+        "[ChatEngine][MAIN-THREAD-SYNC-STALL] syncOnQueue blocked main thread for %dms at %@\n    via %@",
+        elapsedMs, callSite, callers)
       // Also into the exportable log. Retiring these stalls is the scroll goal,
       // and a stall that only reaches the Xcode console cannot be measured from
       // a device the debugger is not attached to — which is every real run. The
@@ -14354,8 +15423,10 @@ final class ChatEngine {
       let musicArtist = self.normalizedString(metadata["artist"] ?? payload["artist"])
       let musicSource = self.normalizedString(
         metadata["source"] ?? metadata["platform"] ?? payload["source"])
-      let width = self.parseLongValue(metadata["width"] ?? payload["width"])
-      let height = self.parseLongValue(metadata["height"] ?? payload["height"])
+      // `var`: if the caller could not read the picked file it passes neither, and the
+      // upload block below fills them from the bytes it just uploaded. See there.
+      var width = self.parseLongValue(metadata["width"] ?? payload["width"])
+      var height = self.parseLongValue(metadata["height"] ?? payload["height"])
       var mediaKey = self.normalizedString(metadata["mediaKey"] ?? metadata["media_key"] ?? payload["mediaKey"])
       let replyToId =
         self.normalizedString(metadata["replyToId"] ?? metadata["reply_to_id"] ?? payload["replyToId"])
@@ -14417,6 +15488,35 @@ final class ChatEngine {
             remoteURL: uploadResult.remoteUrl,
             mediaKey: mediaKey ?? uploadResult.mediaKey
           )
+        }
+        // Dimensions are the receiver's ONLY way to shape the bubble before the bytes
+        // arrive. Without them the cell falls back to a square (see the square fallback in
+        // ChatListViewCells) and then resizes when the real image decodes — a photo-sized
+        // shift, on the recipient, on every media message.
+        //
+        // The caller derives them from the picked file, so when that read fails they are
+        // simply absent and every `if let width` downstream silently omits them. Nothing
+        // errors; the recipient just gets a black square. The bytes are right here — they
+        // were just uploaded — so read the header (no decode) and fill the gap. Covers
+        // every send path at once, including the ones that never passed dimensions.
+        if width == nil || height == nil, ["image", "gif"].contains(type) {
+          let localPath: String? = {
+            if let url = URL(string: currentMediaUrl), url.isFileURL { return url.path }
+            return currentMediaUrl.hasPrefix("/") ? currentMediaUrl : nil
+          }()
+          if let localPath, let headerSize = chatMediaImageHeaderSize(atPath: localPath),
+            headerSize.width > 1.0, headerSize.height > 1.0
+          {
+            width = Int64(headerSize.width)
+            height = Int64(headerSize.height)
+            NSLog(
+              "[MediaDims] recovered from upload source type=%@ %.0fx%.0f",
+              type, headerSize.width, headerSize.height)
+          } else {
+            NSLog(
+              "[MediaDims] MISSING type=%@ local=%@ — recipient will size this as a square",
+              type, localPath ?? "<not-a-file>")
+          }
         }
         mediaUrl = uploadResult.remoteUrl
         if fileName == nil { fileName = uploadResult.fileName }

@@ -103,16 +103,21 @@ struct DiagnosticsView: View {
               category: "core")
           }
 
-        // P5. The first thing the core is allowed to decide for the real list.
-        Toggle("Core orders the list", isOn: $coreOrderAuthorityEnabled)
+        // The core becomes the list: order and content from one answer.
+        //
+        // No longer gated on the shadow-compare switch. That gate existed because
+        // order authority used to be served by `VibeTimelineShadowProbe`, a second
+        // core that had to be armed first; the probe is gone and ordering now comes
+        // from the same instance that canonicalized and decrypted the rows, so
+        // requiring a diagnostic to be on would only make this switch dead.
+        Toggle("Core drives the list (order + content)", isOn: $coreOrderAuthorityEnabled)
           .onChange(of: coreOrderAuthorityEnabled) { _, on in
             UserDefaults.standard.set(
               on, forKey: VibeTimelineUserDefaultsFeatureFlags.coreOrderAuthorityKey)
             VibeLog.notice(
-              "core order authority \(on ? "ENABLED" : "disabled") (reopen a chat)",
+              "core order+content authority \(on ? "ENABLED" : "disabled") (reopen a chat)",
               category: "core")
           }
-          .disabled(!coreShadowEnabled)
       } header: {
         Text("Rust core")
       } footer: {
@@ -134,7 +139,7 @@ struct DiagnosticsView: View {
         Text("Chat list")
       } footer: {
         Text(
-          "Mounts only the newest 200 messages of a conversation instead of every message ever sent, which is what the list does today for everything except agent DMs. Older messages are not dropped — scroll up and they load, using the same reveal path the list already had. This one is independent of the Rust core.\n\nThe log line to look for is \"transcript windowed\", with how many rows were shown and how many were withheld."
+          "Off. The list mounts every message in a conversation, and scrolling back through it is not supposed to stop or stall anywhere.\n\nTurning this on caps the mount at the newest 200 messages. Older ones are not dropped — scrolling up re-applies the whole transcript to get them back — but that re-apply is a visible jump, which is why this is a diagnostic and not the default. Use it to check whether a slow conversation is slow because of how many rows are mounted. This one is independent of the Rust core.\n\nThe log line to look for is \"transcript windowed\", with how many rows were shown and how many were withheld."
         )
       }
 

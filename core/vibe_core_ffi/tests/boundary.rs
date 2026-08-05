@@ -76,7 +76,7 @@ fn frame(message_id: &str, ts_ms: i64) -> Vec<u8> {
 #[test]
 fn a_handle_spawns_a_worker_and_shuts_it_down_cleanly() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
     assert!(!handle.is_shut_down());
     handle.shutdown();
     assert!(handle.is_shut_down());
@@ -87,7 +87,7 @@ fn shutdown_is_idempotent() {
     // A platform tearing down under memory pressure should not have to track
     // whether it already shut the handle down.
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink);
+    let handle = VibeCoreHandle::new(config(), sink, None);
     handle.shutdown();
     handle.shutdown();
     handle.shutdown();
@@ -97,7 +97,7 @@ fn shutdown_is_idempotent() {
 #[test]
 fn commands_after_shutdown_are_refused_rather_than_hanging() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink);
+    let handle = VibeCoreHandle::new(config(), sink, None);
     handle.shutdown();
 
     // The failure mode this guards against is a caller blocking forever on a
@@ -116,7 +116,7 @@ fn commands_after_shutdown_are_refused_rather_than_hanging() {
 #[test]
 fn ingest_reaches_the_sink_without_the_caller_ever_blocking_on_the_core() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
 
     for i in 0..5 {
         handle
@@ -141,7 +141,7 @@ fn ingest_reaches_the_sink_without_the_caller_ever_blocking_on_the_core() {
 #[test]
 fn a_window_request_for_an_unknown_chat_reports_an_error_and_keeps_working() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
 
     handle
         .request_window("never-seen".to_string(), 1)
@@ -200,7 +200,7 @@ fn reentrant_sink_callback_does_not_deadlock() {
         reentered: AtomicBool::new(false),
         depth: AtomicUsize::new(0),
     });
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
     sink.handle.set(handle.clone()).ok();
 
     handle
@@ -258,7 +258,7 @@ fn a_panic_in_a_callback_is_contained_and_the_worker_survives() {
         deltas_after_panic: AtomicUsize::new(0),
         errors: AtomicUsize::new(0),
     });
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
 
     handle
         .ingest_frame(
@@ -308,7 +308,7 @@ fn a_queued_backlog_still_shuts_down() {
     // Shutdown must not wait for an arbitrarily long queue to drain, and must
     // not hang if the worker is mid-command.
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink);
+    let handle = VibeCoreHandle::new(config(), sink, None);
 
     for i in 0..500 {
         let _ = handle.ingest_frame(
@@ -325,7 +325,7 @@ fn a_queued_backlog_still_shuts_down() {
 #[test]
 fn suspend_flushes_without_tearing_the_worker_down() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
 
     handle
         .ingest_frame(
@@ -354,7 +354,7 @@ fn suspend_flushes_without_tearing_the_worker_down() {
 #[test]
 fn a_malformed_frame_is_dropped_without_killing_the_worker() {
     let sink = Arc::new(CountingSink::default());
-    let handle = VibeCoreHandle::new(config(), sink.clone());
+    let handle = VibeCoreHandle::new(config(), sink.clone(), None);
 
     for bad in [
         b"".to_vec(),

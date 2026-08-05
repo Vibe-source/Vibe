@@ -19,7 +19,14 @@ name = "vibe_core_ffi"
 
 [dependencies]
 vibe_core = { path = "../vibe_core" }
+# The store crate, linked so history/paging/backfill can move off the Swift engine's
+# serial queue. It brings bundled SQLite (never the system one) and compiles into the
+# same staticlib the XCFramework ships.
+vibe_core_store = { path = "../vibe_core_store" }
 uniffi = { version = "0.28", features = ["cli"] }
+# Already in the graph via vibe_core; declared here so the unwrapped content key
+# handed over by the platform is scrubbed on this side of the boundary too.
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
@@ -44,6 +51,10 @@ cast_sign_loss = "allow"
 cast_lossless = "allow"
 doc_markdown = "allow"
 too_many_lines = "allow"
+# A `#[uniffi::export]` method cannot take a reference across the boundary — the
+# generated scaffolding hands it an owned value. The lint is right in general and
+# unactionable here.
+needless_pass_by_value = "allow"
 
 [profile.release]
 lto = true
