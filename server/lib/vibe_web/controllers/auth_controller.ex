@@ -1,6 +1,7 @@
 defmodule VibeWeb.AuthController do
   use VibeWeb, :controller
   import Ecto.Query, warn: false
+  require Logger
   alias Vibe.Accounts
   alias Vibe.Accounts.User
 
@@ -55,7 +56,15 @@ defmodule VibeWeb.AuthController do
 
         # SECURITY: Use HMAC instead of plain SHA256 for secure_id
         # This prevents rainbow table attacks even if the database leaks
-        secure_id = secure_id_for(hmac_secret!(), password)
+        #
+        # v3 clients send a `credential` that is a one-way HKDF derivation of the
+        # user's recovery secret, and a `password` that is a *different* one-way
+        # derivation of it. The raw recovery secret — which is also the passphrase
+        # wrapping `encrypted_private_key` — never reaches this server at all.
+        # Pre-v3 clients send no `credential`, and for them `password` *is* the
+        # raw secret, so it stays the lookup handle. See `upgrade_identity/2`.
+        lookup_value = present_credential(params["credential"]) || password
+        secure_id = secure_id_for(hmac_secret!(), lookup_value)
 
         # SECURITY: Token with expiration
         login_token = UUID.uuid4()
@@ -67,8 +76,9 @@ defmodule VibeWeb.AuthController do
 
         {public_key, encrypted_private_key} =
           cond do
-            # V2: Client must provide keys (secure E2E)
-            identity_version == "v2" && params["publicKey"] && params["encryptedPrivateKey"] ->
+            # V2/V3: Client must provide keys (secure E2E)
+            identity_version in ["v2", "v3"] && params["publicKey"] &&
+                params["encryptedPrivateKey"] ->
               {params["publicKey"], params["encryptedPrivateKey"]}
 
             # V1 Legacy: Client provides keys (backward compatible)
@@ -164,6 +174,67 @@ defmodule VibeWeb.AuthController do
         end
     end
   end
+
+  @doc """
+  Re-keys a pre-v3 account onto one-way-derived credentials.
+
+  Before v3 the client sent the user's recovery secret here verbatim, as both the
+  login `credential` and the `password` — while that same secret is the PBKDF2
+  passphrase wrapping `encrypted_private_key`, a copy of which this server
+  stores. Every login therefore handed us both halves: enough to unwrap the
+  user's private key and read their entire history. That made the product's
+  end-to-end encryption nominal. This endpoint rotates such an account so it
+  stops being true, after which the raw secret is never transmitted again.
+
+  It deliberately does **not** touch `encrypted_private_key`. The client's KEK
+  derivation is unchanged, so there is nothing to re-wrap — and that is what
+  makes this migration non-destructive. The worst outcome of a failure here is a
+  login that falls back to the legacy path again, never unreadable key material.
+
+  Authenticated by the bearer token issued moments earlier by `login/2`, so only
+  a caller who already proved possession of the old secret can rotate it.
+  """
+  def upgrade_identity(conn, params) do
+    user = conn.assigns.current_user
+
+    with credential when is_binary(credential) <- present_credential(params["credential"]),
+         password when is_binary(password) <- present_credential(params["password"]) do
+      salt = :crypto.strong_rand_bytes(16)
+      derived_bin = :crypto.pbkdf2_hmac(:sha512, password, salt, @pbkdf2_iterations, 64)
+
+      password_hash =
+        Base.encode16(salt, case: :lower) <> ":" <> Base.encode16(derived_bin, case: :lower)
+
+      # `secure_id` is the account's lookup handle and is derived from whatever
+      # the client will send as `credential` at the next login, so it has to
+      # rotate in lockstep with `password_hash`. The client is handed the new
+      # value back because it cannot recompute it — the pepper is server-side.
+      case Accounts.update_user(user, %{
+             "password_hash" => password_hash,
+             "secure_id" => secure_id_for(hmac_secret!(), credential),
+             "identity_key" => "v3"
+           }) do
+        {:ok, updated_user} ->
+          Logger.info("[Auth] identity upgraded to v3 user_id=#{updated_user.id}")
+          json(conn, %{ok: true, secureId: updated_user.secure_id, identityKey: "v3"})
+
+        {:error, _changeset} ->
+          conn |> put_status(500) |> json(%{error: "Identity upgrade failed"})
+      end
+    else
+      _ ->
+        conn |> put_status(400) |> json(%{error: "credential and password are required"})
+    end
+  end
+
+  defp present_credential(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp present_credential(_), do: nil
 
   defp issue_login_response(conn, %User{} = user) do
     # SECURITY: Generate new token on each login and set expiration

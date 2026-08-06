@@ -58,6 +58,20 @@ if config_env() == :prod do
     media_bucket: System.get_env("SUPABASE_MEDIA_BUCKET"),
     music_bucket: System.get_env("SUPABASE_MUSIC_BUCKET")
 
+  # Cloudflare R2 credentials (additive path alongside Supabase — see
+  # Vibe.R2Storage and Vibe.Storage). Vibe.Storage.backend/0 defaults to
+  # :supabase, so setting these alone does not change any existing
+  # behaviour; the backend only switches when :vibe, :storage_backend is
+  # explicitly set to :r2 elsewhere. R2_PUBLIC_BASE_URL is read here for
+  # forward-compat but is not currently used to build any URL — R2 objects
+  # are private and are only ever read via short-TTL presigned GETs.
+  config :vibe, :r2,
+    account_id: System.get_env("R2_ACCOUNT_ID"),
+    access_key_id: System.get_env("R2_ACCESS_KEY_ID"),
+    secret_access_key: System.get_env("R2_SECRET_ACCESS_KEY"),
+    bucket: System.get_env("R2_BUCKET"),
+    public_base_url: System.get_env("R2_PUBLIC_BASE_URL")
+
   # Lemon Squeezy configuration for payments
   config :vibe, :lemon_squeezy,
     api_key: System.get_env("LEMON_SQUEEZY_API_KEY"),

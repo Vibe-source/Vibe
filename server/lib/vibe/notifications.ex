@@ -1024,7 +1024,15 @@ defmodule Vibe.Notifications do
     if body != "" do
       truncate_text(body, 160)
     else
-      case to_string(message_type || "text") do
+      # `push_kind` is the new content-free label ("image", "voice", "sticker", ...)
+      # sent on every message. It takes priority over `message_type` (derived from
+      # the persisted `type` field) so that a 1:1 E2E DM — which never sends a body
+      # preview — still resolves to a real label here instead of the generic
+      # default. `message_type` remains the fallback for callers/clients that
+      # haven't started sending `push_kind` yet.
+      kind = payload["pushKind"] || payload["push_kind"] || message_type
+
+      case to_string(kind || "text") do
         "image" -> "Photo"
         "video" -> "Video"
         "voice" -> "Voice message"
@@ -1033,7 +1041,9 @@ defmodule Vibe.Notifications do
         "location" -> "Location"
         "contact" -> "Contact"
         "gif" -> "GIF"
-        _ -> "You have a new message"
+        "sticker" -> "Sticker"
+        "text" -> "New message"
+        _ -> "New message"
       end
     end
   end
