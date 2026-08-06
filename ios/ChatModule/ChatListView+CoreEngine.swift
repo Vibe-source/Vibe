@@ -163,10 +163,17 @@ extension ChatListView: VibeMessageListHost {
       coreState.eligibilityChecked = true
       coreState.driver = Self.makeCoreDriverIfEligible(
         chatId: chatId, isGroupOrChannel: isGroupOrChannel, listHost: self)
-      coreState.driver?.start(ownUserId: ownUserId) { [weak self] messageId in
-        guard let self else { return nil }
-        return self.coreMeasurementRow(forIdentity: messageId)
-      }
+      coreState.driver?.start(
+        ownUserId: ownUserId,
+        rowProvider: { [weak self] messageId in
+          guard let self else { return nil }
+          return self.coreMeasurementRow(forIdentity: messageId)
+        },
+        agentStateProvider: { [weak self] row in
+          guard let self else { return AgentTurnBubbleState() }
+          return self.agentTurnBubbleState(for: row)
+        }
+      )
       coreState.driver?.onCoreRows = { [weak self] rows in
         guard let self else { return }
         self.coreState.authoritativeRows = rows

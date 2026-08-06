@@ -1,0 +1,137 @@
+//! Device identity: one Ed25519 signing key plus the MLS `BasicCredential`
+//! that names it.
+//!
+//! Vibe already puts one asymmetric key per *account* in the Keychain; MLS
+//! makes the identity per-*device* instead, which is what finally makes
+//! multi-device native instead of "one key smuggled to a second phone." The
+//! device id is deliberately the thing a future safety-number UI hashes, so
+//! it is threaded through unchanged into the `BasicCredential` rather than
+//! derived from key material — the credential is what a peer actually sees.
+
+use openmls::prelude::tls_codec::Serialize as _;
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+
+use crate::error::VibeSecureError;
+use crate::VIBE_SECURE_CIPHERSUITE;
+
+/// One device's long-term MLS identity: a signing key held in the platform's
+/// key store, plus the credential that names it inside a group.
+///
+/// The signing key never crosses FFI — exactly the rule `vibe_core::crypto`
+/// already holds for the RSA key it replaces. This type does not implement
+/// `Debug`: printing it by accident must not become possible by adding a
+/// derive.
+pub struct VibeDeviceIdentity {
+    device_id: String,
+    signer: SignatureKeyPair,
+    credential_with_key: CredentialWithKey,
+}
+
+impl VibeDeviceIdentity {
+    /// Generates a fresh identity for `device_id` and stores its signing key
+    /// in `provider`'s key store.
+    ///
+    /// `device_id` should be stable for the lifetime of the install — it is
+    /// what other members' safety-number UI will hash, and what a future
+    /// remove-device flow names.
+    pub fn generate(
+        device_id: &str,
+        provider: &impl OpenMlsProvider,
+    ) -> Result<Self, VibeSecureError> {
+        let credential = BasicCredential::new(device_id.as_bytes().to_vec());
+        let signer = SignatureKeyPair::new(VIBE_SECURE_CIPHERSUITE.signature_algorithm())
+            .map_err(|_| VibeSecureError::IdentityGeneration)?;
+        signer
+            .store(provider.storage())
+            .map_err(|_| VibeSecureError::IdentityGeneration)?;
+
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.public().into(),
+        };
+
+        Ok(Self {
+            device_id: device_id.to_string(),
+            signer,
+            credential_with_key,
+        })
+    }
+
+    /// The stable device id this identity was generated for.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Builds a fresh `KeyPackage` for this device and returns the bytes safe
+    /// to publish to the server.
+    ///
+    /// Each call consumes a one-time init key and mints a new one — a
+    /// `KeyPackage` is meant to be used once, the same way the RSA path's
+    /// "fresh key per message" was, except here it is "fresh key package per
+    /// invite". [`VibeKeyPackageBundle::as_bytes`] carries **only** the public
+    /// `KeyPackage`; the matching private key material stays in `provider`'s
+    /// key store, which is what lets [`crate::session::VibeSecureSession::join_from_welcome`]
+    /// find it later without this type ever handling it directly.
+    pub fn key_package(
+        &self,
+        provider: &impl OpenMlsProvider,
+    ) -> Result<VibeKeyPackageBundle, VibeSecureError> {
+        let bundle = KeyPackage::builder()
+            .build(
+                VIBE_SECURE_CIPHERSUITE,
+                provider,
+                &self.signer,
+                self.credential_with_key.clone(),
+            )
+            .map_err(|_| VibeSecureError::KeyPackageBuild)?;
+
+        let bytes = bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|_| VibeSecureError::KeyPackageBuild)?;
+
+        Ok(VibeKeyPackageBundle { bytes })
+    }
+
+    /// The signer used to author group operations on this device's behalf.
+    /// Not exposed outside the crate — callers act through
+    /// [`crate::session::VibeSecureSession`], never on the key directly.
+    pub(crate) fn signer(&self) -> &SignatureKeyPair {
+        &self.signer
+    }
+
+    /// This device's credential, cloned for handing to an OpenMLS call that
+    /// consumes one by value.
+    pub(crate) fn credential_with_key(&self) -> CredentialWithKey {
+        self.credential_with_key.clone()
+    }
+}
+
+/// A serialized `KeyPackage`, safe to publish to the server.
+///
+/// Carries only the public half. The matching private init/encryption keys
+/// this device generated alongside it live in the OpenMLS key store, never
+/// here — this type crossing FFI to the server is exactly the point of it,
+/// so it must never be extended with a field that shouldn't leave the device.
+pub struct VibeKeyPackageBundle {
+    bytes: Vec<u8>,
+}
+
+impl VibeKeyPackageBundle {
+    /// Wraps KeyPackage bytes fetched from the server.
+    ///
+    /// Deliberately does **no** validation: these bytes are attacker-controlled
+    /// (a hostile server can serve anything), and the only validation that means
+    /// anything is OpenMLS's own, which runs inside
+    /// [`crate::VibeSecureSession::add_members`] under its panic guard. Checking
+    /// here as well would invite the caller to treat construction as proof the
+    /// package is trustworthy, which it is not.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}

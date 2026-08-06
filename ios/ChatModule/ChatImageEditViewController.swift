@@ -30,6 +30,13 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private let canvasView = PKCanvasView()
   private let overlayContainer = UIView()
 
+  // MARK: AI edit
+
+  private let aiSelectionView = ChatImageAISelectionView()
+  /// Images replaced by an AI edit, newest last — powers the Undo chip.
+  private var aiUndoStack: [UIImage] = []
+  private var aiTask: Task<Void, Never>?
+
   // MARK: Top chrome
 
   private let topContainer = UIView()
@@ -176,6 +183,17 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     overlayContainer.backgroundColor = .clear
     overlayContainer.isUserInteractionEnabled = true
     renderSurfaceView.addSubview(overlayContainer)
+
+    // Sits on the image at exactly the fitted rect, so its bounds map 1:1 onto
+    // the picture. Hidden until the AI tab is selected.
+    aiSelectionView.isHidden = true
+    aiSelectionView.isUserInteractionEnabled = false
+    aiSelectionView.onSelectionChanged = { [weak self] rect in
+      guard let self else { return }
+      self.markupModel.aiHasSelection = rect != nil
+      self.markupHost.refresh()
+    }
+    renderSurfaceView.addSubview(aiSelectionView)
 
     setupTopBar()
     setupBottomBar()
@@ -324,6 +342,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     markupHost.onAddText = { [weak self] in self?.beginTextEntry() }
     markupHost.onOpenStickers = { [weak self] in self?.showGifPanel() }
     markupHost.onPickShape = { [weak self] kind in self?.addShape(kind) }
+    markupHost.onAIGenerate = { [weak self] in self?.handleAIGenerate() }
+    markupHost.onAIClearSelection = { [weak self] in self?.aiSelectionView.clearSelection() }
+    markupHost.onAIUndo = { [weak self] in self?.handleAIUndo() }
     bottomContainer.addSubview(markupHost)
     markupHost.isHidden = true
 
@@ -549,6 +570,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     imageView.frame = renderSurfaceView.bounds
     canvasView.frame = renderSurfaceView.bounds
     overlayContainer.frame = renderSurfaceView.bounds
+    aiSelectionView.frame = renderSurfaceView.bounds
 
     textDimView.frame = view.bounds
     if isTextEntryActive {
@@ -610,10 +632,12 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private func applyToolFromModel() {
     guard isMarkupActive else {
       canvasView.isUserInteractionEnabled = false
+      setAISelectionActive(false)
       return
     }
     switch markupModel.mode {
     case .draw:
+      setAISelectionActive(false)
       canvasView.isUserInteractionEnabled = true
       overlayContainer.isUserInteractionEnabled = false
       if markupModel.drawTool == .eraser {
@@ -622,9 +646,146 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
         canvasView.tool = markupModel.makeInk()
       }
     case .text, .sticker:
+      setAISelectionActive(false)
       canvasView.isUserInteractionEnabled = false
       overlayContainer.isUserInteractionEnabled = true
+    case .ai:
+      // Drawing and overlay editing are muted so a drag reads as a region
+      // selection rather than a stroke.
+      canvasView.isUserInteractionEnabled = false
+      overlayContainer.isUserInteractionEnabled = false
+      setAISelectionActive(true)
     }
+  }
+
+  private func setAISelectionActive(_ active: Bool) {
+    guard aiSelectionView.isHidden == active || aiSelectionView.isUserInteractionEnabled != active
+    else { return }
+    aiSelectionView.isUserInteractionEnabled = active
+    if !active { aiSelectionView.clearSelection() }
+
+    if active {
+      aiSelectionView.isHidden = false
+      aiSelectionView.alpha = 0
+      renderSurfaceView.bringSubviewToFront(aiSelectionView)
+      UIView.animate(withDuration: 0.22) { self.aiSelectionView.alpha = 1 }
+    } else {
+      UIView.animate(
+        withDuration: 0.18,
+        animations: { self.aiSelectionView.alpha = 0 },
+        completion: { _ in self.aiSelectionView.isHidden = true })
+    }
+  }
+
+  // MARK: AI edit
+
+  private func handleAIGenerate() {
+    let prompt = markupModel.aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !prompt.isEmpty, !markupModel.aiIsWorking else { return }
+    guard let source = imageView.image else { return }
+
+    // Disclosure before a single byte leaves the device.
+    ChatAIMediaConsent.ensureConsent(for: .openAI, from: self) { [weak self] accepted in
+      guard let self, accepted else { return }
+      self.runAIEdit(prompt: prompt, source: source)
+    }
+  }
+
+  private func runAIEdit(prompt: String, source: UIImage) {
+    // The mask must be the same pixel size as the image we upload, so both are
+    // derived from one normalized source here.
+    guard let imageData = source.pngData() else { return }
+    let maskData = aiSelectionView.normalizedSelection.flatMap {
+      Self.makeMaskPNG(imageSize: source.size, scale: source.scale, normalizedHole: $0)
+    }
+
+    markupModel.aiIsWorking = true
+    markupHost.refresh()
+    view.endEditing(true)
+
+    aiTask?.cancel()
+    aiTask = Task { [weak self] in
+      do {
+        let edited = try await ChatAIMediaEditService.editImage(
+          image: imageData,
+          mimeType: "image/png",
+          mask: maskData,
+          prompt: prompt
+        )
+        guard !Task.isCancelled else { return }
+        await MainActor.run {
+          guard let self else { return }
+          self.finishAIEdit(with: UIImage(data: edited.data), error: nil, previous: source)
+        }
+      } catch {
+        guard !Task.isCancelled else { return }
+        await MainActor.run {
+          guard let self else { return }
+          self.finishAIEdit(with: nil, error: error, previous: source)
+        }
+      }
+    }
+  }
+
+  private func finishAIEdit(with image: UIImage?, error: Error?, previous: UIImage) {
+    markupModel.aiIsWorking = false
+
+    if let image {
+      aiUndoStack.append(previous)
+      markupModel.aiCanUndo = true
+      markupModel.aiPrompt = ""
+      aiSelectionView.clearSelection()
+      applyImage(image)
+      UIView.transition(
+        with: imageView, duration: 0.28, options: [.transitionCrossDissolve], animations: nil)
+    } else {
+      let message =
+        (error as? LocalizedError)?.errorDescription ?? "That edit didn't go through."
+      presentAIError(message)
+    }
+
+    markupHost.refresh()
+  }
+
+  private func handleAIUndo() {
+    guard let previous = aiUndoStack.popLast() else { return }
+    markupModel.aiCanUndo = !aiUndoStack.isEmpty
+    applyImage(previous)
+    UIView.transition(
+      with: imageView, duration: 0.24, options: [.transitionCrossDissolve], animations: nil)
+    markupHost.refresh()
+  }
+
+  private func presentAIError(_ message: String) {
+    let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "OK", style: .default))
+    present(alert, animated: true)
+  }
+
+  /// Builds the OpenAI edit mask: opaque everywhere, **transparent over the
+  /// region to replace**, at the source image's pixel dimensions.
+  private static func makeMaskPNG(
+    imageSize: CGSize, scale: CGFloat, normalizedHole: CGRect
+  ) -> Data? {
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = scale
+    format.opaque = false
+
+    let renderer = UIGraphicsImageRenderer(size: imageSize, format: format)
+    let image = renderer.image { ctx in
+      UIColor.black.setFill()
+      ctx.fill(CGRect(origin: .zero, size: imageSize))
+
+      let hole = CGRect(
+        x: normalizedHole.minX * imageSize.width,
+        y: normalizedHole.minY * imageSize.height,
+        width: normalizedHole.width * imageSize.width,
+        height: normalizedHole.height * imageSize.height)
+
+      ctx.cgContext.setBlendMode(.clear)
+      ctx.cgContext.fill(hole)
+    }
+    return image.pngData()
   }
 
   // MARK: Image load
@@ -674,7 +835,10 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   // MARK: Snapshot + send
 
   private func hasVisualEdits() -> Bool {
+    // An AI edit replaces the image itself and leaves no stroke or overlay
+    // behind, so it has to count here or confirm would silently discard it.
     !canvasView.drawing.strokes.isEmpty || !overlayContainer.subviews.isEmpty
+      || !aiUndoStack.isEmpty
   }
 
   private func snapshotEditedImage() -> UIImage? {

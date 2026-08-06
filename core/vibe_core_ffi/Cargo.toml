@@ -23,6 +23,15 @@ vibe_core = { path = "../vibe_core" }
 # serial queue. It brings bundled SQLite (never the system one) and compiles into the
 # same staticlib the XCFramework ships.
 vibe_core_store = { path = "../vibe_core_store" }
+# The MLS session layer. Linked here rather than into `vibe_core`, because
+# `vibe_core` is deliberately deterministic and I/O-free and an MLS state machine
+# is neither — the two are siblings that meet only at this boundary. See
+# docs/secure-core-architecture.md §4.
+vibe_secure = { path = "../vibe_secure" }
+# The MLS provider that holds a device's key material. Already in the graph via
+# `vibe_secure`; named here because this boundary owns the provider instance and
+# hands it to every session built from the same identity.
+openmls_rust_crypto = "0.5"
 uniffi = { version = "0.28", features = ["cli"] }
 # Already in the graph via vibe_core; declared here so the unwrapped content key
 # handed over by the platform is scrubbed on this side of the boundary too.

@@ -537,6 +537,35 @@ final class ChatTimelineLayout: UICollectionViewLayout {
   // transition or update animations". We simply had never implemented it.
   private var stationaryAnchor: (identity: String, offsetInViewport: CGFloat)?
 
+  /// The offset a **non-animated** update owes the reader, because UIKit never asked.
+  ///
+  /// `targetContentOffset(forProposedContentOffset:)` is consulted for animated updates
+  /// only — the header quoted above says so in as many words ("during transition or update
+  /// animations"). The transcript's batch path deliberately runs inside
+  /// `UIView.performWithoutAnimation` + `CATransaction.setDisableActions(true)`
+  /// (`ChatListView.setRows`, modes 0/1/2), which is every insert that is not a small
+  /// append near the bottom. For all of those the anchor above was captured in
+  /// `prepare(forCollectionViewUpdates:)` and then discarded by
+  /// `finalizeCollectionViewUpdates()` without once being read.
+  ///
+  /// That is the history-drain shift. Device run 2026-08-05: a reader restored to offset
+  /// 22858 of a 1,387-row chat, four pages of ~100 older rows inserted above them, and the
+  /// offset still 22858 at the end while `contentH` went 36271 → 50463. The row under the
+  /// viewport changed from `d1a9b741` to `bae0ed7f` with nobody scrolling — 14,192 pt of
+  /// content appeared above the reader and they were made to pay for all of it.
+  ///
+  /// Published rather than applied here on purpose: the list owns *when* the transcript may
+  /// move (`performInternalScrollAdjustment`), and a layout that set `contentOffset` itself
+  /// would read as a user scroll and re-arm auto-follow — one more scroll authority, which
+  /// is the thing this seam is trying to have fewer of.
+  private var pendingStationaryOffsetY: CGFloat?
+
+  /// Takes the pending adjustment. One reader, once.
+  func consumePendingStationaryOffsetY() -> CGFloat? {
+    defer { pendingStationaryOffsetY = nil }
+    return pendingStationaryOffsetY
+  }
+
   /// Records where the topmost visible row sits, in the pre-update tables.
   ///
   /// Must run before `ensurePrepared` rebuilds them, which is why it is the first
@@ -555,24 +584,27 @@ final class ChatTimelineLayout: UICollectionViewLayout {
     stationaryAnchor = (identities[index], origins[index] - collectionView.contentOffset.y)
   }
 
+  /// Where the anchor row now sits, expressed as the offset that puts it back on screen
+  /// exactly where the reader last saw it. Everything above it may have grown or shrunk by
+  /// any amount; that delta is absorbed here instead of being paid by the reader.
+  private func stationaryTargetOffsetY() -> CGFloat? {
+    guard let anchor = stationaryAnchor, let collectionView,
+      let index = identities.firstIndex(of: anchor.identity),
+      index < origins.count
+    else { return nil }
+    let desired = origins[index] - anchor.offsetInViewport
+    let maxOffset = max(
+      -collectionView.adjustedContentInset.top,
+      totalHeight - collectionView.bounds.height + collectionView.adjustedContentInset.bottom)
+    return max(-collectionView.adjustedContentInset.top, min(maxOffset, desired))
+  }
+
   override func targetContentOffset(forProposedContentOffset proposedContentOffset: CGPoint)
     -> CGPoint
   {
     ensurePrepared()
-    guard let anchor = stationaryAnchor,
-      let index = identities.firstIndex(of: anchor.identity),
-      index < origins.count
-    else { return proposedContentOffset }
-    // Put the anchor row back exactly where it was on screen. Everything above it
-    // may have grown or shrunk by any amount; that delta is absorbed here instead
-    // of being paid by the reader.
-    let desired = origins[index] - anchor.offsetInViewport
-    guard let collectionView else { return proposedContentOffset }
-    let maxOffset = max(
-      -collectionView.adjustedContentInset.top,
-      totalHeight - collectionView.bounds.height + collectionView.adjustedContentInset.bottom)
-    let clamped = max(-collectionView.adjustedContentInset.top, min(maxOffset, desired))
-    return CGPoint(x: proposedContentOffset.x, y: clamped)
+    guard let y = stationaryTargetOffsetY() else { return proposedContentOffset }
+    return CGPoint(x: proposedContentOffset.x, y: y)
   }
 
   override func prepare(forCollectionViewUpdates updateItems: [UICollectionViewUpdateItem]) {
@@ -584,6 +616,17 @@ final class ChatTimelineLayout: UICollectionViewLayout {
 
   override func finalizeCollectionViewUpdates() {
     isUpdating = false
+    // Ask once more, now that the tables are final, and publish the answer if it is not
+    // already the offset we are sitting at. On the animated path UIKit applied it through
+    // `targetContentOffset` and the two agree, so nothing is published; on the
+    // non-animated path nobody asked, and this is the only chance to say so. Same
+    // computation either way — there is one anchor rule, not two.
+    ensurePrepared()
+    if let y = stationaryTargetOffsetY(), let collectionView,
+      abs(collectionView.contentOffset.y - y) > 0.5
+    {
+      pendingStationaryOffsetY = y
+    }
     stationaryAnchor = nil
     preUpdateOrigins.removeAll(keepingCapacity: true)
     preUpdateHeights.removeAll(keepingCapacity: true)

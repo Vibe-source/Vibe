@@ -369,7 +369,8 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     let nominalFrameRate: Float
   }
 
-  private let asset: AVAsset
+  /// Mutable because an AI edit replaces the clip under the player.
+  private var asset: AVAsset
   private let headerTitleText: String
   private let previewOnly: Bool
   private var captionText: String
@@ -413,6 +414,8 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private let textButton = UIButton(type: .custom)
   private let drawGlassView = UIVisualEffectView(effect: nil)
   private let drawButton = UIButton(type: .custom)
+  private let aiGlassView = UIVisualEffectView(effect: nil)
+  private let aiButton = UIButton(type: .custom)
   private let muteGlassView = UIVisualEffectView(effect: nil)
   private let muteButton = UIButton(type: .system)
   private let qualityGlassView = UIVisualEffectView(effect: nil)
@@ -443,6 +446,21 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private var trimStartRatio: CGFloat = 0.0
   private var trimEndRatio: CGFloat = 1.0
   private var isExporting = false
+
+  // MARK: AI edit
+  //
+  // Gemini Omni Flash accepts at most 10 seconds of input, so AI mode clamps the
+  // trim selection rather than letting the user pick a window the model will
+  // reject. There is no region/mask parameter for video — prompt only.
+  static let aiMaxClipSeconds: Double = 10.0
+  private var isAIModeActive = false
+  private var isAIWorking = false
+  /// Chains refinements onto the previous result instead of re-editing the original.
+  private var aiInteractionID: String?
+  /// Set when an AI edit replaces the asset, so Undo can restore the original.
+  private var aiOriginalAsset: AVAsset?
+  private var aiTask: Task<Void, Never>?
+  private let aiPromptBar = ChatVideoAIPromptBar()
   private var naturalVideoSize: CGSize = CGSize(width: 720.0, height: 1280.0)
   private var cachedAssetDurationSeconds: Double = 0.1
   private var bufferedProgressRatio: CGFloat = 0.0
@@ -588,8 +606,13 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     timelineView.setSelection(startRatio: trimStartRatio, endRatio: trimEndRatio)
     timelineView.onSelectionChanged = { [weak self] start, end, finished in
       guard let self else { return }
-      self.trimStartRatio = start
-      self.trimEndRatio = end
+      let (clampedStart, clampedEnd) = self.clampSelectionForAI(start: start, end: end)
+      self.trimStartRatio = clampedStart
+      self.trimEndRatio = clampedEnd
+      if clampedStart != start || clampedEnd != end {
+        self.timelineView.setSelection(startRatio: clampedStart, endRatio: clampedEnd)
+      }
+      self.updateAIChrome()
       let targetSeconds = self.selectedTrimStartSeconds()
       self.seekPlayer(to: targetSeconds, playAfterSeek: finished)
     }
@@ -629,7 +652,12 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     bottomToolbar.backgroundColor = .clear
     bottomContainer.addSubview(bottomToolbar)
 
-    [replyGlassView, textGlassView, drawGlassView, muteGlassView, qualityGlassView, sendGlassView]
+    aiPromptBar.isHidden = true
+    aiPromptBar.onSubmit = { [weak self] prompt in self?.runVideoAIEdit(prompt: prompt) }
+    aiPromptBar.onUndo = { [weak self] in self?.handleAIUndo() }
+    bottomContainer.addSubview(aiPromptBar)
+
+    [replyGlassView, textGlassView, drawGlassView, aiGlassView, muteGlassView, qualityGlassView, sendGlassView]
       .forEach {
       configureGlassView($0)
       bottomToolbar.addSubview($0)
@@ -656,6 +684,10 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     configureCircleButton(drawButton, symbol: "pencil.and.scribble", weight: .medium, pointSize: 17.0)
     drawButton.addTarget(self, action: #selector(handleDraw), for: .touchUpInside)
     drawGlassView.contentView.addSubview(drawButton)
+
+    configureCircleButton(aiButton, symbol: "sparkles", weight: .medium, pointSize: 17.0)
+    aiButton.addTarget(self, action: #selector(handleAI), for: .touchUpInside)
+    aiGlassView.contentView.addSubview(aiButton)
 
     configureCircleButton(muteButton, symbol: "speaker.wave.2", weight: .medium, pointSize: 17.0)
     muteButton.addTarget(self, action: #selector(handleMuteToggle), for: .touchUpInside)
@@ -951,12 +983,29 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       captionPlaceholderLabel.frame = .zero
     }
 
+    // AI prompt capsule sits between the caption and the tool row, and takes no
+    // space at all when the AI tool is off.
+    let aiTop =
+      (showsCaption
+        ? captionBlurView.frame.maxY
+        : (previewOnly ? playerProgressGlassView.frame.maxY : timelineView.frame.maxY)) + 12.0
+
+    if isAIModeActive {
+      aiPromptBar.isHidden = false
+      aiPromptBar.frame = CGRect(
+        x: 16.0,
+        y: aiTop,
+        width: view.bounds.width - 32.0,
+        height: ChatVideoAIPromptBar.preferredHeight
+      )
+    } else {
+      aiPromptBar.isHidden = true
+      aiPromptBar.frame = .zero
+    }
+
     bottomToolbar.frame = CGRect(
       x: 16.0,
-      y: (showsCaption
-        ? captionBlurView.frame.maxY
-        : (previewOnly ? playerProgressGlassView.frame.maxY : timelineView.frame.maxY)
-      ) + 12.0,
+      y: (isAIModeActive ? aiPromptBar.frame.maxY : aiTop) + (isAIModeActive ? 10.0 : 0.0),
       width: view.bounds.width - 32.0,
       height: toolbarHeight
     )
@@ -966,6 +1015,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     if previewOnly {
       textGlassView.frame = .zero
       drawGlassView.frame = .zero
+      aiGlassView.frame = .zero
       qualityGlassView.frame = .zero
       sendGlassView.frame = .zero
       muteGlassView.frame = .zero
@@ -982,6 +1032,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       muteButton.frame = .zero
       textButton.frame = .zero
       drawButton.frame = .zero
+      aiButton.frame = .zero
       sendButton.frame = .zero
       sendSpinner.center = .zero
       qualityButton.frame = .zero
@@ -995,13 +1046,19 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
         width: toolSize,
         height: toolSize
       )
-      muteGlassView.frame = CGRect(
+      aiGlassView.frame = CGRect(
         x: drawGlassView.frame.maxX + toolSpacing,
         y: 0.0,
         width: toolSize,
         height: toolSize
       )
-      [textButton, drawButton, muteButton].forEach {
+      muteGlassView.frame = CGRect(
+        x: aiGlassView.frame.maxX + toolSpacing,
+        y: 0.0,
+        width: toolSize,
+        height: toolSize
+      )
+      [textButton, drawButton, aiButton, muteButton].forEach {
         $0.frame = CGRect(x: 0.0, y: 0.0, width: toolSize, height: toolSize)
       }
 
@@ -1030,6 +1087,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       replyGlassView,
       textGlassView,
       drawGlassView,
+      aiGlassView,
       muteGlassView,
       sendGlassView,
       qualityGlassView,
@@ -1043,6 +1101,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       replyButton,
       textButton,
       drawButton,
+      aiButton,
       muteButton,
       sendButton,
       playbackRewindButton,
@@ -1088,6 +1147,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       replyGlassView,
       textGlassView,
       drawGlassView,
+      aiGlassView,
       muteGlassView,
       qualityGlassView,
       sendGlassView,
@@ -1119,6 +1179,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       replyGlassView.isHidden = onReply == nil
       textGlassView.isHidden = true
       drawGlassView.isHidden = true
+      aiGlassView.isHidden = true
       muteGlassView.isHidden = true
       qualityGlassView.isHidden = true
       sendGlassView.isHidden = true
@@ -1134,6 +1195,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       replyGlassView.isHidden = true
       textGlassView.isHidden = false
       drawGlassView.isHidden = false
+      aiGlassView.isHidden = false
       muteGlassView.isHidden = false
       qualityGlassView.isHidden = false
       sendGlassView.isHidden = false
@@ -1162,6 +1224,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       ? accentFill
       : neutralFill
     drawButton.tintColor = drawingView.drawingEnabled ? .systemBlue : .white
+    aiButton.tintColor = isAIModeActive ? .systemBlue : .white
     muteButton.tintColor = isMuted ? .systemBlue : .white
     replyButton.tintColor = .white
     playbackRewindButton.tintColor = .white
@@ -2022,6 +2085,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     replyButton.isEnabled = !exporting
     textButton.isEnabled = !exporting
     drawButton.isEnabled = !exporting
+    aiButton.isEnabled = !exporting && !isAIWorking
     muteButton.isEnabled = !exporting
     playbackRewindButton.isEnabled = !exporting
     playbackToggleButton.isEnabled = !exporting
@@ -2038,6 +2102,180 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       sendButton.imageView?.alpha = 1.0
       sendSpinner.stopAnimating()
     }
+  }
+
+  // MARK: - AI edit
+
+  @objc private func handleAI() {
+    guard !isAIWorking else { return }
+
+    if isAIModeActive {
+      setAIMode(false)
+      return
+    }
+
+    ChatAIMediaConsent.ensureConsent(for: .google, from: self) { [weak self] accepted in
+      guard let self, accepted else { return }
+      self.setAIMode(true)
+    }
+  }
+
+  private func setAIMode(_ active: Bool) {
+    isAIModeActive = active
+
+    if active {
+      // Snap the current window down to something the model will actually take.
+      let (start, end) = clampSelectionForAI(start: trimStartRatio, end: trimEndRatio)
+      trimStartRatio = start
+      trimEndRatio = end
+      timelineView.setSelection(startRatio: start, endRatio: end)
+      seekPlayer(to: selectedTrimStartSeconds(), playAfterSeek: false)
+    } else {
+      _ = aiPromptBar.resignFirstResponder()
+    }
+
+    updateAIChrome()
+    updateChromeAppearance()
+
+    UIView.animate(
+      withDuration: 0.28, delay: 0.0, usingSpringWithDamping: 0.88, initialSpringVelocity: 0.0,
+      options: [.curveEaseInOut]
+    ) {
+      self.view.setNeedsLayout()
+      self.view.layoutIfNeeded()
+    } completion: { _ in
+      if active { self.aiPromptBar.focus() }
+    }
+  }
+
+  /// Keeps the trim window within the model's 10-second input ceiling. Returns
+  /// the pair unchanged when AI mode is off, so normal trimming is unaffected.
+  private func clampSelectionForAI(start: CGFloat, end: CGFloat) -> (CGFloat, CGFloat) {
+    guard isAIModeActive else { return (start, end) }
+
+    let duration = assetDurationSeconds()
+    guard duration > 0 else { return (start, end) }
+
+    let maxRatio = CGFloat(min(1.0, Self.aiMaxClipSeconds / duration))
+    guard (end - start) > maxRatio else { return (start, end) }
+
+    // Anchor on whichever edge the user was not dragging: if the start moved,
+    // pull the end in, otherwise push the start forward.
+    if start != trimStartRatio {
+      return (start, min(1.0, start + maxRatio))
+    }
+    return (max(0.0, end - maxRatio), end)
+  }
+
+  private func updateAIChrome() {
+    guard isAIModeActive else { return }
+    let seconds = max(0.0, selectedTrimEndSeconds() - selectedTrimStartSeconds())
+    aiPromptBar.setHint(
+      String(format: "%.1fs selected · %.0fs max", seconds, Self.aiMaxClipSeconds))
+    aiPromptBar.setCanUndo(aiOriginalAsset != nil)
+  }
+
+  private func runVideoAIEdit(prompt: String) {
+    guard !isAIWorking else { return }
+
+    isAIWorking = true
+    aiPromptBar.setWorking(true)
+    setExporting(true)
+    player.pause()
+
+    // Export exactly the selected ≤10s window, then hand those bytes over.
+    exportEditedVideo { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .failure(let error):
+        self.finishVideoAIEdit(asset: nil, interactionID: nil, error: error)
+
+      case .success(let url):
+        self.aiTask?.cancel()
+        self.aiTask = Task { [weak self] in
+          guard let self else { return }
+          do {
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let edited = try await ChatAIMediaEditService.editVideo(
+              video: data,
+              prompt: prompt,
+              previousInteractionID: self.aiInteractionID,
+              aspectRatio: self.naturalVideoSize.width > self.naturalVideoSize.height
+                ? "16:9" : "9:16"
+            )
+            guard !Task.isCancelled else { return }
+
+            let destination = FileManager.default.temporaryDirectory
+              .appendingPathComponent("vibe-ai-\(UUID().uuidString).mp4")
+            try edited.data.write(to: destination)
+
+            await MainActor.run {
+              self.finishVideoAIEdit(
+                asset: AVURLAsset(url: destination),
+                interactionID: edited.interactionID,
+                error: nil)
+            }
+          } catch {
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+              self.finishVideoAIEdit(asset: nil, interactionID: nil, error: error)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func finishVideoAIEdit(
+    asset editedAsset: AVAsset?, interactionID: String?, error: Error?
+  ) {
+    isAIWorking = false
+    aiPromptBar.setWorking(false)
+    setExporting(false)
+
+    guard let editedAsset else {
+      let message =
+        (error as? LocalizedError)?.errorDescription ?? "That edit didn't go through."
+      let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+      alert.addAction(UIAlertAction(title: "OK", style: .default))
+      present(alert, animated: true)
+      return
+    }
+
+    if aiOriginalAsset == nil { aiOriginalAsset = asset }
+    aiInteractionID = interactionID
+    aiPromptBar.clearPrompt()
+
+    adoptAIEditedAsset(editedAsset)
+  }
+
+  private func handleAIUndo() {
+    guard let original = aiOriginalAsset else { return }
+    aiOriginalAsset = nil
+    aiInteractionID = nil
+    adoptAIEditedAsset(original)
+  }
+
+  /// Swaps the asset under the player and resets the trim window to the whole
+  /// (now short) clip, since the returned video *is* the selection.
+  private func adoptAIEditedAsset(_ newAsset: AVAsset) {
+    asset = newAsset
+    trimStartRatio = 0.0
+    trimEndRatio = 1.0
+
+    let item = AVPlayerItem(asset: newAsset)
+    player.replaceCurrentItem(with: item)
+    observePlayerItem(item)
+
+    cachedAssetDurationSeconds = max(0.1, CMTimeGetSeconds(newAsset.duration))
+    timelineView.setSelection(startRatio: 0.0, endRatio: 1.0)
+    loadThumbnails()
+    updateAIChrome()
+
+    player.seek(to: .zero)
+    player.play()
+
+    view.setNeedsLayout()
   }
 
   private func exportEditedVideo(

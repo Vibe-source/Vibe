@@ -229,7 +229,11 @@ enum VibeCoreBridge {
         arrived
         ? "PASS — core v\(VibeCoreBridge.coreVersion), \(count) delta(s), worker joined"
         : "FAIL — no delta within 3s"
-      let verdict = "\(timeline)\n\(VibeCoreBridge.sealSelfTestVerdict())"
+      let verdict = [
+        timeline,
+        VibeCoreBridge.sealSelfTestVerdict(),
+        VibeCoreBridge.secureSelfTestVerdict(),
+      ].joined(separator: "\n")
       VibeLog.info("[VibeCore] self-test \(verdict)")
       completion(verdict)
     }
@@ -286,6 +290,67 @@ enum VibeCoreBridge {
       return "seal: PASS (round-trip + relocation refused)"
     } catch {
       return "seal: FAIL \(error)"
+    }
+  }
+
+  /// Drives a real two-member MLS group end to end, in the DM shape.
+  ///
+  /// This is the linkage proof for `vibe_secure`: identity generation,
+  /// KeyPackage publication, an add commit, a join from the Welcome, and a
+  /// seal/open across two separate identities — all through the FFI, on device.
+  /// A `PASS` here means the whole Rust→uniffi→Swift chain is live.
+  ///
+  /// Both identities are built against **throwaway stores in a temp directory**,
+  /// never the app's real one at `VibeSecureSessions.storePath()`. A self-test
+  /// that wrote into the live store would add two fake device identities and a
+  /// junk group to the state that real conversations depend on.
+  static func secureSelfTestVerdict() -> String {
+    do {
+      let scratch = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vibe-secure-selftest-\(UUID().uuidString)", isDirectory: true)
+      try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: scratch) }
+
+      let alice = try VibeSecureIdentityHandle.generate(
+        deviceId: "alice-selftest",
+        dbPath: scratch.appendingPathComponent("alice.sqlite").path)
+      let bob = try VibeSecureIdentityHandle.generate(
+        deviceId: "bob-selftest",
+        dbPath: scratch.appendingPathComponent("bob.sqlite").path)
+
+      // Alice opens the group and adds Bob from his published KeyPackage. The
+      // committer adopts the new epoch inside `addMembers`, so she can seal
+      // immediately afterwards.
+      let aliceSession = try VibeSecureSessionHandle.create(identity: alice)
+      let commit = try aliceSession.addMembers(keyPackages: [bob.keyPackage()])
+      let bobSession = try VibeSecureSessionHandle.joinFromWelcome(
+        identity: bob,
+        welcome: commit.welcome,
+        ratchetTree: aliceSession.exportRatchetTree()
+      )
+
+      let probe = Data("mls probe".utf8)
+      let sealed = try aliceSession.seal(plaintext: probe)
+      guard sealed.hasPrefix("vmls1.") else { return "mls: WRONG ENVELOPE PREFIX" }
+      guard try bobSession.open(envelope: sealed) == probe else {
+        return "mls: ROUND-TRIP MISMATCH"
+      }
+
+      // A tampered envelope must be refused, not decrypted and not crashed on.
+      // This is the case that used to panic before `vibe_secure` grew its panic
+      // guard, so it is worth running on a real device rather than trusting the
+      // host test suite.
+      var tampered = Array(sealed.utf8)
+      tampered[tampered.count - 2] = tampered[tampered.count - 2] == UInt8(ascii: "A")
+        ? UInt8(ascii: "B") : UInt8(ascii: "A")
+      let tamperedEnvelope = String(decoding: tampered, as: UTF8.self)
+      if (try? bobSession.open(envelope: tamperedEnvelope)) != nil {
+        return "mls: TAMPERED ENVELOPE NOT REFUSED"
+      }
+
+      return "mls: PASS (2-member seal/open + tamper refused)"
+    } catch {
+      return "mls: FAIL \(error)"
     }
   }
 }

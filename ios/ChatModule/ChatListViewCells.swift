@@ -9885,6 +9885,18 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// clusters as the initializer actually builds them.
   ///
   /// The stamps cost four `systemUptime` reads on the first 20 cells and nothing after.
+  /// Cells this process has constructed, ever.
+  ///
+  /// The scroll profile reads this at both ends of a gesture to answer the one question
+  /// a dropped-frame count cannot: was the reuse pool COLD? A device run measured
+  /// `dequeue=4.0…5.0ms` while cells were being built and `0.5…0.7ms` once the pool had
+  /// filled, so "24 built during this fling" and "0 built during this fling" are two
+  /// completely different bugs wearing the same 9%-dropped line.
+  ///
+  /// One integer increment per cell. It is not gated on a debug flag because the whole
+  /// point is to have the number on the run where the reader says it felt bad.
+  static private(set) var constructionCount = 0
+
   private static var initCensusSamples = 0
   private static var initCensusBase: Double = 0
   private static var initCensusMedia: Double = 0
@@ -9900,6 +9912,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   override init(frame: CGRect) {
     super.init(frame: frame)
+    Self.constructionCount &+= 1
     let censusActive = Self.initCensusSamples < 20
     let t0 = censusActive ? ProcessInfo.processInfo.systemUptime : 0
 

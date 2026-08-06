@@ -63,6 +63,7 @@ use vibe_core::types::{
 use vibe_core::VibeCoreError;
 
 pub mod seal;
+pub mod secure;
 pub mod store;
 pub mod types;
 pub mod unwrap;

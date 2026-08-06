@@ -661,6 +661,11 @@ final class ChatEngine {
   private var chatPeerAgentIdsByChatId: [String: String] = [:]
   private var agentIdsByPeerUserId: [String: String] = [:]
   private var friendPublicKeysByUserId: [String: String] = [:]
+
+  /// When MLS provisioning last ran, so a reconnect that rejoins every open
+  /// chat does not fire one KeyPackage top-up per chat. See
+  /// `ensureMlsProvisionedLocked`.
+  private var mlsProvisionedAtMs: Int64 = 0
   private var pendingFriendKeyChatIdsByUserId: [String: Set<String>] = [:]
   private var friendKeyFetchInFlightUserIds = Set<String>()
   private var friendKeyRetryWorkItemsByUserId: [String: DispatchWorkItem] = [:]
@@ -1921,11 +1926,11 @@ final class ChatEngine {
       let sourceMessages =
         chatId == "saved_messages" ? self.normalizeSavedMessagesLocked(messages) : messages
       let sortedMessages = sourceMessages.sorted { lhs, rhs in
-        let lt =
-          self.parseLongValue(lhs["timestamp"] ?? lhs["timestampMs"] ?? lhs["timestamp_ms"]) ?? 0
-        let rt =
-          self.parseLongValue(rhs["timestamp"] ?? rhs["timestampMs"] ?? rhs["timestamp_ms"]) ?? 0
-        return lt < rt
+        self.transcriptOrderPrecedes(
+          lhsTs: self.transcriptTimestampMs(lhs),
+          lhsId: self.rawMessageIdForOrdering(lhs, chatId: chatId),
+          rhsTs: self.transcriptTimestampMs(rhs),
+          rhsId: self.rawMessageIdForOrdering(rhs, chatId: chatId))
       }
       let recentMessages = Array(sortedMessages.suffix(max(1, min(limit, sortedMessages.count))))
       let rows = self.buildHistoryRowsLocked(chatId: chatId, rawMessages: recentMessages)
@@ -4094,6 +4099,10 @@ final class ChatEngine {
       effectivePayload["messageId"] = messageId
       let isGroup =
         (payload["isGroup"] as? Bool) == true || (payload["isGroupOrChannel"] as? Bool) == true
+      // A channel arrives with `isGroup` true as well — the UI folds the two
+      // together — so this is the only way to tell a conversation from a
+      // broadcast, which they need to be for choosing an encryption scheme.
+      let isChannel = (payload["isChannel"] as? Bool) == true
       NSLog(
         "[ChatEngine] sendMessage START chatId=%@ messageId=%@ isGroup=%@", chatId, messageId,
         isGroup ? "true" : "false")
@@ -4301,6 +4310,85 @@ final class ChatEngine {
       let userId = normalizedString(self.getConfigValueLocked("userId"))
       let myPublicKeyPem = normalizedString(
         self.getConfigValueLocked("publicKeyPem") ?? self.getConfigValueLocked("publicKey"))
+
+      // ── MLS gate: a DM that can be end-to-end encrypted must be ───────────
+      //
+      // This has to fail closed. The encryption branch further down falls back
+      // to `encryptedContent = fullPayloadString` — the payload in the clear —
+      // so "no MLS session yet" must never reach it. Instead the draft waits,
+      // exactly as it does for a missing friend key above, and establishment
+      // is what releases it.
+      //
+      // Only replay on success: a failed attempt leaves the draft queued for a
+      // later trigger to retry. A message stuck as pending is a bad experience;
+      // a message silently sent unencrypted in a conversation the user believes
+      // is private is a broken promise, and that is the trade being made here.
+      //
+      // Four kinds of chat are excluded, each for its own reason:
+      //   * agent chats — the agent runs server-side and must read the message.
+      //   * saved messages — sealed by the store layer, not this path.
+      //   * channels — a subscriber expects to scroll back through everything
+      //     posted before they joined, and MLS structurally cannot give them
+      //     that: a joiner starts at the current epoch. Channels need the
+      //     epoch-key scheme in `vibe_core::group`, which can hand a new member
+      //     older keys. Until that is wired they keep their existing path.
+      //   * chats already found too large — `VibeSecureSessions.isIneligible`.
+      if VibeSecureSessions.isSendEnabled,
+        !isSavedMessagesChat,
+        !isChannel,
+        (peerAgentId ?? "").isEmpty,
+        !VibeSecureSessions.shared.isIneligible(chatId: chatId),
+        let mlsApiBase = apiBase,
+        isGroup || normalizedString(peerUserId) != nil,
+        !VibeSecureSessions.shared.hasSession(chatId: chatId)
+      {
+        NSLog(
+          "[ChatEngine] sendMessage queued reason=mls_establishing chatId=%@ messageId=%@ group=%@",
+          chatId, messageId, isGroup ? "Y" : "N")
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
+        pendingOutboundDraftsByMessageId[messageId] = effectivePayload
+        queueOutboundDraftLocked(
+          chatId: chatId, messageId: messageId, payload: effectivePayload,
+          reason: "mls_establishing")
+        appendJournalLocked(
+          event: "native-send-message-queued",
+          payload: ["chatId": chatId, "messageId": messageId, "reason": "mls_establishing"])
+        postChangeLocked(
+          reason: "messageStatusChanged",
+          userInfo: ["chatId": chatId, "messageId": messageId, "status": "pending"])
+        // `retry` means "something changed, try the send again" — which is
+        // usually "a session now exists", but is also how an over-cap group
+        // reports that it has been marked ineligible. Either way the replay
+        // re-evaluates the gate above, so this call site does not need to know
+        // which happened. `false` leaves the draft queued for a later trigger.
+        let onSettled: (Bool) -> Void = { [weak self] retry in
+          guard let self = self, retry else { return }
+          self.queue.async {
+            self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_established")
+          }
+        }
+        if isGroup {
+          if let myUserId = userId {
+            VibeSecureEstablishment.establishGroup(
+              chatId: chatId, myUserId: myUserId, apiBase: mlsApiBase, token: token,
+              completion: onSettled)
+          } else {
+            // No identity means we cannot tell ourselves apart from the other
+            // members, so we would add ourselves to our own group. Leave it
+            // queued rather than build a broken session.
+            VibeLog.error("[VibeSecure] no userId — cannot establish group \(chatId)")
+          }
+        } else if let mlsPeerUserId = normalizedString(peerUserId) {
+          VibeSecureEstablishment.establishDirectMessage(
+            chatId: chatId, peerUserId: mlsPeerUserId, apiBase: mlsApiBase, token: token,
+            completion: onSettled)
+        }
+        return [
+          "accepted": true, "queued": true, "reason": "mls_establishing",
+          "messageId": messageId,
+          "state": "pending",
+        ]
+      }
 
       let needsUpload =
         ["image", "gif", "file", "voice", "video", "music"].contains(type)
@@ -4762,7 +4850,33 @@ final class ChatEngine {
 
         let encryptedContent: String
         do {
-          if isGroup || friendPublicKey == nil {
+          // MLS first when this chat has a session. A DM that *should* have one
+          // never arrives here without it — the gate earlier in this function
+          // queues it and establishes instead — so reaching the fall-through
+          // below means this chat is one of the kinds listed there, not a
+          // private conversation quietly losing its encryption.
+          //
+          // The send gate matters because a `vmls1.` envelope is unreadable to
+          // any client that has not shipped this code: enabling it early does
+          // not degrade a conversation, it splits it, and that is not
+          // recoverable after the fact. See `VibeSecureSessions.isSendEnabled`.
+          if VibeSecureSessions.isSendEnabled,
+            let mlsSealed = VibeSecureSessions.shared.seal(
+              chatId: chatId, plaintext: fullPayloadString)
+          {
+            encryptedContent = mlsSealed
+          } else if isGroup || friendPublicKey == nil {
+            // Server-readable, and only these three cases can get here:
+            //   * chats over the MLS member cap — broadcast channels, which
+            //     this layer cannot tell apart from groups. The one genuine
+            //     gap; see `VibeSecureSessions.isIneligible(chatId:)` and
+            //     docs/secure-core-architecture.md §4.
+            //   * agent chats — the agent runs server-side and must read the
+            //     message to answer it. Encrypting it to ourselves would break
+            //     the feature, so this is deliberate, not an oversight.
+            //   * saved messages — sealed by the store layer, not this path.
+            // A human DM or an ordinary group reaching this line would be a
+            // bug in the gate above.
             encryptedContent = fullPayloadString
           } else {
             encryptedContent = try chatEngineEncryptHybridMessage(
@@ -4809,6 +4923,16 @@ final class ChatEngine {
           }
         }()
 
+        // Content-free stand-in for pushPreview, sent on EVERY path (including the
+        // real-E2E one below that no longer gets pushPreview at all) so the server can
+        // still shape a push notification / route by kind without reading the message.
+        let pushKind: String = supportedTypes.contains(type) ? type : "text"
+
+        // Mirrors the encryptedContent branch above: true only for a 1:1 DM where we
+        // actually hold the peer's public key, i.e. the one path where encryptedContent
+        // is real ciphertext rather than fullPayloadString in the clear.
+        let isRealE2EDM = !isGroup && friendPublicKey != nil
+
         // CRITICAL: mediaUrl on the wire must be the durable remote URL after upload.
         // Historically this was always NSNull, so the server persisted media_url=NULL.
         // Encrypted payload still carried mediaUrl, but history/profile often only had
@@ -4818,15 +4942,30 @@ final class ChatEngine {
           "encryptedContent": encryptedContent,
           "timestamp": timestampMs,
           "type": type,
-          "pushPreview": pushPreview,
+          "pushKind": pushKind,
           "mediaUrl": finalMediaUrl as Any? ?? NSNull(),
           "fileName": finalFileName as Any? ?? NSNull(),
           "latitude": latitude as Any? ?? NSNull(),
           "longitude": longitude as Any? ?? NSNull(),
         ]
-        if let finalMediaKey, !finalMediaKey.isEmpty {
-          wirePayload["mediaKey"] = finalMediaKey
+        // pushPreview is up to 160 raw chars of the message, in the clear — load-bearing
+        // for server-side @agent-mention routing (chat_channel.ex normalize_dispatch_text
+        // / reserved_workers_from_text), so groups and agent chats keep it exactly as
+        // before: the server already legitimately reads this text. A 1:1 E2E DM is the
+        // one path where encryptedContent above is real ciphertext, so it was also the
+        // one path where this field was a genuine leak — a cleartext copy of the message
+        // riding right next to its own encrypted twin. Omitted there; pushKind is all the
+        // server gets on that path.
+        if !isRealE2EDM {
+          wirePayload["pushPreview"] = pushPreview
         }
+        // mediaKey (the media AES key) no longer rides the wire in the clear on ANY path.
+        // It is already inside fullPayloadBase above, so it travels as part of
+        // encryptedContent instead — real ciphertext for a 1:1 DM, the JSON payload
+        // itself for groups/agent chats — and parseDecryptedMessagePayload (~line 9499)
+        // reads it back out of that on the receiving end. The media bucket is public, so
+        // key + bucket URL sitting together on the wire was equivalent to no encryption
+        // at all. Do not re-add this field.
         if let replyToId, !replyToId.isEmpty {
           wirePayload["replyToId"] = replyToId
         }
@@ -4869,6 +5008,15 @@ final class ChatEngine {
           } else if let existing = cleaned["mediaUrl"] as? String, self.isLocalMediaURI(existing) {
             cleaned.removeValue(forKey: "mediaUrl")
           }
+          // This dict rides the wire in the clear as wirePayload["metadata"] — it is NOT
+          // inside encryptedContent. The post-upload block above (~line 4529) stamps
+          // mediaKey into this same metadata dict for local retry/draft-replay bookkeeping
+          // only; left in here it would re-leak the key through this side door on every
+          // fresh media upload even after removing the top-level wirePayload["mediaKey"]
+          // below. The recipient already gets the key from encryptedContent — strip both
+          // casings so neither rides the wire a second time in the clear.
+          cleaned.removeValue(forKey: "mediaKey")
+          cleaned.removeValue(forKey: "media_key")
           // Sealed agent blobs stay on the wire for bridge dispatch only — server strips them
           // from broadcast/persist. Keep thumbs for durable list/profile after reopen.
           wirePayload["metadata"] = cleaned
@@ -8137,6 +8285,7 @@ final class ChatEngine {
             self.appendJournalLocked(event: "native-chat-joined", payload: ["chatId": chatId])
             self.flushPendingAgentBridgeHistoryRequestsLocked(chatId: chatId)
             self.sweepOrphanedPendingLocked(trigger: "chat_joined")
+            self.ensureMlsProvisionedLocked(trigger: "chat_joined")
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "chat_joined")
             // Resume the live tail for a bridge session this chat had loaded: the topic is
             // freshly (re)joined after a view re-attach or background reconnect, so re-arm
@@ -9565,8 +9714,138 @@ final class ChatEngine {
 
   private func messageTimestampMs(fromRow row: [String: Any]) -> Int64 {
     guard let message = row["message"] as? [String: Any] else { return 0 }
-    return parseLongValue(message["timestampMs"] ?? message["timestamp_ms"] ?? message["timestamp"])
-      ?? 0
+    return transcriptTimestampMs(message) ?? 0
+  }
+
+  /// The ordering timestamp of one message payload, or nil if it genuinely has none.
+  ///
+  /// # Why this is a function and not three `??` chains
+  ///
+  /// There were three, and they disagreed in two separate ways.
+  ///
+  /// **They read the keys in different orders.** The merge comparator took
+  /// `timestampMs` first; the two history sorts took `timestamp` first. A row carrying
+  /// both — and rows do, because `rowAdoptingSettleSlotTs` writes both and the builder
+  /// re-stamps `timestampMs` over a server `timestamp` — sorts to one place under the
+  /// merge and another under history. Same row, same device, two positions depending on
+  /// which producer last touched it.
+  ///
+  /// **They fell through on the wrong condition.** `raw["timestamp"] ?? raw["timestampMs"]`
+  /// picks the first key that is *present*, and only then tries to parse it. A present
+  /// but unparseable `timestamp` — an ISO-8601 string, which `parseLongValue` rejects
+  /// because `Int64("2026-08-06T17:27:03Z")` is nil — therefore ends the chain at nil
+  /// while a perfectly good numeric `timestampMs` sits unread in the same dictionary.
+  /// The caller then substituted `0` (sorts to the very top) or `nowMs()` (sorts to the
+  /// very bottom, and gets persisted). This tries each key until one *parses*.
+  func transcriptTimestampMs(_ message: [String: Any]) -> Int64? {
+    for key in ["timestampMs", "timestamp_ms", "timestamp"] {
+      if let value = message[key], !(value is NSNull), let parsed = parseLongValue(value) {
+        return parsed
+      }
+    }
+    return nil
+  }
+
+  /// How many rows this launch had to be given a locally-invented timestamp.
+  private static var transcriptTimestampSynthesizedCount = 0
+
+  /// Records a message that had no readable ordering timestamp, with the shape of what it
+  /// did carry — never the values, which are content.
+  private func noteSynthesizedTimestamp(chatId: String, messageId: String, raw: [String: Any]) {
+    Self.transcriptTimestampSynthesizedCount &+= 1
+    let present =
+      ["timestampMs", "timestamp_ms", "timestamp"]
+      .compactMap { key -> String? in
+        guard let value = raw[key], !(value is NSNull) else { return nil }
+        return "\(key):\(type(of: value))"
+      }
+      .joined(separator: ",")
+    VibeLog.warning(
+      "message has no readable timestamp — ordered by this device's clock",
+      category: "order",
+      metadata: [
+        "chat": String(chatId.prefix(12)),
+        "message": String(messageId.prefix(12)),
+        "carried": present.isEmpty ? "none" : present,
+        "totalThisLaunch": String(Self.transcriptTimestampSynthesizedCount),
+      ])
+  }
+
+  /// A comparable summary of the order this device settled on for a chat.
+  ///
+  /// Two devices showing the same conversation in different orders is not visible to
+  /// either of them, and it is not visible in any per-row log either — the divergence is
+  /// only a divergence when you hold the two side by side. So this writes one line per
+  /// chat that can be exported from both phones and diffed directly: the digest tells you
+  /// *whether* they agree, and the tail tells you *where* they stopped agreeing.
+  ///
+  /// Ids and timestamps only. No message content leaves the device.
+  func logTranscriptOrderFingerprint(chatId: String, rows: [[String: Any]], reason: String) {
+    guard !rows.isEmpty else { return }
+    var hasher = Hasher()
+    var inversions = 0
+    var previousTs: Int64 = .min
+    for row in rows {
+      let id = messageId(fromRow: row) ?? ""
+      let ts = messageTimestampMs(fromRow: row)
+      hasher.combine(id)
+      hasher.combine(ts)
+      // An inversion here means the rows were handed over out of order — a producer that
+      // skipped the comparator, not a disagreement about the timestamps themselves.
+      if ts < previousTs { inversions += 1 }
+      previousTs = ts
+    }
+    // The last rows are where a burst of near-simultaneous sends lands, which is where
+    // the ties are and therefore where two devices actually part company.
+    let tail = rows.suffix(12).map { row in
+      "\(messageTimestampMs(fromRow: row)):\(String((messageId(fromRow: row) ?? "?").prefix(8)))"
+    }
+    VibeLog.notice(
+      "transcript order chat=\(String(chatId.prefix(12))) rows=\(rows.count) "
+        + "digest=\(String(format: "%016llx", UInt64(bitPattern: Int64(hasher.finalize()))))"
+        + (inversions > 0 ? " INVERSIONS=\(inversions)" : ""),
+      category: "order",
+      metadata: [
+        "chat": String(chatId.prefix(12)),
+        "rows": String(rows.count),
+        "reason": reason,
+        "inversions": String(inversions),
+        "tail": tail.joined(separator: " "),
+      ])
+  }
+
+  /// The id a raw server message will be keyed under once built, for tie-breaking before
+  /// it is built. Mirrors `buildHistoryRowsLocked`'s `preferredId` exactly — including the
+  /// Saved Messages preference for `original_message_id` — because a tie-break that uses a
+  /// different id than the row ends up carrying is a tie-break on a value nothing else
+  /// agrees with.
+  func rawMessageIdForOrdering(_ raw: [String: Any], chatId: String) -> String? {
+    let preferred =
+      chatId == "saved_messages"
+      ? raw["original_message_id"] ?? raw["originalMessageId"] ?? raw["id"] ?? raw["message_id"]
+      : raw["id"] ?? raw["message_id"]
+    return normalizedString(preferred)
+  }
+
+  /// The total order of the transcript: ascending timestamp, ties broken by message id.
+  ///
+  /// The tie-break is not decoration. `Array.sorted(by:)` is explicitly documented as
+  /// **not guaranteed to be stable**, so a comparator that returns false in both
+  /// directions for two rows leaves their relative order up to the algorithm and the
+  /// input permutation — and the input permutation is exactly the thing that differs
+  /// between two devices looking at the same conversation. Voice notes fired off in a
+  /// burst are the case that collides, and the case the reader noticed.
+  ///
+  /// This is the same comparator the Rust core sorts with (`core/vibe_core/src/order.rs`,
+  /// `(ts_ms ASC, message_id ASC)`), deliberately: two producers that disagree about
+  /// order produce a transcript that reorders itself depending on which one painted it.
+  func transcriptOrderPrecedes(
+    lhsTs: Int64?, lhsId: String?, rhsTs: Int64?, rhsId: String?
+  ) -> Bool {
+    let lt = lhsTs ?? 0
+    let rt = rhsTs ?? 0
+    if lt != rt { return lt < rt }
+    return (lhsId ?? "") < (rhsId ?? "")
   }
 
   private func bubbleShapePayload(
@@ -9873,12 +10152,9 @@ final class ChatEngine {
 
     var mergedRows = Array(mergedById.values)
     mergedRows.sort { lhs, rhs in
-      let lt = messageTimestampMs(fromRow: lhs)
-      let rt = messageTimestampMs(fromRow: rhs)
-      if lt == rt {
-        return (messageId(fromRow: lhs) ?? "") < (messageId(fromRow: rhs) ?? "")
-      }
-      return lt < rt
+      transcriptOrderPrecedes(
+        lhsTs: messageTimestampMs(fromRow: lhs), lhsId: messageId(fromRow: lhs),
+        rhsTs: messageTimestampMs(fromRow: rhs), rhsId: messageId(fromRow: rhs))
     }
     mergedRows.insert(contentsOf: rowsWithoutIds, at: 0)
     return rowsByApplyingBubbleSequenceShapes(mergedRows)
@@ -9964,15 +10240,13 @@ final class ChatEngine {
 
     var mergedRows = Array(mergedById.values)
     mergedRows.sort { lhs, rhs in
-      let lt = messageTimestampMs(fromRow: lhs)
-      let rt = messageTimestampMs(fromRow: rhs)
-      if lt == rt {
-        return (messageId(fromRow: lhs) ?? "") < (messageId(fromRow: rhs) ?? "")
-      }
-      return lt < rt
+      transcriptOrderPrecedes(
+        lhsTs: messageTimestampMs(fromRow: lhs), lhsId: messageId(fromRow: lhs),
+        rhsTs: messageTimestampMs(fromRow: rhs), rhsId: messageId(fromRow: rhs))
     }
     mergedRows.insert(contentsOf: rowsWithoutIds, at: 0)
     let rows = rowsByApplyingBubbleSequenceShapes(mergedRows)
+    logTranscriptOrderFingerprint(chatId: chatId, rows: rows, reason: "ingest")
 
     var previousRowsById: [String: [String: Any]] = [:]
     for row in existingRows {
@@ -10767,6 +11041,7 @@ final class ChatEngine {
     let rawMediaKey = normalizedString(payload["mediaKey"] ?? payload["media_key"])
     let derivedFileName = deriveFileNameFromURL(rawMediaUrl)
     let encryptedLooksHybrid = isLikelyHybridCiphertext(encryptedContent)
+    let encryptedIsMls = VibeSecureSessions.isMlsEnvelope(encryptedContent)
 
     // Detect agent messages by fromId or explicit flag.
     //
@@ -10831,6 +11106,14 @@ final class ChatEngine {
       guard let encryptedContent, !encryptedContent.isEmpty else {
         return ""
       }
+      // An MLS envelope is opened by the ratchet in `vibe_secure`, not by the
+      // RSA path — no key travels with it, so there is nothing here to unwrap.
+      // Tested BEFORE the hybrid check: `vmls1.` is not JSON, so it would
+      // otherwise fall through the `!encryptedLooksHybrid` arm below and render
+      // as literal text.
+      if encryptedIsMls {
+        return VibeSecureSessions.shared.open(chatId: chatId, envelope: encryptedContent) ?? ""
+      }
       if !encryptedLooksHybrid {
         return encryptedContent
       }
@@ -10838,8 +11121,12 @@ final class ChatEngine {
       return chatEngineDecryptHybridMessage(
         privateKey: privateKey, ciphertext: encryptedContent, isMyMessage: isMe)
     }()
+    // `encryptedIsMls` belongs here too. Without it a failed MLS open renders as
+    // an empty bubble rather than the decryption-failed state, because the
+    // envelope is not hybrid and the old condition only ever considered hybrid.
     let decryptionFailed =
-      !isAgentMessage && hadEncryptedContent && encryptedLooksHybrid && decryptedText.isEmpty
+      !isAgentMessage && hadEncryptedContent && (encryptedLooksHybrid || encryptedIsMls)
+      && decryptedText.isEmpty
 
     var decryptedFields = parseDecryptedMessagePayload(decryptedText)
     // Always merge server/wire metadata in (forward chrome, covers, etc.). Decrypted
@@ -12861,6 +13148,37 @@ final class ChatEngine {
     )
   }
 
+  /// Publishes this device's KeyPackages and applies any Welcome waiting for it,
+  /// so a peer can start an encrypted conversation with us and we can join one
+  /// they started.
+  ///
+  /// Deliberately **not** gated on `isSendEnabled`. Publishing and joining are
+  /// the receive side: a device that cannot be added to a group cannot be sent
+  /// to at all, so this has to work even on an install that is not sealing its
+  /// own outbound messages yet.
+  ///
+  /// Both halves are cheap no-ops when there is nothing to do (a count check
+  /// and an empty list), which is why this can hang off chat join rather than
+  /// needing a lifecycle event of its own. Throttled because chat join fires
+  /// once per open chat on every reconnect.
+  private func ensureMlsProvisionedLocked(trigger: String) {
+    let now = Int64(nowMs())
+    if mlsProvisionedAtMs != 0, now - mlsProvisionedAtMs < 60_000 { return }
+    guard let apiBase = apiBaseURLLocked() else { return }
+    let token = authHeaderTokenLocked()
+    mlsProvisionedAtMs = now
+    VibeSecureEstablishment.ensureKeyPackagesPublished(apiBase: apiBase, token: token)
+    VibeSecureEstablishment.drainPendingWelcomes(apiBase: apiBase, token: token) {
+      [weak self] joinedChatIds in
+      guard let self = self, !joinedChatIds.isEmpty else { return }
+      self.queue.async {
+        for chatId in joinedChatIds {
+          self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_welcome_drained")
+        }
+      }
+    }
+  }
+
   private func apiBaseURLLocked() -> URL? {
     if let configured = normalizedString(
       getConfigValueLocked("apiBaseUrl") ?? getConfigValueLocked("baseUrl")),
@@ -13258,8 +13576,11 @@ final class ChatEngine {
     // queue, never here. Putting it at the persist choke rather than at a load site
     // is deliberate: every path that changes the durable transcript passes through
     // here exactly once, so there is no second feed to keep in agreement.
+    // `.page`, because this is the rows *this write* touched — a history page, a backfill,
+    // one incoming message — not the chat. Declaring it full is what made every drained
+    // page evict the transcript's measurements and the next pass re-measure them.
     VibeTimelinePreparedStore.shared.prepareAsync(
-      chatId: chatId, rawRows: durableRows, reason: "persist")
+      chatId: chatId, rawRows: durableRows, reason: "persist", scope: .page)
     historyRestoreMissChats.remove(chatId)
     if let deletedIds = deletedMessageIdsByChat[chatId], !deletedIds.isEmpty {
       messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: Array(deletedIds))
@@ -14657,9 +14978,9 @@ final class ChatEngine {
     Any]]
   {
     let sortedMessages = rawMessages.sorted { lhs, rhs in
-      let lt = parseLongValue(lhs["timestamp"] ?? lhs["timestampMs"] ?? lhs["timestamp_ms"]) ?? 0
-      let rt = parseLongValue(rhs["timestamp"] ?? rhs["timestampMs"] ?? rhs["timestamp_ms"]) ?? 0
-      return lt < rt
+      transcriptOrderPrecedes(
+        lhsTs: transcriptTimestampMs(lhs), lhsId: rawMessageIdForOrdering(lhs, chatId: chatId),
+        rhsTs: transcriptTimestampMs(rhs), rhsId: rawMessageIdForOrdering(rhs, chatId: chatId))
     }
     let rows: [[String: Any]] = sortedMessages.compactMap { (raw: [String: Any]) -> [String: Any]? in
       // Saved messages carry TWO ids: the server row's UUID (`id`) and the client's
@@ -14675,9 +14996,21 @@ final class ChatEngine {
       guard let messageId = normalizedString(preferredId) else { return nil }
       let fromId = normalizedString(raw["fromId"] ?? raw["from_id"])
       let type = normalizedString(raw["type"]) ?? "text"
-      let timestampMs =
-        parseLongValue(raw["timestamp"] ?? raw["timestampMs"] ?? raw["timestamp_ms"])
-        ?? Int64(nowMs())
+      // A message with no readable timestamp gets this device's clock, and that value is
+      // then PERSISTED as if the server had sent it — so two devices that first parsed
+      // the same message at different moments disagree about where it belongs, forever,
+      // and no refresh talks either of them out of it. It is the one ordering divergence
+      // in this file that cannot heal itself.
+      //
+      // The fallback stays (a row with no slot is worse than a row in a wrong slot), but
+      // it is no longer silent. Reading through the shared helper already removes the
+      // likely way to get here: a present-but-unparseable `timestamp` shadowing a good
+      // numeric `timestampMs` in the same dictionary.
+      let parsedTimestampMs = transcriptTimestampMs(raw)
+      if parsedTimestampMs == nil {
+        noteSynthesizedTimestamp(chatId: chatId, messageId: messageId, raw: raw)
+      }
+      let timestampMs = parsedTimestampMs ?? Int64(nowMs())
       let encryptedContent = normalizedString(raw["encryptedContent"] ?? raw["encrypted_content"])
       let plaintextFallback = normalizedString(raw["plaintext"] ?? raw["text"]) ?? ""
       let serverStatus = normalizedString(raw["status"])?.lowercased()
@@ -14725,6 +15058,23 @@ final class ChatEngine {
         }
 
         if let encryptedContent, !encryptedContent.isEmpty {
+          // Same reasoning as the live path: an MLS envelope is opened by the
+          // ratchet, and it must be tested before the hybrid check or it falls
+          // into the `!encryptedLooksHybrid` arm and gets parsed as if the
+          // envelope string were itself the payload JSON.
+          if VibeSecureSessions.isMlsEnvelope(encryptedContent) {
+            guard
+              let opened = VibeSecureSessions.shared.open(
+                chatId: chatId, envelope: encryptedContent)
+            else {
+              historyDecryptionFailed = true
+              return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
+            }
+            let parsed = parseDecryptedMessagePayload(opened)
+            if !parsed.isEmpty { return parsed }
+            historyDecryptionFailed = true
+            return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
+          }
           if !encryptedLooksHybrid {
             return parseDecryptedMessagePayload(encryptedContent)
           }
@@ -15223,9 +15573,11 @@ final class ChatEngine {
         normalizedString(raw["from_id"] ?? raw["fromId"])
         ?? normalizedString(getConfigValueLocked("userId"))
       let type = normalizedString(raw["type"])?.lowercased() ?? "text"
-      let timestampMs =
-        parseLongValue(raw["timestamp"] ?? raw["timestampMs"] ?? raw["timestamp_ms"])
-        ?? Int64(nowMs())
+      let parsedTimestampMs = transcriptTimestampMs(raw)
+      if parsedTimestampMs == nil {
+        noteSynthesizedTimestamp(chatId: "saved_messages", messageId: messageId, raw: raw)
+      }
+      let timestampMs = parsedTimestampMs ?? Int64(nowMs())
       let encryptedContent =
         normalizedString(raw["encrypted_content"] ?? raw["encryptedContent"])
       let parsedExtra = parseJSONObjectString(raw["extra"])

@@ -85,6 +85,21 @@ final class VibeRowMeasurementCache {
   /// Diagnostics preview) the placeholder still applies.
   var rowProvider: ((String) -> ChatListRow?)?
 
+  /// The row's live agent-turn state (expanded / streaming / tall), from the same surface
+  /// that supplies `rowProvider`.
+  ///
+  /// Without it this measured every agent row with a default-constructed
+  /// `AgentTurnBubbleState`, while the list measures with the row's REAL state — so the
+  /// two sized the same row from different inputs and could never agree. That is the
+  /// disagreement blocking the geometry flip, and it is not the flat 8pt on every row it
+  /// was recorded as: a plain 1,386-row chat reports `geometry AGREES … placeholders=0`,
+  /// while the rows that differ carry `b-…` (bridge/agent) keys —
+  /// `differed=5 worst=b-74be38704a52 core=34.0 list=40.0`.
+  ///
+  /// Same row, same width, same state ⇒ same height, because both sides call the same
+  /// `VibeRowMetrics` measurement.
+  var agentStateProvider: ((ChatListRow) -> AgentTurnBubbleState)?
+
   private(set) var measurements = 0
   private(set) var reuses = 0
   private(set) var invalidations = 0
@@ -176,7 +191,9 @@ final class VibeRowMeasurementCache {
 
   private func measure(_ message: VibeFfiMessage, revision: UInt64) -> VibeMeasuredRow {
     if let row = rowProvider?(message.messageId),
-      let height = VibeRowMetrics.mainThreadHeight(row: row, rowWidth: width)
+      let height = VibeRowMetrics.mainThreadHeight(
+        row: row, rowWidth: width,
+        state: agentStateProvider?(row) ?? AgentTurnBubbleState())
     {
       placeholderIds.remove(message.messageId)
       return measuredFromRealRow(height: height, revision: revision)
@@ -586,6 +603,13 @@ final class VibeTimelineHost {
   func setRowProvider(_ provider: @escaping (String) -> ChatListRow?) {
     cache.rowProvider = provider
     (listHost as? VibeCollectionMessageListHost)?.rowProvider = provider
+  }
+
+  /// Agent-turn state for the rows `rowProvider` supplies. Set it alongside the provider:
+  /// measuring an agent row without it uses a default state and produces a height the list
+  /// will never draw. See `VibeRowMeasurementCache.agentStateProvider`.
+  func setAgentStateProvider(_ provider: @escaping (ChatListRow) -> AgentTurnBubbleState) {
+    cache.agentStateProvider = provider
   }
 
   var measurementStats: (measured: Int, reused: Int, invalidations: Int, placeholders: Int) {

@@ -16,12 +16,18 @@ enum ChatWallpaperMaskStore {
   private static let cache: NSCache<NSString, CGImageBox> = {
     let cache = NSCache<NSString, CGImageBox>()
     cache.countLimit = 6
-    // Cap total decoded mask pixels (~12 MB).
-    cache.totalCostLimit = 12 * 1024 * 1024
+    // Cap total decoded mask bytes. A device-resolution vector mask is alpha-only
+    // (1 byte/px, ~4 MB) rather than RGBA (4 bytes/px, ~17 MB), so this holds two.
+    cache.totalCostLimit = 24 * 1024 * 1024
     return cache
   }()
 
-  /// Long-edge cap for pattern masks (aspect-fill backdrop, not photography).
+  /// Long-edge cap for RASTER pattern masks (aspect-fill backdrop, not photography).
+  ///
+  /// Vector masks ignore this: they rasterise at exactly the size they will be
+  /// drawn, so they never upscale. The legacy PNGs are 1312x3232 and get capped
+  /// here, which on a 1290pt-wide screen meant a ~416px-wide mask stretched 3.1x —
+  /// that upscale, not the source art, was the visible blur.
   private static let maxPixelSize = 1024
 
   static func image(forKey key: String, bundles: [Bundle] = [.main]) -> CGImage? {
@@ -30,6 +36,15 @@ enum ChatWallpaperMaskStore {
     if let cached = cache.object(forKey: normalized as NSString) {
       return cached.image
     }
+
+    // Prefer a vector asset when one exists for this key.
+    if let vectorName = vectorName(for: normalized),
+      let image = loadVector(named: vectorName, bundles: bundles)
+    {
+      store(image, key: normalized)
+      return image
+    }
+
     guard let baseName = baseName(for: normalized) else { return nil }
 
     for bundle in bundles {
@@ -56,8 +71,92 @@ enum ChatWallpaperMaskStore {
   }
 
   private static func store(_ image: CGImage, key: String) {
-    let cost = image.width * image.height * 4
+    let bytesPerPixel = max(1, image.bitsPerPixel / 8)
+    let cost = image.width * image.height * bytesPerPixel
     cache.setObject(CGImageBox(image), forKey: key as NSString, cost: cost)
+  }
+
+  /// Asset-catalog name for keys that ship as vector (`preserves-vector-representation`).
+  ///
+  /// A key listed here still falls back to its legacy PNG if the vector asset is
+  /// missing, so adding a name before its artwork lands is safe.
+  private static func vectorName(for key: String) -> String? {
+    switch key {
+    case "doodles", "hearts":
+      return "DoodleWallpaper"
+    case "music":
+      return "MusicWallpaper"
+    case "music2":
+      return "Music2Wallpaper"
+    case "food":
+      return "FoodWallpaper"
+    case "animals":
+      return "AnimalsWallpaper"
+    case "cosmos":
+      return "CosmosWallpaper"
+    default:
+      return nil
+    }
+  }
+
+  private static func loadVector(named name: String, bundles: [Bundle]) -> CGImage? {
+    for bundle in bundles {
+      guard let image = UIImage(named: name, in: bundle, compatibleWith: nil),
+        image.size.width > 0, image.size.height > 0
+      else { continue }
+
+      let size = vectorRenderSize(for: image.size)
+      if let alphaOnly = renderAlphaOnly(image, size: size) {
+        return alphaOnly
+      }
+      // Fall back to a normal RGBA raster if an alpha-only context is unavailable.
+      let format = UIGraphicsImageRendererFormat.default()
+      format.scale = 1
+      format.opaque = false
+      let rendered = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+        image.draw(in: CGRect(origin: .zero, size: size))
+      }
+      if let cg = rendered.cgImage { return cg }
+    }
+    return nil
+  }
+
+  /// Smallest size that still covers the screen, since the mask is drawn
+  /// `resizeAspectFill`. Rasterising the vector here means zero upscale.
+  private static func vectorRenderSize(for source: CGSize) -> CGSize {
+    let screen = UIScreen.main.nativeBounds.size
+    guard source.width > 0, source.height > 0, screen.width > 0, screen.height > 0 else {
+      return source
+    }
+    let scale = max(screen.width / source.width, screen.height / source.height)
+    return CGSize(
+      width: max(1, (source.width * scale).rounded()),
+      height: max(1, (source.height * scale).rounded())
+    )
+  }
+
+  /// 8-bit alpha-only raster: a mask only ever uses its alpha, so storing RGBA
+  /// would waste 4x the memory for identical output.
+  private static func renderAlphaOnly(_ image: UIImage, size: CGSize) -> CGImage? {
+    let width = Int(size.width)
+    let height = Int(size.height)
+    guard width > 0, height > 0,
+      let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
+    else { return nil }
+
+    context.translateBy(x: 0, y: size.height)
+    context.scaleBy(x: 1, y: -1)
+    UIGraphicsPushContext(context)
+    image.draw(in: CGRect(origin: .zero, size: size))
+    UIGraphicsPopContext()
+    return context.makeImage()
   }
 
   private static func baseName(for key: String) -> String? {

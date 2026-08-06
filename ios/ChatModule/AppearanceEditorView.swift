@@ -75,16 +75,7 @@ struct ChatAppearanceCanvas: View {
         endPoint: .bottomTrailing
       )
 
-      if let maskKey = appearance.wallpaperMaskKey,
-        let cgImage = ChatWallpaperMaskStore.image(forKey: maskKey)
-      {
-        Image(decorative: cgImage, scale: 1.0, orientation: .up)
-          .resizable()
-          .scaledToFill()
-          .opacity(Double(max(0.04, appearance.wallpaperPatternOpacity)))
-          .blendMode(.overlay)
-          .allowsHitTesting(false)
-      }
+      WallpaperPatternPreview(appearance: appearance)
 
       VStack(alignment: .leading, spacing: compact ? 8 : 10) {
         if !compact {
@@ -318,10 +309,10 @@ struct AppearanceHubView: View {
           Text("COLOR THEME")
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(palette.secondaryText.opacity(0.7))
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 16)
 
           ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
               ForEach(AppearanceThemeCatalog.plates) { card in
                 Button {
                   applyTheme(card.id)
@@ -332,6 +323,7 @@ struct AppearanceHubView: View {
               }
             }
             .padding(.horizontal, 16)
+            .padding(.vertical, 2)
           }
         }
 

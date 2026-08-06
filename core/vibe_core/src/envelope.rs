@@ -61,6 +61,11 @@ pub const VIBE_MESSAGE_ENVELOPE_AAD: &[u8] = b"";
 /// Prefix of the sealed agent runtime format. Recognised, never opened.
 pub const VIBE_AGENT_SEALED_PREFIX: &str = "arte1.";
 
+/// Prefix of an MLS application message. Recognised, never opened — see
+/// [`VibeEnvelopeFormat::MlsV2`]. The payload belongs to `vibe_secure`, which
+/// this crate does not depend on and cannot import.
+pub const VIBE_MLS_SEALED_PREFIX: &str = "vmls1.";
+
 /// What a raw `encrypted_content` string actually is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VibeEnvelopeFormat {
@@ -75,6 +80,9 @@ pub enum VibeEnvelopeFormat {
     /// `arte1.<iv>.<ct>.<tag>` — agent runtime, sealed under a pairing key this
     /// crate does not have and must never be given.
     AgentSealedArte1,
+    /// `vmls1.<base64>` — an MLS application message. Recognised so it is never
+    /// mistaken for plaintext payload JSON; opened by `vibe_secure`, not here.
+    MlsV2,
     /// Anything else. Rendered as literal text, exactly as today.
     Unrecognized,
 }
@@ -196,6 +204,13 @@ pub fn classify(raw: &str) -> VibeEnvelopeFormat {
         } else {
             VibeEnvelopeFormat::Unrecognized
         };
+    }
+    // Prefix-only: this crate recognises an MLS application message so it is
+    // never mistaken for plaintext payload JSON, but never opens it — there is
+    // no shape to validate here the way `parse_agent_sealed` validates arte1,
+    // because the body belongs entirely to `vibe_secure`.
+    if trimmed.starts_with(VIBE_MLS_SEALED_PREFIX) {
+        return VibeEnvelopeFormat::MlsV2;
     }
     if trimmed.starts_with('{') {
         let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
@@ -433,6 +448,22 @@ mod tests {
     fn plain_text_that_happens_to_be_base64_is_not_an_envelope() {
         // "dGVzdA==" decodes fine but is not 256 bytes.
         assert_eq!(classify("dGVzdA=="), VibeEnvelopeFormat::Unrecognized);
+    }
+
+    #[test]
+    fn classifies_mls_v2_by_prefix_only() {
+        // Detection is a bare prefix check — unlike arte1, there is no shape to
+        // validate, so even a body far too short to be a real MLS message
+        // still classifies as MlsV2.
+        assert_eq!(classify("vmls1.AAAA"), VibeEnvelopeFormat::MlsV2);
+        assert_eq!(
+            classify("  vmls1.AAAA  "),
+            VibeEnvelopeFormat::MlsV2,
+            "whitespace is trimmed like every other shape"
+        );
+        // A prefix collision must never fall into a different arm.
+        assert_ne!(classify("vmls1.AAAA"), VibeEnvelopeFormat::Unrecognized);
+        assert_ne!(classify("vmls1.AAAA"), VibeEnvelopeFormat::AgentSealedArte1);
     }
 
     #[test]

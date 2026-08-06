@@ -58,6 +58,12 @@ final class VibeMainThreadWatchdog {
   private let sampleInterval: CFTimeInterval = 0.05
   /// Repeat interval for the "still blocked" line during one continuous hang.
   private let ongoingReportInterval: CFTimeInterval = 1.0
+  /// A gap between watcher ticks larger than this means the process was suspended.
+  /// Generous relative to the 50ms interval: a `.utility` queue on a loaded device can
+  /// legitimately be late by a wide margin, and the cost of being wrong in this
+  /// direction is one discarded hang report, while being wrong the other way is a
+  /// minute of pocket time logged as a freeze.
+  private static let suspensionSampleGap: CFTimeInterval = 2.0
 
   private let queue = DispatchQueue(label: "vibe.mainthread.watchdog", qos: .utility)
   private var timer: DispatchSourceTimer?
@@ -88,6 +94,15 @@ final class VibeMainThreadWatchdog {
 
   private var reportedHangStart: CFTimeInterval = 0
   private var lastOngoingReport: CFTimeInterval = 0
+  /// Captured when the hang is first detected, not at recovery: by the time the main
+  /// thread comes back it has moved on, and the interesting breadcrumb is the one it
+  /// was standing on when it stopped.
+  private var reportedHangActivity = "?"
+  private var reportedHangMode = "?"
+  /// When the watcher itself last ran. A main-thread hang does not stop this queue —
+  /// that is the entire premise of watching from off the main thread — so a gap here
+  /// means the *process* stopped, not the main thread. See `sample`.
+  private var lastSampleAt: CFTimeInterval = 0
 
   private init() {}
 
@@ -153,6 +168,29 @@ final class VibeMainThreadWatchdog {
   // MARK: Watching
 
   private func sample() {
+    let sampledAt = CACurrentMediaTime()
+    let sinceLastSample = lastSampleAt > 0 ? sampledAt - lastSampleAt : 0
+    lastSampleAt = sampledAt
+    // The process was frozen, not the main thread. When iOS suspends an app it stops
+    // every thread, including this one; on resume the run loop's `busySince` stamp is
+    // still whatever it was before the freeze, and subtracting it from now measures how
+    // long the app was in the reader's pocket. The first device export reported
+    // `main thread blocked 61.54s` on exactly this — a minute in which nothing was
+    // wrong, filed at the same severity as a real half-second stall.
+    //
+    // The tell is that this watcher missed its own 50ms tick: a genuine main-thread hang
+    // never delays it, because it is not on the main thread. Discard the stale stamp and
+    // start the next window clean rather than reporting a hang that did not happen.
+    if sinceLastSample > Self.suspensionSampleGap {
+      os_unfair_lock_lock(lock)
+      busySince = 0
+      busyMode = ""
+      os_unfair_lock_unlock(lock)
+      reportedHangStart = 0
+      lastOngoingReport = 0
+      return
+    }
+
     os_unfair_lock_lock(lock)
     let since = busySince
     let mode = busyMode
@@ -163,6 +201,19 @@ final class VibeMainThreadWatchdog {
       if reportedHangStart > 0 {
         let duration = CACurrentMediaTime() - reportedHangStart
         NSLog("[MainHang] RECOVERED after %.2fs", duration)
+        // Durable copy. `NSLog` exists only while a console is attached, and a hang
+        // that a user notices is by definition one that happened while they were just
+        // using the app. This is the version that is still there afterwards.
+        VibeLog.warning(
+          "main thread blocked \(String(format: "%.2f", duration))s during \(reportedHangActivity)",
+          category: "mainhang",
+          metadata: [
+            "seconds": String(format: "%.2f", duration),
+            "mode": reportedHangMode,
+            "during": reportedHangActivity,
+          ])
+        VibeOpenTrace.shared.noteHang(
+          seconds: duration, mode: reportedHangMode, activity: reportedHangActivity)
         reportedHangStart = 0
         lastOngoingReport = 0
       }
@@ -183,16 +234,22 @@ final class VibeMainThreadWatchdog {
       // report its own length.
       reportedHangStart = since
       lastOngoingReport = now
+      // The run-loop mode says *when* ("under the finger" vs "not"), never *what*.
+      // `VibeOpenTrace` keeps the main thread's last recorded stage, which is as close
+      // to a stack as this can get without suspending the thread to walk it.
+      reportedHangMode = mode.isEmpty ? "?" : mode
+      reportedHangActivity = VibeOpenTrace.shared.activity
       NSLog(
-        "[MainHang] BLOCKED %.2fs mode=%@ — main thread is not advancing; no touches or frames are being serviced",
-        blockedFor, mode.isEmpty ? "?" : mode)
+        "[MainHang] BLOCKED %.2fs mode=%@ during=%@ — main thread is not advancing; no touches or frames are being serviced",
+        blockedFor, reportedHangMode, reportedHangActivity)
       return
     }
 
     if now - lastOngoingReport >= ongoingReportInterval {
       lastOngoingReport = now
       NSLog(
-        "[MainHang] STILL BLOCKED %.2fs mode=%@", blockedFor, mode.isEmpty ? "?" : mode)
+        "[MainHang] STILL BLOCKED %.2fs mode=%@ during=%@", blockedFor,
+        mode.isEmpty ? "?" : mode, reportedHangActivity)
     }
   }
 }

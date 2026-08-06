@@ -276,8 +276,13 @@ fn prepare(
             // Legacy RSA-direct needs a private-key operation over the whole
             // ciphertext, which is platform-owned. Recognised so the row is
             // flagged rather than rendered as base64 text.
+            // `MlsV2` groups with these: recognised so it never renders as
+            // literal text, never opened here (`vibe_secure` owns that), and
+            // this crate does not depend on `vibe_secure`, so there is nothing
+            // more this arm could do with it.
             VibeEnvelopeFormat::LegacyRsaDirect
             | VibeEnvelopeFormat::AgentSealedArte1
+            | VibeEnvelopeFormat::MlsV2
             | VibeEnvelopeFormat::Unrecognized => {}
         }
     }

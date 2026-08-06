@@ -1557,6 +1557,492 @@ public func FfiConverterTypeVibeLegacyStoreHandle_lower(_ value: VibeLegacyStore
 
 
 /**
+ * One device's MLS identity, plus the provider that holds its key material.
+ *
+ * The provider is owned here and never handed out. A session built from this
+ * identity must use the *same* provider — the signature keypair was stored in
+ * it at generation — which is why [`VibeSecureSessionHandle`] holds an `Arc` of
+ * this handle rather than taking a provider of its own.
+ * One device's MLS identity and its persistent store.
+ *
+ * The provider is behind a `Mutex` because it owns a `rusqlite::Connection`,
+ * which is `Send` but **not** `Sync` — a uniffi object must be both, so access
+ * has to be serialized. That is not merely a type-system workaround: a SQLite
+ * connection genuinely cannot be used concurrently, and MLS operations mutate
+ * ratchet state that must not interleave anyway.
+ *
+ * **Lock order is session-then-provider, everywhere.** Constructors take only
+ * the provider. Nothing takes them in the other order, which is what keeps this
+ * deadlock-free.
+ */
+public protocol VibeSecureIdentityHandleProtocol : AnyObject {
+    
+    func deviceId()  -> String
+    
+    /**
+     * Serialized KeyPackage, for publication so a peer can add this device.
+     *
+     * **Single-use.** MLS consumes a KeyPackage's one-time init key when it
+     * adds a member, so every call must produce a fresh one and a published
+     * package must never be handed out twice — the server enforces that with an
+     * atomic claim.
+     */
+    func keyPackage() throws  -> Data
+    
+    /**
+     * Reloads a persisted group, or `None` if this store has never held one.
+     *
+     * `None` is an ordinary answer — a fresh install, or a chat never
+     * established — and the caller establishes instead of treating it as an
+     * error. This is the call that makes a relaunch continue an existing
+     * conversation rather than silently starting a new group whose messages
+     * nobody can read.
+     *
+     * This hangs off the identity rather than being a `VibeSecureSession`
+     * constructor because uniffi requires a constructor to return `Self` or
+     * `Arc<Self>` — it cannot express "maybe a session". Expressing the
+     * absent case as an error instead would be worse: a fresh install would
+     * then throw on every chat it has never established, and the caller would
+     * have to tell that apart from a genuine store failure.
+     */
+    func loadSession(groupId: Data) throws  -> VibeSecureSessionHandle?
+    
+}
+
+/**
+ * One device's MLS identity, plus the provider that holds its key material.
+ *
+ * The provider is owned here and never handed out. A session built from this
+ * identity must use the *same* provider — the signature keypair was stored in
+ * it at generation — which is why [`VibeSecureSessionHandle`] holds an `Arc` of
+ * this handle rather than taking a provider of its own.
+ * One device's MLS identity and its persistent store.
+ *
+ * The provider is behind a `Mutex` because it owns a `rusqlite::Connection`,
+ * which is `Send` but **not** `Sync` — a uniffi object must be both, so access
+ * has to be serialized. That is not merely a type-system workaround: a SQLite
+ * connection genuinely cannot be used concurrently, and MLS operations mutate
+ * ratchet state that must not interleave anyway.
+ *
+ * **Lock order is session-then-provider, everywhere.** Constructors take only
+ * the provider. Nothing takes them in the other order, which is what keeps this
+ * deadlock-free.
+ */
+open class VibeSecureIdentityHandle:
+    VibeSecureIdentityHandleProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibesecureidentityhandle(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibesecureidentityhandle(pointer, $0) }
+    }
+
+    
+    /**
+     * Generates a device identity backed by the MLS store at `db_path`.
+     *
+     * `device_id` is carried in the MLS credential and is what a safety-number
+     * UI will eventually hash, so it must be stable for the lifetime of the
+     * install — not a per-launch UUID.
+     *
+     * The store is SQLite on disk, so ratchet state survives relaunch. That is
+     * what makes [`VibeSecureSessionHandle::load`] able to return a session at
+     * all, and it is the difference between MLS being usable and being a demo.
+     */
+public static func generate(deviceId: String, dbPath: String)throws  -> VibeSecureIdentityHandle {
+    return try  FfiConverterTypeVibeSecureIdentityHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibesecureidentityhandle_generate(
+        FfiConverterString.lower(deviceId),
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+    
+
+    
+open func deviceId() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_device_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Serialized KeyPackage, for publication so a peer can add this device.
+     *
+     * **Single-use.** MLS consumes a KeyPackage's one-time init key when it
+     * adds a member, so every call must produce a fresh one and a published
+     * package must never be handed out twice — the server enforces that with an
+     * atomic claim.
+     */
+open func keyPackage()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_key_package(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Reloads a persisted group, or `None` if this store has never held one.
+     *
+     * `None` is an ordinary answer — a fresh install, or a chat never
+     * established — and the caller establishes instead of treating it as an
+     * error. This is the call that makes a relaunch continue an existing
+     * conversation rather than silently starting a new group whose messages
+     * nobody can read.
+     *
+     * This hangs off the identity rather than being a `VibeSecureSession`
+     * constructor because uniffi requires a constructor to return `Self` or
+     * `Arc<Self>` — it cannot express "maybe a session". Expressing the
+     * absent case as an error instead would be worse: a fresh install would
+     * then throw on every chat it has never established, and the caller would
+     * have to tell that apart from a genuine store failure.
+     */
+open func loadSession(groupId: Data)throws  -> VibeSecureSessionHandle? {
+    return try  FfiConverterOptionTypeVibeSecureSessionHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_load_session(self.uniffiClonePointer(),
+        FfiConverterData.lower(groupId),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeSecureIdentityHandle: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeSecureIdentityHandle
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeSecureIdentityHandle {
+        return VibeSecureIdentityHandle(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeSecureIdentityHandle) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeSecureIdentityHandle {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeSecureIdentityHandle, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeSecureIdentityHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeSecureIdentityHandle {
+    return try FfiConverterTypeVibeSecureIdentityHandle.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeSecureIdentityHandle_lower(_ value: VibeSecureIdentityHandle) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeSecureIdentityHandle.lower(value)
+}
+
+
+
+
+/**
+ * One MLS group session. A 1:1 DM is a two-member group; there is no separate
+ * pairwise path, by design.
+ */
+public protocol VibeSecureSessionHandleProtocol : AnyObject {
+    
+    /**
+     * Adds devices to the group from their published KeyPackages.
+     *
+     * The bytes are attacker-controlled — a hostile server can serve any
+     * KeyPackage it likes — so they are validated inside `vibe_secure` under
+     * its panic guard, not here. Until identity pinning lands (Phase 1), a
+     * substituted KeyPackage is exactly the MITM this cannot yet detect.
+     */
+    func addMembers(keyPackages: [Data]) throws  -> VibeFfiCommitOutput
+    
+    /**
+     * The group's ratchet tree, which a joiner needs alongside a Welcome.
+     */
+    func exportRatchetTree() throws  -> Data
+    
+    /**
+     * The group's id — the handle the platform stores against its chat id.
+     */
+    func groupId() throws  -> Data
+    
+    /**
+     * Opens a `vmls1.` envelope.
+     *
+     * Every ordinary failure — wrong session, tampered ciphertext, malformed
+     * envelope — is indistinguishable by design. A `SessionPoisoned` detail is
+     * the one case the caller must treat differently: discard the session
+     * rather than retry.
+     */
+    func `open`(envelope: String) throws  -> Data
+    
+    /**
+     * Seals `plaintext` as a `vmls1.` envelope string.
+     */
+    func seal(plaintext: Data) throws  -> String
+    
+}
+
+/**
+ * One MLS group session. A 1:1 DM is a two-member group; there is no separate
+ * pairwise path, by design.
+ */
+open class VibeSecureSessionHandle:
+    VibeSecureSessionHandleProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibesecuresessionhandle(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibesecuresessionhandle(pointer, $0) }
+    }
+
+    
+    /**
+     * Creates a new group with this device as its only member.
+     */
+public static func create(identity: VibeSecureIdentityHandle)throws  -> VibeSecureSessionHandle {
+    return try  FfiConverterTypeVibeSecureSessionHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibesecuresessionhandle_create(
+        FfiConverterTypeVibeSecureIdentityHandle.lower(identity),$0
+    )
+})
+}
+    
+    /**
+     * Joins a group from a Welcome produced by another member's `add_members`.
+     */
+public static func joinFromWelcome(identity: VibeSecureIdentityHandle, welcome: Data, ratchetTree: Data?)throws  -> VibeSecureSessionHandle {
+    return try  FfiConverterTypeVibeSecureSessionHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibesecuresessionhandle_join_from_welcome(
+        FfiConverterTypeVibeSecureIdentityHandle.lower(identity),
+        FfiConverterData.lower(welcome),
+        FfiConverterOptionData.lower(ratchetTree),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Adds devices to the group from their published KeyPackages.
+     *
+     * The bytes are attacker-controlled — a hostile server can serve any
+     * KeyPackage it likes — so they are validated inside `vibe_secure` under
+     * its panic guard, not here. Until identity pinning lands (Phase 1), a
+     * substituted KeyPackage is exactly the MITM this cannot yet detect.
+     */
+open func addMembers(keyPackages: [Data])throws  -> VibeFfiCommitOutput {
+    return try  FfiConverterTypeVibeFfiCommitOutput.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_add_members(self.uniffiClonePointer(),
+        FfiConverterSequenceData.lower(keyPackages),$0
+    )
+})
+}
+    
+    /**
+     * The group's ratchet tree, which a joiner needs alongside a Welcome.
+     */
+open func exportRatchetTree()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_export_ratchet_tree(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The group's id — the handle the platform stores against its chat id.
+     */
+open func groupId()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_group_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Opens a `vmls1.` envelope.
+     *
+     * Every ordinary failure — wrong session, tampered ciphertext, malformed
+     * envelope — is indistinguishable by design. A `SessionPoisoned` detail is
+     * the one case the caller must treat differently: discard the session
+     * rather than retry.
+     */
+open func `open`(envelope: String)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_open(self.uniffiClonePointer(),
+        FfiConverterString.lower(envelope),$0
+    )
+})
+}
+    
+    /**
+     * Seals `plaintext` as a `vmls1.` envelope string.
+     */
+open func seal(plaintext: Data)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_seal(self.uniffiClonePointer(),
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeSecureSessionHandle: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeSecureSessionHandle
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeSecureSessionHandle {
+        return VibeSecureSessionHandle(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeSecureSessionHandle) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeSecureSessionHandle {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeSecureSessionHandle, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeSecureSessionHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeSecureSessionHandle {
+    return try FfiConverterTypeVibeSecureSessionHandle.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeSecureSessionHandle_lower(_ value: VibeSecureSessionHandle) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeSecureSessionHandle.lower(value)
+}
+
+
+
+
+/**
  * Read-write handle onto the sealed core tables.
  */
 public protocol VibeStoreHandleProtocol : AnyObject {
@@ -2520,6 +3006,80 @@ public func FfiConverterTypeVibeFfiBounds_lift(_ buf: RustBuffer) throws -> Vibe
 #endif
 public func FfiConverterTypeVibeFfiBounds_lower(_ value: VibeFfiBounds) -> RustBuffer {
     return FfiConverterTypeVibeFfiBounds.lower(value)
+}
+
+
+/**
+ * The two messages an `add_members` commit produces.
+ *
+ * `commit` goes to existing members; `welcome` goes to the joiner, who also
+ * needs the group's ratchet tree. They are separate because they have different
+ * audiences — sending a Welcome to the existing group would be a bug, not a
+ * harmless extra.
+ */
+public struct VibeFfiCommitOutput {
+    public var commit: Data
+    public var welcome: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(commit: Data, welcome: Data) {
+        self.commit = commit
+        self.welcome = welcome
+    }
+}
+
+
+
+extension VibeFfiCommitOutput: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiCommitOutput, rhs: VibeFfiCommitOutput) -> Bool {
+        if lhs.commit != rhs.commit {
+            return false
+        }
+        if lhs.welcome != rhs.welcome {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(commit)
+        hasher.combine(welcome)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiCommitOutput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiCommitOutput {
+        return
+            try VibeFfiCommitOutput(
+                commit: FfiConverterData.read(from: &buf), 
+                welcome: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiCommitOutput, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.commit, into: &buf)
+        FfiConverterData.write(value.welcome, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiCommitOutput_lift(_ buf: RustBuffer) throws -> VibeFfiCommitOutput {
+    return try FfiConverterTypeVibeFfiCommitOutput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiCommitOutput_lower(_ value: VibeFfiCommitOutput) -> RustBuffer {
+    return FfiConverterTypeVibeFfiCommitOutput.lower(value)
 }
 
 
@@ -5012,6 +5572,30 @@ fileprivate struct FfiConverterOptionTypeVibeFfiKeyUnwrapper: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeVibeSecureSessionHandle: FfiConverterRustBuffer {
+    typealias SwiftType = VibeSecureSessionHandle?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVibeSecureSessionHandle.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVibeSecureSessionHandle.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeVibeFfiAgent: FfiConverterRustBuffer {
     typealias SwiftType = VibeFfiAgent?
 
@@ -5474,6 +6058,30 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_method_vibelegacystorehandle_newest_message_ids() != 9496) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_device_id() != 11425) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_key_package() != 48910) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_load_session() != 42463) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_add_members() != 56357) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_export_ratchet_tree() != 24404) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_group_id() != 9124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_open() != 64976) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_seal() != 2398) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vibe_core_ffi_checksum_method_vibestorehandle_backfill_batch() != 23420) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5526,6 +6134,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_constructor_vibelegacystorehandle_open() != 15415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecureidentityhandle_generate() != 29728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecuresessionhandle_create() != 7798) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecuresessionhandle_join_from_welcome() != 4621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_constructor_vibestorehandle_open() != 40680) {

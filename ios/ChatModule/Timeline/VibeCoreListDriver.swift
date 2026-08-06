@@ -77,9 +77,16 @@ final class VibeCoreListDriver {
   /// its own tombstones, id aliases and generations for the same conversations,
   /// and a fake identity that decides `author.is_me` and therefore which
   /// wrapped-key slot is tried first. Both are gone — one core, the real user id.
-  func start(ownUserId: String, rowProvider: @escaping (String) -> ChatListRow?) {
+  func start(
+    ownUserId: String,
+    rowProvider: @escaping (String) -> ChatListRow?,
+    agentStateProvider: @escaping (ChatListRow) -> AgentTurnBubbleState
+  ) {
     guard handle == nil else { return }
     timelineHost.setRowProvider(rowProvider)
+    // Measured with the SAME inputs the list uses, or the two can never agree on an agent
+    // row's height. Set together with the provider — never one without the other.
+    timelineHost.setAgentStateProvider(agentStateProvider)
 
     guard let core = VibeCoreBridge.sharedCore(ownUserId: ownUserId) else { return }
     handle = core

@@ -300,53 +300,53 @@ struct AppearanceThemeThumbView: View {
         endPoint: .bottomTrailing
       )
 
-      if let maskKey = appearance.wallpaperMaskKey,
-        let cg = ChatWallpaperMaskStore.image(forKey: maskKey)
-      {
-        Image(decorative: cg, scale: 1, orientation: .up)
-          .resizable()
-          .scaledToFill()
-          .opacity(Double(max(0.05, appearance.wallpaperPatternOpacity)))
-          .blendMode(.overlay)
-          .allowsHitTesting(false)
-      }
+      WallpaperPatternPreview(appearance: appearance)
 
-      VStack(alignment: .leading, spacing: 6) {
-        Capsule()
-          .fill(
-            LinearGradient(
-              colors: appearance.bubbleThemGradient.map { Color(uiColor: $0) },
-              startPoint: .leading,
-              endPoint: .trailing
+      // Bubble mockups: bounded `HStack` + `Spacer(minLength:)` rows so a
+      // narrow tile (the 72pt COLOR THEME strip) never reports an intrinsic
+      // width larger than what it was offered. The previous
+      // `.frame(width: 44/54).frame(maxWidth: .infinity).padding(20)` chain
+      // let the fixed-width capsule win over a tight proposal, inflating
+      // this view's (and its clipShape's) width past the frame the caller
+      // assigned — which is what bled tiles into their neighbors.
+      VStack(alignment: .leading, spacing: 5) {
+        HStack(spacing: 0) {
+          Capsule()
+            .fill(
+              LinearGradient(
+                colors: appearance.bubbleThemGradient.map { Color(uiColor: $0) },
+                startPoint: .leading,
+                endPoint: .trailing
+              )
             )
-          )
-          .frame(width: 44, height: 18)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.trailing, 20)
-
-        Capsule()
-          .fill(
-            LinearGradient(
-              colors: appearance.bubbleMeGradient.map { Color(uiColor: $0) },
-              startPoint: .leading,
-              endPoint: .trailing
+            .frame(width: 26, height: 14)
+          Spacer(minLength: 6)
+        }
+        HStack(spacing: 0) {
+          Spacer(minLength: 6)
+          Capsule()
+            .fill(
+              LinearGradient(
+                colors: appearance.bubbleMeGradient.map { Color(uiColor: $0) },
+                startPoint: .leading,
+                endPoint: .trailing
+              )
             )
-          )
-          .frame(width: 54, height: 18)
-          .frame(maxWidth: .infinity, alignment: .trailing)
-          .padding(.leading, 20)
+            .frame(width: 32, height: 14)
+        }
       }
-      .padding(12)
+      .padding(10)
 
       if let emoji {
         Text(emoji)
-          .font(.system(size: 22))
+          .font(.system(size: 16))
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
           .padding(8)
       }
     }
-    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     .overlay(
-      RoundedRectangle(cornerRadius: 14, style: .continuous)
+      RoundedRectangle(cornerRadius: 16, style: .continuous)
         .stroke(
           selected
             ? Color(uiColor: ChatListAppearance.brandAccentFallback)
@@ -354,6 +354,60 @@ struct AppearanceThemeThumbView: View {
           lineWidth: selected ? 2.5 : 1
         )
     )
+    .shadow(
+      color: selected
+        ? Color(uiColor: ChatListAppearance.brandAccentFallback).opacity(0.35)
+        : .clear,
+      radius: selected ? 6 : 0, x: 0, y: selected ? 2 : 0
+    )
+  }
+}
+
+// MARK: - Wallpaper pattern preview (mask over gradient, mirrors ChatWallpaperView)
+
+/// SwiftUI mirror of `ChatWallpaperView`'s `patternLayer` + `patternMaskLayer`: the
+/// pattern's own gradient is masked by the wallpaper mask image, never drawn as
+/// ordinary image content. The mask (device-resolution SVG rasterization used for
+/// `doodles`/`hearts`) is alpha-only — it has no color channels, so treating it as
+/// image content (as this used to via `.blendMode(.overlay)`) reads it as solid
+/// black with only alpha varying, crushing every swatch toward black. Using it as
+/// a `.mask()` reads only its alpha, which is all a mask should ever contribute.
+struct WallpaperPatternPreview: View {
+  let appearance: ChatListAppearance
+
+  var body: some View {
+    if appearance.backgroundMode != "transparent",
+      appearance.wallpaperPatternGradient.count >= 2,
+      appearance.wallpaperPatternOpacity > 0.001,
+      let maskKey = appearance.wallpaperMaskKey, !maskKey.isEmpty,
+      let cgImage = ChatWallpaperMaskStore.image(forKey: maskKey)
+    {
+      patternGradient
+        .mask(
+          Image(decorative: cgImage, scale: 1, orientation: .up)
+            .resizable()
+            .scaledToFill()
+        )
+        .opacity(Double(max(0.04, appearance.wallpaperPatternOpacity)))
+        .allowsHitTesting(false)
+    }
+  }
+
+  private var patternGradient: LinearGradient {
+    LinearGradient(
+      gradient: patternGradientStops, startPoint: .topLeading, endPoint: .bottomTrailing)
+  }
+
+  private var patternGradientStops: Gradient {
+    let colors = appearance.wallpaperPatternGradient.map { Color(uiColor: $0) }
+    if let locations = appearance.wallpaperPatternLocations, locations.count == colors.count {
+      return Gradient(
+        stops: zip(colors, locations).map {
+          Gradient.Stop(color: $0, location: CGFloat($1.doubleValue))
+        }
+      )
+    }
+    return Gradient(colors: colors)
   }
 }
 
@@ -374,6 +428,7 @@ enum AppearanceWallpaperCatalog {
     .init(id: "music2", title: "Pulse", maskKey: "music2", emoji: "🎧"),
     .init(id: "food", title: "Food", maskKey: "food", emoji: "🍕"),
     .init(id: "animals", title: "Animals", maskKey: "animals", emoji: "🐱"),
+    .init(id: "cosmos", title: "Cosmos", maskKey: "cosmos", emoji: "🚀"),
     .init(id: "none", title: "None", maskKey: nil, emoji: "⬛"),
   ]
 }
@@ -381,6 +436,7 @@ enum AppearanceWallpaperCatalog {
 struct ChatWallpaperPickerView: View {
   @Binding var draft: ChatAppearanceDraft
   @Environment(\.colorScheme) private var colorScheme
+  @State private var previewOption: AppearanceWallpaperOption?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -412,7 +468,7 @@ struct ChatWallpaperPickerView: View {
           ForEach(AppearanceWallpaperCatalog.all) { option in
             let selected = selectedId == option.id
             Button {
-              apply(option)
+              previewOption = option
             } label: {
               wallpaperThumb(option: option, selected: selected)
             }
@@ -448,6 +504,13 @@ struct ChatWallpaperPickerView: View {
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Chat Wallpaper")
     .navigationBarTitleDisplayMode(.inline)
+    .sheet(item: $previewOption) { option in
+      WallpaperPreviewSheet(option: option, baseDraft: draft) {
+        apply(option)
+      }
+      .presentationDetents([.fraction(0.92), .large])
+      .presentationDragIndicator(.visible)
+    }
   }
 
   private var selectedId: String {
@@ -457,6 +520,9 @@ struct ChatWallpaperPickerView: View {
     return "none"
   }
 
+  /// Commits a wallpaper selection into the real draft and persists it.
+  /// Only ever called from the preview sheet's "Set" button — tapping a
+  /// grid tile just opens the preview, it never mutates `draft` itself.
   private func apply(_ option: AppearanceWallpaperOption) {
     draft.wallpaperPatternMaskKey = option.maskKey
     if option.maskKey == nil {
@@ -482,6 +548,80 @@ struct ChatWallpaperPickerView: View {
         .background(Capsule().fill(Color.black.opacity(0.45)))
         .padding(8)
     }
-    .frame(height: 110)
+    // Portrait 3:4 tile — matches how a wallpaper actually reads behind a
+    // full chat column, rather than the old near-square crop.
+    .aspectRatio(3.0 / 4.0, contentMode: .fit)
+  }
+}
+
+// MARK: - Wallpaper full-screen preview sheet
+
+/// Large preview of a single wallpaper option, rendered with the same
+/// gradient + mask recipe as `WallpaperPatternPreview`/`ChatAppearanceCanvas`
+/// (a couple of sample bubbles included) so what you see here is exactly
+/// what the chat will look like. `baseDraft` is a snapshot, not the live
+/// binding — dismissing without tapping "Set" never touches the real draft.
+private struct WallpaperPreviewSheet: View {
+  let option: AppearanceWallpaperOption
+  let baseDraft: ChatAppearanceDraft
+  var onSet: () -> Void
+
+  @Environment(\.dismiss) private var dismiss
+
+  private var previewDraft: ChatAppearanceDraft {
+    var next = baseDraft
+    next.wallpaperPatternMaskKey = option.maskKey
+    next.wallpaperPatternOpacity =
+      option.maskKey == nil ? 0 : max(0.12, baseDraft.wallpaperPatternOpacity)
+    next.wallpaperKind = option.maskKey == nil ? "solid" : "gradient"
+    return next
+  }
+
+  var body: some View {
+    ZStack {
+      ChatAppearanceCanvas(draft: previewDraft)
+        .ignoresSafeArea()
+
+      VStack {
+        HStack {
+          Button {
+            dismiss()
+          } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 14, weight: .bold))
+              .foregroundColor(.white)
+              .frame(width: 34, height: 34)
+              .background(Circle().fill(Color.black.opacity(0.4)))
+          }
+          Spacer()
+          Text(option.title)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.white)
+            .shadow(color: .black.opacity(0.4), radius: 4)
+          Spacer()
+          Color.clear.frame(width: 34, height: 34)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+
+        Spacer()
+
+        Button {
+          onSet()
+          dismiss()
+        } label: {
+          Text("Set")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.black.opacity(0.85))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(Capsule().fill(Color.white.opacity(0.92)))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 24)
+      }
+    }
+    .preferredColorScheme(.dark)
   }
 }

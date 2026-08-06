@@ -5,13 +5,14 @@ import UIKit
 // MARK: - Model
 
 enum ChatImageMarkupMode: String, CaseIterable, Identifiable {
-  case draw, sticker, text
+  case draw, sticker, text, ai
   var id: String { rawValue }
   var title: String {
     switch self {
     case .draw: return "Draw"
     case .sticker: return "Sticker"
     case .text: return "Text"
+    case .ai: return "AI"
     }
   }
 }
@@ -89,6 +90,13 @@ final class ChatImageMarkupModel: ObservableObject {
   @Published var isEditing = false
   @Published var showShapeMenu = false
 
+  // AI editing. `aiHasSelection` reflects whether the user has dragged a region
+  // on the image — when false the edit applies to the whole picture.
+  @Published var aiPrompt: String = ""
+  @Published var aiIsWorking = false
+  @Published var aiHasSelection = false
+  @Published var aiCanUndo = false
+
   var uiColor: UIColor {
     UIColor(inkColor).withAlphaComponent(inkOpacity)
   }
@@ -121,6 +129,9 @@ struct ChatImageMarkupToolbar: View {
   var onAddText: () -> Void
   var onOpenStickers: () -> Void
   var onPickShape: (ChatImageShapeKind) -> Void
+  var onAIGenerate: () -> Void = {}
+  var onAIClearSelection: () -> Void = {}
+  var onAIUndo: () -> Void = {}
 
   private let palette: [Color] = [
     .red, .orange, .yellow, .green, .cyan, .blue, .purple, .white,
@@ -134,6 +145,7 @@ struct ChatImageMarkupToolbar: View {
         case .draw: drawStrip
         case .text: textStrip
         case .sticker: stickerHintStrip
+        case .ai: aiStrip
         }
       }
       .frame(minHeight: 72)
@@ -326,6 +338,97 @@ struct ChatImageMarkupToolbar: View {
         .foregroundStyle(Color.accentColor)
     }
     .frame(maxWidth: .infinity, minHeight: 56)
+  }
+
+  // MARK: AI strip — prompt + scope chip, same height as the other strips so
+  // switching tabs never resizes the bar.
+
+  private var aiStrip: some View {
+    HStack(spacing: 10) {
+      scopeChip
+
+      HStack(spacing: 8) {
+        TextField("Describe the edit…", text: $model.aiPrompt)
+          .textFieldStyle(.plain)
+          .font(.system(size: 15))
+          .foregroundStyle(.white)
+          .tint(.white)
+          .submitLabel(.go)
+          .disabled(model.aiIsWorking)
+          .onSubmit { if canGenerate { onAIGenerate() } }
+
+        if model.aiIsWorking {
+          ProgressView()
+            .controlSize(.small)
+            .tint(.white)
+            .transition(.opacity)
+        } else {
+          Button(action: onAIGenerate) {
+            Image(systemName: "arrow.up")
+              .font(.system(size: 14, weight: .bold))
+              .foregroundStyle(canGenerate ? Color.black : Color.white.opacity(0.4))
+              .frame(width: 28, height: 28)
+              .background(
+                Circle().fill(canGenerate ? Color.white : Color.white.opacity(0.12))
+              )
+          }
+          .buttonStyle(.plain)
+          .disabled(!canGenerate)
+        }
+      }
+      .padding(.leading, 14)
+      .padding(.trailing, 6)
+      .padding(.vertical, 6)
+      .background(Capsule().fill(Color.white.opacity(0.10)))
+
+      if model.aiCanUndo && !model.aiIsWorking {
+        Button(action: onAIUndo) {
+          Image(systemName: "arrow.uturn.backward")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 36, height: 36)
+            .background(Color.white.opacity(0.12), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .transition(.scale.combined(with: .opacity))
+      }
+    }
+    .frame(maxWidth: .infinity, minHeight: 56)
+    .animation(.easeInOut(duration: 0.18), value: model.aiIsWorking)
+    .animation(.easeInOut(duration: 0.18), value: model.aiCanUndo)
+    .animation(.easeInOut(duration: 0.18), value: model.aiHasSelection)
+  }
+
+  /// Tapping the chip when a region is set clears it back to whole-image.
+  private var scopeChip: some View {
+    Button {
+      if model.aiHasSelection { onAIClearSelection() }
+    } label: {
+      HStack(spacing: 5) {
+        Image(systemName: model.aiHasSelection ? "viewfinder" : "photo")
+          .font(.system(size: 12, weight: .semibold))
+        Text(model.aiHasSelection ? "Area" : "All")
+          .font(.system(size: 13, weight: .semibold))
+        if model.aiHasSelection {
+          Image(systemName: "xmark")
+            .font(.system(size: 9, weight: .bold))
+            .opacity(0.7)
+        }
+      }
+      .foregroundStyle(model.aiHasSelection ? Color.black : Color.white.opacity(0.75))
+      .padding(.horizontal, 11)
+      .padding(.vertical, 9)
+      .background(
+        Capsule().fill(model.aiHasSelection ? Color.white : Color.white.opacity(0.10))
+      )
+    }
+    .buttonStyle(.plain)
+    .disabled(model.aiIsWorking)
+  }
+
+  private var canGenerate: Bool {
+    !model.aiIsWorking
+      && !model.aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
   private var colorWheelButton: some View {
@@ -588,6 +691,9 @@ final class ChatImageMarkupToolbarHost: UIView {
   var onAddText: (() -> Void)?
   var onOpenStickers: (() -> Void)?
   var onPickShape: ((ChatImageShapeKind) -> Void)?
+  var onAIGenerate: (() -> Void)?
+  var onAIClearSelection: (() -> Void)?
+  var onAIUndo: (() -> Void)?
 
   init(model: ChatImageMarkupModel) {
     self.model = model
@@ -616,7 +722,10 @@ final class ChatImageMarkupToolbarHost: UIView {
       onColorWheel: { [weak self] in self?.onColorWheel?() },
       onAddText: { [weak self] in self?.onAddText?() },
       onOpenStickers: { [weak self] in self?.onOpenStickers?() },
-      onPickShape: { [weak self] k in self?.onPickShape?(k) }
+      onPickShape: { [weak self] k in self?.onPickShape?(k) },
+      onAIGenerate: { [weak self] in self?.onAIGenerate?() },
+      onAIClearSelection: { [weak self] in self?.onAIClearSelection?() },
+      onAIUndo: { [weak self] in self?.onAIUndo?() }
     )
   }
 

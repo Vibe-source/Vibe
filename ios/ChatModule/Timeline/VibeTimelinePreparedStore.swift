@@ -69,6 +69,32 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     let measureMs: Int
   }
 
+  /// What a payload represents, and therefore whether keys missing from it are dead.
+  ///
+  /// The prune used to be unconditional, which silently assumed every caller hands over
+  /// the whole transcript. One does not: the engine's persist choke prepares **the rows
+  /// it just wrote**, so a history page arrives here as 100 rows and every other row in
+  /// the chat looked like a row that no longer exists. Device run 2026-08-05, one open of
+  /// a 1,387-row chat:
+  ///
+  /// ```
+  /// prepared rows=100  fresh=100  carried=1002 ms=64   reason=persist  ← evicted 1002
+  /// prepared rows=1103 fresh=1003 carried=100  ms=595  reason=settle   ← re-measured them
+  /// prepared rows=100  fresh=100  carried=1103 ms=60   reason=persist  ← evicted 1103
+  /// ```
+  ///
+  /// Four pages, and each one threw the transcript's measurements away for the next pass
+  /// to rebuild — ~600ms of duplicated measurement per page, for heights that had just
+  /// been computed. Coverage could never accumulate past whatever the last pass happened
+  /// to be handed.
+  enum Scope {
+    /// Every row the chat has. Keys absent from it are gone, and are pruned.
+    case fullTranscript
+    /// Part of it — a page, or one persist's worth of writes. Contributes heights and
+    /// evicts nothing: a payload that does not mention a row is not evidence about it.
+    case page
+  }
+
   /// Chats kept prepared at once. The MRU list the raster prewarm uses is six; eight
   /// leaves room for the two the user bounces between without letting a long session
   /// accumulate transcripts nothing will open.
@@ -146,7 +172,9 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
   /// Takes raw rows rather than `ChatListRow` on purpose: the parse and the decrypt
   /// are themselves main-thread work at open today, and moving the measurement while
   /// leaving the parse behind would only relocate half the cost.
-  func prepareAsync(chatId: String, rawRows: [[String: Any]], reason: String) {
+  func prepareAsync(
+    chatId: String, rawRows: [[String: Any]], reason: String, scope: Scope
+  ) {
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, !rawRows.isEmpty else { return }
     let width = currentMeasurementWidth
@@ -155,7 +183,8 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // keeps its tail rather than its head.
     let bounded = rawRows.count > Self.maxRows ? Array(rawRows.suffix(Self.maxRows)) : rawRows
     queue.async { [weak self] in
-      self?.prepareNow(chatId: trimmed, rawRows: bounded, width: width, reason: reason)
+      self?.prepareNow(
+        chatId: trimmed, rawRows: bounded, width: width, reason: reason, scope: scope)
     }
   }
 
@@ -164,7 +193,7 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
   /// The list has them; re-serialising them so this could parse them again would be
   /// pure ceremony. Used on the way *out* of a chat, which is the moment the transcript
   /// is final, the main thread is idle, and the next open is the one that pays.
-  func prepareAsync(chatId: String, rows: [ChatListRow], reason: String) {
+  func prepareAsync(chatId: String, rows: [ChatListRow], reason: String, scope: Scope) {
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, !rows.isEmpty else { return }
     let width = currentMeasurementWidth
@@ -173,7 +202,8 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // copied across a queue boundary only to have most of it thrown away.
     let bounded = rows.count > Self.maxRows ? Array(rows.suffix(Self.maxRows)) : rows
     queue.async { [weak self] in
-      self?.prepareNow(chatId: trimmed, rows: bounded, width: width, reason: reason)
+      self?.prepareNow(
+        chatId: trimmed, rows: bounded, width: width, reason: reason, scope: scope)
     }
   }
 
@@ -181,7 +211,8 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
   /// exposed at this level so a test can assert the result without a queue hop.
   @discardableResult
   func prepareNow(
-    chatId: String, rawRows: [[String: Any]], width: CGFloat, reason: String
+    chatId: String, rawRows: [[String: Any]], width: CGFloat, reason: String,
+    scope: Scope = .fullTranscript
   ) -> Prepared? {
     var rows: [ChatListRow] = []
     rows.reserveCapacity(rawRows.count)
@@ -189,12 +220,13 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
       guard let row = ChatListRow(raw: raw) else { continue }
       rows.append(row)
     }
-    return prepareNow(chatId: chatId, rows: rows, width: width, reason: reason)
+    return prepareNow(chatId: chatId, rows: rows, width: width, reason: reason, scope: scope)
   }
 
   @discardableResult
   func prepareNow(
-    chatId: String, rows: [ChatListRow], width: CGFloat, reason: String
+    chatId: String, rows: [ChatListRow], width: CGFloat, reason: String,
+    scope: Scope = .fullTranscript
   ) -> Prepared? {
     guard width > 0, !rows.isEmpty else { return nil }
     let started = ProcessInfo.processInfo.systemUptime
@@ -236,9 +268,31 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // A row that measured cleanly this time is no longer deferred.
     deferredKeys.subtract(pending.map(\.key).filter { measured.byKey[$0] != nil })
 
-    // Ordering follows the rows just handed over — that is the live transcript order —
-    // but heights carried in from earlier passes stay usable for rows outside it.
-    let orderedKeys = rows.map(\.key)
+    // Which measurements survive this pass — and that depends on what the payload *is*.
+    // See ``Scope``: only a full transcript is evidence that an absent row is gone, so
+    // only a full transcript prunes. A page adds.
+    let payloadKeys = rows.map(\.key)
+    var orderedKeys: [String]
+    switch scope {
+    case .fullTranscript:
+      orderedKeys = payloadKeys
+    case .page:
+      // Transcript order comes from the last full pass — a page knows its own rows, not
+      // where they sit — with anything new appended so its heights are retained. The
+      // list reads this store by key (``preparedRow``), never by position, so a page's
+      // placement here costs nothing; the next full pass restores true order.
+      var merged = existing?.orderedKeys ?? []
+      var seen = Set(merged)
+      for key in payloadKeys where seen.insert(key).inserted {
+        merged.append(key)
+      }
+      orderedKeys = merged
+    }
+    // The memory bound applies to the union, or a chat drained page by page would grow
+    // without limit. Least-recently-prepared goes first.
+    if orderedKeys.count > Self.maxRows {
+      orderedKeys = Array(orderedKeys.suffix(Self.maxRows))
+    }
     let liveKeys = Set(orderedKeys)
     heightsByKey = heightsByKey.filter { liveKeys.contains($0.key) }
     rowsByKey = rowsByKey.filter { liveKeys.contains($0.key) }
@@ -277,10 +331,11 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // are needed: the old line printed only a count that happened to equal the cap on
     // every pass, which read as healthy while coverage never moved.
     NSLog(
-      "[VibeCore] prepared chat=%@ rows=%d sized=%d fresh=%d carried=%d deferred=%d width=%.0f ms=%d reason=%@ total=%d",
+      "[VibeCore] prepared chat=%@ rows=%d sized=%d fresh=%d carried=%d deferred=%d width=%.0f ms=%d reason=%@ scope=%@ total=%d",
       String(chatId.prefix(12)), rows.count, prepared.heightsByKey.count,
       pending.count, (existing?.heightsByKey.count ?? 0),
-      prepared.deferredKeys.count, width, prepared.measureMs, reason, total)
+      prepared.deferredKeys.count, width, prepared.measureMs, reason,
+      scope == .fullTranscript ? "full" : "page", total)
     return prepared
   }
 

@@ -609,6 +609,12 @@ struct ChatRoute: Identifiable, Hashable {
     // Route creation IS the tap: anchor every [ChatOpen] host-stage log to it so the
     // full tap→settled timeline reads out of one log stream.
     VibeChatOpenTap.uptime = ProcessInfo.processInfo.systemUptime
+    // Same anchor, durable copy. `initial` is the row's own preview payload — when the
+    // open ends up empty, this is the first thing worth knowing: whether Home handed
+    // the chat any content to start from at all.
+    VibeOpenTrace.shared.begin(
+      chatId: row.chatId,
+      detail: "initial=\(row.initialMessages.isEmpty ? row.previewRows.count : row.initialMessages.count)")
     // Groups never resolve to a bridge agent — even if a stale/cached row leaked an
     // agent peerUserId (pre-fix "group opens Codex" bug). See the designated init.
     let resolvedBridge =
@@ -10119,8 +10125,19 @@ final class ChatProfileRootController: UIViewController {
       name: ChatEngine.didChangeNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceDraftChanged(_:)),
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
     applyRoute()
     refreshRows()
+  }
+
+  /// Repaint on wallpaper/theme edits instead of waiting for the next push.
+  @objc private func handleAppearanceDraftChanged(_ notification: Notification) {
+    profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
   }
 
   deinit {
@@ -10656,6 +10673,15 @@ final class ChatConversationController: UIViewController {
       name: AgentBridgeSelectionStore.didChangeNotification,
       object: nil
     )
+    // Wallpaper/theme edits land in ChatAppearanceDraftStore, which posts this. Without
+    // an observer the surface only re-read appearance inside `applyRoute`, so a chat that
+    // was already on screen kept the OLD wallpaper until it was pushed again.
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceDraftChanged(_:)),
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
 
     let applyRouteStartedAt = ProcessInfo.processInfo.systemUptime
     applyRoute(forceChannelRefresh: true)
@@ -10704,6 +10730,11 @@ final class ChatConversationController: UIViewController {
       Int((rowsDoneAt - appearanceDoneAt) * 1000),
       Int((ProcessInfo.processInfo.systemUptime - rowsDoneAt) * 1000),
       VibeChatOpenTap.msSinceTap())
+    // The push has begun. Without this the durable timeline jumps straight from
+    // `prestage` to `complete` — 600ms on a large chat, most of it main-thread-blocked,
+    // with no way to tell how much was spent getting to the transition and how much was
+    // the transition itself.
+    VibeOpenTrace.shared.mark("will-appear")
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -10712,6 +10743,7 @@ final class ChatConversationController: UIViewController {
     hasAppeared = true
     NSLog(
       "[ChatOpen] host-stage viewDidAppear sinceTapMs=%d", VibeChatOpenTap.msSinceTap())
+    VibeOpenTrace.shared.mark("did-appear")
     logLifecycle("viewDidAppear")
     logVisualState("viewDidAppear", force: true)
     applyPendingAppearanceAfterAttachment(reason: "viewDidAppear")
@@ -12898,6 +12930,17 @@ final class ChatConversationController: UIViewController {
   @objc private func handleAgentBridgeSelectionChanged(_ notification: Notification) {
     guard route.bridgeProvider?.isEmpty == false else { return }
     refreshHeaderState()
+  }
+
+  /// Repaint immediately when the wallpaper/theme draft is edited, so a chat that is
+  /// already on screen picks the change up on selection instead of on the next push.
+  /// Off-screen surfaces defer to attachment, which is what `applyRoute` would have done.
+  @objc private func handleAppearanceDraftChanged(_ notification: Notification) {
+    applySurfaceAppearance(
+      Self.resolvedAppearance(isDark: isDark),
+      reason: "appearanceDraftChanged",
+      allowDeferUntilAttached: true
+    )
   }
 
   private static func isOnline(for route: ChatRoute) -> Bool {
@@ -16484,6 +16527,15 @@ final class ChatAgentConversationController: UIViewController {
 
     let appearance: [String: Any] = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
 
+    // Same live-repaint contract as ChatConversationController: without this the agent
+    // chat keeps whatever wallpaper it was built with until it is rebuilt.
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceDraftChanged(_:)),
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
+
     // Headless transport: in the hierarchy so it gets a window and connects the
     // agent socket, but not a second full-screen chat UI. Full-screen + local
     // message list + blur layers here previously doubled memory with ChatMainView
@@ -16550,6 +16602,11 @@ final class ChatAgentConversationController: UIViewController {
     super.viewWillAppear(animated)
     navigationController?.setNavigationBarHidden(true, animated: false)
     mainView.setGeometryFrozenForDismissal(false)
+  }
+
+  /// Repaint on wallpaper/theme edits instead of waiting to be rebuilt.
+  @objc private func handleAppearanceDraftChanged(_ notification: Notification) {
+    mainView.setAppearance(ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark))
   }
 
   /// Stage the local persisted agent transcript at the real destination bounds before

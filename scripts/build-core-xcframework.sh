@@ -3,6 +3,18 @@ set -euo pipefail
 
 CRATE_NAME="vibe_core_ffi"
 LIB_NAME="libvibe_core_ffi.a"
+# Bindings are generated from the .dylib, not the .a the framework ships.
+#
+# Both are built from the same source with the same features, so they describe
+# the same interface — but the release profile is `lto = true, codegen-units =
+# 1`, which collapses the crate into a single ~9MB archive member, and
+# uniffi-bindgen's archive reader fails on it ("Failed to extract data from
+# archive member ...rcgu.o"). It only started failing when openmls and rusqlite
+# were linked in and that member grew. Reading the Mach-O directly skips the
+# archive parser entirely and keeps the property that matters: the interface is
+# recovered from compiled metadata, so it can never describe an export the
+# binary does not have.
+BINDGEN_LIB_NAME="libvibe_core_ffi.dylib"
 FRAMEWORK_NAME="VibeCoreFFI"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE_DIR="$REPO_ROOT/core/$CRATE_NAME"
@@ -86,7 +98,7 @@ generate_bindings() {
         CARGO_TARGET_DIR="$BUILD_DIR" cargo run --release --quiet \
             --bin uniffi-bindgen -- \
             generate \
-            --library "$BUILD_DIR/aarch64-apple-ios/release/$LIB_NAME" \
+            --library "$BUILD_DIR/aarch64-apple-ios/release/$BINDGEN_LIB_NAME" \
             --language swift \
             --out-dir "$GENERATED_DIR"
     )
