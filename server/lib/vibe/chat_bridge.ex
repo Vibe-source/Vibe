@@ -10,7 +10,7 @@ defmodule Vibe.ChatBridge do
   alias Vibe.Chat.MessageRead
   alias Vibe.Repo
   alias Vibe.RepoRLS
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
 
   @poll_limit 200
   @long_poll_timeout_ms 25_000
@@ -868,7 +868,7 @@ defmodule Vibe.ChatBridge do
     normalize_integer(Map.get(message, :timestamp) || Map.get(message, "timestamp")) || 0
   end
 
-  defp rewrite_media_url(url), do: SupabaseStorage.rewrite_public_url(url)
+  defp rewrite_media_url(url), do: Storage.rewrite_public_url(url)
 
   defp ms_to_naive(ms) when is_integer(ms) do
     ms

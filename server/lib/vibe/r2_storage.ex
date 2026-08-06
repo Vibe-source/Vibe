@@ -101,25 +101,40 @@ defmodule Vibe.R2Storage do
   def configured?, do: configured?(get_config())
 
   @doc """
-  Rewrite a stored URL onto the configured public base.
+  Rewrite an R2 object URL onto the configured public base.
 
-  Mirrors `Vibe.SupabaseStorage.rewrite_public_url/1`. Returns `url` unchanged
-  when no public base is configured: an unrewritten URL may be wrong, but a URL
-  rewritten onto a base that does not exist is *certainly* wrong, and the
-  unchanged value at least keeps whatever already worked working.
+  **Only touches URLs that belong to this account's R2 endpoint.** Anything
+  else — most importantly the Supabase URLs already stored against existing
+  media — is returned unchanged. Rewriting by path alone would point every
+  legacy URL at R2, where those objects do not exist, turning working media
+  into 404s at the moment the backend flips.
+
+  Returns `url` unchanged when no public base is configured too: an unrewritten
+  URL may be suboptimal, but a URL rewritten onto a base that does not exist is
+  certainly broken.
   """
   def rewrite_public_url(url) when is_binary(url) do
     config = get_config()
 
     with true <- present?(config.public_base_url),
-         %URI{path: path} when is_binary(path) <- URI.parse(url) do
-      String.trim_trailing(config.public_base_url, "/") <> path
+         %URI{host: host, path: path} when is_binary(host) and is_binary(path) <- URI.parse(url),
+         true <- r2_host?(host, config) do
+      # The endpoint form is `<account>.r2.cloudflarestorage.com/<bucket>/<key>`
+      # while the public base already addresses the bucket, so the bucket
+      # segment has to come off or it ends up in the path twice.
+      key = String.replace_prefix(path, "/#{config.bucket}", "")
+      String.trim_trailing(config.public_base_url, "/") <> key
     else
       _ -> url
     end
   end
 
   def rewrite_public_url(url), do: url
+
+  defp r2_host?(host, config) do
+    host == "#{config.account_id}.r2.cloudflarestorage.com" or
+      String.ends_with?(host, ".r2.cloudflarestorage.com")
+  end
 
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_), do: false

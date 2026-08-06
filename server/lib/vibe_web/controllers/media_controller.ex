@@ -5,7 +5,7 @@ defmodule VibeWeb.MediaController do
   """
   use VibeWeb, :controller
 
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
 
   require Logger
 
@@ -44,7 +44,7 @@ defmodule VibeWeb.MediaController do
         # Stored inside the configured media bucket (default: "chat-media").
         remote_path = "#{user_id}/#{timestamp}_#{random}#{ext}"
 
-        case SupabaseStorage.upload(upload.path, remote_path, bucket: :media) do
+        case Storage.upload(upload.path, remote_path, bucket: :media) do
           {:ok, public_url} ->
             Logger.info("[MediaController] Uploaded to: #{public_url}")
             json(conn, %{url: public_url, size: size, type: media_type})
