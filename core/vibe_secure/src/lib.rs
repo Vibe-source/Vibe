@@ -73,6 +73,7 @@ mod identity;
 mod padding;
 mod provider;
 mod session;
+mod trust;
 
 pub use envelope::{VIBE_MLS_MAX_CIPHERTEXT, VIBE_MLS_SEALED_PREFIX};
 pub use error::VibeSecureError;
@@ -80,6 +81,9 @@ pub use identity::{VibeDeviceIdentity, VibeKeyPackageBundle};
 pub use padding::{VibePaddingError, VIBE_PAD_BUCKETS};
 pub use provider::VibeSecureProvider;
 pub use session::{VibeCommitOutput, VibeSecureSession};
+pub use trust::{
+    inspect_key_package, vibe_safety_number, VibeKeyPackageIdentity, VIBE_SAFETY_NUMBER_DIGITS,
+};
 
 /// The one ciphersuite this build speaks: X25519 for key agreement, AES-128-GCM
 /// for the AEAD, SHA-256 for the key schedule's hash, Ed25519 for signatures.

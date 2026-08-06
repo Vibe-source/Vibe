@@ -176,6 +176,42 @@ final class VibeSecureSessions {
     }
   }
 
+  /// Validates a peer's KeyPackage and reads the identity it claims.
+  ///
+  /// `nil` means the bytes did not survive validation — malformed, wrong
+  /// ciphersuite, bad signature. A non-nil result is *not* proof the key
+  /// belongs to the person you asked for; that is what `VibeSecureTrust` is
+  /// for.
+  func inspectKeyPackage(_ keyPackage: Data) -> VibeFfiKeyPackageIdentity? {
+    queue.sync {
+      guard let identity = identityHandleLocked() else { return nil }
+      do {
+        return try identity.inspectKeyPackage(keyPackage: keyPackage)
+      } catch {
+        VibeLog.error("[VibeSecure] key package inspect failed: \(error)")
+        return nil
+      }
+    }
+  }
+
+  /// This device's public signature key — our half of any safety number.
+  func mySignatureKey() -> Data? {
+    queue.sync {
+      guard let identity = identityHandleLocked() else { return nil }
+      return try? identity.signatureKey()
+    }
+  }
+
+  /// The safety number to compare with `peerUserId`, or `nil` before either
+  /// side's key is known.
+  func safetyNumber(peerUserId: String) -> String? {
+    guard
+      let mine = mySignatureKey(),
+      let theirs = VibeSecureTrust.pinnedKey(userId: peerUserId)
+    else { return nil }
+    return VibeSecureTrust.safetyNumber(myKey: mine, peerKey: theirs)
+  }
+
   /// Registers a session established elsewhere (group creation or a Welcome).
   func register(session: VibeSecureSessionHandle, chatId: String) {
     queue.sync { sessions[chatId] = session }
@@ -274,6 +310,58 @@ final class VibeSecureSessions {
         VibeLog.error("[VibeSecure] session join failed for \(chatId): \(error)")
         return nil
       }
+    }
+  }
+
+  // ── Own-message plaintext ───────────────────────────────────────────────
+  //
+  // A sender cannot decrypt its own MLS message. `create_message` encrypts to
+  // the group's *other* members and OpenMLS refuses to process a message the
+  // caller authored — pinned by
+  // `a_sender_cannot_open_its_own_message_so_platforms_must_keep_the_plaintext`.
+  //
+  // The old hybrid envelope hid this: it was dual-wrapped, so the sender could
+  // open its own. MLS is not, so when the server echoes a sent message back and
+  // the engine re-parses `encryptedContent`, `open` fails and the row renders
+  // empty. That is not corruption — the peer reads it fine — it is the sender
+  // asking a question that has no answer.
+  //
+  // So the plaintext is kept here at seal time. Persisted, because the echo can
+  // arrive after a relaunch and because scrolling back through your own history
+  // must not go blank.
+
+  /// How many of our own messages keep a retained plaintext.
+  ///
+  /// Bounded because this grows with every message sent and never shrinks on
+  /// its own. Beyond the bound the oldest entries drop and those rows fall back
+  /// to the locally cached history row, which already carries the text — the
+  /// bound costs fidelity in a rare path, not correctness.
+  private static let ownPlaintextLimit = 5000
+
+  private static let ownPlaintextKey = "vibe.mls.ownPlaintext"
+  private static let ownPlaintextOrderKey = "vibe.mls.ownPlaintext.order"
+
+  /// Retains our own plaintext for `messageId`.
+  func rememberOwnPlaintext(_ plaintext: String, messageId: String) {
+    queue.sync {
+      var store = UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
+      var order = UserDefaults.standard.stringArray(forKey: Self.ownPlaintextOrderKey) ?? []
+      if store[messageId] == nil { order.append(messageId) }
+      store[messageId] = plaintext
+      while order.count > Self.ownPlaintextLimit {
+        let evicted = order.removeFirst()
+        store.removeValue(forKey: evicted)
+      }
+      UserDefaults.standard.set(store, forKey: Self.ownPlaintextKey)
+      UserDefaults.standard.set(order, forKey: Self.ownPlaintextOrderKey)
+    }
+  }
+
+  /// The plaintext we retained for one of our own messages, if we still have it.
+  func ownPlaintext(messageId: String) -> String? {
+    queue.sync {
+      (UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String])?[
+        messageId]
     }
   }
 

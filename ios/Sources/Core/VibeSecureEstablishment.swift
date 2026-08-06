@@ -147,6 +147,15 @@ enum VibeSecureEstablishment {
           return
         }
 
+        // Check who this KeyPackage actually belongs to before letting it into
+        // a group. The server chose these bytes, and MLS does not make the
+        // server honest — a substituted KeyPackage is a working MITM that
+        // nothing else here would notice.
+        guard case .trusted = verifyPeer(keyPackage: keyPackage, peerUserId: peerUserId) else {
+          finish(false)
+          return
+        }
+
         // Create only after the claim succeeds. Creating first would leave a
         // real group on disk for a chat that never got a second member, and
         // `hasSession` would then report a session that nobody else can read.
@@ -189,6 +198,45 @@ enum VibeSecureEstablishment {
           finish(true)
         }
       }
+    }
+  }
+
+  // ── Trust ───────────────────────────────────────────────────────────────
+
+  enum PeerCheck: Equatable {
+    case trusted
+    /// The peer's identity key is not the one we pinned. Establishment stops.
+    case identityChanged
+    /// The KeyPackage did not validate at all — malformed, wrong ciphersuite,
+    /// or a bad signature.
+    case unreadable
+  }
+
+  /// Validates a claimed KeyPackage and compares its identity against the pin.
+  ///
+  /// Fails closed on `identityChanged`. That will occasionally block a peer who
+  /// legitimately reinstalled, and that is the correct trade: the alternative
+  /// is accepting any key the server offers, which is precisely the attack.
+  /// Clearing it is a deliberate human act — `VibeSecureTrust.acceptChange` —
+  /// ideally after comparing a safety number.
+  static func verifyPeer(keyPackage: Data, peerUserId: String) -> PeerCheck {
+    guard let identity = VibeSecureSessions.shared.inspectKeyPackage(keyPackage) else {
+      VibeLog.error("[VibeSecure] peer KeyPackage failed validation for \(peerUserId)")
+      return .unreadable
+    }
+    switch VibeSecureTrust.evaluate(signatureKey: identity.signatureKey, userId: peerUserId) {
+    case .pinnedOnFirstContact:
+      VibeLog.info("[VibeSecure] pinned identity for \(peerUserId) on first contact")
+      return .trusted
+    case .matchesPin:
+      return .trusted
+    case .changed:
+      // Loud, because this is either a reinstall or someone in the middle and
+      // the two look identical from here.
+      VibeLog.error(
+        "[VibeSecure] IDENTITY CHANGED for \(peerUserId) — refusing to establish. "
+          + "Verify the safety number before accepting.")
+      return .identityChanged
     }
   }
 
@@ -334,7 +382,13 @@ enum VibeSecureEstablishment {
         token: token, body: nil
       ) { object in
         if let encoded = object?["keyPackage"] as? String,
-          let data = Data(base64Encoded: encoded)
+          let data = Data(base64Encoded: encoded),
+          // Same pin check as a DM. A group is only as private as its least
+          // verified member, so one substituted KeyPackage here reads the whole
+          // conversation — and because establishment is all-or-nothing, a
+          // failure just leaves the group unestablished rather than silently
+          // admitting an impostor.
+          verifyPeer(keyPackage: data, peerUserId: userId) == .trusted
         {
           claimed[userId] = data
         }

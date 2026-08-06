@@ -122,6 +122,35 @@ impl VibeSecureIdentityHandle {
         })
     }
 
+    /// This device's public signature key — our half of a safety number, and
+    /// the value peers pin for us.
+    pub fn signature_key(&self) -> Vec<u8> {
+        self.identity.signature_key()
+    }
+
+    /// Reads the identity out of a peer's KeyPackage, validating it first.
+    ///
+    /// Call this **before** `add_members`. The bytes come from the server,
+    /// which is not trusted: an `Ok` here means the KeyPackage is well-formed,
+    /// uses the expected ciphersuite, and is self-consistently signed — it does
+    /// *not* mean the key belongs to the person you asked for. Comparing
+    /// `signatureKey` against what was pinned on first contact is what turns
+    /// substitution from an anytime attack into a first-contact-only one, and
+    /// the safety number is what closes even that.
+    pub fn inspect_key_package(
+        &self,
+        key_package: Vec<u8>,
+    ) -> Result<VibeFfiKeyPackageIdentity, VibeFfiError> {
+        self.with_provider(|provider| {
+            vibe_secure::inspect_key_package(&key_package, provider).map(|identity| {
+                VibeFfiKeyPackageIdentity {
+                    credential_identity: identity.credential_identity,
+                    signature_key: identity.signature_key,
+                }
+            })
+        })
+    }
+
     /// Reloads a persisted group, or `None` if this store has never held one.
     ///
     /// `None` is an ordinary answer — a fresh install, or a chat never
@@ -148,6 +177,29 @@ impl VibeSecureIdentityHandle {
             })
         }))
     }
+}
+
+/// Who a KeyPackage claims to be, and the key that claim is bound to.
+///
+/// `signatureKey` is what the platform pins. `credentialIdentity` is the device
+/// id the peer chose and is **not** an authorization input — anyone can put any
+/// string in a BasicCredential; it is for display only.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct VibeFfiKeyPackageIdentity {
+    pub credential_identity: Vec<u8>,
+    pub signature_key: Vec<u8>,
+}
+
+/// The safety number two people compare out of band to prove nobody is in the
+/// middle.
+///
+/// Order-independent: both sides pass their own key and the peer's in whatever
+/// order they have them and get the same digits, because neither can know who
+/// is "first" during a phone call. Pure function of two public keys — see
+/// `vibe_secure::trust`.
+#[uniffi::export]
+pub fn vibe_safety_number(key_a: Vec<u8>, key_b: Vec<u8>) -> String {
+    vibe_secure::vibe_safety_number(&key_a, &key_b)
 }
 
 /// The two messages an `add_members` commit produces.

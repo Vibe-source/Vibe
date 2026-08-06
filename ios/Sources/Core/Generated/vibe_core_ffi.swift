@@ -1580,6 +1580,19 @@ public protocol VibeSecureIdentityHandleProtocol : AnyObject {
     func deviceId()  -> String
     
     /**
+     * Reads the identity out of a peer's KeyPackage, validating it first.
+     *
+     * Call this **before** `add_members`. The bytes come from the server,
+     * which is not trusted: an `Ok` here means the KeyPackage is well-formed,
+     * uses the expected ciphersuite, and is self-consistently signed — it does
+     * *not* mean the key belongs to the person you asked for. Comparing
+     * `signatureKey` against what was pinned on first contact is what turns
+     * substitution from an anytime attack into a first-contact-only one, and
+     * the safety number is what closes even that.
+     */
+    func inspectKeyPackage(keyPackage: Data) throws  -> VibeFfiKeyPackageIdentity
+    
+    /**
      * Serialized KeyPackage, for publication so a peer can add this device.
      *
      * **Single-use.** MLS consumes a KeyPackage's one-time init key when it
@@ -1606,6 +1619,12 @@ public protocol VibeSecureIdentityHandleProtocol : AnyObject {
      * have to tell that apart from a genuine store failure.
      */
     func loadSession(groupId: Data) throws  -> VibeSecureSessionHandle?
+    
+    /**
+     * This device's public signature key — our half of a safety number, and
+     * the value peers pin for us.
+     */
+    func signatureKey()  -> Data
     
 }
 
@@ -1706,6 +1725,25 @@ open func deviceId() -> String {
 }
     
     /**
+     * Reads the identity out of a peer's KeyPackage, validating it first.
+     *
+     * Call this **before** `add_members`. The bytes come from the server,
+     * which is not trusted: an `Ok` here means the KeyPackage is well-formed,
+     * uses the expected ciphersuite, and is self-consistently signed — it does
+     * *not* mean the key belongs to the person you asked for. Comparing
+     * `signatureKey` against what was pinned on first contact is what turns
+     * substitution from an anytime attack into a first-contact-only one, and
+     * the safety number is what closes even that.
+     */
+open func inspectKeyPackage(keyPackage: Data)throws  -> VibeFfiKeyPackageIdentity {
+    return try  FfiConverterTypeVibeFfiKeyPackageIdentity.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_inspect_key_package(self.uniffiClonePointer(),
+        FfiConverterData.lower(keyPackage),$0
+    )
+})
+}
+    
+    /**
      * Serialized KeyPackage, for publication so a peer can add this device.
      *
      * **Single-use.** MLS consumes a KeyPackage's one-time init key when it
@@ -1740,6 +1778,17 @@ open func loadSession(groupId: Data)throws  -> VibeSecureSessionHandle? {
     return try  FfiConverterOptionTypeVibeSecureSessionHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_load_session(self.uniffiClonePointer(),
         FfiConverterData.lower(groupId),$0
+    )
+})
+}
+    
+    /**
+     * This device's public signature key — our half of a safety number, and
+     * the value peers pin for us.
+     */
+open func signatureKey() -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_method_vibesecureidentityhandle_signature_key(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3278,6 +3327,79 @@ public func FfiConverterTypeVibeFfiDelta_lift(_ buf: RustBuffer) throws -> VibeF
 #endif
 public func FfiConverterTypeVibeFfiDelta_lower(_ value: VibeFfiDelta) -> RustBuffer {
     return FfiConverterTypeVibeFfiDelta.lower(value)
+}
+
+
+/**
+ * Who a KeyPackage claims to be, and the key that claim is bound to.
+ *
+ * `signatureKey` is what the platform pins. `credentialIdentity` is the device
+ * id the peer chose and is **not** an authorization input — anyone can put any
+ * string in a BasicCredential; it is for display only.
+ */
+public struct VibeFfiKeyPackageIdentity {
+    public var credentialIdentity: Data
+    public var signatureKey: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(credentialIdentity: Data, signatureKey: Data) {
+        self.credentialIdentity = credentialIdentity
+        self.signatureKey = signatureKey
+    }
+}
+
+
+
+extension VibeFfiKeyPackageIdentity: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiKeyPackageIdentity, rhs: VibeFfiKeyPackageIdentity) -> Bool {
+        if lhs.credentialIdentity != rhs.credentialIdentity {
+            return false
+        }
+        if lhs.signatureKey != rhs.signatureKey {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(credentialIdentity)
+        hasher.combine(signatureKey)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiKeyPackageIdentity: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiKeyPackageIdentity {
+        return
+            try VibeFfiKeyPackageIdentity(
+                credentialIdentity: FfiConverterData.read(from: &buf), 
+                signatureKey: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiKeyPackageIdentity, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.credentialIdentity, into: &buf)
+        FfiConverterData.write(value.signatureKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyPackageIdentity_lift(_ buf: RustBuffer) throws -> VibeFfiKeyPackageIdentity {
+    return try FfiConverterTypeVibeFfiKeyPackageIdentity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiKeyPackageIdentity_lower(_ value: VibeFfiKeyPackageIdentity) -> RustBuffer {
+    return FfiConverterTypeVibeFfiKeyPackageIdentity.lower(value)
 }
 
 
@@ -5985,6 +6107,23 @@ fileprivate struct FfiConverterSequenceOptionData: FfiConverterRustBuffer {
         return seq
     }
 }
+/**
+ * The safety number two people compare out of band to prove nobody is in the
+ * middle.
+ *
+ * Order-independent: both sides pass their own key and the peer's in whatever
+ * order they have them and get the same digits, because neither can know who
+ * is "first" during a phone call. Pure function of two public keys — see
+ * `vibe_secure::trust`.
+ */
+public func vibeSafetyNumber(keyA: Data, keyB: Data) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_func_vibe_safety_number(
+        FfiConverterData.lower(keyA),
+        FfiConverterData.lower(keyB),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -6000,6 +6139,9 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_vibe_core_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_safety_number() != 16482) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibecorehandle_clear_chat() != 26894) {
         return InitializationResult.apiChecksumMismatch
@@ -6061,10 +6203,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_device_id() != 11425) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_inspect_key_package() != 61823) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_key_package() != 48910) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_load_session() != 42463) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecureidentityhandle_signature_key() != 31110) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_add_members() != 56357) {

@@ -38,6 +38,9 @@ openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 base64 = "0.22"
+# Safety-number derivation (trust.rs). Not used for any message crypto —
+# that all lives inside OpenMLS.
+sha2 = "0.10"
 
 # SQLite-backed OpenMLS storage (`provider.rs`). Pinned to 0.2.0 deliberately:
 # it depends on `openmls_traits ^0.5.0`, matching the pin above. The 0.3.0-rc.x

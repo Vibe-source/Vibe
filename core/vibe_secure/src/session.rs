@@ -68,7 +68,7 @@ use crate::VIBE_SECURE_CIPHERSUITE;
 /// here." Do not reach for this where `f` has `&mut` access to
 /// [`VibeSecureSession`]'s group -- that is [`VibeSecureSession::with_group`],
 /// deliberately a different function with a different failure mode.
-fn catch_untrusted<T>(
+pub(crate) fn catch_untrusted<T>(
     on_panic: VibeSecureError,
     f: impl FnOnce() -> T,
 ) -> Result<T, VibeSecureError> {

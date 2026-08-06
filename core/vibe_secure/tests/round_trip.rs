@@ -274,3 +274,42 @@ fn the_vmls1_prefix_is_required() {
     let result = bob_session.open(&bare, &bob_provider);
     assert_eq!(result, Err(VibeSecureError::MalformedEnvelope));
 }
+
+/// A sender **cannot** open its own message, and that is correct MLS.
+///
+/// `create_message` produces a PrivateMessage encrypted to the group's other
+/// members; OpenMLS refuses to process a message the caller authored. This is
+/// pinned as a test because it is a load-bearing constraint on every platform
+/// built on this crate, not a quirk: the platform re-parses `encryptedContent`
+/// when the server echoes a sent message back, so anything that decrypts to
+/// display **must** keep the sender's own plaintext locally instead of asking
+/// this function. Vibe learned that the hard way — own messages rendered as
+/// empty bubbles. See `VibeSecureSessions.rememberOwnPlaintext`.
+#[test]
+fn a_sender_cannot_open_its_own_message_so_platforms_must_keep_the_plaintext() {
+    let alice_provider = provider();
+    let bob_provider = provider();
+    let alice_identity = identity("alice-device-1", &alice_provider);
+    let bob_identity = identity("bob-device-1", &bob_provider);
+
+    let (mut alice_session, mut bob_session) = paired_dm(
+        &alice_identity,
+        &alice_provider,
+        &bob_identity,
+        &bob_provider,
+    );
+
+    let sealed = alice_session
+        .seal(&alice_identity, b"hello", &alice_provider)
+        .expect("alice seals");
+
+    assert!(
+        alice_session.open(&sealed, &alice_provider).is_err(),
+        "if this ever starts succeeding, the platform's own-plaintext cache can be removed"
+    );
+    // The peer, of course, reads it fine — the message is not corrupt.
+    assert_eq!(
+        bob_session.open(&sealed, &bob_provider).expect("bob opens"),
+        b"hello"
+    );
+}

@@ -78,7 +78,9 @@ use base64::Engine as _;
 
 use crate::crypto::VibeAeadProvider;
 use crate::error::VibeCryptoError;
-use crate::secret::{VibeNonce, VibePlaintext, VibeSecretKey, VIBE_NONCE_LEN, VIBE_TAG_LEN};
+use crate::secret::{
+    VibeNonce, VibePlaintext, VibeSecretKey, VIBE_KEY_LEN, VIBE_NONCE_LEN, VIBE_TAG_LEN,
+};
 
 /// Prefix of the group envelope. Recognised by prefix, like `arte1.`.
 pub const VIBE_GROUP_SEALED_PREFIX: &str = "vgrp2.";
@@ -414,6 +416,25 @@ pub fn open_group(
         .map_err(VibeGroupError::from)
 }
 
+/// Mints a fresh epoch key from the operating-system CSPRNG.
+///
+/// This is the only function in the module that yields raw key material, and it
+/// does so because the device opening a new epoch is the device that has to hand
+/// that key to every member. Everything else here is write-only: a
+/// [`VibeGroupKeyring`] takes keys and never gives them back.
+///
+/// It exists so key generation cannot be open-coded at a call site. An epoch key
+/// drawn from a weak source is not a degraded encryption — it is no encryption,
+/// and it fails *silently*: every message still seals, still opens, and is still
+/// readable by anyone who can reproduce the guess. Keeping the one legitimate
+/// source of key material beside the code that consumes it is what makes that
+/// mistake unavailable rather than merely discouraged.
+pub fn mint_epoch_key() -> Result<[u8; VIBE_KEY_LEN], VibeCryptoError> {
+    let mut bytes = [0u8; VIBE_KEY_LEN];
+    getrandom::fill(&mut bytes).map_err(|_| VibeCryptoError::RandomnessUnavailable)?;
+    Ok(bytes)
+}
+
 /// Seals a group message under the authorized epoch's key.
 ///
 /// Takes a [`VibeGroupSealAuthorization`] rather than a bare epoch so that
@@ -600,6 +621,48 @@ mod tests {
         assert_ne!(
             a, b,
             "identical plaintext must not produce identical output"
+        );
+    }
+
+    #[test]
+    fn a_minted_epoch_key_is_full_length_and_never_repeats() {
+        let a = mint_epoch_key().expect("mint");
+        let b = mint_epoch_key().expect("mint");
+
+        assert_eq!(a.len(), VIBE_KEY_LEN, "an epoch key must be a full AES-256 key");
+        assert_ne!(
+            a, b,
+            "two mints returning the same key would mean the RNG is not wired to anything"
+        );
+        assert_ne!(
+            a,
+            [0u8; VIBE_KEY_LEN],
+            "an all-zero key is what a silently-failing RNG returns, and it would still seal and open"
+        );
+    }
+
+    #[test]
+    fn a_minted_key_actually_encrypts_under_this_module() {
+        // Mint, install, round-trip. Without this the mint could return
+        // well-formed bytes that the keyring rejects, and the failure would only
+        // surface on a real device with a real group.
+        let provider = default_aead_provider();
+        let mut ring = VibeGroupKeyring::new();
+        ring.install_epoch(
+            VibeGroupEpoch::GENESIS,
+            VibeSecretKey::from_bytes(mint_epoch_key().expect("mint")),
+        )
+        .expect("install");
+
+        let auth =
+            VibeGroupSealAuthorization::all_members_capable(VibeGroupEpoch::GENESIS, 3, 3).unwrap();
+        let sealed = seal_group(provider.as_ref(), &ring, "g", auth, b"minted").expect("seal");
+
+        assert_eq!(
+            open_group(provider.as_ref(), &ring, "g", &sealed)
+                .expect("open")
+                .as_bytes(),
+            b"minted"
         );
     }
 

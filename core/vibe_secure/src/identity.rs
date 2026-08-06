@@ -106,6 +106,17 @@ impl VibeDeviceIdentity {
     pub(crate) fn credential_with_key(&self) -> CredentialWithKey {
         self.credential_with_key.clone()
     }
+
+    /// This device's **public** signature key.
+    ///
+    /// Public on purpose, unlike everything else on this type: it is one half
+    /// of the safety number a user reads aloud to a peer, and the value a peer
+    /// pins for us. Exposing the public half is what makes the pinning
+    /// symmetric — there is nothing secret here, and the private half still
+    /// never leaves `signer`.
+    pub fn signature_key(&self) -> Vec<u8> {
+        self.credential_with_key.signature_key.as_slice().to_vec()
+    }
 }
 
 /// A serialized `KeyPackage`, safe to publish to the server.

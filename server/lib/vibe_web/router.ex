@@ -121,6 +121,10 @@ defmodule VibeWeb.Router do
     get "/mls/welcomes", MlsController, :pending_welcomes
     post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
     get "/mls/chats/:chat_id/members", MlsController, :chat_members
+    # Group epoch keys — channels and groups past the MLS member cap.
+    post "/group-keys", MlsController, :post_epoch_keys
+    get "/group-keys", MlsController, :pending_epoch_keys
+    post "/group-keys/:id/ack", MlsController, :ack_epoch_key
 
     # Account devices — linked-device management + approving a pending pairing.
     get "/account/devices", AccountDeviceController, :index
