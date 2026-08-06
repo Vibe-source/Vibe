@@ -19,7 +19,11 @@ defmodule VibeWeb.Plugs.RateLimiter do
     # 60 requests per minute for expensive authenticated ops
     strict: {60, 60_000},
     # 600 requests per minute for secret-backed agent ingress
-    public_agent: {600, 60_000}
+    public_agent: {600, 60_000},
+    # 10 per 5 minutes for AI media edits. Each call is a paid third-party
+    # generation (~$0.17 an image, ~$1 a 10s video clip), so the strict bucket's
+    # 60/min was an unbounded spend surface, not a safety limit.
+    ai_media: {10, 300_000}
   }
 
   def init(opts) do

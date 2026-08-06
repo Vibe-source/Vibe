@@ -30,6 +30,13 @@ defmodule VibeWeb.Router do
     plug VibeWeb.Plugs.RateLimiter, type: :strict
   end
 
+  # AI media editing calls a paid third-party model per request, so it gets its
+  # own much tighter bucket rather than sharing the strict one.
+  pipeline :ai_media_rate_limited do
+    plug :accepts, ["json"]
+    plug VibeWeb.Plugs.RateLimiter, type: :ai_media
+  end
+
   # Secret-backed public agent ingress should be rate limited, but not in the tiny strict bucket.
   pipeline :public_agent_rate_limited do
     plug :accepts, ["json"]
@@ -80,6 +87,12 @@ defmodule VibeWeb.Router do
     # TURN/ICE credentials for WebRTC calls
     get "/turn-credentials", ApiController, :turn_credentials
 
+    # Rotates a pre-v3 account onto one-way-derived credentials so the raw
+    # recovery secret — which also wraps the private key — stops being sent to
+    # this server. Authenticated: only a caller who just proved possession of
+    # the old secret may rotate it.
+    post "/upgrade-identity", AuthController, :upgrade_identity
+
     # User
     get "/user/:id", UserController, :show
     get "/user/name/:username", UserController, :show_by_name
@@ -94,6 +107,19 @@ defmodule VibeWeb.Router do
     # PreKey
     get "/user/:id/prekey-bundle", EncryptionController, :get_bundle
     post "/user/prekey-bundle", EncryptionController, :upload_bundle
+
+    # MLS KeyPackages — publish/claim one-time init keys so a peer device can
+    # be added to an MLS group (docs/secure-core-architecture.md §3-4). Claim
+    # is single-use: an atomic UPDATE marks a row claimed in the same
+    # statement that hands it out, so it never returns the same package twice.
+    # The literal "/count" route must stay above ":user_id" or it would match
+    # as a user id instead.
+    post "/mls/key-packages", MlsController, :publish
+    get "/mls/key-packages/count", MlsController, :count
+    get "/mls/key-packages/:user_id", MlsController, :claim
+    post "/mls/welcomes", MlsController, :post_welcome
+    get "/mls/welcomes", MlsController, :pending_welcomes
+    post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
 
     # Account devices — linked-device management + approving a pending pairing.
     get "/account/devices", AccountDeviceController, :index
@@ -286,8 +312,14 @@ defmodule VibeWeb.Router do
     post "/agent/chat/sync", AgentController, :chat_sync  # Non-streaming
     get "/agent/health", AgentController, :health
 
-    # AI
+  end
+
+  # AI media editing — authenticated, and on its own paid-call rate limit.
+  scope "/api", VibeWeb do
+    pipe_through [:ai_media_rate_limited, :api_authenticated]
+
     post "/ai/edit_image", AIController, :edit_image
+    post "/ai/edit_video", AIController, :edit_video
   end
 
   scope "/api", VibeWeb do

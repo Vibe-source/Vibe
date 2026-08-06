@@ -217,12 +217,22 @@ defmodule VibeWeb.ChatChannel do
                           _ -> nil
                         end
 
+                      # 1:1 E2E DMs no longer send `pushPreview` at all (it leaked the
+                      # first 160 chars of every message to the server in cleartext), so
+                      # `push_body` above is nil on that path. `pushKind` is the
+                      # content-free replacement — sent on every message — that lets
+                      # Notifications.resolve_message_body/2 fall back to a generic but
+                      # still useful label ("Photo", "Voice message", ...) instead of a
+                      # blank notification.
+                      push_kind = data["pushKind"] || data["push_kind"]
+
                       _ =
                         Notifications.send_message_push(p.user_id, %{
                           "chat_id" => chat_id,
                           "message_id" => data["id"],
                           "from_id" => user_id,
                           "type" => data["type"],
+                          "push_kind" => push_kind,
                           "body" => push_body,
                           "media_url" => data["mediaUrl"] || data["media_url"]
                         })
