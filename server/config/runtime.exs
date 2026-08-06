@@ -104,14 +104,65 @@ if config_env() == :prod do
       _ -> nil
     end
 
+  # Supabase's pooler presents a chain rooted in *its own* private CA
+  # ("Supabase Root 2021 CA"), which is in no public bundle. Verifying it
+  # against /etc/ssl/certs/ca-certificates.crt therefore cannot ever succeed —
+  # it fails with a TLS `unknown_ca` alert, the Repo never connects, and the
+  # release dies during `Vibe.Release.migrate()` before it can serve a
+  # healthcheck. That is exactly what happened on the first deploy after the
+  # default flipped from verify_none to verify_peer.
+  #
+  # So trust list = Supabase's root *plus* whatever public bundle is
+  # configured, passed as `cacerts` (DER) rather than `cacertfile` because
+  # only one file can be named and we need both. Reading both at boot costs a
+  # few milliseconds, once.
+  load_pem_ders = fn
+    path when is_binary(path) ->
+      case File.read(path) do
+        {:ok, pem} -> for {:Certificate, der, _} <- :public_key.pem_decode(pem), do: der
+        _ -> []
+      end
+
+    _ ->
+      []
+  end
+
+  # Two candidate locations, because each can fail on its own: the release's
+  # priv dir is version-stamped (a bump moves it), and the fixed /app path only
+  # exists in the Docker image (not when running from source).
+  supabase_root_candidates =
+    [
+      try do
+        Path.join(:code.priv_dir(:vibe), "certs/supabase-root-2021.crt")
+      rescue
+        _ -> nil
+      end,
+      "/app/certs/supabase-root-2021.crt",
+      Path.join(File.cwd!(), "priv/certs/supabase-root-2021.crt")
+    ]
+    |> Enum.filter(&(is_binary(&1) and File.exists?(&1)))
+
+  supabase_root_ders =
+    supabase_root_candidates |> Enum.take(1) |> Enum.flat_map(load_pem_ders)
+
+  if supabase_root_ders == [] and db_ssl_verify_norm != "none" do
+    IO.warn(
+      "Supabase root CA not found in any known location. The pooler chains to a " <>
+        "private root, so verify_peer against a public bundle will fail with " <>
+        "unknown_ca and the release will not start."
+    )
+  end
+
+  db_cacert_ders = supabase_root_ders ++ load_pem_ders.(db_cacertfile)
+
   ssl_opts =
     case db_ssl_verify_norm do
       "none" ->
         [verify: :verify_none]
 
       _ ->
-        if is_binary(db_cacertfile) and String.trim(db_cacertfile) != "" do
-          [verify: :verify_peer, cacertfile: db_cacertfile]
+        if db_cacert_ders != [] do
+          [verify: :verify_peer, cacerts: db_cacert_ders]
         else
           IO.warn(
             "DB SSL peer verification requested (or defaulted) but no CA bundle found; " <>

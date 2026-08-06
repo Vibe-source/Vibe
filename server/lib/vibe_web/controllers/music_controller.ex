@@ -14,7 +14,7 @@ defmodule VibeWeb.MusicController do
   alias Vibe.AI.Tools.YtDlp
   alias Vibe.MusicCache
   alias Vibe.MusicCacheFill
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
   alias Vibe.Repo
   import Ecto.Query
 
@@ -153,7 +153,7 @@ defmodule VibeWeb.MusicController do
     # Prefer permanent Supabase cache (survives stream_url expiry).
     case MusicCache.get_by_video_id(video_id) do
       %MusicCache{cached_file_path: url} when is_binary(url) and url != "" ->
-        {:ok, SupabaseStorage.rewrite_public_url(url)}
+        {:ok, Storage.rewrite_public_url(url)}
 
       # Fresh ephemeral extractor URL is still usable when we have not yet uploaded a
       # permanent copy — BUT only when the client can actually fetch it. YouTube hands back
@@ -325,7 +325,7 @@ defmodule VibeWeb.MusicController do
             path ->
               case File.stat(path) do
                 {:ok, stat} ->
-                  case SupabaseStorage.upload(path, remote_path) do
+                  case Storage.upload(path, remote_path) do
                     {:ok, public_url} ->
                       save_to_database(video_id, public_url, stat.size)
                       File.rm(path)

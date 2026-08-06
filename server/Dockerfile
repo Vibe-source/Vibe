@@ -79,6 +79,11 @@ COPY --from=elixir-build --chown=nobody:root /app/_build/prod/rel/vibe ./
 
 # Copy Python doc renderer
 COPY --chown=nobody:root priv/python/ /app/python/
+# The Supabase pooler's private root CA, at a stable path. It also travels
+# inside the release under the app's priv dir, but that resolves to a
+# version-stamped directory; runtime.exs checks this fixed path too so a
+# version bump can never silently drop DB TLS verification.
+COPY --chown=nobody:root priv/certs/ /app/certs/
 
 # Copy startup script
 COPY --chmod=755 start.sh /app/start.sh

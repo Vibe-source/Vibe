@@ -7,7 +7,7 @@ defmodule Vibe.Chat do
   alias Vibe.Agent
   alias Vibe.Repo
   alias Vibe.RepoRLS
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
 
   alias Vibe.Chat.{
     Room,
@@ -3454,7 +3454,7 @@ defmodule Vibe.Chat do
     }
   end
 
-  defp rewrite_media_url(url), do: SupabaseStorage.rewrite_public_url(url)
+  defp rewrite_media_url(url), do: Storage.rewrite_public_url(url)
 
   defp invalidate_chat_home_cache(chat_id) when is_binary(chat_id) do
     participant_ids =

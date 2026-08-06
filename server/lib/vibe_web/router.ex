@@ -120,6 +120,7 @@ defmodule VibeWeb.Router do
     post "/mls/welcomes", MlsController, :post_welcome
     get "/mls/welcomes", MlsController, :pending_welcomes
     post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
+    get "/mls/chats/:chat_id/members", MlsController, :chat_members
 
     # Account devices — linked-device management + approving a pending pairing.
     get "/account/devices", AccountDeviceController, :index

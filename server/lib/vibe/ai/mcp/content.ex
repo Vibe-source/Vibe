@@ -16,7 +16,7 @@ defmodule Vibe.AI.MCP.Content do
 
   require Logger
 
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
 
   # Anything larger is refused rather than streamed through the BEAM heap and
   # up to storage. A cargo manifest is tens of KB; 25 MB means something is
@@ -172,7 +172,7 @@ defmodule Vibe.AI.MCP.Content do
 
     try do
       with :ok <- File.write(tmp, bytes),
-           {:ok, url} <- SupabaseStorage.upload(tmp, remote_path, bucket: :media) do
+           {:ok, url} <- Storage.upload(tmp, remote_path, bucket: :media) do
         {:ok, url}
       else
         {:error, reason} -> {:error, reason}

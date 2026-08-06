@@ -1,6 +1,7 @@
 defmodule VibeWeb.MlsController do
   use VibeWeb, :controller
 
+  alias Vibe.Chat
   alias Vibe.Mls
 
   @doc """
@@ -131,6 +132,24 @@ defmodule VibeWeb.MlsController do
     case Mls.ack_welcome(user_id, id) do
       :ok -> json(conn, %{success: true})
       {:error, :not_found} -> conn |> put_status(:not_found) |> json(%{error: "Not found"})
+    end
+  end
+
+  @doc """
+  The user ids that must be added to this chat's MLS group.
+
+  Exists because establishing a group session needs the whole membership in
+  one commit, and the client has no other way to learn it. Only a participant
+  may ask: a non-member gets 404 rather than 403, so this cannot be used to
+  probe which chat ids exist.
+  """
+  def chat_members(conn, %{"chat_id" => chat_id}) do
+    user_id = conn.assigns.current_user.id
+
+    if Chat.is_participant?(chat_id, user_id) do
+      json(conn, %{memberIds: Chat.get_participant_ids(chat_id)})
+    else
+      conn |> put_status(:not_found) |> json(%{error: "Not found"})
     end
   end
 end

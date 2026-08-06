@@ -1,0 +1,134 @@
+defmodule Vibe.StorageTest do
+  @moduledoc """
+  `Vibe.Storage.backend/0` decides where every upload in the app lands, and
+  `rewrite_public_url/1` decides which host every stored media URL is served
+  from. Both are now driven by environment rather than an explicit flag, so
+  these tests exist to pin the two ways that can go wrong:
+
+    * selecting `:r2` on *partial* config, which would route uploads at a
+      backend that then refuses every call, and
+    * rewriting a URL onto a host the object does not live on, which turns
+      working media into 404s the moment the backend flips.
+
+  Nothing here makes a network call or needs real credentials.
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Vibe.Storage
+
+  @r2_env_vars ~w(R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_PUBLIC_BASE_URL)
+
+  setup do
+    prev_app_env = Application.get_env(:vibe, :r2)
+    prev_backend = Application.get_env(:vibe, :storage_backend)
+    prev_os_env = for key <- @r2_env_vars, into: %{}, do: {key, System.get_env(key)}
+
+    Application.delete_env(:vibe, :r2)
+    Application.delete_env(:vibe, :storage_backend)
+    Enum.each(@r2_env_vars, &System.delete_env/1)
+
+    on_exit(fn ->
+      restore_app_env(:r2, prev_app_env)
+      restore_app_env(:storage_backend, prev_backend)
+
+      Enum.each(prev_os_env, fn
+        {key, nil} -> System.delete_env(key)
+        {key, value} -> System.put_env(key, value)
+      end)
+    end)
+
+    :ok
+  end
+
+  describe "backend/0" do
+    test "defaults to supabase with nothing configured" do
+      assert Storage.backend() == :supabase
+    end
+
+    test "selects r2 once every required env var is present" do
+      set_full_r2_env()
+      assert Storage.backend() == :r2
+    end
+
+    test "an explicit config wins in both directions" do
+      set_full_r2_env()
+
+      # The escape hatch has to be able to force Supabase *back on* even with
+      # a complete R2 environment — otherwise there is no way to roll back a
+      # bad cutover without deleting credentials.
+      Application.put_env(:vibe, :storage_backend, :supabase)
+      assert Storage.backend() == :supabase
+
+      Application.put_env(:vibe, :storage_backend, :r2)
+      assert Storage.backend() == :r2
+    end
+
+    test "partial config never selects r2" do
+      for omitted <- ~w(R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET) do
+        set_full_r2_env()
+        System.delete_env(omitted)
+
+        assert Storage.backend() == :supabase,
+               "expected :supabase with #{omitted} missing — a partial config must not " <>
+                 "route uploads at a backend that will refuse them"
+      end
+    end
+
+    test "an empty-string env var counts as absent" do
+      set_full_r2_env()
+      System.put_env("R2_BUCKET", "   ")
+      assert Storage.backend() == :supabase
+    end
+
+    test "the public base URL is not required to select r2" do
+      set_full_r2_env()
+      System.delete_env("R2_PUBLIC_BASE_URL")
+
+      # Uploads work without a CDN in front; only URL rewriting degrades.
+      assert Storage.backend() == :r2
+    end
+  end
+
+  describe "rewrite_public_url/1 across a cutover" do
+    test "a legacy Supabase URL survives the switch to r2 untouched" do
+      set_full_r2_env()
+
+      supabase_url =
+        "https://project.supabase.co/storage/v1/object/public/media/abc.jpg"
+
+      # The object is still in Supabase. Rewriting it onto the R2 host would
+      # 404 every piece of existing media the instant the backend flipped.
+      assert Storage.rewrite_public_url(supabase_url) == supabase_url
+    end
+
+    test "an r2 object URL is rewritten onto the public base" do
+      set_full_r2_env()
+
+      r2_url = "https://acct.r2.cloudflarestorage.com/vibe-media/abc.jpg"
+
+      assert Storage.rewrite_public_url(r2_url) == "https://cdn.example.com/abc.jpg"
+    end
+
+    test "an unrelated URL is left alone" do
+      set_full_r2_env()
+      assert Storage.rewrite_public_url("https://example.com/x.jpg") == "https://example.com/x.jpg"
+    end
+
+    test "nil passes through rather than raising" do
+      set_full_r2_env()
+      assert Storage.rewrite_public_url(nil) == nil
+    end
+  end
+
+  defp set_full_r2_env do
+    System.put_env("R2_ACCOUNT_ID", "acct")
+    System.put_env("R2_ACCESS_KEY_ID", "AKIAEXAMPLE00000TEST")
+    System.put_env("R2_SECRET_ACCESS_KEY", "test-placeholder-secret-not-a-real-credential")
+    System.put_env("R2_BUCKET", "vibe-media")
+    System.put_env("R2_PUBLIC_BASE_URL", "https://cdn.example.com")
+  end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:vibe, key)
+  defp restore_app_env(key, value), do: Application.put_env(:vibe, key, value)
+end

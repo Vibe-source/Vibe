@@ -71,10 +71,20 @@ defmodule Vibe.Storage do
     end
   end
 
-  @doc "Rewrite a stored URL through the configured backend. See backend/0."
+  @doc """
+  Rewrite a stored URL onto whichever CDN fronts the storage it actually lives
+  in.
+
+  On `:r2` this applies **both** rewriters, not just R2's. Switching backends
+  does not move the objects already uploaded, so the database keeps serving a
+  mix: old rows hold Supabase URLs, new rows hold R2 ones. Each rewriter only
+  recognises its own URLs and passes everything else through untouched, so
+  running both is what keeps existing media working across the cutover —
+  picking one would break whichever half it did not recognise.
+  """
   def rewrite_public_url(url) do
     case backend() do
-      :r2 -> R2Storage.rewrite_public_url(url)
+      :r2 -> url |> SupabaseStorage.rewrite_public_url() |> R2Storage.rewrite_public_url()
       :supabase -> SupabaseStorage.rewrite_public_url(url)
     end
   end

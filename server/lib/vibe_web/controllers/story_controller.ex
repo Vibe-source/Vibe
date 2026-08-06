@@ -6,7 +6,7 @@ defmodule VibeWeb.StoryController do
   use VibeWeb, :controller
 
   alias Vibe.Stories
-  alias Vibe.SupabaseStorage
+  alias Vibe.Storage
 
   @doc """
   Creates a new story.
@@ -206,11 +206,11 @@ defmodule VibeWeb.StoryController do
     %{
       id: story.id,
       user_id: story.user_id,
-      media_url: SupabaseStorage.rewrite_public_url(story.media_url),
+      media_url: Storage.rewrite_public_url(story.media_url),
       media_type: story.media_type,
       caption: story.caption,
       duration: story.duration,
-      original_media_url: SupabaseStorage.rewrite_public_url(story.original_media_url),
+      original_media_url: Storage.rewrite_public_url(story.original_media_url),
       visibility: story.visibility,
       view_count: Map.get(story, :view_count, 0),
       expires_at: format_datetime(story.expires_at),

@@ -128,7 +128,7 @@ defmodule VibeWeb.Endpoint do
 
   Pure helper so unit tests can prove the prod default without booting runtime.exs.
   """
-  def db_ssl_opts(verify_env, cacertfile) do
+  def db_ssl_opts(verify_env, cacert_ders) do
     verify =
       case verify_env do
         nil -> nil
@@ -141,8 +141,8 @@ defmodule VibeWeb.Endpoint do
         [verify: :verify_none]
 
       _ ->
-        if is_binary(cacertfile) and String.trim(cacertfile) != "" do
-          [verify: :verify_peer, cacertfile: cacertfile]
+        if is_list(cacert_ders) and cacert_ders != [] do
+          [verify: :verify_peer, cacerts: cacert_ders]
         else
           [verify: :verify_none]
         end
