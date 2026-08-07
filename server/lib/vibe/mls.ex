@@ -310,6 +310,39 @@ defmodule Vibe.Mls do
     Ecto.Query.CastError -> {:error, :not_found}
   end
 
+  @doc """
+  How the Welcomes `sender_user_id` posted for `chat_id` are getting on.
+
+  Returns `%{pending: n, delivered: n}` counted over that sender's own rows.
+
+  Exists because a sender otherwise has **no way to know whether the peer can
+  read anything it sends**. MLS gives the sender no feedback at all: sealing
+  succeeds whether or not the other side ever applied the Welcome, and — since a
+  sender cannot decrypt its own message — a device can seal, store, and display
+  a whole conversation that nobody on earth can open.
+
+  That is not a hypothetical. It is what happened on 2026-08-06: sealing was
+  switched on before establishment had been confirmed end-to-end, and every DM
+  became unreadable on both sides at once. `pending > 0` is the signal to keep
+  using the older path until the peer confirms.
+  """
+  def welcome_status(sender_user_id, chat_id)
+      when is_binary(sender_user_id) and is_binary(chat_id) do
+    rows =
+      MlsWelcome
+      |> where([w], w.sender_user_id == ^sender_user_id and w.chat_id == ^chat_id)
+      |> select([w], {is_nil(w.delivered_at), count(w.id)})
+      |> group_by([w], is_nil(w.delivered_at))
+      |> Repo.all()
+
+    Enum.reduce(rows, %{pending: 0, delivered: 0}, fn
+      {true, count}, acc -> %{acc | pending: count}
+      {false, count}, acc -> %{acc | delivered: count}
+    end)
+  end
+
+  def welcome_status(_sender_user_id, _chat_id), do: %{pending: 0, delivered: 0}
+
   defp check_pending_quota(recipient_id, sender_id) do
     count =
       MlsWelcome

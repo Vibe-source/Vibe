@@ -22,6 +22,16 @@ defmodule Vibe.AI.ToolRegistry do
       testability: "live_readonly"
     },
     %{
+      id: "read_url",
+      name: "Read Web Page",
+      description:
+        "Open a search result (or a link the user pasted) and read its actual text, so answers " <>
+          "cite pages instead of snippets.",
+      category: "research",
+      always_on: false,
+      testability: "live_readonly"
+    },
+    %{
       id: "search_music",
       name: "Music Search",
       description:

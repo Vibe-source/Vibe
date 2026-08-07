@@ -38,13 +38,47 @@ defmodule Vibe.AI.GroupAgent do
   @tools [
     %{
       name: "search_google",
-      description: "Search the web using Google. Returns relevant web results.",
+      description:
+        "Search the web. Returns real source URLs with titles, snippets, relevance scores " <>
+          "and publication dates. This FINDS sources; it does not read them — use read_url " <>
+          "before relying on a result's specifics. Call it more than once when one query " <>
+          "cannot cover the question.",
       input_schema: %{
         type: "object",
         properties: %{
-          query: %{type: "string", description: "Search query"}
+          query: %{type: "string", description: "Search query"},
+          max_results: %{type: "integer", description: "How many results. Default 6, max 12."},
+          topic: %{
+            type: "string",
+            enum: ["general", "news", "finance"],
+            description: "Search index. \"news\" for current events."
+          },
+          time_range: %{
+            type: "string",
+            enum: ["day", "week", "month", "year"],
+            description: "Only results published within this window."
+          }
         },
         required: ["query"]
+      }
+    },
+    %{
+      name: "read_url",
+      description:
+        "Read the actual text of one or more pages found with search_google (or pasted by a " <>
+          "user). Use it before stating specifics — numbers, dates, versions, prices, quotes " <>
+          "— that you only saw in a snippet.",
+      input_schema: %{
+        type: "object",
+        properties: %{
+          url: %{type: "string", description: "The page to read."},
+          urls: %{
+            type: "array",
+            items: %{type: "string"},
+            description: "Up to 3 pages in one call. Prefer this over 3 separate calls."
+          }
+        },
+        required: []
       }
     },
     %{
@@ -315,8 +349,19 @@ defmodule Vibe.AI.GroupAgent do
       |> Enum.filter(&MapSet.member?(allowed, &1))
 
     selected = if normalized == [], do: available, else: normalized
-    selected_set = MapSet.new(selected ++ mandatory)
+    selected_set = MapSet.new(selected ++ mandatory) |> grant_reading_to_searchers()
     Enum.filter(available, &MapSet.member?(selected_set, &1))
+  end
+
+  # If a group agent may search the web it may read what it found. Every group agent in the
+  # database has an `enabled_tools` list written before `read_url` existed; without this,
+  # all of them stay permanently snippet-bound.
+  defp grant_reading_to_searchers(selected_set) do
+    if MapSet.member?(selected_set, "search_google") do
+      MapSet.put(selected_set, "read_url")
+    else
+      selected_set
+    end
   end
 
   @doc """
@@ -521,6 +566,8 @@ defmodule Vibe.AI.GroupAgent do
 
     base_prompt = """
     #{base_system_prompt}
+
+    #{Vibe.AI.AgenticPolicy.prompt_guidance(enabled_tools)}
 
     IMPORTANT RULES:
 
@@ -849,71 +896,27 @@ defmodule Vibe.AI.GroupAgent do
 
       request = Finch.build(:post, @claude_api, headers, body)
 
+      dispatch = fn parsed ->
+        dispatch_provider_response(
+          parsed,
+          messages,
+          system_prompt,
+          api_key,
+          depth,
+          user_id,
+          enabled_tools,
+          enabled_tool_definitions,
+          chat_id,
+          pending_attachment,
+          tool_audit
+        )
+      end
+
       case Finch.request(request, Vibe.Finch, receive_timeout: 30_000) do
         {:ok, %{status: 200, body: resp_body}} ->
           case Jason.decode(resp_body) do
-            {:ok, %{"content" => content, "stop_reason" => stop_reason} = parsed} ->
-              Logger.info(
-                "[GroupAgent] Claude response received, stop_reason=#{inspect(stop_reason)}"
-              )
-
-              if stop_reason == "tool_use" do
-                # Handle tool calls
-                handle_tool_response(
-                  content,
-                  messages,
-                  system_prompt,
-                  api_key,
-                  depth,
-                  user_id,
-                  enabled_tools,
-                  enabled_tool_definitions,
-                  chat_id,
-                  pending_attachment,
-                  tool_audit
-                )
-              else
-                # Extract text from response
-                text = extract_text(content)
-
-                maybe_force_llm_confirmation(
-                  messages,
-                  content,
-                  text,
-                  system_prompt,
-                  api_key,
-                  depth,
-                  user_id,
-                  enabled_tools,
-                  enabled_tool_definitions,
-                  chat_id,
-                  pending_attachment,
-                  tool_audit
-                )
-              end
-
-            {:ok, %{"content" => content} = parsed} ->
-              Logger.info(
-                "[GroupAgent] Claude response received, stop_reason=#{inspect(Map.get(parsed, "stop_reason"))}"
-              )
-
-              # Extract text from response
-              text = extract_text(content)
-
-              maybe_force_llm_confirmation(
-                messages,
-                content,
-                text,
-                system_prompt,
-                api_key,
-                depth,
-                user_id,
-                enabled_tools,
-                enabled_tool_definitions,
-                chat_id,
-                pending_attachment,
-                tool_audit
-              )
+            {:ok, parsed} when is_map(parsed) ->
+              dispatch.(parsed)
 
             other ->
               Logger.error("[GroupAgent] Failed to parse Claude response: #{inspect(other)}")
@@ -925,11 +928,108 @@ defmodule Vibe.AI.GroupAgent do
             "[GroupAgent] Claude API error: status=#{status} body=#{String.slice(body, 0..500)}"
           )
 
-          {:error, "API error: #{status}"}
+          fallback_to_openai(
+            messages,
+            system_prompt,
+            enabled_tool_definitions,
+            "API error: #{status}",
+            dispatch
+          )
 
         {:error, reason} ->
-          {:error, reason}
+          fallback_to_openai(
+            messages,
+            system_prompt,
+            enabled_tool_definitions,
+            inspect(reason),
+            dispatch
+          )
       end
+    end
+  end
+
+  # Group agents had NO provider fallback: a non-200 from Anthropic ended the turn. With the
+  # production key out of credit that meant every group and channel agent failed on every
+  # message, while the DM assistant kept working because its runtime falls back. Borrow that
+  # runtime's OpenAI path, which hands back the same decoded shape this loop already parses,
+  # so the tool loop, attachments and audit below are untouched.
+  defp fallback_to_openai(messages, system_prompt, tool_definitions, reason, dispatch) do
+    Logger.warning("[GroupAgent] Anthropic unavailable (#{reason}); falling back to OpenAI")
+
+    config = %Vibe.AI.AgentRuntime.Config{
+      model: @claude_model,
+      system_prompt: system_prompt,
+      tools: tool_definitions,
+      max_tokens: 4096,
+      execute_tools: fn _calls, state, _callback -> {[], state} end,
+      request_label: "GroupAgent"
+    }
+
+    case Vibe.AI.AgentRuntime.anthropic_shaped_openai_completion(messages, config) do
+      {:ok, parsed} ->
+        dispatch.(parsed)
+
+      {:error, openai_reason} ->
+        Logger.error("[GroupAgent] OpenAI fallback also failed: #{inspect(openai_reason)}")
+        {:error, reason}
+    end
+  end
+
+  # One place that decides what a provider response means, so the Anthropic path and the
+  # OpenAI fallback cannot drift apart.
+  defp dispatch_provider_response(
+         parsed,
+         messages,
+         system_prompt,
+         api_key,
+         depth,
+         user_id,
+         enabled_tools,
+         enabled_tool_definitions,
+         chat_id,
+         pending_attachment,
+         tool_audit
+       ) do
+    content = Map.get(parsed, "content")
+    stop_reason = Map.get(parsed, "stop_reason")
+
+    Logger.info("[GroupAgent] Provider response received, stop_reason=#{inspect(stop_reason)}")
+
+    cond do
+      not is_list(content) ->
+        Logger.error("[GroupAgent] Provider response had no content: #{inspect(parsed)}")
+        {:error, "Failed to parse Claude response"}
+
+      stop_reason == "tool_use" ->
+        handle_tool_response(
+          content,
+          messages,
+          system_prompt,
+          api_key,
+          depth,
+          user_id,
+          enabled_tools,
+          enabled_tool_definitions,
+          chat_id,
+          pending_attachment,
+          tool_audit
+        )
+
+      true ->
+        maybe_force_llm_confirmation(
+          messages,
+          content,
+          extract_text(content),
+          system_prompt,
+          api_key,
+          depth,
+          user_id,
+          enabled_tools,
+          enabled_tool_definitions,
+          chat_id,
+          pending_attachment,
+          tool_audit
+        )
     end
   end
 
@@ -1345,7 +1445,8 @@ defmodule Vibe.AI.GroupAgent do
 
   defp execute_tool_once(name, input, user_id, chat_id) do
     case name do
-      "search_google" -> Vibe.AI.Tools.Search.google(input)
+      "search_google" -> Vibe.AI.Tools.Research.search(input)
+      "read_url" -> Vibe.AI.Tools.Research.read(input)
       "analyze_image" -> Vibe.AI.Tools.Vision.analyze(input)
       "analyze_document" -> Vibe.AI.Tools.Document.analyze(input)
       "create_document" -> create_document_tool(chat_id, input, user_id)

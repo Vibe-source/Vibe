@@ -2,6 +2,7 @@ defmodule VibeWeb.MlsController do
   use VibeWeb, :controller
 
   alias Vibe.Chat
+  alias Vibe.GroupKeys
   alias Vibe.Mls
 
   @doc """
@@ -150,6 +151,102 @@ defmodule VibeWeb.MlsController do
       json(conn, %{memberIds: Chat.get_participant_ids(chat_id)})
     else
       conn |> put_status(:not_found) |> json(%{error: "Not found"})
+    end
+  end
+
+  @doc """
+  Whether the Welcomes this caller sent for a chat have been applied.
+
+  The client uses this to decide whether sealing with MLS is safe yet: a sender
+  cannot decrypt its own message, so without this it has no way to tell an
+  established session from one the peer never joined, and would happily produce
+  a conversation nobody can read.
+  """
+  def welcome_status(conn, %{"chat_id" => chat_id}) do
+    status = Mls.welcome_status(conn.assigns.current_user.id, chat_id)
+    json(conn, %{chatId: chat_id, pending: status.pending, delivered: status.delivered})
+  end
+
+  # ── group epoch keys ───────────────────────────────────────────────────────
+  #
+  # The epoch-key layer covers channels and groups past the MLS member cap. See
+  # `Vibe.GroupKeys` for why authority is checked on every post rather than
+  # assumed — an epoch key blob, unlike a Welcome, is useful to whoever can get
+  # a recipient to install it.
+
+  @doc """
+  Post epoch keys, each already sealed to its recipient by the caller's device.
+
+  Refused unless the caller is the chat's key authority: owner/admin for a
+  channel, any member for a group. A DM has no epochs and is refused outright.
+  """
+  def post_epoch_keys(conn, params) do
+    sender_id = conn.assigns.current_user.id
+
+    case GroupKeys.post_epoch_keys(sender_id, params) do
+      {:ok, count} ->
+        json(conn, %{success: true, stored: count})
+
+      {:error, :not_allowed} ->
+        # 403 rather than 404: unlike claiming a key package, the caller already
+        # knows this chat exists — they are in it — so there is nothing to hide
+        # and "you are not an admin" is the actionable answer.
+        conn |> put_status(:forbidden) |> json(%{error: "Not allowed to issue keys here"})
+
+      {:error, :too_large} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Sealed key too large"})
+
+      {:error, :too_many} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Too many keys in one batch"})
+
+      {:error, :invalid_encoding} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: "sealedKey must be base64-encoded"})
+
+      {:error, :too_many_pending} ->
+        conn
+        |> put_status(:too_many_requests)
+        |> json(%{error: "Too many undelivered epoch keys"})
+
+      {:error, _reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: "Invalid request"})
+    end
+  end
+
+  @doc """
+  Every epoch key still waiting for the caller. Scoped to the caller only.
+  """
+  def pending_epoch_keys(conn, _params) do
+    user_id = conn.assigns.current_user.id
+
+    keys =
+      user_id
+      |> GroupKeys.pending_epoch_keys()
+      |> Enum.map(fn row ->
+        %{
+          id: row.id,
+          chatId: row.chat_id,
+          senderUserId: row.sender_user_id,
+          epoch: row.epoch,
+          sealedKey: Base.encode64(row.sealed_key),
+          createdAt: row.inserted_at
+        }
+      end)
+
+    json(conn, %{keys: keys})
+  end
+
+  @doc """
+  Confirm an epoch key was installed. Scoped by recipient; a mismatch reports
+  404 and leaks nothing about the id.
+  """
+  def ack_epoch_key(conn, %{"id" => id}) do
+    user_id = conn.assigns.current_user.id
+
+    case GroupKeys.ack_epoch_key(user_id, id) do
+      :ok -> json(conn, %{success: true})
+      {:error, :not_found} -> conn |> put_status(:not_found) |> json(%{error: "Not found"})
     end
   end
 end

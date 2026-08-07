@@ -15,7 +15,10 @@ defmodule VibeWeb.AIController do
   require Logger
 
   @max_image_bytes 40_000_000
-  @max_video_bytes 200_000_000
+  # Must stay under the endpoint's Plug.Parsers `length` (MAX_REQUEST_BYTES,
+  # 120MB by default) — anything above it is rejected by the parser before this
+  # controller runs, so a larger number here would only mislead.
+  @max_video_bytes 100_000_000
 
   @doc """
   Edit an image using AI.
@@ -165,6 +168,13 @@ defmodule VibeWeb.AIController do
   defp bad_request(conn, error, details) do
     conn
     |> put_status(:bad_request)
-    |> json(%{success: false, error: error, details: to_string(details)})
+    |> json(%{success: false, error: error, details: stringify(details)})
   end
+
+  # `to_string/1` raises for anything that does not implement String.Chars, which
+  # would turn a handled error into a 500 on the one path whose entire job is
+  # reporting the error. Fall back to inspect/1 rather than trusting the shape.
+  defp stringify(details) when is_binary(details), do: details
+  defp stringify(details) when is_atom(details) or is_number(details), do: to_string(details)
+  defp stringify(details), do: inspect(details)
 end
