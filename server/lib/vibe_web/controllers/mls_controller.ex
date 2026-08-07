@@ -16,8 +16,8 @@ defmodule VibeWeb.MlsController do
     user_id = conn.assigns.current_user.id
 
     case Mls.publish_key_packages(user_id, params) do
-      {:ok, %{count: count}} ->
-        json(conn, %{success: true, count: count})
+      {:ok, %{count: count} = result} ->
+        json(conn, %{success: true, count: count, retired: Map.get(result, :retired, false)})
 
       {:error, :invalid_device_id} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "Invalid deviceId"})

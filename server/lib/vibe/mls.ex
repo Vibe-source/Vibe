@@ -233,8 +233,13 @@ defmodule Vibe.Mls do
       end)
     end)
     |> case do
+      # `retired` is reported back because the client cannot otherwise tell this
+      # server from one that predates the flag and silently ignored it. A device
+      # that assumed success against an old server would clear its pending
+      # retirement while every stale KeyPackage stayed claimable — reproducing
+      # the exact failure the flag exists to end.
       {:ok, inserted} ->
-        {:ok, %{count: length(inserted)}}
+        {:ok, %{count: length(inserted), retired: retire?}}
 
       {:error, reason} ->
         Logger.warning("[Mls] publish batch failed: #{inspect(reason)}")

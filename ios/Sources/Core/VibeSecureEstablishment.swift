@@ -112,6 +112,19 @@ enum VibeSecureEstablishment {
         return
       }
       if retireDeviceKeys {
+        // `retired` must come back true, not merely `success`. A server that
+        // predates the flag ignores it, publishes the fresh batch, and answers
+        // exactly like one that honoured it — while every KeyPackage signed by
+        // the retired key stays claimable, and `claim` hands out the oldest
+        // first. Clearing on that reply would rebuild the same broken group and
+        // never ask again. Staying pending costs a republish per provisioning
+        // pass until the server catches up, which is the cheap side of this.
+        guard object?["retired"] as? Bool == true else {
+          VibeLog.error(
+            "[VibeSecure] server did not retire the old signing key — staying pending;"
+              + " KeyPackages naming the dead key are still claimable")
+          return
+        }
         // Only now. Clearing on the request rather than the response would let
         // a dropped reply strand the device with a server-side pool that still
         // names its retired key, and nothing would ever ask again.
