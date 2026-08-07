@@ -483,8 +483,23 @@ final class VibeSecureSessions {
   /// outside — both sides hold a valid session, both seal happily, and neither
   /// can read the other. Printing the group id is what makes that visible
   /// instead of merely suspected.
+  ///
+  /// **Reads the stored id directly and must never call `groupId(chatId:)`.**
+  /// Every caller is already inside `queue.sync`, and that accessor takes the
+  /// same serial queue — re-entering it is not a deadlock but an immediate
+  /// `__builtin_trap` from libdispatch ("dispatch_sync called on queue already
+  /// owned by current thread"), which surfaces as signal 5 with nothing on
+  /// stderr. It killed the app on launch on 2026-08-07, from a log line whose
+  /// only job was explaining a decrypt failure: the diagnostic crashed on
+  /// exactly the failure it existed to describe, so the first MLS history page
+  /// with an unopenable row took the process down.
+  ///
+  /// Reading the stored id is also strictly more informative here than
+  /// `groupId(chatId:)` would be, since that returns nil unless a session
+  /// loads — which is precisely the branch that cannot load one. "Stored group
+  /// exists but no session" and "nothing stored at all" are different bugs.
   private func groupIdHexLocked(chatId: String) -> String? {
-    guard let id = groupId(chatId: chatId) else { return nil }
+    guard let id = Self.storedGroupId(chatId: chatId) else { return nil }
     return id.prefix(8).map { String(format: "%02x", $0) }.joined()
   }
 
