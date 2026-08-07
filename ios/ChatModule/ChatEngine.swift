@@ -4860,10 +4860,24 @@ final class ChatEngine {
           // any client that has not shipped this code: enabling it early does
           // not degrade a conversation, it splits it, and that is not
           // recoverable after the fact. See `VibeSecureSessions.isSendEnabled`.
+          // `isPeerConfirmed` is not belt-and-braces — it is the whole safety
+          // property. MLS tells a sender nothing about whether anyone can read
+          // what it sealed, and a sender cannot check by decrypting its own
+          // message, so without this a chat can go silently unreadable on both
+          // sides at once and still look perfectly healthy. It did, on
+          // 2026-08-06. Until the peer acks the Welcome we use the path that
+          // already works.
           if VibeSecureSessions.isSendEnabled,
+            VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId),
             let mlsSealed = VibeSecureSessions.shared.seal(
               chatId: chatId, plaintext: fullPayloadString)
           {
+            // Keep our own plaintext: MLS encrypts to the group's *other*
+            // members, so we cannot decrypt this back when the server echoes it
+            // to us, and the row would render empty. See
+            // `VibeSecureSessions.rememberOwnPlaintext`.
+            VibeSecureSessions.shared.rememberOwnPlaintext(
+              fullPayloadString, messageId: messageId)
             encryptedContent = mlsSealed
           } else if isGroup || friendPublicKey == nil {
             // Server-readable, and only these three cases can get here:
@@ -8286,6 +8300,7 @@ final class ChatEngine {
             self.flushPendingAgentBridgeHistoryRequestsLocked(chatId: chatId)
             self.sweepOrphanedPendingLocked(trigger: "chat_joined")
             self.ensureMlsProvisionedLocked(trigger: "chat_joined")
+            self.refreshMlsPeerConfirmationLocked(chatId: chatId)
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "chat_joined")
             // Resume the live tail for a bridge session this chat had loaded: the topic is
             // freshly (re)joined after a view re-attach or background reconnect, so re-arm
@@ -11112,7 +11127,15 @@ final class ChatEngine {
       // otherwise fall through the `!encryptedLooksHybrid` arm below and render
       // as literal text.
       if encryptedIsMls {
-        return VibeSecureSessions.shared.open(chatId: chatId, envelope: encryptedContent) ?? ""
+        // Our own message can never be opened — MLS encrypts to the *other*
+        // members and refuses to process what we authored. Asking anyway is
+        // how these rendered as empty bubbles; the retained plaintext is the
+        // only source for them.
+        if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(messageId: messageId) {
+          return mine
+        }
+        return VibeSecureSessions.shared.open(
+          chatId: chatId, envelope: encryptedContent, isMine: isMe, messageId: messageId) ?? ""
       }
       if !encryptedLooksHybrid {
         return encryptedContent
@@ -13161,6 +13184,21 @@ final class ChatEngine {
   /// and an empty list), which is why this can hang off chat join rather than
   /// needing a lifecycle event of its own. Throttled because chat join fires
   /// once per open chat on every reconnect.
+  /// Asks whether this chat's peer applied our Welcome, so the send path knows
+  /// whether sealing is safe yet.
+  ///
+  /// Per-chat, unlike `ensureMlsProvisionedLocked`, because the answer is about
+  /// one conversation's peer rather than about this device. Cheap and one-way:
+  /// it returns immediately once confirmed and never un-confirms, so a bad
+  /// network cannot silently downgrade an established chat.
+  private func refreshMlsPeerConfirmationLocked(chatId: String) {
+    guard VibeSecureSessions.isSendEnabled else { return }
+    guard !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) else { return }
+    guard let apiBase = apiBaseURLLocked() else { return }
+    VibeSecureEstablishment.refreshPeerConfirmation(
+      chatId: chatId, apiBase: apiBase, token: authHeaderTokenLocked())
+  }
+
   private func ensureMlsProvisionedLocked(trigger: String) {
     let now = Int64(nowMs())
     if mlsProvisionedAtMs != 0, now - mlsProvisionedAtMs < 60_000 { return }
@@ -13174,6 +13212,17 @@ final class ChatEngine {
       self.queue.async {
         for chatId in joinedChatIds {
           self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_welcome_drained")
+          // Anything the peer sent between adding us and this drain was parsed
+          // without a session and stored as decryption-failed. The ciphertext is
+          // still good and we can read it *now*, but nothing re-parses a row that
+          // already resolved — so those messages would stay stuck on the failure
+          // placeholder for the life of the install. Re-fetch and re-parse them.
+          //
+          // The heights cached for those rows describe the placeholder, not the
+          // real text, so they have to go too or the transcript sizes itself
+          // against content it is about to replace.
+          VibeTimelinePreparedStore.shared.invalidate(chatId: chatId)
+          self.loadChatHistoryIfNeededLocked(chatId: chatId, force: true)
         }
       }
     }
@@ -14749,6 +14798,104 @@ final class ChatEngine {
       tombstoneMs: Int64(Date().timeIntervalSince1970 * 1000))
   }
 
+  // MARK: - Repairing a missed clear
+  //
+  // `chat-deleted` is a fire-and-forget socket push, and it is the ONLY thing that used to
+  // tell a peer its chat had been deleted for both sides. The device exports from
+  // 2026-08-06 are wall-to-wall `ws dead socket reason=heartbeat_timeout` /
+  // `Software caused connection abort`, so missing that push is the ordinary case, not an
+  // exotic one — and missing it was permanent. The server filters cleared messages out of
+  // every subsequent response, so it can never re-send what the peer is holding, and
+  // nothing on the client compared the two. The result is exactly the reported symptom:
+  // one phone deletes a conversation for both sides, the other keeps rendering all of it,
+  // forever, with no error anywhere.
+  //
+  // The server now publishes the clear POINT (`messagesClearedAt`) on every chat row, so
+  // any refresh is enough to notice and repair. This is where that repair lands.
+
+  /// Clear points already applied on this device, per chat. A home refresh runs several
+  /// times a minute and almost always has nothing to do; this is what makes the common
+  /// case a dictionary lookup instead of a store scan.
+  private var appliedMessagesClearedAtByChat: [String: Int64] = [:]
+
+  /// Drop every locally-held message at or before a clear point the server reports.
+  ///
+  /// Matches the server's own predicate exactly — it keeps `timestamp > cleared_at`, so
+  /// this keeps `ts > clearedAtMs` — because a client that disagreed by one millisecond
+  /// would resurrect a row on every refresh and look like a flickering bug.
+  ///
+  /// Deliberately NOT `clearChatStateLocked`: that wipes the conversation whole, which is
+  /// right for "delete this chat" but wrong here. A clear point can be older than the
+  /// newest message (the peer messaged again after the delete, and the server restored the
+  /// row via `restore_if_deleted`), and those newer messages are real.
+  func applyRemoteMessagesClearedAt(chatId: String, clearedAtMs: Int64) {
+    guard !chatId.isEmpty, clearedAtMs > 0 else { return }
+    queue.async { [weak self] in
+      self?.applyRemoteMessagesClearedAtLocked(chatId: chatId, clearedAtMs: clearedAtMs)
+    }
+  }
+
+  private func applyRemoteMessagesClearedAtLocked(chatId: String, clearedAtMs: Int64) {
+    guard (appliedMessagesClearedAtByChat[chatId] ?? Int64.min) < clearedAtMs else { return }
+    appliedMessagesClearedAtByChat[chatId] = clearedAtMs
+
+    var droppedFromStore = 0
+    if let userId = chatHistoryCacheUserIdLocked() {
+      let stale = messageStore.messageIdsWithTimestamps(userId: userId, chatId: chatId)
+        .filter { $0.ts <= clearedAtMs }
+        .map(\.messageId)
+      if !stale.isEmpty {
+        messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: stale)
+        droppedFromStore = stale.count
+      }
+    }
+
+    let historyBefore = historyRowsByChat[chatId]?.count ?? 0
+    if let rows = historyRowsByChat[chatId] {
+      historyRowsByChat[chatId] = rows.filter { messageTimestampMs(fromRow: $0) > clearedAtMs }
+    }
+    let liveBefore = liveMessageRowsByChat[chatId]?.count ?? 0
+    if let live = liveMessageRowsByChat[chatId] {
+      liveMessageRowsByChat[chatId] = live.filter {
+        messageTimestampMs(fromRow: $0.value) > clearedAtMs
+      }
+    }
+    let droppedFromMemory =
+      (historyBefore - (historyRowsByChat[chatId]?.count ?? 0))
+      + (liveBefore - (liveMessageRowsByChat[chatId]?.count ?? 0))
+
+    // The core is a second reader of the same transcript; leaving it holding the cleared
+    // rows means a core-authoritative list paints straight back over the wipe. `+1`
+    // because the reducer's cutoff is exclusive (`retain(ts_ms >= cutoff)`).
+    if let core = VibeCoreBridge.sharedCore(ownUserId: currentUserIdLocked() ?? "") {
+      try? core.clearChat(
+        chatId: chatId, beforeTsMs: clearedAtMs &+ 1, clearedAtMs: clearedAtMs)
+    }
+
+    guard droppedFromStore > 0 || droppedFromMemory > 0 else { return }
+
+    // Heights and the warm snapshot describe rows that no longer exist. Left behind, the
+    // next open sizes a transcript against a content size for messages it will not show.
+    VibeTimelinePreparedStore.shared.invalidate(chatId: chatId)
+    ChatListView.clearWarmTranscriptSnapshot(chatId: chatId)
+
+    VibeLog.notice(
+      "repaired a missed remote clear",
+      category: "engine",
+      metadata: [
+        "chat": String(chatId.prefix(12)),
+        "clearedAtMs": String(clearedAtMs),
+        "droppedStore": String(droppedFromStore),
+        "droppedMemory": String(droppedFromMemory),
+      ])
+    appendJournalLocked(
+      event: "native-chat-clear-repair",
+      payload: ["chatId": chatId, "clearedAtMs": clearedAtMs, "dropped": droppedFromStore])
+    state["updatedAt"] = nowMs()
+    postChangeLocked(reason: "chatRowsReloaded", userInfo: ["chatId": chatId])
+    postChangeLocked(reason: "chatCleared", userInfo: ["chatId": chatId])
+  }
+
   /// Tells the core the whole chat was cleared (Clear Chat for me / for both).
   ///
   /// Same class of bug as ``feedCoreDeleteLocked``: clear is not a frame, so without
@@ -15063,9 +15210,15 @@ final class ChatEngine {
           // into the `!encryptedLooksHybrid` arm and gets parsed as if the
           // envelope string were itself the payload JSON.
           if VibeSecureSessions.isMlsEnvelope(encryptedContent) {
+            // Our own messages have no decryptable form — MLS encrypts to the
+            // other members. Scrolling back through our own history would go
+            // blank without the retained plaintext.
+            if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(messageId: messageId) {
+              return parseDecryptedMessagePayload(mine)
+            }
             guard
               let opened = VibeSecureSessions.shared.open(
-                chatId: chatId, envelope: encryptedContent)
+                chatId: chatId, envelope: encryptedContent, isMine: isMe, messageId: messageId)
             else {
               historyDecryptionFailed = true
               return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
