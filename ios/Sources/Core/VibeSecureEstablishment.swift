@@ -142,10 +142,18 @@ enum VibeSecureEstablishment {
           let encoded = object?["keyPackage"] as? String,
           let keyPackage = Data(base64Encoded: encoded)
         else {
+          // The peer's device has never published a key, so there is nothing
+          // to encrypt to — waiting cannot conjure one. See
+          // `VibeSecureSessions.markPeerKeysUnavailable`: `true` re-evaluates
+          // the send rather than leaving it pending forever, and it cannot
+          // downgrade an established chat because the send path checks
+          // `isPeerConfirmed` first.
           VibeLog.info("[VibeSecure] no KeyPackage available for peer in \(chatId)")
-          finish(false)
+          VibeSecureSessions.shared.markPeerKeysUnavailable(chatId: chatId)
+          finish(true)
           return
         }
+        VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: chatId)
 
         // Check who this KeyPackage actually belongs to before letting it into
         // a group. The server chose these bytes, and MLS does not make the
@@ -315,9 +323,22 @@ enum VibeSecureEstablishment {
             VibeLog.info(
               "[VibeSecure] \(chatId) only \(claimed.count)/\(peers.count) KeyPackages — not establishing"
             )
-            finish(false)
+            // A member has published no key, so there is nothing to encrypt to
+            // and no amount of waiting changes that on its own. Reporting this
+            // as a plain failure left the draft queued for a retry that could
+            // only fail the same way, which is how a send stuck as pending
+            // *forever* rather than for a moment.
+            //
+            // `true` means "state changed, re-evaluate the send" — not
+            // "encrypted". The gate reads the mark and lets the message go out
+            // on the envelope this peer can actually read. Nothing here can
+            // downgrade an established chat: the send path checks
+            // `isPeerConfirmed` first and that is one-way.
+            VibeSecureSessions.shared.markPeerKeysUnavailable(chatId: chatId)
+            finish(true)
             return
           }
+          VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: chatId)
           guard let session = VibeSecureSessions.shared.createSession(chatId: chatId) else {
             finish(false)
             return

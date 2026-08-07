@@ -4333,11 +4333,18 @@ final class ChatEngine {
       //     epoch-key scheme in `vibe_core::group`, which can hand a new member
       //     older keys. Until that is wired they keep their existing path.
       //   * chats already found too large — `VibeSecureSessions.isIneligible`.
+      //   * chats whose peer has published no KeyPackage — there is no key to
+      //     encrypt to, so waiting cannot succeed and the draft would sit
+      //     pending forever rather than for a moment. This one is temporary
+      //     and re-probed; see `VibeSecureSessions.peerKeysUnavailable`. It
+      //     cannot weaken an established chat, because sealing is decided by
+      //     `isPeerConfirmed` below and that is one-way.
       if VibeSecureSessions.isSendEnabled,
         !isSavedMessagesChat,
         !isChannel,
         (peerAgentId ?? "").isEmpty,
         !VibeSecureSessions.shared.isIneligible(chatId: chatId),
+        !VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId),
         let mlsApiBase = apiBase,
         isGroup || normalizedString(peerUserId) != nil,
         !VibeSecureSessions.shared.hasSession(chatId: chatId)
@@ -4868,10 +4875,34 @@ final class ChatEngine {
           // 2026-08-06. Until the peer acks the Welcome we use the path that
           // already works.
           if VibeSecureSessions.isSendEnabled,
-            VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId),
-            let mlsSealed = VibeSecureSessions.shared.seal(
-              chatId: chatId, plaintext: fullPayloadString)
+            VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
           {
+            // ── One-way ratchet: confirmed means MLS or nothing ─────────────
+            //
+            // A failed seal must NOT fall through to the hybrid branch below.
+            // Letting it would mean a broken session — or a server that simply
+            // stops serving KeyPackages — silently moves an already-private
+            // conversation back onto the older envelope. That is a downgrade
+            // an attacker can *trigger*, and neither participant would see any
+            // sign of it: the message sends, ticks, and renders normally.
+            //
+            // Refusing is visible and recoverable; a silent downgrade is
+            // neither. This is the whole reason `isPeerConfirmed` is one-way —
+            // a chat that has ever been readable end-to-end never quietly
+            // stops being so.
+            guard
+              let mlsSealed = VibeSecureSessions.shared.seal(
+                chatId: chatId, plaintext: fullPayloadString)
+            else {
+              throw NSError(
+                domain: "VibeSecure", code: 1,
+                userInfo: [
+                  NSLocalizedDescriptionKey:
+                    "mls_seal_failed_on_confirmed_chat — refusing to send this "
+                    + "message under a weaker envelope than the one this chat "
+                    + "already uses"
+                ])
+            }
             // Keep our own plaintext: MLS encrypts to the group's *other*
             // members, so we cannot decrypt this back when the server echoes it
             // to us, and the row would render empty. See

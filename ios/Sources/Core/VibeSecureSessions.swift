@@ -304,6 +304,55 @@ final class VibeSecureSessions {
     UserDefaults.standard.set(true, forKey: "vibe.mls.ineligible.\(chatId)")
   }
 
+  // ── "the peer has published no key" ─────────────────────────────────────
+  //
+  // Distinct from `isIneligible`, and the difference is the whole point:
+  // ineligible is permanent (the chat is structurally too big for MLS), this
+  // is temporary (the peer simply has not published a KeyPackage yet, because
+  // their device has not run a build that does).
+  //
+  // You cannot encrypt to a device whose public key you do not have. That is
+  // arithmetic, not policy — no amount of gating produces a readable message
+  // for a peer with no published key. So the only real choice is between
+  // sending under the envelope that peer CAN read and not sending at all, and
+  // a message stuck pending forever is not the safer option: people retry
+  // over another app, which is a genuine plaintext leak rather than a
+  // theoretical one.
+  //
+  // Crucially this can never weaken a chat that already works — the send path
+  // consults `isPeerConfirmed` first, and that is one-way. This flag only
+  // decides whether a chat that has NEVER been established waits or sends.
+
+  private static func peerKeysMissingKey(_ chatId: String) -> String {
+    "vibe.mls.peerKeysMissing.\(chatId)"
+  }
+
+  /// How long a "no KeyPackage" answer is trusted before we probe again.
+  ///
+  /// Bounded so a peer who installs the app is not stuck on the older envelope
+  /// indefinitely. Chat-open re-establishment usually notices much sooner;
+  /// this is the backstop for a chat nobody reopens.
+  private static let peerKeysMissingTtl: TimeInterval = 6 * 60 * 60
+
+  /// Records that `chatId` cannot be established because a member has no
+  /// published KeyPackage.
+  func markPeerKeysUnavailable(chatId: String) {
+    UserDefaults.standard.set(
+      Date().timeIntervalSince1970, forKey: Self.peerKeysMissingKey(chatId))
+  }
+
+  /// True while a recent attempt found a member with no published KeyPackage.
+  func peerKeysUnavailable(chatId: String) -> Bool {
+    let stamp = UserDefaults.standard.double(forKey: Self.peerKeysMissingKey(chatId))
+    guard stamp > 0 else { return false }
+    return Date().timeIntervalSince1970 - stamp < Self.peerKeysMissingTtl
+  }
+
+  /// Clears the mark once establishment succeeds.
+  func clearPeerKeysUnavailable(chatId: String) {
+    UserDefaults.standard.removeObject(forKey: Self.peerKeysMissingKey(chatId))
+  }
+
   /// Forgets the session bound to `chatId`.
   ///
   /// Used when an establishment attempt cannot be completed — the peer never
