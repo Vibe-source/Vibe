@@ -22076,8 +22076,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let cell = collectionView.visibleCells.compactMap { $0 as? ChatListCell }
       .first { $0.row?.messageId == row.messageId || $0.row?.key == row.key }
 
-    let pages = buildNativeImagePages(for: row, cell: cell)
-    guard !pages.isEmpty else {
+    let messagePages = buildNativeImagePages(for: row, cell: cell)
+
+    // A multi-image message pages within itself and keeps its filmstrip. A
+    // single-image message instead swipes across every photo in the chat, in
+    // send order — there the filmstrip would just be a scroll bar for hundreds
+    // of thumbnails, so it stands down.
+    if messagePages.count > 1 {
+      let start = max(0, min(gridIndex, messagePages.count - 1))
+      let primary = messagePages[start]
+      presentImageEditView(
+        for: row,
+        mediaURL: primary.mediaURL,
+        seedImage: primary.image,
+        sourceView: sourceView,
+        galleryPages: messagePages,
+        startIndex: start,
+        allowsFilmstrip: true
+      )
+      return
+    }
+
+    let chatPages = buildChatImagePages()
+    if chatPages.count > 1,
+      let start = chatPages.firstIndex(where: { $0.messageId == row.messageId })
+    {
+      let primary = chatPages[start]
+      presentImageEditView(
+        for: row,
+        mediaURL: primary.mediaURL,
+        seedImage: primary.image,
+        sourceView: sourceView,
+        galleryPages: chatPages,
+        startIndex: start,
+        allowsFilmstrip: false
+      )
+      return
+    }
+
+    guard !messagePages.isEmpty else {
       let seed = cell?.mediaImage(atGridIndex: gridIndex) ?? cell?.currentMediaImage()
       let url = resolvedPreferredMediaURL(for: row) ?? row.mediaUrl ?? ""
       guard !url.isEmpty || seed != nil else { return }
@@ -22086,16 +22123,67 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         startIndex: 0)
       return
     }
-    let start = max(0, min(gridIndex, pages.count - 1))
-    let primary = pages[start]
+    let primary = messagePages[0]
     presentImageEditView(
       for: row,
       mediaURL: primary.mediaURL,
       seedImage: primary.image,
       sourceView: sourceView,
-      galleryPages: pages,
-      startIndex: start
+      galleryPages: messagePages,
+      startIndex: 0
     )
+  }
+
+  /// Every single-image message in the chat, oldest first, so the viewer can
+  /// swipe left and right through the chat's photos the way the reference does.
+  private func buildChatImagePages() -> [ChatImageEditGalleryPage] {
+    let visibleCells = collectionView.visibleCells.compactMap { $0 as? ChatListCell }
+
+    return rows.compactMap { row -> ChatImageEditGalleryPage? in
+      guard row.kind == .message, row.visualKind == .media, let messageId = row.messageId
+      else { return nil }
+      // Multi-image messages page inside themselves; folding their tiles into a
+      // flat chat-wide list would lose which tile the user actually tapped.
+      let tileCount = max(row.agentBridgeAttachmentsEnc.count, row.attachmentThumbnailsB64.count)
+      guard tileCount <= 1 else { return nil }
+
+      let url = resolvedPreferredMediaURL(for: row) ?? row.mediaUrl ?? ""
+      let seed =
+        visibleCells.first { $0.row?.messageId == messageId }?.currentMediaImage()
+        ?? row.agentBridgeAttachmentsEnc.first.flatMap {
+          ChatListCell.decodeBridgeGridImagePublic(blob: $0)
+        }
+        ?? chatMediaImageFromBase64Public(row.thumbnailBase64)
+
+      guard !url.isEmpty || seed != nil else { return nil }
+      return ChatImageEditGalleryPage(
+        mediaURL: url,
+        image: seed,
+        messageId: messageId,
+        subtitle: mediaHeaderDateText(for: row)
+      )
+    }
+  }
+
+  /// Short date line under the viewer title, matching the reference header.
+  private func mediaHeaderDateText(for row: ChatListRow) -> String? {
+    let raw = row.timestamp.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return nil }
+
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date =
+      iso.date(from: raw)
+      ?? {
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+      }()
+    guard let date else { return nil }
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "dd/MM/yy"
+    return formatter.string(from: date)
   }
 
   /// Pages for one message only (not the whole chat). Seeds from visible tiles / blobs / thumbs.
@@ -22124,7 +22212,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           return ""
         }()
         if seed == nil && url.isEmpty { continue }
-        pages.append(ChatImageEditGalleryPage(mediaURL: url, image: seed))
+        pages.append(
+          ChatImageEditGalleryPage(
+            mediaURL: url,
+            image: seed,
+            messageId: row.messageId,
+            subtitle: mediaHeaderDateText(for: row)))
       }
       return pages
     }
@@ -22136,7 +22229,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ?? chatMediaImageFromBase64Public(row.thumbnailBase64)
     let url = resolvedPreferredMediaURL(for: row) ?? row.mediaUrl ?? ""
     if url.isEmpty && seed == nil { return [] }
-    return [ChatImageEditGalleryPage(mediaURL: url, image: seed)]
+    return [
+      ChatImageEditGalleryPage(
+        mediaURL: url,
+        image: seed,
+        messageId: row.messageId,
+        subtitle: mediaHeaderDateText(for: row))
+    ]
   }
 
   private func presentImageEditView(
@@ -22145,7 +22244,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     seedImage: UIImage?,
     sourceView: UIView? = nil,
     galleryPages: [ChatImageEditGalleryPage] = [],
-    startIndex: Int = 0
+    startIndex: Int = 0,
+    allowsFilmstrip: Bool = true
   ) {
     guard let presenter = topPresentingViewController() else { return }
     ChatImageEditModule.presentEditor(
@@ -22156,13 +22256,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       initialImage: seedImage,
       initialCaption: row.text,
       headerTitle: resolvedMediaPreviewHeaderTitle(for: row),
+      headerSubtitle: mediaHeaderDateText(for: row),
       galleryPages: galleryPages,
-      startIndex: startIndex
+      startIndex: startIndex,
+      allowsFilmstrip: allowsFilmstrip
     ) { [weak self] payload in
       guard let self else { return }
+      // The viewer swipes across messages, so these act on the photo that was on
+      // screen, not on the row the viewer happened to be opened from.
+      let targetRow =
+        payload.messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+
+      if payload.eventType == .showInChat {
+        if let messageId = payload.messageId {
+          self.scrollToMessage(messageId: messageId, animated: true, viewPosition: 0.5)
+        }
+        return
+      }
+
+      if payload.eventType == .delete {
+        self.presentMediaViewerDeletion(for: targetRow)
+        return
+      }
+
       // Reply only arms the banner — no media re-send.
       if payload.eventType == .reply {
-        self.showReplyBanner(for: row, fallbackText: "Photo")
+        self.showReplyBanner(for: targetRow, fallbackText: "Photo")
         var event: [String: Any] = [
           "type": payload.eventType.rawValue,
           "mediaUrl": payload.mediaURL,
@@ -22207,6 +22326,43 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       self.onNativeEvent(event)
     }
+  }
+
+  /// Delete confirmation for the media viewer. Reuses the same
+  /// `performMessageDeletion` path as the context menu so both routes agree on
+  /// scope (for me vs for everyone) and on what the engine is told.
+  private func presentMediaViewerDeletion(for row: ChatListRow) {
+    guard let messageId = row.messageId, let presenter = topPresentingViewController() else {
+      return
+    }
+    let config = contextDeleteConfiguration(for: row)
+    guard !config.chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      onNativeEvent(["type": "agentToast", "message": "Couldn't identify this chat."])
+      return
+    }
+
+    let sheet = UIAlertController(
+      title: nil, message: "Delete this photo?", preferredStyle: .actionSheet)
+    sheet.addAction(
+      UIAlertAction(title: "Delete for me", style: .destructive) { [weak self] _ in
+        self?.performMessageDeletion(
+          messageId: messageId, row: row, chatId: config.chatId, deleteForEveryone: false)
+      })
+    if let everyoneTitle = config.deleteForEveryoneTitle {
+      sheet.addAction(
+        UIAlertAction(title: everyoneTitle, style: .destructive) { [weak self] _ in
+          self?.performMessageDeletion(
+            messageId: messageId, row: row, chatId: config.chatId, deleteForEveryone: true)
+        })
+    }
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+    if let popover = sheet.popoverPresentationController {
+      popover.sourceView = presenter.view
+      popover.sourceRect = CGRect(
+        x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 120, width: 1, height: 1)
+    }
+    presenter.present(sheet, animated: true)
   }
 
   private func showReplyBanner(for row: ChatListRow, fallbackText: String) {

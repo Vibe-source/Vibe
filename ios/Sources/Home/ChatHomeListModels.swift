@@ -631,6 +631,19 @@ struct ChatHomeListRow {
   /// visible message, else room creation). Drives newest-first home ordering.
   /// Mirrors the server's `lastMessageAt`.
   let lastMessageAt: Double
+  /// Epoch-ms instant this participant last cleared the chat, `0` when never cleared.
+  /// Mirrors the server's `messagesClearedAt`.
+  ///
+  /// This is the repair channel for "deleted for both sides, but the other phone still
+  /// shows everything". The delete itself travels as a fire-and-forget `chat-deleted`
+  /// socket push; a peer whose socket was down never hears it and keeps its whole local
+  /// transcript, which the server will never contradict because it filters cleared
+  /// messages out of every response. Carrying the clear *point* instead means any
+  /// refresh is enough to notice and repair the divergence.
+  ///
+  /// `var` with a default so the existing memberwise-init call sites keep compiling;
+  /// every copy helper below forwards it explicitly.
+  var messagesClearedAt: Double = 0
   /// Room creation epoch-ms when present (`createdAt`).
   let createdAt: Double
   /// Optional room description (group/channel).
@@ -859,6 +872,9 @@ struct ChatHomeListRow {
       "previewRows": shouldIncludeMessagePayload ? previewRows : [],
       "messages": shouldIncludeMessagePayload ? Array(initialMessages.suffix(messageLimit)) : [],
       "lastMessageAt": lastMessageAt,
+      // Survives a cold start so a relaunch does not re-import a transcript this
+      // participant already cleared.
+      "messagesClearedAt": messagesClearedAt,
     ]
     if let peerUserId { payload["peerUserId"] = peerUserId }
     if let peerAgentId { payload["peerAgentId"] = peerAgentId }
@@ -891,7 +907,7 @@ struct ChatHomeListRow {
   }
 
   func withPresence(isTyping: Bool, isOnline: Bool, preview: String? = nil) -> ChatHomeListRow {
-    return ChatHomeListRow(
+    var copy = ChatHomeListRow(
       chatId: chatId,
       title: title,
       preview: preview ?? self.preview,
@@ -933,6 +949,10 @@ struct ChatHomeListRow {
       memberCount: memberCount,
       subscriberCount: subscriberCount
     )
+    // Not a memberwise parameter (it defaults, so old call sites still compile), so a
+    // copy has to forward it by hand or the clear point silently resets to "never".
+    copy.messagesClearedAt = messagesClearedAt
+    return copy
   }
 
   /// Local-only unread state, applied before (and independently of) the server call.
@@ -942,7 +962,7 @@ struct ChatHomeListRow {
   /// status is rewritten, and the peer's own ticks are unaffected — the server endpoint
   /// behind it only flips this participant's `marked_unread` flag.
   func withLocalUnread(_ unread: Bool) -> ChatHomeListRow {
-    ChatHomeListRow(
+    var copy = ChatHomeListRow(
       chatId: chatId,
       title: title,
       preview: preview,
@@ -984,6 +1004,10 @@ struct ChatHomeListRow {
       memberCount: memberCount,
       subscriberCount: subscriberCount
     )
+    // Not a memberwise parameter (it defaults, so old call sites still compile), so a
+    // copy has to forward it by hand or the clear point silently resets to "never".
+    copy.messagesClearedAt = messagesClearedAt
+    return copy
   }
 
   static func parse(_ raw: [String: Any]) -> ChatHomeListRow? {
@@ -1167,8 +1191,10 @@ struct ChatHomeListRow {
       parseBool(raw["restrictSavingContent"] ?? raw["restrict_saving_content"]) ?? false
     let memberCount = parseInt(raw["memberCount"] ?? raw["member_count"])
     let subscriberCount = parseInt(raw["subscriberCount"] ?? raw["subscriber_count"])
+    let messagesClearedAt =
+      parseEpochMillis(raw["messagesClearedAt"] ?? raw["messages_cleared_at"]) ?? 0
 
-    return ChatHomeListRow(
+    var parsed = ChatHomeListRow(
       chatId: chatId,
       title: title,
       preview: preview,
@@ -1210,6 +1236,8 @@ struct ChatHomeListRow {
       memberCount: memberCount,
       subscriberCount: subscriberCount
     )
+    parsed.messagesClearedAt = messagesClearedAt
+    return parsed
   }
 
   private static func parsePreviewRows(_ value: Any?) -> [[String: Any]] {

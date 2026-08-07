@@ -2741,6 +2741,16 @@ private final class ChatsViewModel: ObservableObject {
         "[Launch] /api/chats rows=%d in %dms",
         fetchedRows.count,
         Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))
+      // Repair any chat the server considers cleared past a point we are still holding
+      // messages before. This is the catch-up path for a `chat-deleted` push that never
+      // arrived — see `ChatEngine.applyRemoteMessagesClearedAt`. Cheap and idempotent:
+      // the engine keeps the last point it applied per chat and returns immediately when
+      // there is nothing new, which is every refresh but the one that matters.
+      for fetchedRow in fetchedRows where fetchedRow.messagesClearedAt > 0 {
+        ChatEngine.shared.applyRemoteMessagesClearedAt(
+          chatId: fetchedRow.chatId,
+          clearedAtMs: Int64(fetchedRow.messagesClearedAt))
+      }
       let existingRowsByChatID = Dictionary(
         rows.map { ($0.chatId, $0) },
         uniquingKeysWith: { current, _ in current }

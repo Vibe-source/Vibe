@@ -394,16 +394,31 @@ defmodule Vibe.Chat do
           friend_agent =
             if(friend_p, do: Map.get(agent_friends_by_user_id, friend_p.user_id), else: nil)
 
+          # The instant this participant last cleared the chat, in epoch ms. Hoisted out of
+          # the filter below because the CLIENT needs it too, not just this query.
+          #
+          # Deleting a DM "for both sides" marks both participants cleared and pushes
+          # `chat-deleted` over the socket. That push is the peer's only signal, and it is
+          # fire-and-forget: a peer whose socket is down (device exports 2026-08-06 are
+          # wall-to-wall `ws dead socket reason=heartbeat_timeout`) never hears it. Its
+          # local SQLite + core store keep the whole transcript, this endpoint will never
+          # resend those messages because of the very filter below, and the two devices
+          # then disagree permanently with nothing left to repair it.
+          #
+          # Publishing the clear point makes the delete self-healing: any refresh is enough
+          # for a client to notice it is holding messages the server considers cleared.
+          cleared_at_ms =
+            if my_settings.messages_cleared_at do
+              my_settings.messages_cleared_at
+              |> DateTime.from_naive!("Etc/UTC")
+              |> DateTime.to_unix(:millisecond)
+            end
+
           # Filter last message by cleared_at if applicable
           chat_messages = Map.get(last_messages_by_chat, chat_id, [])
 
           chat_messages =
-            if my_settings.messages_cleared_at do
-              cleared_at_ms =
-                my_settings.messages_cleared_at
-                |> DateTime.from_naive!("Etc/UTC")
-                |> DateTime.to_unix(:millisecond)
-
+            if cleared_at_ms do
               Enum.filter(chat_messages, &(&1.timestamp > cleared_at_ms))
             else
               chat_messages
@@ -474,6 +489,10 @@ defmodule Vibe.Chat do
             # when type is missing from a stale cache row.
             isChannel: room_type == "channel",
             lastMessageAt: last_activity_at,
+            # Epoch ms of this participant's last clear, or nil if they never cleared.
+            # The client drops anything it stored at or before this instant — see the
+            # comment where it is computed.
+            messagesClearedAt: cleared_at_ms,
             createdAt: created_at,
             name: if(room, do: room.name, else: nil),
             description: if(room, do: room.description, else: nil),

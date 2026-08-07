@@ -9623,13 +9623,82 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// Everything above: bubble plate, tail, text/rich-text, reply + link previews.
   private let clkPropsAfterBubble = ProcessInfo.processInfo.systemUptime
   private let mediaContainerView = UIView()
-  private let mediaPlaceholderBlurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
-  private let mediaPlaceholderTintView = UIView()
+  /// Built the first time a row actually needs the transfer scrim — see
+  /// ``mediaPlaceholderBlurView``. The tint lives inside the blur's `contentView` and has
+  /// no independent existence, so the two are created together and share one backing.
+  private var _mediaPlaceholderBlurView: UIVisualEffectView?
+  private var _mediaPlaceholderTintView: UIView?
+  /// The soft material scrim over a still preview while its media transfers.
+  ///
+  /// Same contract as ``linkPreviewView``: hiding, resetting, zeroing a frame, reading
+  /// visibility and re-tinting all go through `_mediaPlaceholderBlurView?` /
+  /// `_mediaPlaceholderTintView?`; only actually SHOWING a scrim goes through this.
+  ///
+  /// `UIVisualEffectView` is one of the three types every cell used to pay for whether or
+  /// not it had media — the census at ``logConstructionCostCensus`` measured the whole
+  /// cell at 12-17ms, and a plain text bubble bought a blur, an `AVPlayerLayer` and a
+  /// Lottie view it could never show. Device export 2026-08-06: `layout=63..170ms` for a
+  /// 64-row seed, against 2ms for all of `ChatTimelineLayout`. The geometry was never the
+  /// cost; constructing ~12 of these was.
+  private var mediaPlaceholderBlurView: UIVisualEffectView {
+    if let existing = _mediaPlaceholderBlurView { return existing }
+    let view = UIVisualEffectView(
+      effect: UIBlurEffect(
+        style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight))
+    view.clipsToBounds = true
+    view.isHidden = true
+    let tint = UIView()
+    tint.backgroundColor = UIColor(
+      white: appearance.isDark ? 0.02 : 0.98,
+      alpha: appearance.isDark ? 0.18 : 0.10
+    )
+    view.contentView.addSubview(tint)
+    // Directly above the video host, matching the eager initializer's subview order:
+    // image → video host → scrim → sticker → chrome. Anchoring to `mediaVideoPlayerHostView`
+    // rather than to the sticker keeps this correct whichever of the two lazy views was
+    // built first — asking for the sticker here would construct the thing being avoided.
+    mediaContainerView.insertSubview(view, aboveSubview: mediaVideoPlayerHostView)
+    _mediaPlaceholderBlurView = view
+    _mediaPlaceholderTintView = tint
+    // Frames are assigned in `layoutSubviews`, which has not run for this view yet.
+    setNeedsLayout()
+    return view
+  }
+  /// The tint plate inside the scrim. Reaching for it builds the scrim, because it cannot
+  /// exist without one.
+  private var mediaPlaceholderTintView: UIView {
+    _ = mediaPlaceholderBlurView
+    return _mediaPlaceholderTintView ?? UIView()
+  }
   private let mediaImageView = UIImageView()
   /// Quality of pixels currently in `mediaImageView` — enforces promote-only replaces.
   private var mediaPixelQuality: ChatMediaPreviewQuality = .none
   private let mediaVideoPlayerHostView = UIView()
-  private let mediaStickerAnimationView = LottieAnimationView()
+  /// Built the first time a row renders an animated sticker — see
+  /// ``mediaStickerAnimationView``.
+  private var _mediaStickerAnimationView: LottieAnimationView?
+  /// The Lottie surface for animated stickers.
+  ///
+  /// Same contract as ``mediaPlaceholderBlurView``: stopping, clearing, hiding, zeroing a
+  /// frame and reading `isHidden` / `isAnimationPlaying` all go through
+  /// `_mediaStickerAnimationView?`; only mounting an animation goes through this.
+  private var mediaStickerAnimationView: LottieAnimationView {
+    if let existing = _mediaStickerAnimationView { return existing }
+    let view = LottieAnimationView()
+    view.backgroundColor = .clear
+    view.contentMode = .scaleAspectFit
+    view.loopMode = .loop
+    view.backgroundBehavior = .pauseAndRestore
+    view.isUserInteractionEnabled = false
+    view.isHidden = true
+    // Directly below the media chrome, matching the eager initializer's subview order.
+    // Anchored to `mediaPrimaryIconView` (always eager) rather than to the scrim above it,
+    // so building a sticker never drags a blur view into existence with it.
+    mediaContainerView.insertSubview(view, belowSubview: mediaPrimaryIconView)
+    _mediaStickerAnimationView = view
+    setNeedsLayout()
+    return view
+  }
   private let mediaPrimaryIconView = UIImageView()
   private let mediaBorderLayer = CAShapeLayer()
   private let mediaVoiceButtonView = VoicePlayProgressView()
@@ -9774,7 +9843,24 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var cachedLayoutWidth: CGFloat = 0
   private var mediaImageTask: URLSessionDataTask?
   private var musicCoverTask: URLSessionDataTask?
-  private let mediaVideoPlayerLayer = AVPlayerLayer()
+  /// Built the first time a row plays inline video — see ``mediaVideoPlayerLayer``.
+  private var _mediaVideoPlayerLayer: AVPlayerLayer?
+  /// The inline video surface.
+  ///
+  /// Same contract as ``mediaStickerAnimationView``: detaching a player, zeroing opacity,
+  /// sizing and reading `player` all go through `_mediaVideoPlayerLayer?`; only attaching
+  /// a player goes through this. It is the only sublayer `mediaVideoPlayerHostView` ever
+  /// gets, so there is no z-order to preserve.
+  private var mediaVideoPlayerLayer: AVPlayerLayer {
+    if let existing = _mediaVideoPlayerLayer { return existing }
+    let layer = AVPlayerLayer()
+    layer.videoGravity = .resizeAspectFill
+    layer.opacity = 0.0
+    layer.frame = mediaVideoPlayerHostView.bounds
+    mediaVideoPlayerHostView.layer.addSublayer(layer)
+    _mediaVideoPlayerLayer = layer
+    return layer
+  }
   private var mediaVideoPlayer: AVPlayer?
   private var mediaVideoLoopObserver: NSObjectProtocol?
   private var mediaVideoStatusObserver: NSKeyValueObservation?
@@ -9934,9 +10020,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // transfer look) but below progress ring / play chrome.
     mediaContainerView.addSubview(mediaImageView)
     mediaContainerView.addSubview(mediaVideoPlayerHostView)
-    mediaContainerView.addSubview(mediaPlaceholderBlurView)
-    mediaPlaceholderBlurView.contentView.addSubview(mediaPlaceholderTintView)
-    mediaContainerView.addSubview(mediaStickerAnimationView)
+    // The transfer scrim and the sticker surface are built on demand and insert
+    // themselves here — see `mediaPlaceholderBlurView` / `mediaStickerAnimationView`.
     mediaContainerView.addSubview(mediaPrimaryIconView)
     mediaContainerView.addSubview(mediaVoiceButtonView)
     mediaContainerView.addSubview(mediaTitleLabel)
@@ -10001,26 +10086,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaContainerView.layer.cornerCurve = .continuous
     mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.16)
 
-    mediaPlaceholderBlurView.clipsToBounds = true
-    mediaPlaceholderBlurView.isHidden = true
-    mediaPlaceholderTintView.backgroundColor = UIColor(white: 0.0, alpha: 0.16)
-
     mediaImageView.backgroundColor = .clear
     mediaImageView.contentMode = .scaleAspectFill
     mediaImageView.clipsToBounds = true
 
     mediaVideoPlayerHostView.backgroundColor = .clear
     mediaVideoPlayerHostView.isHidden = true
-    mediaVideoPlayerLayer.videoGravity = .resizeAspectFill
-    mediaVideoPlayerLayer.opacity = 0.0
-    mediaVideoPlayerHostView.layer.addSublayer(mediaVideoPlayerLayer)
-
-    mediaStickerAnimationView.backgroundColor = .clear
-    mediaStickerAnimationView.contentMode = .scaleAspectFit
-    mediaStickerAnimationView.loopMode = .loop
-    mediaStickerAnimationView.backgroundBehavior = .pauseAndRestore
-    mediaStickerAnimationView.isUserInteractionEnabled = false
-    mediaStickerAnimationView.isHidden = true
 
     mediaPrimaryIconView.tintColor = .white
     mediaPrimaryIconView.contentMode = .center
@@ -10435,7 +10506,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let duration = max(0.01, mediaVideoTotalDuration ?? row?.duration ?? 1)
     // Read the player, not the 4Hz observer mirror: the ring is redrawn per frame, so it
     // may as well advance per frame instead of stepping four times a second.
-    let live = mediaVideoPlayerLayer.player?.currentTime()
+    let live = _mediaVideoPlayerLayer?.player?.currentTime()
     let current = max(
       0, live.map { $0.isNumeric ? CMTimeGetSeconds($0) : mediaVideoCurrentTime }
         ?? mediaVideoCurrentTime)
@@ -10490,10 +10561,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.clipsToBounds = true
     let isCurrentRowMe = row?.isMe == true
     applyVoiceChromeColors(isMe: isCurrentRowMe)
-    mediaPlaceholderBlurView.effect = UIBlurEffect(
+    // Only re-style a scrim that exists. A cell with no media has nothing to restyle, and
+    // the lazy initializer already reads the current appearance when it does build one.
+    _mediaPlaceholderBlurView?.effect = UIBlurEffect(
       style: appearance.isDark ? .systemChromeMaterialDark : .systemChromeMaterialLight
     )
-    mediaPlaceholderTintView.backgroundColor = UIColor(
+    _mediaPlaceholderTintView?.backgroundColor = UIColor(
       white: appearance.isDark ? 0.02 : 0.98,
       alpha: appearance.isDark ? 0.18 : 0.10
     )
@@ -11276,7 +11349,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     bubbleView.transform = .identity
     tailView.transform = .identity
     metaContainerView.transform = .identity
-    mediaPlaceholderBlurView.isHidden = true
+    setMediaPlaceholderHidden(true)
     resetStickerAnimation()
     lastReactionDebugSignature = nil
     applyContextMenuExtractionIfNeeded()
@@ -11753,7 +11826,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
       mediaProgressOverlayView.frame = mediaContainerView.bounds
       mediaImageView.frame = mediaContainerView.bounds
-      mediaStickerAnimationView.frame = mediaContainerView.bounds
+      _mediaStickerAnimationView?.frame = mediaContainerView.bounds
       layoutMediaSubviews(for: row, in: mediaContainerView.bounds)
       inlineAttachmentView.frame = .zero
       clearTallCollapseFadeMask(on: messageLabel)
@@ -12430,8 +12503,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     mediaVideoPlayer?.pause()
     mediaVideoPlayer = nil
-    mediaVideoPlayerLayer.player = nil
-    mediaVideoPlayerLayer.opacity = 0.0
+    _mediaVideoPlayerLayer?.player = nil
+    _mediaVideoPlayerLayer?.opacity = 0.0
     mediaVideoPlayerHostView.isHidden = true
     mediaVideoPlayerURLKey = nil
     mediaVideoReady = false
@@ -12504,9 +12577,31 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
   }
 
+  /// Show or hide the transfer scrim without forcing it to exist.
+  ///
+  /// This is the whole reason the lazy views need a helper rather than a `lazy var`.
+  /// Almost every call here is `hidden: true` — every text bubble, every settled photo,
+  /// every early return below — and a plain `mediaPlaceholderBlurView.isHidden = true`
+  /// would construct a `UIVisualEffectView` in order to hide it, which is the cost this
+  /// was meant to remove. Hiding something that was never built is a no-op.
+  private func setMediaPlaceholderHidden(_ hidden: Bool) {
+    if hidden {
+      _mediaPlaceholderBlurView?.isHidden = true
+    } else {
+      mediaPlaceholderBlurView.isHidden = false
+    }
+  }
+
+  /// Re-tint the scrim only if it exists. A fully transparent tint on a scrim that was
+  /// never built is the same picture.
+  private func setMediaPlaceholderTint(white: CGFloat, alpha: CGFloat) {
+    guard alpha > 0 || _mediaPlaceholderTintView != nil else { return }
+    mediaPlaceholderTintView.backgroundColor = UIColor(white: white, alpha: alpha)
+  }
+
   private func updateMediaPlaceholderVisibility() {
     guard let row else {
-      mediaPlaceholderBlurView.isHidden = true
+      setMediaPlaceholderHidden(true)
       return
     }
     let supportsPlaceholder =
@@ -12515,25 +12610,27 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       || row.visualKind == .document
       || (row.visualKind == .media && row.messageType != "file")
     guard supportsPlaceholder else {
-      mediaPlaceholderBlurView.isHidden = true
+      setMediaPlaceholderHidden(true)
       return
     }
     let hasInlineVideo =
-      !mediaVideoPlayerHostView.isHidden && mediaVideoReady && mediaVideoPlayerLayer.player != nil
+      !mediaVideoPlayerHostView.isHidden && mediaVideoReady
+      && _mediaVideoPlayerLayer?.player != nil
     if hasInlineVideo {
       // Live video frames replace any still preview.
-      mediaPlaceholderBlurView.isHidden = true
+      setMediaPlaceholderHidden(true)
       return
     }
-    if !mediaStickerAnimationView.isHidden {
-      mediaPlaceholderBlurView.isHidden = true
+    // A sticker surface that was never built is, by definition, not showing a sticker.
+    if _mediaStickerAnimationView?.isHidden == false {
+      setMediaPlaceholderHidden(true)
       return
     }
     let hasPixels = mediaImageView.image != nil
     if row.visualKind == .document {
       let resolvedPage = mediaPixelQuality == .full
-      mediaPlaceholderBlurView.isHidden = resolvedPage
-      mediaPlaceholderTintView.backgroundColor = UIColor(
+      setMediaPlaceholderHidden(resolvedPage)
+      setMediaPlaceholderTint(
         white: appearance.isDark ? 0.0 : 1.0,
         alpha: resolvedPage ? 0.0 : (appearance.isDark ? 0.28 : 0.14)
       )
@@ -12546,15 +12643,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // transferring. Full-quality pixels hide the overlay.
       let softContentBlur =
         transferPending && mediaPixelQuality == .microThumb
-      mediaPlaceholderBlurView.isHidden = !softContentBlur
-      mediaPlaceholderTintView.backgroundColor = UIColor(
+      setMediaPlaceholderHidden(!softContentBlur)
+      setMediaPlaceholderTint(
         white: appearance.isDark ? 0.0 : 1.0,
         alpha: softContentBlur ? (appearance.isDark ? 0.28 : 0.14) : 0.0
       )
     } else {
       // Last resort only — no durable thumb on the wire. Prefer never reaching here.
-      mediaPlaceholderBlurView.isHidden = false
-      mediaPlaceholderTintView.backgroundColor = UIColor(
+      setMediaPlaceholderHidden(false)
+      setMediaPlaceholderTint(
         white: appearance.isDark ? 0.02 : 0.98,
         alpha: appearance.isDark ? 0.18 : 0.10
       )
@@ -12582,7 +12679,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         "refresh pause active=\(mediaVideoPlaybackActive ? "Y" : "N") hasWindow=\(window != nil ? "Y" : "N") extracted=\(isContextMenuExtracted ? "Y" : "N") uploading=\(row.shouldShowUploadOverlay ? "Y" : "N") downloading=\(mediaIsDownloading ? "Y" : "N")"
       )
       mediaVideoPlayer?.pause()
-      mediaVideoPlayerLayer.opacity = 0.0
+      _mediaVideoPlayerLayer?.opacity = 0.0
       mediaVideoPlayerHostView.isHidden = true
       updateInlineVideoAudioIcon()
       updateMediaPlaceholderVisibility()
@@ -12643,7 +12740,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             }
             self.mediaVideoHasAudio = !item.asset.tracks(withMediaType: .audio).isEmpty
             self.mediaVideoPlayer?.isMuted = self.mediaVideoIsMuted || !self.mediaVideoHasAudio
-            self.mediaVideoPlayerLayer.opacity = 1.0
+            self._mediaVideoPlayerLayer?.opacity = 1.0
             self.mediaVideoPlayerHostView.isHidden = false
             self.mediaVideoPlayer?.play()
             self.updateInlineVideoTimeBadge()
@@ -12652,7 +12749,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             )
           case .failed:
             self.mediaVideoReady = false
-            self.mediaVideoPlayerLayer.opacity = 0.0
+            self._mediaVideoPlayerLayer?.opacity = 0.0
             self.mediaVideoPlayerHostView.isHidden = true
             self.inlineVideoLog(
               "player failed url=\(playbackKey) error=\(item.error?.localizedDescription ?? "nil")"
@@ -12661,7 +12758,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             fallthrough
           @unknown default:
             self.mediaVideoReady = false
-            self.mediaVideoPlayerLayer.opacity = 0.0
+            self._mediaVideoPlayerLayer?.opacity = 0.0
             self.inlineVideoLog("player unknown url=\(playbackKey)")
           }
           self.updateInlineVideoAudioIcon()
@@ -12673,7 +12770,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaVideoPlayer?.isMuted = mediaVideoIsMuted || !mediaVideoHasAudio
     if mediaVideoReady {
       mediaVideoPlayerHostView.isHidden = false
-      mediaVideoPlayerLayer.opacity = 1.0
+      _mediaVideoPlayerLayer?.opacity = 1.0
       mediaVideoPlayer?.play()
       inlineVideoLog(
         "player play url=\(playbackKey) timeControl=\(mediaVideoPlayer?.timeControlStatus.rawValue ?? -1)"
@@ -13102,7 +13199,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaVideoAudioIconView.image = nil
     mediaDurationBadge.isHidden = true
     mediaImageView.isHidden = true
-    mediaStickerAnimationView.isHidden = true
+    _mediaStickerAnimationView?.isHidden = true
     mediaImageView.image = preservedMediaImage
     mediaImageTask?.cancel()
     mediaImageTask = nil
@@ -13277,7 +13374,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // Soft center play only when not already playing inline (Telegram circle).
       let playingInline =
         !mediaVideoPlayerHostView.isHidden && mediaVideoReady
-        && mediaVideoPlayerLayer.player != nil
+        && _mediaVideoPlayerLayer?.player != nil
       mediaPrimaryIconView.isHidden = playingInline
       mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
         UIImage.SymbolConfiguration(pointSize: 22, weight: .bold))
@@ -13324,10 +13421,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if !hasPagePixels, let placeholder = chatMediaImage(fromBase64: row.thumbnailBase64) {
         mediaImageView.image = placeholder
         mediaPixelQuality = .microThumb
-        mediaPlaceholderBlurView.isHidden = false
+        setMediaPlaceholderHidden(false)
       } else if !hasPagePixels {
         mediaImageView.image = nil
-        mediaPlaceholderBlurView.isHidden = false
+        setMediaPlaceholderHidden(false)
       }
 
     case .media, .sticker:
@@ -13928,10 +14025,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaContainerView.layer.cornerRadius = cornerRadius
       mediaContainerView.layer.mask = nil
     }
-    mediaPlaceholderBlurView.frame = mediaContainerView.bounds
-    mediaPlaceholderTintView.frame = mediaPlaceholderBlurView.contentView.bounds
+    // Sizing an unbuilt view is what a lazy view exists to avoid, and `layoutSubviews`
+    // is the hottest path in the cell — every scroll tick, for every mounted row.
+    if let scrim = _mediaPlaceholderBlurView {
+      scrim.frame = mediaContainerView.bounds
+      _mediaPlaceholderTintView?.frame = scrim.contentView.bounds
+    }
     mediaVideoPlayerHostView.frame = mediaContainerView.bounds
-    mediaVideoPlayerLayer.frame = mediaVideoPlayerHostView.bounds
+    _mediaVideoPlayerLayer?.frame = mediaVideoPlayerHostView.bounds
     mediaProgressOverlayView.layer.cornerRadius = 0.0
     mediaBorderLayer.frame = mediaContainerView.bounds
     if !mediaBorderLayer.isHidden && mediaBorderLayer.lineWidth > 0.0 {
@@ -14031,8 +14132,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         height: previewSide
       )
       mediaImageView.frame = previewFrame
-      mediaPlaceholderBlurView.frame = previewFrame
-      mediaPlaceholderTintView.frame = mediaPlaceholderBlurView.contentView.bounds
+      if let scrim = _mediaPlaceholderBlurView {
+        scrim.frame = previewFrame
+        _mediaPlaceholderTintView?.frame = scrim.contentView.bounds
+      }
       mediaImageView.layer.cornerRadius = documentPreviewCornerRadius
       mediaImageView.layer.cornerCurve = .continuous
       mediaPrimaryIconView.frame = previewFrame
@@ -14299,14 +14402,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     NSLog("[ChatStickerCell] Lottie path=%@", filePath)
 
-    if currentStickerAnimationKey != filePath || mediaStickerAnimationView.animation == nil {
-      mediaStickerAnimationView.stop()
-      mediaStickerAnimationView.animation = LottieAnimation.filepath(filePath)
+    // The one path that genuinely needs a Lottie view, so the one path that builds it.
+    let stickerView = mediaStickerAnimationView
+    if currentStickerAnimationKey != filePath || stickerView.animation == nil {
+      stickerView.stop()
+      stickerView.animation = LottieAnimation.filepath(filePath)
       currentStickerAnimationKey = filePath
     }
 
-    let hasAnimation = mediaStickerAnimationView.animation != nil
-    mediaStickerAnimationView.isHidden = !hasAnimation
+    let hasAnimation = stickerView.animation != nil
+    stickerView.isHidden = !hasAnimation
     if !hasAnimation {
       NSLog("[ChatStickerCell] Lottie parse FAILED for path=%@", filePath)
       currentStickerAnimationKey = nil
@@ -14317,14 +14422,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return hasAnimation
   }
 
+  /// Runs on reuse for every cell, sticker or not — so it must clear a view that exists
+  /// and do nothing at all for one that does not.
   private func resetStickerAnimation() {
-    mediaStickerAnimationView.stop()
-    mediaStickerAnimationView.animation = nil
-    mediaStickerAnimationView.isHidden = true
     currentStickerAnimationKey = nil
+    guard let stickerView = _mediaStickerAnimationView else { return }
+    stickerView.stop()
+    stickerView.animation = nil
+    stickerView.isHidden = true
   }
 
   private func updateStickerAnimationPlayback() {
+    // No view means no animation to start or stop.
+    guard let mediaStickerAnimationView = _mediaStickerAnimationView else { return }
     let shouldPlay =
       window != nil
       && !mediaStickerAnimationView.isHidden
@@ -14668,7 +14778,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       self.mediaImageView.image = image
       self.mediaImageView.isHidden = false
       self.mediaPrimaryIconView.isHidden = true
-      self.mediaPlaceholderBlurView.isHidden = true
+      self.setMediaPlaceholderHidden(true)
     }
     // Already showing exactly these pixels: nothing to fade, nothing to re-apply.
     if mediaImageView.image === image, !mediaImageView.isHidden {

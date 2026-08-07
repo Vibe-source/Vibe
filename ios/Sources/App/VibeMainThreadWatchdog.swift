@@ -99,16 +99,29 @@ final class VibeMainThreadWatchdog {
   /// was standing on when it stopped.
   private var reportedHangActivity = "?"
   private var reportedHangMode = "?"
+  /// The main thread's own stack, sampled at the moment the hang was detected. This is
+  /// the line that names the function; `reportedHangActivity` is only a breadcrumb and
+  /// says `idle` for everything that is not a chat open.
+  private var reportedHangStack: [String] = []
   /// When the watcher itself last ran. A main-thread hang does not stop this queue —
   /// that is the entire premise of watching from off the main thread — so a gap here
   /// means the *process* stopped, not the main thread. See `sample`.
   private var lastSampleAt: CFTimeInterval = 0
+
+  /// The main thread's mach port, captured on `start()`. Suspending and reading a
+  /// thread requires its port, and `pthread_mach_thread_np` must be asked on the thread
+  /// itself — there is no "give me the main thread's port" call from elsewhere.
+  private var mainThreadPort: mach_port_t = 0
 
   private init() {}
 
   /// Installs the observer and starts watching. Safe to call once, from the main thread.
   func start() {
     guard observer == nil else { return }
+
+    // Must be read here, on main. `mach_thread_self()` would hand back a send right that
+    // needs deallocating; the pthread form is a borrowed name with no ownership.
+    mainThreadPort = pthread_mach_thread_np(pthread_self())
 
     let activities: CFRunLoopActivity = [.beforeSources, .afterWaiting, .beforeWaiting, .exit]
     let observer = CFRunLoopObserverCreateWithHandler(
@@ -211,11 +224,16 @@ final class VibeMainThreadWatchdog {
             "seconds": String(format: "%.2f", duration),
             "mode": reportedHangMode,
             "during": reportedHangActivity,
+            // Trimmed to the app's own frames: a diagnostics export is a ring buffer,
+            // and 40 lines of UIKit trampolines per hang would push out the rest of the
+            // session. The full trace is in `NSLog` for anyone with a console attached.
+            "stack": Self.compactStack(reportedHangStack),
           ])
         VibeOpenTrace.shared.noteHang(
           seconds: duration, mode: reportedHangMode, activity: reportedHangActivity)
         reportedHangStart = 0
         lastOngoingReport = 0
+        reportedHangStack = []
       }
       return
     }
@@ -239,17 +257,201 @@ final class VibeMainThreadWatchdog {
       // to a stack as this can get without suspending the thread to walk it.
       reportedHangMode = mode.isEmpty ? "?" : mode
       reportedHangActivity = VibeOpenTrace.shared.activity
+      // The stack is the whole point. `activity` reports `idle` for every stall that is
+      // not a chat open, which is most of them, and a run-loop mode cannot distinguish
+      // a wallpaper rasterize from a synchronous SQLite read. Sampled while the thread
+      // is stopped, so it is the real frame list and not a guess.
+      reportedHangStack = captureMainThreadStack()
       NSLog(
         "[MainHang] BLOCKED %.2fs mode=%@ during=%@ — main thread is not advancing; no touches or frames are being serviced",
         blockedFor, reportedHangMode, reportedHangActivity)
+      for line in reportedHangStack { NSLog("[MainHang]   %@", line) }
       return
     }
 
     if now - lastOngoingReport >= ongoingReportInterval {
       lastOngoingReport = now
+      // Re-sample. One stack says where it started; a second one a second later says
+      // whether it is stuck in one call or grinding through a loop of them, which are
+      // different bugs with different fixes.
+      let ongoing = captureMainThreadStack()
       NSLog(
         "[MainHang] STILL BLOCKED %.2fs mode=%@ during=%@", blockedFor,
         mode.isEmpty ? "?" : mode, reportedHangActivity)
+      for line in ongoing { NSLog("[MainHang]   %@", line) }
+      // A hang long enough to repeat is one the reader definitely felt, and it may end
+      // in a kill that never reaches the recovery path. Put this one in the durable log
+      // where a diagnostics export will still find it.
+      VibeLog.warning(
+        "main thread STILL blocked \(String(format: "%.2f", blockedFor))s during \(reportedHangActivity)",
+        category: "mainhang",
+        metadata: [
+          "seconds": String(format: "%.2f", blockedFor),
+          "mode": mode.isEmpty ? "?" : mode,
+          "during": reportedHangActivity,
+          "stack": Self.compactStack(ongoing),
+        ])
     }
+  }
+
+  // MARK: Sampling the main thread's stack
+  //
+  // Everything above can say a hang happened, how long it lasted and which run-loop mode
+  // it was in. None of it can say *what ran*. `VibeOpenTrace.activity` was the stand-in,
+  // and it answers `idle` for anything that is not a chat open — so a device export
+  // showing four 0.4-1.0s blocks on the home screen attributed all four to "idle" and
+  // named nothing. This closes that: stop the main thread, read its registers, walk its
+  // frame pointers, resume, and symbolicate afterwards.
+  //
+  // The ordering is not incidental. While the main thread is suspended it may be holding
+  // the malloc lock or the dyld lock, so nothing between `thread_suspend` and
+  // `thread_resume` is allowed to allocate or to call `dladdr` — that is a self-inflicted
+  // deadlock in the one component that exists to diagnose freezes. Only register reads
+  // and `vm_read_overwrite` happen inside the window; symbolication happens after.
+  //
+  // Frames are read with `vm_read_overwrite` rather than dereferenced. A corrupt or
+  // mid-prologue frame pointer is normal — the leaf frame is often half-built — and a
+  // raw load on a bad address crashes the app. `vm_read_overwrite` returns a failure
+  // code instead, which ends the walk with a short stack rather than a crash report.
+
+  /// Max frames to walk. Deep enough to cross UIKit and reach app code, bounded so a
+  /// cyclic frame chain cannot spin.
+  private static let maxStackDepth = 48
+
+  private func captureMainThreadStack() -> [String] {
+    #if arch(arm64)
+      let thread = mainThreadPort
+      guard thread != MACH_PORT_NULL else { return ["<no main-thread port>"] }
+
+      var addresses: [UInt64] = []
+
+      guard thread_suspend(thread) == KERN_SUCCESS else {
+        return ["<thread_suspend failed>"]
+      }
+
+      var state = arm_thread_state64_t()
+      var count = mach_msg_type_number_t(
+        MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+      let readState = withUnsafeMutablePointer(to: &state) { statePointer in
+        statePointer.withMemoryRebound(to: natural_t.self, capacity: Int(count)) { rebound in
+          thread_get_state(thread, thread_state_flavor_t(ARM_THREAD_STATE64), rebound, &count)
+        }
+      }
+
+      if readState == KERN_SUCCESS {
+        addresses.append(Self.stripPointerAuth(state.__pc))
+        // Frame records are { saved FP, saved LR } at [fp], [fp+8].
+        var frame = state.__fp
+        var previousFrame: UInt64 = 0
+        var slot = (next: UInt64(0), returnAddress: UInt64(0))
+        while addresses.count < Self.maxStackDepth {
+          let framePointer = Self.stripPointerAuth(frame)
+          // Stacks grow down, so each caller's record sits at a HIGHER address than the
+          // callee's. A next-frame that is not strictly above the current one is either
+          // garbage or a cycle; either way the walk is over.
+          guard framePointer != 0, framePointer % 8 == 0, framePointer > previousFrame else {
+            break
+          }
+          guard Self.readMemory(at: framePointer, into: &slot) else { break }
+          let returnAddress = Self.stripPointerAuth(slot.returnAddress)
+          guard returnAddress != 0 else { break }
+          addresses.append(returnAddress)
+          previousFrame = framePointer
+          frame = slot.next
+        }
+      }
+
+      thread_resume(thread)
+
+      guard readState == KERN_SUCCESS else { return ["<thread_get_state failed>"] }
+      return Self.symbolicate(addresses)
+    #else
+      return ["<stack sampling requires arm64>"]
+    #endif
+  }
+
+  /// arm64e signs return addresses and frame pointers. The app itself builds arm64, but
+  /// a frame that passed through a system library can still carry signature bits in the
+  /// high half. Masking to the 47-bit user-space range is what makes those addresses
+  /// resolvable; it is a no-op for unsigned ones.
+  private static func stripPointerAuth(_ value: UInt64) -> UInt64 {
+    value & 0x0000_7FFF_FFFF_FFFF
+  }
+
+  /// Reads one frame record out of the suspended thread's stack. Returns false rather
+  /// than trapping when the address is not mapped.
+  private static func readMemory(
+    at address: UInt64, into slot: inout (next: UInt64, returnAddress: UInt64)
+  ) -> Bool {
+    var readSize: vm_size_t = 0
+    let wanted = vm_size_t(MemoryLayout<UInt64>.size * 2)
+    let result = withUnsafeMutablePointer(to: &slot) { destination -> kern_return_t in
+      vm_read_overwrite(
+        mach_task_self_,
+        vm_address_t(address),
+        wanted,
+        vm_address_t(UInt(bitPattern: destination)),
+        &readSize)
+    }
+    return result == KERN_SUCCESS && readSize == wanted
+  }
+
+  private static func symbolicate(_ addresses: [UInt64]) -> [String] {
+    addresses.enumerated().map { index, address in
+      var info = Dl_info()
+      guard let pointer = UnsafeRawPointer(bitPattern: UInt(address)),
+        dladdr(pointer, &info) != 0
+      else {
+        return String(format: "%2d  ??? 0x%016llx", index, address)
+      }
+      let image =
+        info.dli_fname.map { (String(cString: $0) as NSString).lastPathComponent } ?? "???"
+      guard let nameCString = info.dli_sname else {
+        return String(format: "%2d  %@ 0x%016llx", index, image, address)
+      }
+      let symbol = demangle(String(cString: nameCString))
+      let offset = address &- UInt64(UInt(bitPattern: info.dli_saddr))
+      return String(format: "%2d  %@ %@ + %llu", index, image, symbol, offset)
+    }
+  }
+
+  /// `swift_demangle` lives in the Swift runtime the app is already linked against, but
+  /// it is not exposed to Swift source. Resolving it by name keeps the pretty names
+  /// without a bridging header, and falls back to the mangled form if it ever moves.
+  private typealias SwiftDemangleFunction = @convention(c) (
+    UnsafePointer<CChar>?, Int, UnsafeMutablePointer<CChar>?, UnsafeMutablePointer<Int>?, UInt32
+  ) -> UnsafeMutablePointer<CChar>?
+
+  private static let swiftDemangle: SwiftDemangleFunction? = {
+    // RTLD_DEFAULT — search every loaded image.
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "swift_demangle") else {
+      return nil
+    }
+    return unsafeBitCast(symbol, to: SwiftDemangleFunction.self)
+  }()
+
+  private static func demangle(_ name: String) -> String {
+    guard name.hasPrefix("$s") || name.hasPrefix("_$s"), let demangler = swiftDemangle,
+      let output = demangler(name, name.utf8.count, nil, nil, 0)
+    else { return name }
+    defer { free(output) }
+    return String(cString: output)
+  }
+
+  /// The version that goes in the durable log: this app's own frames, innermost first,
+  /// capped. Everything the reader needs to name the culprit, in one field.
+  private static func compactStack(_ frames: [String]) -> String {
+    guard !frames.isEmpty else { return "<none>" }
+    let appFrames = frames.filter { $0.contains("Vibe") }
+    let chosen = appFrames.isEmpty ? Array(frames.prefix(4)) : Array(appFrames.prefix(6))
+    return
+      chosen
+      .map { line in
+        // Drop the leading index and the image name — the frames are already in order
+        // and they are all the same image once filtered.
+        line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).last
+          .map(String.init) ?? line
+      }
+      .joined(separator: " ← ")
   }
 }

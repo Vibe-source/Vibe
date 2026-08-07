@@ -5,6 +5,8 @@ enum ChatImageEditEventType: String {
   case edit = "mediaEditRequested"
   case resend = "mediaResendRequested"
   case sendNew = "mediaSendNewRequested"
+  case showInChat = "mediaShowInChatRequested"
+  case delete = "mediaDeleteRequested"
 }
 
 struct ChatImageEditActionPayload {
@@ -19,6 +21,20 @@ struct ChatImageEditActionPayload {
 struct ChatImageEditGalleryPage {
   let mediaURL: String
   let image: UIImage?
+  /// Message id this page came from — swiping across a chat moves between
+  /// messages, so the action menu has to follow the photo, not the opener.
+  let messageId: String?
+  /// Second header line (the message date, as in the reference).
+  let subtitle: String?
+
+  init(
+    mediaURL: String, image: UIImage?, messageId: String? = nil, subtitle: String? = nil
+  ) {
+    self.mediaURL = mediaURL
+    self.image = image
+    self.messageId = messageId
+    self.subtitle = subtitle
+  }
 }
 
 enum ChatImageEditModule {
@@ -30,11 +46,15 @@ enum ChatImageEditModule {
     initialImage: UIImage?,
     initialCaption: String?,
     headerTitle: String? = nil,
+    headerSubtitle: String? = nil,
     dismissPresenterOnSend: Bool = false,
     galleryPages: [ChatImageEditGalleryPage] = [],
     startIndex: Int = 0,
     /// When true, open directly in markup mode (draw/text). Default is view-only until Edit.
     startInEditMode: Bool = false,
+    /// Only a multi-image *message* gets the thumbnail strip; swiping across a
+    /// whole chat would turn it into a scroll bar for hundreds of photos.
+    allowsFilmstrip: Bool = true,
     onAction: @escaping (ChatImageEditActionPayload) -> Void
   ) {
     let pages: [ChatImageEditGalleryPage] = {
@@ -48,21 +68,20 @@ enum ChatImageEditModule {
       initialImage: initialImage,
       initialCaption: initialCaption,
       headerTitle: headerTitle,
+      headerSubtitle: headerSubtitle,
       dismissPresenterOnSend: dismissPresenterOnSend,
       galleryPages: pages,
       startIndex: startIndex,
-      startInEditMode: startInEditMode
+      startInEditMode: startInEditMode,
+      allowsFilmstrip: allowsFilmstrip
     )
     // Opaque full-screen so chat / cell message never shows through.
     controller.modalPresentationStyle = .fullScreen
-    if #available(iOS 18.0, *), let sourceView = sourceView {
-      let options = UIViewController.Transition.ZoomOptions()
-      controller.preferredTransition = .zoom(options: options) { _ in
-        return sourceView
-      }
-    } else {
-      controller.modalTransitionStyle = .crossDissolve
-    }
+    // Deliberately NOT the iOS 18 zoom transition: it shrinks the presenting
+    // chat behind the viewer, and that root scale-down is not wanted here. A
+    // cross dissolve leaves the chat exactly where the user left it.
+    _ = sourceView
+    controller.modalTransitionStyle = .crossDissolve
     controller.onAction = onAction
     presenter.present(controller, animated: true)
   }

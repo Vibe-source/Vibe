@@ -546,31 +546,32 @@ struct MarkupMarkerView: View {
 
 struct ChatImageViewerBottomBar: View {
   var onShare: () -> Void
-  var onEdit: () -> Void
+  var onMarkup: () -> Void
+  var onAI: () -> Void
   var onDelete: () -> Void
 
+  /// One control size for every slot in the bar. Previously the side circles
+  /// were 48pt with 18pt glyphs while the centre capsule sized itself from its
+  /// own padding, so the three groups never sat on a shared baseline.
+  static let controlSide: CGFloat = 48.0
+  static let glyphSize: CGFloat = 19.0
+  static let verticalPadding: CGFloat = 12.0
+  static let barHeight: CGFloat = controlSide + verticalPadding * 2.0
+
   var body: some View {
-    HStack {
-      glassCircleButton(system: "square.and.arrow.up", action: onShare)
+    HStack(spacing: 0) {
+      // Forward-arrow share, matching the send/forward affordance used in the
+      // chat itself rather than the system box-and-arrow.
+      circleButton(system: "arrowshape.turn.up.right.fill", action: onShare)
 
-      Spacer()
+      Spacer(minLength: 12)
 
-      HStack(spacing: 20) {
-        Button(action: onEdit) {
-          Image(systemName: "pencil.tip.crop.circle")
-            .font(.system(size: 20, weight: .medium))
-            .foregroundStyle(.white)
-        }
-        .buttonStyle(.plain)
-        Button(action: onEdit) {
-          Image(systemName: "slider.horizontal.3")
-            .font(.system(size: 18, weight: .medium))
-            .foregroundStyle(.white)
-        }
-        .buttonStyle(.plain)
+      HStack(spacing: 0) {
+        capsuleButton(system: "pencil.tip.crop.circle", action: onMarkup)
+        capsuleButton(system: "sparkles", action: onAI)
       }
-      .padding(.horizontal, 24)
-      .padding(.vertical, 12)
+      .frame(height: Self.controlSide)
+      .padding(.horizontal, 6)
       .background {
         Capsule()
           .fill(.ultraThinMaterial)
@@ -578,27 +579,38 @@ struct ChatImageViewerBottomBar: View {
           .overlay(Capsule().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
       }
 
-      Spacer()
+      Spacer(minLength: 12)
 
-      glassCircleButton(system: "trash", action: onDelete)
+      circleButton(system: "trash", action: onDelete)
     }
     .padding(.horizontal, 20)
-    .padding(.vertical, 10)
-    .background(Color.black)
+    .padding(.vertical, Self.verticalPadding)
+    .frame(maxWidth: .infinity)
   }
 
-  private func glassCircleButton(system: String, action: @escaping () -> Void) -> some View {
+  private func circleButton(system: String, action: @escaping () -> Void) -> some View {
     Button(action: action) {
       Image(systemName: system)
-        .font(.system(size: 18, weight: .medium))
+        .font(.system(size: Self.glyphSize, weight: .medium))
         .foregroundStyle(.white)
-        .frame(width: 48, height: 48)
+        .frame(width: Self.controlSide, height: Self.controlSide)
         .background {
           Circle()
             .fill(.ultraThinMaterial)
             .environment(\.colorScheme, .dark)
             .overlay(Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
         }
+    }
+    .buttonStyle(.plain)
+  }
+
+  private func capsuleButton(system: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: system)
+        .font(.system(size: Self.glyphSize, weight: .medium))
+        .foregroundStyle(.white)
+        .frame(width: Self.controlSide, height: Self.controlSide)
+        .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
   }
@@ -746,21 +758,25 @@ final class ChatImageMarkupToolbarHost: UIView {
 final class ChatImageViewerBottomBarHost: UIView {
   private var hosting: UIHostingController<ChatImageViewerBottomBar>?
   var onShare: (() -> Void)?
-  var onEdit: (() -> Void)?
+  var onMarkup: (() -> Void)?
+  var onAI: (() -> Void)?
   var onDelete: (() -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
-    backgroundColor = .black
-    isOpaque = true
+    // Transparent: the bar floats over a full-bleed photo now, so an opaque
+    // black plate here would crop the picture it sits on.
+    backgroundColor = .clear
+    isOpaque = false
     let root = ChatImageViewerBottomBar(
       onShare: { [weak self] in self?.onShare?() },
-      onEdit: { [weak self] in self?.onEdit?() },
+      onMarkup: { [weak self] in self?.onMarkup?() },
+      onAI: { [weak self] in self?.onAI?() },
       onDelete: { [weak self] in self?.onDelete?() }
     )
     let host = UIHostingController(rootView: root)
-    host.view.backgroundColor = .black
-    host.view.isOpaque = true
+    host.view.backgroundColor = .clear
+    host.view.isOpaque = false
     addSubview(host.view)
     hosting = host
   }
@@ -772,5 +788,5 @@ final class ChatImageViewerBottomBarHost: UIView {
     hosting?.view.frame = bounds
   }
 
-  var preferredHeight: CGFloat { 72 }
+  var preferredHeight: CGFloat { ChatImageViewerBottomBar.barHeight }
 }

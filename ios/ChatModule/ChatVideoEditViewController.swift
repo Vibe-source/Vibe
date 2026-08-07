@@ -461,6 +461,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private var aiOriginalAsset: AVAsset?
   private var aiTask: Task<Void, Never>?
   private let aiPromptBar = ChatVideoAIPromptBar()
+  private let aiProcessingOverlay = ChatAIProcessingOverlayView()
   private var naturalVideoSize: CGSize = CGSize(width: 720.0, height: 1280.0)
   private var cachedAssetDurationSeconds: Double = 0.1
   private var bufferedProgressRatio: CGFloat = 0.0
@@ -831,7 +832,10 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     let playerProgressHeight: CGFloat = 54.0
     let mediaControlHeight: CGFloat = previewOnly ? playerProgressHeight : timelineHeight
     let captionHeight = max(44.0, min(64.0, captionSize.height))
-    let showsCaption = !previewOnly || !captionText.isEmpty
+    // AI mode brings its own prompt field. Leaving the caption box up as well put
+    // two text inputs on screen at once with no way to tell which one the model
+    // reads, so the caption stands down while AI mode owns the input.
+    let showsCaption = !isAIModeActive && (!previewOnly || !captionText.isEmpty)
     let toolbarHeight: CGFloat = 42.0
     let bottomInset = keyboardHeight > 0.0 ? (keyboardHeight + 6.0) : (safe.bottom + 10.0)
     let captionSectionHeight = showsCaption ? (10.0 + captionHeight) : 0.0
@@ -1072,8 +1076,10 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       sendButton.frame = sendGlassView.bounds
       sendSpinner.center = CGPoint(x: sendButton.bounds.midX, y: sendButton.bounds.midY)
 
-      let qualityWidth: CGFloat = 52.0
-      let qualityHeight: CGFloat = 34.0
+      let qualityWidth: CGFloat = 56.0
+      // Same height as every other control in the row — at 34pt it sat as a
+      // short pill between 42pt circles and read as a misalignment.
+      let qualityHeight: CGFloat = toolSize
       qualityGlassView.frame = CGRect(
         x: sendGlassView.frame.minX - 10.0 - qualityWidth,
         y: (toolbarHeight - qualityHeight) * 0.5,
@@ -2182,10 +2188,26 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     aiPromptBar.setWorking(true)
     setExporting(true)
     player.pause()
+    view.endEditing(true)
+
+    // The frame the user is looking at carries the wait, under a travelling
+    // Metal blur — a spinner over a frozen sheet said nothing about which clip
+    // was being worked on.
+    aiProcessingOverlay.onCancel = { [weak self] in self?.cancelVideoAIEdit() }
+    aiProcessingOverlay.setCaption("Editing with AI")
+    aiProcessingOverlay.present(
+      in: view,
+      frame: currentPlayerFrameImage(),
+      detail: "Sent to Google · this step is not end-to-end encrypted"
+    )
 
     // Export exactly the selected ≤10s window, then hand those bytes over.
     exportEditedVideo { [weak self] result in
       guard let self else { return }
+      // Cancel can land while the export is still running. Without this the
+      // export would finish afterwards and start the paid upload anyway.
+      guard self.isAIWorking else { return }
+
       switch result {
       case .failure(let error):
         self.finishVideoAIEdit(asset: nil, interactionID: nil, error: error)
@@ -2232,6 +2254,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     isAIWorking = false
     aiPromptBar.setWorking(false)
     setExporting(false)
+    aiProcessingOverlay.dismiss()
 
     guard let editedAsset else {
       let message =
@@ -2247,6 +2270,39 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     aiPromptBar.clearPrompt()
 
     adoptAIEditedAsset(editedAsset)
+  }
+
+  /// Stops the in-flight edit and takes the overlay down. The export that may
+  /// still be running writes to a temp file nobody reads, so there is nothing to
+  /// unwind beyond the task itself.
+  private func cancelVideoAIEdit() {
+    guard isAIWorking else { return }
+    aiTask?.cancel()
+    aiTask = nil
+    isAIWorking = false
+    aiPromptBar.setWorking(false)
+    setExporting(false)
+    aiProcessingOverlay.dismiss()
+  }
+
+  /// Still of the frame currently under the playhead, for the processing
+  /// overlay to blur. `AVPlayerLayer` contents cannot be snapshotted by the
+  /// view hierarchy, so this goes back to the asset for the pixels.
+  private func currentPlayerFrameImage() -> UIImage? {
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.4, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 0.4, preferredTimescale: 600)
+    // Downscale: this only ever feeds a heavy blur, so full resolution would be
+    // decode cost with nothing to show for it.
+    generator.maximumSize = CGSize(width: 720.0, height: 720.0)
+
+    let time = player.currentTime()
+    let requested = CMTIME_IS_NUMERIC(time) ? time : .zero
+    guard let cgImage = try? generator.copyCGImage(at: requested, actualTime: nil) else {
+      return nil
+    }
+    return UIImage(cgImage: cgImage)
   }
 
   private func handleAIUndo() {

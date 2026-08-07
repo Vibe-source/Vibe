@@ -14,8 +14,10 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private let initialImage: UIImage?
   private let initialCaption: String
   private let headerTitleText: String
+  private let headerSubtitleText: String
   private let dismissPresenterOnSend: Bool
   private let startInEditMode: Bool
+  private let allowsFilmstrip: Bool
   private var captionText: String
   private var galleryPages: [ChatImageEditGalleryPage]
   private var galleryIndex: Int
@@ -25,6 +27,15 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   // MARK: Canvas
 
   private let stageView = UIView()
+
+  // MARK: Paging
+  //
+  // Viewing pages horizontally through the chat's photos; the markup surface
+  // rides on top of the current page and is translated with the scroll so the
+  // picture being edited is the one that moves under the finger.
+  private let pagingScrollView = UIScrollView()
+  private var pageImageViews: [UIImageView] = []
+  private var isChromeHidden = false
   private let renderSurfaceView = UIView()
   private let imageView = UIImageView()
   private let canvasView = PKCanvasView()
@@ -44,14 +55,27 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private let clearAllGlass = UIVisualEffectView(effect: nil)
   private let editGlass = UIVisualEffectView(effect: nil)
   private let closeButton = UIButton(type: .system)
+  /// Centre title lives inside its own glass pill so it lines up with the back
+  /// and menu circles instead of floating as a tinted label at a different size.
+  private let titleGlass = UIVisualEffectView(effect: nil)
   private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+  private let menuGlass = UIVisualEffectView(effect: nil)
+  private let menuButton = UIButton(type: .system)
   private let editButton = UIButton(type: .system)
   private let sendButton = UIButton(type: .system)
   private let clearAllButton = UIButton(type: .system)
 
+  /// Control diameter shared by the back circle, the title pill and the menu
+  /// circle — the header's whole balance problem was three different heights.
+  private static let headerControlSide: CGFloat = 40.0
+
   // MARK: Bottom
 
   private let bottomContainer = UIView()
+  /// Keeps white chrome readable when it floats over a bright photo.
+  private let topScrim = CAGradientLayer()
+  private let bottomScrim = CAGradientLayer()
   private let captionField = UITextField()
   private let markupModel = ChatImageMarkupModel()
   private lazy var markupHost = ChatImageMarkupToolbarHost(model: markupModel)
@@ -101,7 +125,8 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private var isMarkupActive = false
   private var undoManagerProxy = UndoManager()
 
-  private var showsFilmstrip: Bool { galleryPages.count > 1 }
+  private var showsFilmstrip: Bool { allowsFilmstrip && galleryPages.count > 1 }
+  private var showsPaging: Bool { galleryPages.count > 1 }
 
   // MARK: Init
 
@@ -111,10 +136,12 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     initialImage: UIImage?,
     initialCaption: String?,
     headerTitle: String?,
+    headerSubtitle: String? = nil,
     dismissPresenterOnSend: Bool,
     galleryPages: [ChatImageEditGalleryPage] = [],
     startIndex: Int = 0,
-    startInEditMode: Bool = false
+    startInEditMode: Bool = false,
+    allowsFilmstrip: Bool = true
   ) {
     self.messageId = messageId
     let pages: [ChatImageEditGalleryPage] = {
@@ -134,8 +161,11 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     self.captionText = ""
     let normalizedHeaderTitle = headerTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.headerTitleText = normalizedHeaderTitle.isEmpty ? "Photo" : normalizedHeaderTitle
+    self.headerSubtitleText =
+      headerSubtitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.dismissPresenterOnSend = dismissPresenterOnSend
     self.startInEditMode = startInEditMode
+    self.allowsFilmstrip = allowsFilmstrip
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .fullScreen
   }
@@ -155,9 +185,27 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     view.backgroundColor = .black
     view.isOpaque = true
 
-    stageView.backgroundColor = .black
+    // Sits under the markup stage and carries the neighbouring photos. Only the
+    // current page's image view is hidden — the markup surface stands in for it
+    // so drawings and AI edits stay attached to the picture they belong to.
+    pagingScrollView.isPagingEnabled = true
+    pagingScrollView.showsHorizontalScrollIndicator = false
+    pagingScrollView.showsVerticalScrollIndicator = false
+    pagingScrollView.alwaysBounceHorizontal = true
+    pagingScrollView.backgroundColor = .clear
+    pagingScrollView.delegate = self
+    pagingScrollView.contentInsetAdjustmentBehavior = .never
+    view.addSubview(pagingScrollView)
+
+    let chromeTap = UITapGestureRecognizer(target: self, action: #selector(handleChromeTap))
+    pagingScrollView.addGestureRecognizer(chromeTap)
+
+    // The stage lives *inside* the scroll view so a drag that starts on the
+    // photo is delivered to the paging pan recogniser. Hanging it off `view`
+    // instead would swallow every swipe before the scroll view saw it.
+    stageView.backgroundColor = .clear
     stageView.clipsToBounds = true
-    view.addSubview(stageView)
+    pagingScrollView.addSubview(stageView)
 
     renderSurfaceView.backgroundColor = .black
     renderSurfaceView.clipsToBounds = true
@@ -197,7 +245,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
 
     setupTopBar()
     setupBottomBar()
+    rebuildPages()
     loadImage()
+    refreshHeaderForCurrentPage()
     applyToolFromModel()
 
     markupCancellable = markupModel.objectWillChange.sink { [weak self] _ in
@@ -242,7 +292,8 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     topContainer.backgroundColor = .clear
     view.addSubview(topContainer)
 
-    configureGlassPill(closeGlass, diameter: 40)
+    let side = Self.headerControlSide
+    configureGlassPill(closeGlass, diameter: side)
     topContainer.addSubview(closeGlass)
     closeButton.setImage(
       UIImage(
@@ -253,15 +304,35 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     closeButton.addTarget(self, action: #selector(handleClose), for: .touchUpInside)
     closeGlass.contentView.addSubview(closeButton)
 
-    // Center title pill (ref #1 “Saved Messages”)
+    // Centre title pill — same glass and same height as the circles beside it.
+    configureGlassPill(titleGlass, diameter: side)
+    topContainer.addSubview(titleGlass)
+
     titleLabel.text = headerTitleText
     titleLabel.textColor = .white
-    titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+    titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
     titleLabel.textAlignment = .center
-    titleLabel.backgroundColor = UIColor.white.withAlphaComponent(0.12)
-    titleLabel.layer.cornerRadius = 16
-    titleLabel.clipsToBounds = true
-    topContainer.addSubview(titleLabel)
+    titleLabel.lineBreakMode = .byTruncatingMiddle
+    titleGlass.contentView.addSubview(titleLabel)
+
+    subtitleLabel.text = headerSubtitleText
+    subtitleLabel.textColor = UIColor.white.withAlphaComponent(0.55)
+    subtitleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+    subtitleLabel.textAlignment = .center
+    subtitleLabel.isHidden = headerSubtitleText.isEmpty
+    titleGlass.contentView.addSubview(subtitleLabel)
+
+    configureGlassPill(menuGlass, diameter: side)
+    topContainer.addSubview(menuGlass)
+    menuButton.setImage(
+      UIImage(
+        systemName: "ellipsis",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)),
+      for: .normal)
+    menuButton.tintColor = .white
+    menuButton.showsMenuAsPrimaryAction = true
+    menuButton.menu = makeOverflowMenu()
+    menuGlass.contentView.addSubview(menuButton)
 
     configureGlassPill(clearAllGlass, diameter: 36)
     topContainer.addSubview(clearAllGlass)
@@ -308,13 +379,39 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   }
 
   private func setupBottomBar() {
-    bottomContainer.backgroundColor = .black
+    // Clear + scrim rather than a black plate: the photo now runs the full
+    // height of the screen and the bar floats on top of it.
+    bottomContainer.backgroundColor = .clear
+    bottomScrim.colors = [
+      UIColor.clear.cgColor,
+      UIColor.black.withAlphaComponent(0.55).cgColor,
+    ]
+    bottomScrim.locations = [0, 1]
+    view.layer.addSublayer(bottomScrim)
     view.addSubview(bottomContainer)
 
-    // View-mode bar: share · edit · delete (ref #1)
+    topScrim.colors = [
+      UIColor.black.withAlphaComponent(0.45).cgColor,
+      UIColor.clear.cgColor,
+    ]
+    topScrim.locations = [0, 1]
+    view.layer.addSublayer(topScrim)
+
+    // View-mode bar: share · markup · AI · delete (ref #1)
     viewerBarHost.onShare = { [weak self] in self?.handleShare() }
-    viewerBarHost.onEdit = { [weak self] in self?.setMarkupActive(true, animated: true) }
-    viewerBarHost.onDelete = { [weak self] in self?.handleClose() }
+    viewerBarHost.onMarkup = { [weak self] in
+      guard let self else { return }
+      self.markupModel.mode = .draw
+      self.setMarkupActive(true, animated: true)
+    }
+    viewerBarHost.onAI = { [weak self] in
+      guard let self else { return }
+      self.setMarkupActive(true, animated: true)
+      self.markupModel.mode = .ai
+      self.markupHost.refresh()
+      self.applyToolFromModel()
+    }
+    viewerBarHost.onDelete = { [weak self] in self?.handleDeleteRequested() }
     bottomContainer.addSubview(viewerBarHost)
 
     captionField.isHidden = true
@@ -445,12 +542,13 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     let safe = view.safeAreaInsets
     let w = view.bounds.width
     let h = view.bounds.height
+    let side = Self.headerControlSide
 
     let topH = safe.top + 52
-    topContainer.frame = CGRect(x: 0, y: 0, width: w, height: topH)
+    setChromeFrame(topContainer, CGRect(x: 0, y: 0, width: w, height: topH))
 
     // Glass back
-    closeGlass.frame = CGRect(x: 14, y: safe.top + 4, width: 40, height: 40)
+    closeGlass.frame = CGRect(x: 14, y: safe.top + 6, width: side, height: side)
     closeButton.frame = closeGlass.contentView.bounds
 
     editGlass.isHidden = true
@@ -459,7 +557,8 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
 
     if isTextEntryActive {
       clearAllGlass.isHidden = true
-      titleLabel.isHidden = true
+      titleGlass.isHidden = true
+      menuGlass.isHidden = true
       closeGlass.isHidden = true
       textCancelButton.isHidden = false
       textDoneButton.isHidden = false
@@ -467,34 +566,50 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       textDoneButton.sizeToFit()
       let cancelW = max(84, textCancelButton.bounds.width + 28)
       let doneW = max(72, textDoneButton.bounds.width + 28)
-      textCancelButton.frame = CGRect(x: 14, y: safe.top + 6, width: cancelW, height: 36)
-      textDoneButton.frame = CGRect(x: w - 14 - doneW, y: safe.top + 6, width: doneW, height: 36)
+      textCancelButton.frame = CGRect(x: 14, y: safe.top + 6, width: cancelW, height: side)
+      textDoneButton.frame = CGRect(x: w - 14 - doneW, y: safe.top + 6, width: doneW, height: side)
     } else if isMarkupActive {
       textCancelButton.isHidden = true
       textDoneButton.isHidden = true
       closeGlass.isHidden = false
-      titleLabel.isHidden = true
+      titleGlass.isHidden = true
+      menuGlass.isHidden = true
       clearAllGlass.isHidden = false
       clearAllButton.isHidden = false
       clearAllButton.sizeToFit()
       let clearW = max(96, clearAllButton.bounds.width + 28)
       clearAllGlass.frame = CGRect(
-        x: w - 14 - clearW, y: safe.top + 6, width: clearW, height: 36)
-      clearAllGlass.layer.cornerRadius = 18
+        x: w - 14 - clearW, y: safe.top + 6, width: clearW, height: side)
+      clearAllGlass.layer.cornerRadius = side * 0.5
       clearAllButton.frame = clearAllGlass.contentView.bounds
     } else {
       textCancelButton.isHidden = true
       textDoneButton.isHidden = true
       closeGlass.isHidden = false
       clearAllGlass.isHidden = true
-      titleLabel.isHidden = false
-      // Title pill centered
-      let titleW = min(w - 120, max(140, headerTitleText.size(withAttributes: [
-        .font: titleLabel.font as Any
-      ]).width + 28))
-      titleLabel.frame = CGRect(
-        x: (w - titleW) * 0.5, y: safe.top + 6, width: titleW, height: 36)
-      // More menu button area uses right glass as empty for now — mirror ref with close only
+      titleGlass.isHidden = false
+      menuGlass.isHidden = false
+
+      menuGlass.frame = CGRect(x: w - 14 - side, y: safe.top + 6, width: side, height: side)
+      menuButton.frame = menuGlass.contentView.bounds
+
+      // Title pill: centred, same height as the circles, never wide enough to
+      // collide with them.
+      let titleWidth = ceil(titleLabel.intrinsicContentSize.width)
+      let subtitleWidth = subtitleLabel.isHidden ? 0 : ceil(subtitleLabel.intrinsicContentSize.width)
+      let available = max(120, w - (14 + side + 12) * 2)
+      let pillW = min(available, max(132, max(titleWidth, subtitleWidth) + 32))
+      titleGlass.frame = CGRect(
+        x: (w - pillW) * 0.5, y: safe.top + 6, width: pillW, height: side)
+      titleGlass.layer.cornerRadius = side * 0.5
+
+      let inner = titleGlass.contentView.bounds.insetBy(dx: 12, dy: 0)
+      if subtitleLabel.isHidden {
+        titleLabel.frame = inner
+      } else {
+        titleLabel.frame = CGRect(x: inner.minX, y: 5, width: inner.width, height: 18)
+        subtitleLabel.frame = CGRect(x: inner.minX, y: 22, width: inner.width, height: 13)
+      }
       sendButton.isHidden = true
     }
 
@@ -515,13 +630,27 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       return bottomContent + safe.bottom
     }()
 
-    bottomContainer.backgroundColor = .black
+    // Opaque only while editing: the markup strip is a working surface, the
+    // viewer bar is chrome floating on the photo.
+    bottomContainer.backgroundColor = isMarkupActive ? .black : .clear
+    let naturalBottomMinY = h - bottomTotal
     if isGifPanelVisible {
       // Hide mode bar under panel; panel owns the bottom.
-      bottomContainer.frame = CGRect(x: 0, y: h, width: w, height: bottomContent + safe.bottom)
+      setChromeFrame(
+        bottomContainer, CGRect(x: 0, y: h, width: w, height: bottomContent + safe.bottom))
     } else {
-      bottomContainer.frame = CGRect(x: 0, y: h - bottomTotal, width: w, height: bottomTotal)
+      setChromeFrame(
+        bottomContainer, CGRect(x: 0, y: naturalBottomMinY, width: w, height: bottomTotal))
     }
+
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    topScrim.frame = CGRect(x: 0, y: 0, width: w, height: topH + 28)
+    topScrim.isHidden = isMarkupActive
+    bottomScrim.frame = CGRect(
+      x: 0, y: max(0, naturalBottomMinY - 44), width: w, height: bottomTotal + 44)
+    bottomScrim.isHidden = isMarkupActive || isGifPanelVisible
+    CATransaction.commit()
 
     if isMarkupActive {
       viewerBarHost.isHidden = true
@@ -552,11 +681,22 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       gifPanel?.frame = CGRect(x: 0, y: 16, width: w, height: gifH - 8)
     }
 
-    // Canvas: full area between top chrome and bottom bar — no letterbox gap
-    let stageTop = topContainer.frame.maxY
-    let stageBottom =
-      isGifPanelVisible ? gifPanelContainer.frame.minY : bottomContainer.frame.minY
-    stageView.frame = CGRect(x: 0, y: stageTop, width: w, height: max(1, stageBottom - stageTop))
+    // Viewing runs full-bleed — the picture owns the screen and the chrome
+    // floats over it, the way it does in the reference. Markup insets back
+    // between the bars so the tool strip never covers what is being drawn on.
+    let stageTop: CGFloat = isMarkupActive ? topH : 0
+    let stageBottom: CGFloat = {
+      if isGifPanelVisible { return gifPanelContainer.frame.minY }
+      return isMarkupActive ? naturalBottomMinY : h
+    }()
+
+    let pagingEnabled = layoutPages(width: w, height: h)
+    // Stage coordinates are the scroll view's content space, so the stage sits
+    // on its own page and travels with the swipe for free.
+    let stageX: CGFloat = pagingEnabled ? CGFloat(galleryIndex) * w : 0
+    stageView.frame = CGRect(
+      x: stageX, y: stageTop, width: w, height: max(1, stageBottom - stageTop))
+
     view.bringSubviewToFront(topContainer)
     view.bringSubviewToFront(bottomContainer)
     if isGifPanelVisible { view.bringSubviewToFront(gifPanelContainer) }
@@ -589,6 +729,269 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     }
   }
 
+  /// Frame assignment that survives an active transform. The chrome carries a
+  /// translation while it is hidden and the stage carries one while a swipe is
+  /// in flight, and setting `.frame` under a transform is undefined.
+  private func setChromeFrame(_ target: UIView, _ frame: CGRect) {
+    let transform = target.transform
+    guard !transform.isIdentity else {
+      target.frame = frame
+      return
+    }
+    target.transform = .identity
+    target.frame = frame
+    target.transform = transform
+  }
+
+  // MARK: - Paging
+
+  private func rebuildPages() {
+    pageImageViews.forEach { $0.removeFromSuperview() }
+    pageImageViews = galleryPages.map { page in
+      let imageView = UIImageView()
+      imageView.contentMode = .scaleAspectFit
+      imageView.clipsToBounds = true
+      imageView.backgroundColor = .clear
+      imageView.image = page.image
+      pagingScrollView.addSubview(imageView)
+      return imageView
+    }
+  }
+
+  /// Returns whether horizontal paging is live for this pass.
+  @discardableResult
+  private func layoutPages(width: CGFloat, height: CGFloat) -> Bool {
+    pagingScrollView.frame = view.bounds
+    let pagingEnabled = showsPaging && !isMarkupActive && !isTextEntryActive
+    pagingScrollView.isScrollEnabled = pagingEnabled
+
+    guard pagingEnabled else {
+      // Collapse to a single page while editing so a stray drag cannot carry the
+      // markup surface off the photo it belongs to.
+      pagingScrollView.contentSize = CGSize(width: width, height: height)
+      pagingScrollView.contentOffset = .zero
+      pageImageViews.forEach { $0.isHidden = true }
+      return false
+    }
+
+    let count = max(1, pageImageViews.count)
+    pagingScrollView.contentSize = CGSize(width: width * CGFloat(count), height: height)
+
+    for (index, pageView) in pageImageViews.enumerated() {
+      pageView.frame = CGRect(x: CGFloat(index) * width, y: 0, width: width, height: height)
+      // The current page is drawn by the markup stage on top, so showing it here
+      // as well would double the image during a swipe.
+      pageView.isHidden = index == galleryIndex
+    }
+
+    if !pagingScrollView.isDragging, !pagingScrollView.isDecelerating {
+      let target = CGPoint(x: CGFloat(galleryIndex) * width, y: 0)
+      if abs(pagingScrollView.contentOffset.x - target.x) > 0.5 {
+        pagingScrollView.contentOffset = target
+      }
+    }
+    return true
+  }
+
+  private func commitPageChange() {
+    let width = view.bounds.width
+    guard width > 0, !galleryPages.isEmpty else { return }
+    let index = max(
+      0, min(galleryPages.count - 1, Int((pagingScrollView.contentOffset.x / width).rounded())))
+    guard index != galleryIndex else {
+      view.setNeedsLayout()
+      return
+    }
+    selectPage(at: index)
+  }
+
+  /// Moves the editing surface onto another photo. Any markup on the page being
+  /// left is dropped rather than silently carried across — strokes belong to the
+  /// picture they were drawn on.
+  private func selectPage(at index: Int) {
+    guard index >= 0, index < galleryPages.count else { return }
+    galleryIndex = index
+    let page = galleryPages[index]
+    mediaURL = page.mediaURL
+    canvasView.drawing = PKDrawing()
+    overlayContainer.subviews.forEach { $0.removeFromSuperview() }
+    aiUndoStack.removeAll()
+    markupModel.aiCanUndo = false
+    aiSelectionView.clearSelection()
+
+    if let image = page.image {
+      applyImage(image)
+    } else {
+      imageView.image = nil
+      loadImage()
+    }
+
+    refreshHeaderForCurrentPage()
+    filmstrip.reloadData()
+    centerFilmstripContentIfNeeded()
+    view.setNeedsLayout()
+  }
+
+  // MARK: - Paging scroll delegate
+  //
+  // The filmstrip is a `UICollectionView` on the same delegate, so every one of
+  // these has to check which scroll view is talking.
+
+  func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+    guard scrollView === pagingScrollView else { return }
+    commitPageChange()
+  }
+
+  func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+    guard scrollView === pagingScrollView else { return }
+    commitPageChange()
+  }
+
+  func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+    guard scrollView === pagingScrollView, !decelerate else { return }
+    commitPageChange()
+  }
+
+  // MARK: - Chrome visibility
+
+  @objc private func handleChromeTap() {
+    guard !isMarkupActive, !isTextEntryActive, !isGifPanelVisible else { return }
+    setChromeHidden(!isChromeHidden, animated: true)
+  }
+
+  /// Header and footer move as one gesture — they translate off their own edges
+  /// together rather than each animating on its own timing.
+  private func setChromeHidden(_ hidden: Bool, animated: Bool) {
+    guard isChromeHidden != hidden else { return }
+    isChromeHidden = hidden
+
+    let topShift = -(topContainer.bounds.height + 12)
+    let bottomShift = bottomContainer.bounds.height + 12
+
+    let changes = {
+      self.topContainer.transform =
+        hidden ? CGAffineTransform(translationX: 0, y: topShift) : .identity
+      self.bottomContainer.transform =
+        hidden ? CGAffineTransform(translationX: 0, y: bottomShift) : .identity
+      self.topContainer.alpha = hidden ? 0 : 1
+      self.bottomContainer.alpha = hidden ? 0 : 1
+      self.topScrim.opacity = hidden ? 0 : 1
+      self.bottomScrim.opacity = hidden ? 0 : 1
+    }
+
+    if animated {
+      UIView.animate(
+        withDuration: 0.26, delay: 0,
+        options: [.curveEaseInOut, .beginFromCurrentState, .allowUserInteraction],
+        animations: changes)
+    } else {
+      changes()
+    }
+  }
+
+  // MARK: - Overflow menu
+
+  private func makeOverflowMenu() -> UIMenu {
+    var actions: [UIMenuElement] = []
+
+    if currentMessageId != nil {
+      actions.append(
+        UIAction(
+          title: "Show in Chat",
+          image: UIImage(systemName: "bubble.left.and.text.bubble.right")
+        ) { [weak self] _ in
+          self?.emitAfterDismiss(.showInChat)
+        })
+    }
+
+    actions.append(
+      UIAction(title: "Save Image", image: UIImage(systemName: "square.and.arrow.down")) {
+        [weak self] _ in
+        self?.handleSaveImage()
+      })
+
+    if currentMessageId != nil {
+      actions.append(
+        UIAction(title: "Reply", image: UIImage(systemName: "arrowshape.turn.up.left")) {
+          [weak self] _ in
+          self?.emitAfterDismiss(.reply)
+        })
+      actions.append(
+        UIAction(
+          title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive
+        ) { [weak self] _ in
+          self?.handleDeleteRequested()
+        })
+    }
+
+    return UIMenu(children: actions)
+  }
+
+  private func handleDeleteRequested() {
+    guard currentMessageId != nil else {
+      handleClose()
+      return
+    }
+    emitAfterDismiss(.delete)
+  }
+
+  /// Menu actions that hand the chat back control — reply, delete, jump to the
+  /// message — fire *after* the viewer is off screen. `emit` reports first and
+  /// dismisses second, which would tear down any sheet the chat then presents.
+  private func emitAfterDismiss(_ eventType: ChatImageEditEventType) {
+    let payload = ChatImageEditActionPayload(
+      eventType: eventType,
+      messageId: currentMessageId,
+      mediaURL: mediaURL,
+      caption: nil,
+      editedImageURL: nil
+    )
+    let action = onAction
+    hideGifPanel()
+    endTextEntry(commit: false)
+    dismiss(animated: true) { action?(payload) }
+  }
+
+  private func handleSaveImage() {
+    guard let image = snapshotEditedImage() ?? imageView.image else { return }
+    UIImageWriteToSavedPhotosAlbum(
+      image, self,
+      #selector(handleSaveFinished(_:didFinishSavingWithError:contextInfo:)), nil)
+  }
+
+  @objc private func handleSaveFinished(
+    _ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer?
+  ) {
+    presentToast(error == nil ? "Saved to Photos" : "Couldn't save this photo")
+  }
+
+  private func presentToast(_ text: String) {
+    let label = PaddedLabel()
+    label.text = text
+    label.font = .systemFont(ofSize: 14, weight: .semibold)
+    label.textColor = .white
+    label.textAlignment = .center
+    label.backgroundColor = UIColor(white: 0.1, alpha: 0.92)
+    label.layer.cornerRadius = 18
+    label.layer.cornerCurve = .continuous
+    label.clipsToBounds = true
+    label.alpha = 0
+    view.addSubview(label)
+
+    let size = label.intrinsicContentSize
+    label.frame = CGRect(
+      x: (view.bounds.width - size.width) * 0.5,
+      y: view.bounds.height - view.safeAreaInsets.bottom - 140,
+      width: size.width,
+      height: 36)
+
+    UIView.animate(withDuration: 0.22) { label.alpha = 1 }
+    UIView.animate(
+      withDuration: 0.28, delay: 1.6, options: [.curveEaseIn],
+      animations: { label.alpha = 0 },
+      completion: { _ in label.removeFromSuperview() })
+  }
+
   private func fittingRect(container: CGRect, mediaSize: CGSize) -> CGRect {
     let scale = min(
       container.width / max(mediaSize.width, 1),
@@ -605,6 +1008,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   // MARK: Markup mode
 
   private func setMarkupActive(_ active: Bool, animated: Bool) {
+    // Tools are useless behind hidden chrome, so entering or leaving markup
+    // always brings the bars back.
+    setChromeHidden(false, animated: animated)
     isMarkupActive = active
     markupModel.isEditing = active
     if active {
@@ -829,7 +1235,35 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private func applyImage(_ image: UIImage) {
     originalImage = image
     imageView.image = image
+    // Keep the page cache in step so swiping away and back shows what the user
+    // is actually looking at, edits included.
+    if galleryIndex >= 0, galleryIndex < galleryPages.count {
+      let page = galleryPages[galleryIndex]
+      galleryPages[galleryIndex] = ChatImageEditGalleryPage(
+        mediaURL: page.mediaURL,
+        image: image,
+        messageId: page.messageId,
+        subtitle: page.subtitle)
+      if galleryIndex < pageImageViews.count {
+        pageImageViews[galleryIndex].image = image
+      }
+    }
     view.setNeedsLayout()
+  }
+
+  /// Message the *current page* came from. Swiping moves between messages, so
+  /// Reply / Delete / Show in Chat must target the photo on screen.
+  private var currentMessageId: String? {
+    galleryPages[safeIndex: galleryIndex]?.messageId ?? messageId
+  }
+
+  private func refreshHeaderForCurrentPage() {
+    let subtitle =
+      galleryPages[safeIndex: galleryIndex]?.subtitle?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? headerSubtitleText
+    subtitleLabel.text = subtitle
+    subtitleLabel.isHidden = subtitle.isEmpty
+    menuButton.menu = makeOverflowMenu()
   }
 
   // MARK: Snapshot + send
@@ -927,7 +1361,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     onAction?(
       ChatImageEditActionPayload(
         eventType: eventType,
-        messageId: messageId,
+        messageId: currentMessageId,
         mediaURL: mediaURL,
         caption: captionText.isEmpty ? nil : captionText,
         editedImageURL: finalEdited
@@ -955,10 +1389,25 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     overlayContainer.subviews.forEach { $0.removeFromSuperview() }
   }
 
+  /// Same system share sheet the chat list uses, and the same preference for a
+  /// media URL over a re-encoded bitmap when one is available.
   private func handleShare() {
-    guard let image = snapshotEditedImage() ?? imageView.image else { return }
-    let ac = UIActivityViewController(activityItems: [image], applicationActivities: nil)
-    present(ac, animated: true)
+    var items: [Any] = []
+    let trimmed = mediaURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !hasVisualEdits(), !trimmed.isEmpty, let url = URL(string: trimmed) {
+      items.append(url)
+    } else if let image = snapshotEditedImage() ?? imageView.image {
+      items.append(image)
+    }
+    guard !items.isEmpty else { return }
+
+    let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
+    if let popover = activity.popoverPresentationController {
+      popover.sourceView = viewerBarHost
+      popover.sourceRect = CGRect(
+        x: 44, y: viewerBarHost.bounds.midY, width: 1, height: 1)
+    }
+    present(activity, animated: true)
   }
 
   // MARK: - GIF / sticker panel (slide up from bottom, expandable)
@@ -1157,7 +1606,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     let captionChanged =
       !(captionField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     let eventType: ChatImageEditEventType = {
-      if messageId == nil { return .sendNew }
+      if currentMessageId == nil { return .sendNew }
       if edited || captionChanged { return .edit }
       return .resend
     }()
@@ -1313,18 +1762,24 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
 
   func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
     guard indexPath.item != galleryIndex else { return }
-    galleryIndex = indexPath.item
-    let page = galleryPages[indexPath.item]
-    mediaURL = page.mediaURL
-    canvasView.drawing = PKDrawing()
-    overlayContainer.subviews.forEach { $0.removeFromSuperview() }
-    if let img = page.image {
-      applyImage(img)
-    } else {
-      loadImage()
-    }
-    filmstrip.reloadData()
-    centerFilmstripContentIfNeeded()
+    selectPage(at: indexPath.item)
+  }
+}
+
+// MARK: - Toast label
+
+private final class PaddedLabel: UILabel {
+  private let inset = UIEdgeInsets(top: 8, left: 18, bottom: 8, right: 18)
+
+  override func drawText(in rect: CGRect) {
+    super.drawText(in: rect.inset(by: inset))
+  }
+
+  override var intrinsicContentSize: CGSize {
+    let size = super.intrinsicContentSize
+    return CGSize(
+      width: size.width + inset.left + inset.right,
+      height: size.height + inset.top + inset.bottom)
   }
 }
 

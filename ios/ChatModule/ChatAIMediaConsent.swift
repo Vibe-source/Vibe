@@ -80,8 +80,9 @@ enum ChatAIMediaConsent {
       completion(accepted)
     }
     sheet.modalPresentationStyle = .overFullScreen
-    sheet.modalTransitionStyle = .crossDissolve
-    presenter.present(sheet, animated: true)
+    // The sheet animates its own blur and card in `viewDidAppear`; a modal
+    // transition on top of that would just play the same fade twice.
+    presenter.present(sheet, animated: false)
   }
 
   /// Clears consent — used by the Settings row so the decision is reversible.
@@ -99,8 +100,15 @@ private final class ConsentSheetViewController: UIViewController {
   private let provider: ChatAIMediaConsent.Provider
   private let completion: (Bool) -> Void
 
-  private let dimView = UIView()
+  /// Real blur over whatever is behind, not a flat black wash — the editor stays
+  /// legible underneath so the sheet reads as a layer, not a new screen.
+  private let backdrop = UIVisualEffectView(effect: nil)
   private let card = UIView()
+
+  private static let cardRadius: CGFloat = 30.0
+  private static let cardWidth: CGFloat = 360.0
+  private static let buttonHeight: CGFloat = 50.0
+  private static let buttonRadius: CGFloat = 15.0
 
   init(provider: ChatAIMediaConsent.Provider, completion: @escaping (Bool) -> Void) {
     self.provider = provider
@@ -113,51 +121,57 @@ private final class ConsentSheetViewController: UIViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .clear
+    overrideUserInterfaceStyle = .dark
 
-    dimView.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-    dimView.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(dimView)
+    backdrop.frame = view.bounds
+    backdrop.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    view.addSubview(backdrop)
 
-    card.backgroundColor = UIColor(white: 0.11, alpha: 1)
-    card.layer.cornerRadius = 28
+    let tapOut = UITapGestureRecognizer(target: self, action: #selector(handleCancel))
+    backdrop.contentView.addGestureRecognizer(tapOut)
+
+    card.backgroundColor = UIColor(white: 0.10, alpha: 0.98)
+    card.layer.cornerRadius = Self.cardRadius
     card.layer.cornerCurve = .continuous
+    card.layer.borderWidth = 1.0 / UIScreen.main.scale
+    card.layer.borderColor = UIColor(white: 1.0, alpha: 0.12).cgColor
     card.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(card)
 
     let stack = UIStackView()
     stack.axis = .vertical
-    stack.spacing = 18
+    stack.spacing = 14.0
+    stack.alignment = .fill
     stack.translatesAutoresizingMaskIntoConstraints = false
     card.addSubview(stack)
 
-    let icon = UIImageView(
-      image: UIImage(systemName: "sparkles")?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 30, weight: .semibold)))
-    icon.tintColor = .white
-    icon.contentMode = .scaleAspectFit
-    stack.addArrangedSubview(icon)
+    stack.addArrangedSubview(makeBadge())
 
     let title = UILabel()
     title.text = "Edit this \(provider.mediaNoun) with AI"
-    title.font = .systemFont(ofSize: 22, weight: .bold)
+    title.font = .systemFont(ofSize: 20.0, weight: .semibold)
     title.textColor = .white
     title.numberOfLines = 0
     stack.addArrangedSubview(title)
 
+    let points = UIStackView()
+    points.axis = .vertical
+    points.spacing = 12.0
     for (symbol, text) in provider.points {
-      stack.addArrangedSubview(makePoint(symbol: symbol, text: text))
+      points.addArrangedSubview(makePoint(symbol: symbol, text: text))
     }
+    stack.addArrangedSubview(points)
 
     let footnote = UILabel()
     footnote.text = "You'll only be asked once for \(provider.displayName)."
-    footnote.font = .systemFont(ofSize: 13)
-    footnote.textColor = UIColor(white: 1, alpha: 0.45)
+    footnote.font = .systemFont(ofSize: 12.0)
+    footnote.textColor = UIColor(white: 1.0, alpha: 0.4)
     footnote.numberOfLines = 0
     stack.addArrangedSubview(footnote)
 
     let buttons = UIStackView()
     buttons.axis = .horizontal
-    buttons.spacing = 12
+    buttons.spacing = 10.0
     buttons.distribution = .fillEqually
 
     let cancel = makeButton(title: "Not now", filled: false)
@@ -167,58 +181,94 @@ private final class ConsentSheetViewController: UIViewController {
     buttons.addArrangedSubview(cancel)
     buttons.addArrangedSubview(accept)
     stack.addArrangedSubview(buttons)
-    stack.setCustomSpacing(24, after: footnote)
+
+    stack.setCustomSpacing(16.0, after: title)
+    stack.setCustomSpacing(16.0, after: points)
+    stack.setCustomSpacing(20.0, after: footnote)
 
     NSLayoutConstraint.activate([
-      dimView.topAnchor.constraint(equalTo: view.topAnchor),
-      dimView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-      dimView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      dimView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-
       card.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-      card.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
-      card.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
       card.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      card.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+      // Pinning the width keeps the card from hugging its text into an
+      // off-balance column on one provider and a wide slab on the other.
+      card.widthAnchor.constraint(equalToConstant: Self.cardWidth),
+      card.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 20.0),
 
-      stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 28),
-      stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -24),
-      stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
-      stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
+      stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 24.0),
+      stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -20.0),
+      stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20.0),
+      stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20.0),
 
-      buttons.heightAnchor.constraint(equalToConstant: 50),
+      buttons.heightAnchor.constraint(equalToConstant: Self.buttonHeight),
     ])
 
-    card.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
-    card.alpha = 0
+    card.transform = CGAffineTransform(translationX: 0.0, y: 14.0).scaledBy(x: 0.96, y: 0.96)
+    card.alpha = 0.0
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-    UIView.animate(withDuration: 0.32, delay: 0, usingSpringWithDamping: 0.85, initialSpringVelocity: 0) {
+    UIView.animate(
+      withDuration: 0.34, delay: 0.0, usingSpringWithDamping: 0.88, initialSpringVelocity: 0.0,
+      options: [.curveEaseOut]
+    ) {
+      self.backdrop.effect = UIBlurEffect(style: .systemThinMaterialDark)
       self.card.transform = .identity
-      self.card.alpha = 1
+      self.card.alpha = 1.0
     }
+  }
+
+  /// Fixed-size tinted badge rather than a bare glyph — inside a vertical stack a
+  /// plain image view stretches full width and floats away from the title.
+  private func makeBadge() -> UIView {
+    let container = UIView()
+    let badge = UIView()
+    badge.backgroundColor = UIColor(white: 1.0, alpha: 0.1)
+    badge.layer.cornerRadius = 14.0
+    badge.layer.cornerCurve = .continuous
+    badge.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(badge)
+
+    let icon = UIImageView(
+      image: UIImage(systemName: "sparkles")?.withConfiguration(
+        UIImage.SymbolConfiguration(pointSize: 22.0, weight: .medium)))
+    icon.tintColor = .white
+    icon.contentMode = .center
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    badge.addSubview(icon)
+
+    NSLayoutConstraint.activate([
+      badge.widthAnchor.constraint(equalToConstant: 48.0),
+      badge.heightAnchor.constraint(equalToConstant: 48.0),
+      badge.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      badge.topAnchor.constraint(equalTo: container.topAnchor),
+      badge.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+      icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+    ])
+    return container
   }
 
   private func makePoint(symbol: String, text: String) -> UIView {
     let row = UIStackView()
     row.axis = .horizontal
-    row.spacing = 12
+    row.spacing = 12.0
     row.alignment = .top
 
     let icon = UIImageView(
       image: UIImage(systemName: symbol)?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)))
-    icon.tintColor = UIColor(white: 1, alpha: 0.7)
-    icon.contentMode = .scaleAspectFit
+        UIImage.SymbolConfiguration(pointSize: 14.0, weight: .medium)))
+    icon.tintColor = UIColor(white: 1.0, alpha: 0.55)
+    icon.contentMode = .center
     icon.setContentHuggingPriority(.required, for: .horizontal)
-    icon.widthAnchor.constraint(equalToConstant: 22).isActive = true
+    icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+    icon.widthAnchor.constraint(equalToConstant: 20.0).isActive = true
+    icon.heightAnchor.constraint(equalToConstant: 21.0).isActive = true
 
     let label = UILabel()
     label.text = text
-    label.font = .systemFont(ofSize: 15)
-    label.textColor = UIColor(white: 1, alpha: 0.82)
+    label.font = .systemFont(ofSize: 14.0)
+    label.textColor = UIColor(white: 1.0, alpha: 0.78)
     label.numberOfLines = 0
 
     row.addArrangedSubview(icon)
@@ -227,13 +277,14 @@ private final class ConsentSheetViewController: UIViewController {
   }
 
   private func makeButton(title: String, filled: Bool) -> UIButton {
-    let button = UIButton(type: .system)
+    let button = UIButton(type: .custom)
     button.setTitle(title, for: .normal)
-    button.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
-    button.setTitleColor(filled ? .black : .white, for: .normal)
-    button.backgroundColor = filled ? .white : UIColor(white: 1, alpha: 0.14)
-    button.layer.cornerRadius = 16
+    button.titleLabel?.font = .systemFont(ofSize: 16.0, weight: .semibold)
+    button.setTitleColor(filled ? .black : UIColor(white: 1.0, alpha: 0.92), for: .normal)
+    button.backgroundColor = filled ? .white : UIColor(white: 1.0, alpha: 0.1)
+    button.layer.cornerRadius = Self.buttonRadius
     button.layer.cornerCurve = .continuous
+    button.adjustsImageWhenHighlighted = false
     return button
   }
 
@@ -241,6 +292,18 @@ private final class ConsentSheetViewController: UIViewController {
   @objc private func handleAccept() { finish(accepted: true) }
 
   private func finish(accepted: Bool) {
-    dismiss(animated: true) { [completion] in completion(accepted) }
+    // Held outside the animation closures so the callback survives the sheet
+    // being torn down before the completion runs.
+    let callback = completion
+    UIView.animate(
+      withDuration: 0.2, delay: 0.0, options: [.curveEaseIn],
+      animations: {
+        self.backdrop.effect = nil
+        self.card.alpha = 0.0
+        self.card.transform = CGAffineTransform(scaleX: 0.97, y: 0.97)
+      },
+      completion: { _ in
+        self.dismiss(animated: false) { callback(accepted) }
+      })
   }
 }
