@@ -93,11 +93,54 @@ impl VibeSecureIdentityHandle {
     /// The store is SQLite on disk, so ratchet state survives relaunch. That is
     /// what makes [`VibeSecureSessionHandle::load`] able to return a session at
     /// all, and it is the difference between MLS being usable and being a demo.
+    ///
+    /// **Platforms must not call this on launch — use [`Self::load_or_generate`].**
+    /// A stable `device_id` is not a stable identity; see that constructor.
     #[uniffi::constructor]
     pub fn generate(device_id: String, db_path: String) -> Result<Arc<Self>, VibeFfiError> {
         let provider = VibeSecureProvider::open(&db_path).map_err(|e| map_err(&e))?;
         let identity =
             VibeDeviceIdentity::generate(&device_id, &provider).map_err(|e| map_err(&e))?;
+        Ok(Arc::new(Self {
+            provider: Mutex::new(provider),
+            identity,
+        }))
+    }
+
+    /// Reopens this device's existing identity, or generates one if
+    /// `signature_public_key` is absent or no longer resolves.
+    ///
+    /// **This is the launch constructor.** `signature_public_key` is what
+    /// [`Self::signature_key`] returned last time; the platform persists it and
+    /// hands it back. Only the public half crosses — the private key never
+    /// leaves the store at `db_path`.
+    ///
+    /// [`Self::generate`] mints a fresh signing key on every call, and a device
+    /// that does that on every launch reloads its groups fine and seals fine
+    /// while becoming permanently unreadable to every peer: an application
+    /// message is verified against the signing key recorded in the sender's leaf
+    /// node, and a new key is not that one. Two devices in the same group, each
+    /// unable to open the other, both looking healthy from the inside — that is
+    /// the shape this constructor exists to prevent.
+    ///
+    /// The caller must store [`Self::signature_key`] after **every** call, not
+    /// only the first: a restore-from-backup brings the platform's stored
+    /// pointer back without the (backup-excluded) key store, so the pointer goes
+    /// stale, this falls back to generating, and the stale value has to be
+    /// overwritten or the next launch repeats the whole failure.
+    #[uniffi::constructor]
+    pub fn load_or_generate(
+        device_id: String,
+        db_path: String,
+        signature_public_key: Option<Vec<u8>>,
+    ) -> Result<Arc<Self>, VibeFfiError> {
+        let provider = VibeSecureProvider::open(&db_path).map_err(|e| map_err(&e))?;
+        let identity = VibeDeviceIdentity::load_or_generate(
+            &device_id,
+            signature_public_key.as_deref(),
+            &provider,
+        )
+        .map_err(|e| map_err(&e))?;
         Ok(Arc::new(Self {
             provider: Mutex::new(provider),
             identity,

@@ -1380,6 +1380,292 @@ public func FfiConverterTypeVibeFfiKeyUnwrapper_lower(_ value: VibeFfiKeyUnwrapp
 
 
 /**
+ * The epoch keys this device holds for one group.
+ *
+ * Bound to a single `group_id` at construction and never retargeted: the group
+ * id is authenticated data on every seal, so a keyring pointed at the wrong
+ * group does not silently decrypt the wrong thing — it fails, which is correct
+ * but is a failure that need never happen.
+ */
+public protocol VibeGroupKeyringHandleProtocol : AnyObject {
+    
+    /**
+     * Installs a key for an epoch **older** than the newest held, so history
+     * handed to a new member becomes readable.
+     *
+     * Named separately from [`Self::install_epoch`] on purpose. This is the one
+     * operation that legitimately moves backwards, so it cannot be reached by a
+     * frame that merely looks like a rotation.
+     */
+    func backfillEpoch(epoch: UInt32, key: Data) throws 
+    
+    func epochCount() throws  -> UInt32
+    
+    func hasEpoch(epoch: UInt32) throws  -> Bool
+    
+    /**
+     * Installs the key for a **strictly newer** epoch.
+     *
+     * Refusing an equal or older epoch is the anti-rollback rule: without it a
+     * replayed membership frame could walk a group back onto a key a removed
+     * member still holds, and removal would mean nothing.
+     */
+    func installEpoch(epoch: UInt32, key: Data) throws 
+    
+    /**
+     * The highest epoch held, or `None` when this device has no key for the
+     * group at all — which is the signal to go ask for one before sending.
+     */
+    func newestEpoch() throws  -> UInt32?
+    
+    /**
+     * Opens an envelope under whichever epoch it names.
+     *
+     * Fails — rather than returning empty — when the epoch key is absent, so
+     * the caller can tell "I need epoch 3" apart from "this message is empty",
+     * and show the row as undecryptable instead of as a blank bubble.
+     */
+    func `open`(envelope: String) throws  -> Data
+    
+    /**
+     * Seals under the newest held epoch, but only if every member can read it.
+     *
+     * `total_members` and `capable_members` are passed rather than inferred
+     * because this layer cannot see the roster. They are checked by
+     * `VibeGroupSealAuthorization`, which has no constructor that skips the
+     * check — so "seal only when everyone can read" is enforced by the type
+     * system rather than by remembering to write an `if` at each call site.
+     *
+     * A group with zero known members is refused rather than treated as
+     * vacuously fine: an empty roster is far more likely to be a failed fetch
+     * than a real empty group, and encrypting to nobody is not a safe default.
+     */
+    func seal(totalMembers: UInt32, capableMembers: UInt32, plaintext: Data) throws  -> String
+    
+}
+
+/**
+ * The epoch keys this device holds for one group.
+ *
+ * Bound to a single `group_id` at construction and never retargeted: the group
+ * id is authenticated data on every seal, so a keyring pointed at the wrong
+ * group does not silently decrypt the wrong thing — it fails, which is correct
+ * but is a failure that need never happen.
+ */
+open class VibeGroupKeyringHandle:
+    VibeGroupKeyringHandleProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vibe_core_ffi_fn_clone_vibegroupkeyringhandle(self.pointer, $0) }
+    }
+    /**
+     * A keyring for `group_id`, holding nothing yet.
+     */
+public convenience init(groupId: String) {
+    let pointer =
+        try! rustCall() {
+    uniffi_vibe_core_ffi_fn_constructor_vibegroupkeyringhandle_new(
+        FfiConverterString.lower(groupId),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vibe_core_ffi_fn_free_vibegroupkeyringhandle(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Installs a key for an epoch **older** than the newest held, so history
+     * handed to a new member becomes readable.
+     *
+     * Named separately from [`Self::install_epoch`] on purpose. This is the one
+     * operation that legitimately moves backwards, so it cannot be reached by a
+     * frame that merely looks like a rotation.
+     */
+open func backfillEpoch(epoch: UInt32, key: Data)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_backfill_epoch(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(epoch),
+        FfiConverterData.lower(key),$0
+    )
+}
+}
+    
+open func epochCount()throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_epoch_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func hasEpoch(epoch: UInt32)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_has_epoch(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(epoch),$0
+    )
+})
+}
+    
+    /**
+     * Installs the key for a **strictly newer** epoch.
+     *
+     * Refusing an equal or older epoch is the anti-rollback rule: without it a
+     * replayed membership frame could walk a group back onto a key a removed
+     * member still holds, and removal would mean nothing.
+     */
+open func installEpoch(epoch: UInt32, key: Data)throws  {try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_install_epoch(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(epoch),
+        FfiConverterData.lower(key),$0
+    )
+}
+}
+    
+    /**
+     * The highest epoch held, or `None` when this device has no key for the
+     * group at all — which is the signal to go ask for one before sending.
+     */
+open func newestEpoch()throws  -> UInt32? {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_newest_epoch(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Opens an envelope under whichever epoch it names.
+     *
+     * Fails — rather than returning empty — when the epoch key is absent, so
+     * the caller can tell "I need epoch 3" apart from "this message is empty",
+     * and show the row as undecryptable instead of as a blank bubble.
+     */
+open func `open`(envelope: String)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_open(self.uniffiClonePointer(),
+        FfiConverterString.lower(envelope),$0
+    )
+})
+}
+    
+    /**
+     * Seals under the newest held epoch, but only if every member can read it.
+     *
+     * `total_members` and `capable_members` are passed rather than inferred
+     * because this layer cannot see the roster. They are checked by
+     * `VibeGroupSealAuthorization`, which has no constructor that skips the
+     * check — so "seal only when everyone can read" is enforced by the type
+     * system rather than by remembering to write an `if` at each call site.
+     *
+     * A group with zero known members is refused rather than treated as
+     * vacuously fine: an empty roster is far more likely to be a failed fetch
+     * than a real empty group, and encrypting to nobody is not a safe default.
+     */
+open func seal(totalMembers: UInt32, capableMembers: UInt32, plaintext: Data)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibegroupkeyringhandle_seal(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(totalMembers),
+        FfiConverterUInt32.lower(capableMembers),
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeGroupKeyringHandle: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VibeGroupKeyringHandle
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeGroupKeyringHandle {
+        return VibeGroupKeyringHandle(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VibeGroupKeyringHandle) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeGroupKeyringHandle {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VibeGroupKeyringHandle, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeGroupKeyringHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> VibeGroupKeyringHandle {
+    return try FfiConverterTypeVibeGroupKeyringHandle.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeGroupKeyringHandle_lower(_ value: VibeGroupKeyringHandle) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVibeGroupKeyringHandle.lower(value)
+}
+
+
+
+
+/**
  * Read-only handle onto the shipped app's `messages` table.
  *
  * Opened `SQLITE_OPEN_READ_ONLY`. The app stays the sole writer; this exists so
@@ -1705,12 +1991,48 @@ open class VibeSecureIdentityHandle:
      * The store is SQLite on disk, so ratchet state survives relaunch. That is
      * what makes [`VibeSecureSessionHandle::load`] able to return a session at
      * all, and it is the difference between MLS being usable and being a demo.
+     *
+     * **Platforms must not call this on launch — use [`Self::load_or_generate`].**
+     * A stable `device_id` is not a stable identity; see that constructor.
      */
 public static func generate(deviceId: String, dbPath: String)throws  -> VibeSecureIdentityHandle {
     return try  FfiConverterTypeVibeSecureIdentityHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_constructor_vibesecureidentityhandle_generate(
         FfiConverterString.lower(deviceId),
         FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+    
+    /**
+     * Reopens this device's existing identity, or generates one if
+     * `signature_public_key` is absent or no longer resolves.
+     *
+     * **This is the launch constructor.** `signature_public_key` is what
+     * [`Self::signature_key`] returned last time; the platform persists it and
+     * hands it back. Only the public half crosses — the private key never
+     * leaves the store at `db_path`.
+     *
+     * [`Self::generate`] mints a fresh signing key on every call, and a device
+     * that does that on every launch reloads its groups fine and seals fine
+     * while becoming permanently unreadable to every peer: an application
+     * message is verified against the signing key recorded in the sender's leaf
+     * node, and a new key is not that one. Two devices in the same group, each
+     * unable to open the other, both looking healthy from the inside — that is
+     * the shape this constructor exists to prevent.
+     *
+     * The caller must store [`Self::signature_key`] after **every** call, not
+     * only the first: a restore-from-backup brings the platform's stored
+     * pointer back without the (backup-excluded) key store, so the pointer goes
+     * stale, this falls back to generating, and the stale value has to be
+     * overwritten or the next launch repeats the whole failure.
+     */
+public static func loadOrGenerate(deviceId: String, dbPath: String, signaturePublicKey: Data?)throws  -> VibeSecureIdentityHandle {
+    return try  FfiConverterTypeVibeSecureIdentityHandle.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_constructor_vibesecureidentityhandle_load_or_generate(
+        FfiConverterString.lower(deviceId),
+        FfiConverterString.lower(dbPath),
+        FfiConverterOptionData.lower(signaturePublicKey),$0
     )
 })
 }
@@ -5550,6 +5872,30 @@ extension VibeFfiSource: Equatable, Hashable {}
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
     typealias SwiftType = Int64?
 
@@ -6108,6 +6454,60 @@ fileprivate struct FfiConverterSequenceOptionData: FfiConverterRustBuffer {
     }
 }
 /**
+ * The epoch a group envelope names, or `None` when it is not parseable.
+ *
+ * Exists so a client holding the *wrong* keys can tell the platform exactly
+ * which epoch to go fetch, instead of the platform having to re-request
+ * everything or the row staying unreadable forever. Reads the header only; it
+ * never touches the ciphertext and never needs a key.
+ */
+public func vibeGroupEnvelopeEpoch(raw: String) -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_func_vibe_group_envelope_epoch(
+        FfiConverterString.lower(raw),$0
+    )
+})
+}
+/**
+ * Number of epoch keys one keyring retains, exposed so the platform can size
+ * its own persistence to match rather than guessing.
+ */
+public func vibeGroupEpochRetention() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_func_vibe_group_epoch_retention($0
+    )
+})
+}
+/**
+ * True when `raw` is a group envelope this layer can open.
+ *
+ * A cheap prefix test so the message pipeline can route without allocating or
+ * parsing — the same shape as the `vmls1.` check next door.
+ */
+public func vibeGroupIsEnvelope(raw: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_func_vibe_group_is_envelope(
+        FfiConverterString.lower(raw),$0
+    )
+})
+}
+/**
+ * Mints a fresh epoch key from the OS CSPRNG.
+ *
+ * Returns raw key material — the **one** place in this boundary that does, and
+ * only because the device minting an epoch is the device that must hand it to
+ * every member. The caller's obligation is to deliver it over an already
+ * end-to-end-encrypted channel and to persist it somewhere only this device can
+ * read. Everything after that point is write-only: the keyring takes keys and
+ * never gives them back.
+ */
+public func vibeGroupMintEpochKey()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_func_vibe_group_mint_epoch_key($0
+    )
+})
+}
+/**
  * The safety number two people compare out of band to prove nobody is in the
  * middle.
  *
@@ -6139,6 +6539,18 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_vibe_core_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_group_envelope_epoch() != 23548) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_group_epoch_retention() != 12283) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_group_is_envelope() != 62761) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_group_mint_epoch_key() != 62093) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_func_vibe_safety_number() != 16482) {
         return InitializationResult.apiChecksumMismatch
@@ -6192,6 +6604,27 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibeffikeyunwrapper_unwrap_aes_keys() != 53855) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_backfill_epoch() != 40457) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_epoch_count() != 3602) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_has_epoch() != 30679) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_install_epoch() != 7345) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_newest_epoch() != 63666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_open() != 4363) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibegroupkeyringhandle_seal() != 42240) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibelegacystorehandle_count() != 49553) {
@@ -6281,10 +6714,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_constructor_vibecorehandle_new() != 18647) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibegroupkeyringhandle_new() != 22871) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vibe_core_ffi_checksum_constructor_vibelegacystorehandle_open() != 15415) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecureidentityhandle_generate() != 29728) {
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecureidentityhandle_generate() != 33286) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_constructor_vibesecureidentityhandle_load_or_generate() != 44495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_constructor_vibesecuresessionhandle_create() != 7798) {

@@ -35,6 +35,12 @@ impl VibeDeviceIdentity {
     /// `device_id` should be stable for the lifetime of the install — it is
     /// what other members' safety-number UI will hash, and what a future
     /// remove-device flow names.
+    ///
+    /// **A platform must not call this on launch — use
+    /// [`Self::load_or_generate`].** A stable `device_id` is not a stable
+    /// identity: this mints a new signing key every time, and a device that
+    /// does so on every launch keeps every group it is in while becoming
+    /// unreadable to every peer in them.
     pub fn generate(
         device_id: &str,
         provider: &impl OpenMlsProvider,
@@ -46,6 +52,64 @@ impl VibeDeviceIdentity {
             .store(provider.storage())
             .map_err(|_| VibeSecureError::IdentityGeneration)?;
 
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.public().into(),
+        };
+
+        Ok(Self {
+            device_id: device_id.to_string(),
+            signer,
+            credential_with_key,
+        })
+    }
+
+    /// Reloads the identity whose public half is `signature_public_key`, or
+    /// generates a fresh one when that key is absent or cannot be resolved.
+    ///
+    /// **This, not [`Self::generate`], is what a platform calls on launch.**
+    /// The signing key is what a peer's copy of our leaf node names, and an
+    /// application message is verified against that leaf — so minting a new key
+    /// on relaunch leaves the group loading fine, sealing fine, and producing
+    /// messages the peer can never open. The sender sees success; the receiver
+    /// sees a decrypt failure it can only read as tampering. That shipped, and
+    /// wedged live conversations for two days; `tests/identity_persistence.rs`
+    /// pins both halves of it.
+    ///
+    /// Only the *public* half crosses this boundary, in either direction. The
+    /// private key stays in `provider`'s key store, which is the same rule the
+    /// rest of this type holds: the platform gets an address to look the
+    /// identity up by, never the identity itself.
+    ///
+    /// Falls back to generating rather than failing when the key does not
+    /// resolve. That is the restore-from-backup shape — a platform's stored
+    /// pointer survives while the backup-excluded key store does not — and
+    /// failing there would make MLS permanently unavailable on that install
+    /// with no route back short of a reinstall. The caller must persist
+    /// [`Self::signature_key`] after **every** call for the same reason: a
+    /// stale pointer has to be overwritten, not just written once.
+    pub fn load_or_generate(
+        device_id: &str,
+        signature_public_key: Option<&[u8]>,
+        provider: &impl OpenMlsProvider,
+    ) -> Result<Self, VibeSecureError> {
+        let Some(public_key) = signature_public_key else {
+            return Self::generate(device_id, provider);
+        };
+        let Some(signer) = SignatureKeyPair::read(
+            provider.storage(),
+            public_key,
+            VIBE_SECURE_CIPHERSUITE.signature_algorithm(),
+        ) else {
+            return Self::generate(device_id, provider);
+        };
+
+        // Rebuilt from the reloaded key rather than from `public_key`, so a
+        // caller that passed a truncated or otherwise mangled pointer cannot
+        // produce a credential that names something the signer will not sign
+        // as. `read` already keyed on the exact bytes, so these are equal
+        // today — this keeps them equal by construction.
+        let credential = BasicCredential::new(device_id.as_bytes().to_vec());
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.public().into(),

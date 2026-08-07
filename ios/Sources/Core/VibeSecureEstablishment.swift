@@ -65,6 +65,17 @@ enum VibeSecureEstablishment {
   /// remain first and does nothing when the pool is healthy.
   static func ensureKeyPackagesPublished(apiBase: URL, token: String?) {
     establishmentQueue.async {
+      // A retired signing key must **not** consult the count. Every package the
+      // server holds for this device names the dead key, so the pool looks
+      // perfectly healthy at exactly the moment its entire contents are
+      // poison — that is why a device in this state logged "published 0
+      // KeyPackages" all day while being unreachable. Republish unconditionally
+      // and let the server retire the old batch in the same transaction.
+      guard !VibeSecureSessions.identityResetPending else {
+        publishKeyPackages(
+          count: keyPackagePoolSize, apiBase: apiBase, token: token, retireDeviceKeys: true)
+        return
+      }
       request(
         method: "GET", path: "api/mls/key-packages/count", apiBase: apiBase, token: token,
         body: nil
@@ -76,7 +87,9 @@ enum VibeSecureEstablishment {
     }
   }
 
-  private static func publishKeyPackages(count: Int, apiBase: URL, token: String?) {
+  private static func publishKeyPackages(
+    count: Int, apiBase: URL, token: String?, retireDeviceKeys: Bool = false
+  ) {
     guard count > 0, let deviceId = VibeSecureDeviceId.loadOrCreate() else { return }
     var encoded: [String] = []
     encoded.reserveCapacity(count)
@@ -88,11 +101,26 @@ enum VibeSecureEstablishment {
       VibeLog.error("[VibeSecure] could not mint any KeyPackage — MLS unavailable to peers")
       return
     }
+    var body: [String: Any] = ["deviceId": deviceId, "keyPackages": encoded]
+    if retireDeviceKeys { body["retireDeviceKeys"] = true }
     request(
-      method: "POST", path: "api/mls/key-packages", apiBase: apiBase, token: token,
-      body: ["deviceId": deviceId, "keyPackages": encoded]
+      method: "POST", path: "api/mls/key-packages", apiBase: apiBase, token: token, body: body
     ) { object in
       let published = (object?["count"] as? Int) ?? 0
+      guard published > 0 else {
+        VibeLog.error("[VibeSecure] KeyPackage publish returned nothing — peers cannot add us")
+        return
+      }
+      if retireDeviceKeys {
+        // Only now. Clearing on the request rather than the response would let
+        // a dropped reply strand the device with a server-side pool that still
+        // names its retired key, and nothing would ever ask again.
+        VibeSecureSessions.identityResetPending = false
+        VibeLog.notice(
+          "[VibeSecure] retired the old signing key server-side and published"
+            + " \(published) fresh KeyPackages")
+        return
+      }
       VibeLog.info("[VibeSecure] published \(published) KeyPackages")
     }
   }
@@ -118,6 +146,33 @@ enum VibeSecureEstablishment {
     establishmentQueue.async {
       guard !inFlight.contains(chatId) else { return }
       if VibeSecureSessions.shared.hasSession(chatId: chatId) {
+        // A local session is NOT the same thing as an established chat, and treating it
+        // as one is why a chat can sit at "not sealing yet — welcomes pending=0
+        // delivered=0" for days: those counts mean the server holds no Welcome row at
+        // all, so the peer was never told this group exists.
+        //
+        // The window is real. `createSession` persists the group before the
+        // `POST /api/mls/welcomes` below returns, so a kill — or a dropped response — in
+        // between leaves a group on disk whose Welcome was never recorded. Every later
+        // attempt then short-circuits HERE, which is why a device in this state never
+        // issues another `GET /api/mls/key-packages/<peer>` or `POST /api/mls/welcomes`.
+        // Confirmed against the 2026-08-07 server log: neither call appears once, while
+        // `welcome-status` is polled all day.
+        //
+        // Not self-healing yet. Recovery means discarding the orphan and re-establishing,
+        // which is safe only because nothing was ever sealed under it (the send path
+        // requires `isPeerConfirmed`). Naming the state is the prerequisite for that.
+        if !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) {
+          VibeLog.error(
+            "MLS session exists but peer never confirmed — chat cannot seal",
+            category: "crypto",
+            metadata: [
+              "chat": String(chatId.prefix(12)),
+              "peer": String(peerUserId.prefix(12)),
+              "state": "orphaned-group",
+              "effect": "sends fall back to the hybrid envelope",
+            ])
+        }
         completion(true)
         return
       }
@@ -467,9 +522,19 @@ enum VibeSecureEstablishment {
   /// release any drafts queued behind the send gate for those chats. Nothing
   /// else would release them — the sender is blocked waiting on exactly this.
   static func drainPendingWelcomes(
-    apiBase: URL, token: String?, completion: (([String]) -> Void)? = nil
+    apiBase: URL, token: String?, selfUserId: String?, completion: (([String]) -> Void)? = nil
   ) {
     establishmentQueue.async {
+      // Every Welcome on the server right now targets a KeyPackage signed by
+      // the key this device just retired — and the matching private init key is
+      // still in the store, so joining would *succeed* and mint a session that
+      // is unreadable from birth. Wait for the retirement to land; it deletes
+      // these rows in the same transaction that publishes the fresh pool.
+      guard !VibeSecureSessions.identityResetPending else {
+        VibeLog.info("[VibeSecure] skipping welcome drain until the retired key is cleared")
+        completion?([])
+        return
+      }
       request(
         method: "GET", path: "api/mls/welcomes", apiBase: apiBase, token: token, body: nil
       ) { object in
@@ -487,11 +552,12 @@ enum VibeSecureEstablishment {
           else { continue }
           let ratchetTree = (entry["ratchetTree"] as? String).flatMap { Data(base64Encoded: $0) }
 
-          if let existing = VibeSecureSessions.shared.groupId(chatId: chatId) {
-            guard resolveCollision(existing: existing, incoming: welcome) else {
+          if VibeSecureSessions.shared.groupId(chatId: chatId) != nil {
+            let senderUserId = entry["senderUserId"] as? String
+            guard adoptIncoming(senderUserId: senderUserId, selfUserId: selfUserId) else {
               // Our group wins the tie-break. Ack so the server stops
-              // redelivering; the peer is applying the same rule and will
-              // adopt ours from the Welcome we sent them.
+              // redelivering; the peer is applying the same rule to the same
+              // pair of ids, so it is adopting ours right now.
               ack(id: id, apiBase: apiBase, token: token)
               continue
             }
@@ -517,15 +583,35 @@ enum VibeSecureEstablishment {
   /// Decides whether an incoming Welcome should replace the session we already
   /// hold for that chat. Returns `true` to adopt the incoming group.
   ///
-  /// Both devices run this on the same pair of groups, so the rule only has to
-  /// be *deterministic and symmetric* — not clever. Lowest group id wins.
+  /// Both devices see the same pair of user ids and must reach *opposite*
+  /// conclusions, or the tie-break does not break anything. Lowest user id
+  /// wins its own group; the other side adopts.
+  ///
+  /// The previous rule compared our stored **group id** against the incoming
+  /// **Welcome blob** — two unrelated byte strings of different kinds and
+  /// lengths. Its doc claimed both devices ran it "on the same pair of groups",
+  /// but each device was comparing its own id against the other's welcome, so
+  /// the two answers were independent coin flips: both could keep, or both
+  /// could adopt and swap. A Welcome does not carry a readable group id (it is
+  /// encrypted to the joiner), so there was never a way to compare the two
+  /// groups without staging the join first. User ids are the identifiers both
+  /// sides genuinely share.
+  ///
+  /// Falls back to adopting when either id is missing. An unknown id means we
+  /// cannot run the rule at all, and adopting at least converges with a peer
+  /// that keeps its own — while declining would leave a chat with a group its
+  /// peer has abandoned, which never recovers.
   ///
   /// Messages sealed under the losing group before convergence are unreadable
   /// afterwards. That is a first-contact-only window, and losing a handful of
   /// opening messages is strictly better than the alternative, which is two
   /// devices talking past each other in a conversation that never converges.
-  private static func resolveCollision(existing: Data, incoming: Data) -> Bool {
-    incoming.lexicographicallyPrecedes(existing)
+  private static func adoptIncoming(senderUserId: String?, selfUserId: String?) -> Bool {
+    guard
+      let sender = senderUserId?.uppercased(), let me = selfUserId?.uppercased(),
+      !sender.isEmpty, !me.isEmpty, sender != me
+    else { return true }
+    return sender < me
   }
 
   private static func ack(id: String, apiBase: URL, token: String?) {

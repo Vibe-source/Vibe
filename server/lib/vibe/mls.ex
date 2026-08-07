@@ -49,14 +49,40 @@ defmodule Vibe.Mls do
   serialized MLS KeyPackage). Returns `{:ok, %{count: n}}` or `{:error, reason}`
   with `reason` one of `:invalid_device_id`, `:invalid_key_packages`,
   `:batch_too_large`, `:invalid_key_package_encoding`.
+
+  ## `retireDeviceKeys`
+
+  When truthy, everything already on file for this device is deleted in the
+  **same transaction** as the insert. A device sends this when its MLS signing
+  key changed, and it is not housekeeping — without it the fix for that does not
+  hold:
+
+    * Unclaimed KeyPackages carry the retired signing key. `claim_key_package/1`
+      hands out the *oldest* first, so a peer would reliably claim a dead one,
+      build a group around a leaf the device can no longer sign as, and land
+      right back in "both sides sealed fine, neither can read the other".
+    * Undelivered Welcomes are the same trap from the other side: they target a
+      dead KeyPackage whose private half is still in the device's store, so the
+      join *succeeds* and produces a session that is broken from birth.
+
+  One transaction rather than a separate endpoint the client calls first, so
+  there is no window in which a peer can claim a stale KeyPackage that has
+  already been "logically" retired, and none in which the device has no
+  KeyPackages at all.
+
+  Welcomes are cleared per **user**, not per device: `mls_welcomes` records only
+  a recipient user. With one device per account today that is exact; a real
+  multi-device account would need the recipient device recorded on the row
+  before this can be narrowed.
   """
   def publish_key_packages(user_id, params) when is_binary(user_id) and is_map(params) do
     device_id = params["deviceId"] || params["device_id"]
     key_packages = params["keyPackages"] || params["key_packages"]
+    retire? = params["retireDeviceKeys"] == true or params["retire_device_keys"] == true
 
     with {:ok, device_id} <- validate_device_id(device_id),
          {:ok, decoded} <- validate_key_packages(key_packages) do
-      insert_batch(user_id, device_id, decoded)
+      insert_batch(user_id, device_id, decoded, retire?)
     end
   end
 
@@ -192,8 +218,10 @@ defmodule Vibe.Mls do
     end
   end
 
-  defp insert_batch(user_id, device_id, decoded_key_packages) do
+  defp insert_batch(user_id, device_id, decoded_key_packages, retire?) do
     Repo.transaction(fn ->
+      if retire?, do: retire_device_artifacts(user_id, device_id)
+
       Enum.map(decoded_key_packages, fn key_package ->
         %MlsKeyPackage{}
         |> MlsKeyPackage.changeset(%{
@@ -212,6 +240,33 @@ defmodule Vibe.Mls do
         Logger.warning("[Mls] publish batch failed: #{inspect(reason)}")
         {:error, :publish_failed}
     end
+  end
+
+  # Deletes what a retired signing key leaves behind. Runs inside the publish
+  # transaction — see `publish_key_packages/2`'s doc for why it cannot be its
+  # own call.
+  #
+  # Claimed KeyPackages are left alone. They are already spent (a claim is
+  # single-use and irreversible), so deleting them would only destroy the record
+  # that they were, and the groups they produced are the caller's to abandon
+  # locally.
+  defp retire_device_artifacts(user_id, device_id) do
+    {retired_packages, _} =
+      from(kp in MlsKeyPackage,
+        where: kp.user_id == ^user_id and kp.device_id == ^device_id and is_nil(kp.claimed_at)
+      )
+      |> Repo.delete_all()
+
+    {dropped_welcomes, _} =
+      from(w in MlsWelcome,
+        where: w.recipient_user_id == ^user_id and is_nil(w.delivered_at)
+      )
+      |> Repo.delete_all()
+
+    Logger.info(
+      "[Mls] retired signing key for device #{String.slice(device_id, 0, 12)}: " <>
+        "#{retired_packages} unclaimed KeyPackage(s), #{dropped_welcomes} pending Welcome(s)"
+    )
   end
 
   # ── Welcome relay ────────────────────────────────────────────────────────

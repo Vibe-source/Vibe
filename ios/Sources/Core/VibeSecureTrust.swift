@@ -83,6 +83,35 @@ enum VibeSecureTrust {
     queue.sync { storeKey(signatureKey, userId: userId) }
   }
 
+  /// Forgets every pin this device holds.
+  ///
+  /// **Only for the one case where every pin is known-dead**: this device's own
+  /// signing key was retired, which means it was minted per launch — and so were
+  /// its peers'. Every stored pin then names a key its owner will never sign
+  /// with again, `evaluate` returns `changed` for all of them, and `verifyPeer`
+  /// fails closed, so no conversation can re-establish. See
+  /// `VibeSecureSessions.retireStateForNewIdentityLocked`.
+  ///
+  /// This is the one operation that undoes what pinning is for, so it must never
+  /// become a general-purpose "reset trust" convenience: an attacker who can
+  /// provoke it gets a fresh first-contact window against every peer at once.
+  /// Nothing calls it except identity retirement, and that runs at most once per
+  /// key change.
+  static func clearAllPins() {
+    queue.sync {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+      ]
+      let status = SecItemDelete(query as CFDictionary)
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        VibeLog.error("[VibeSecure] could not clear peer pins: OSStatus \(status)")
+        return
+      }
+      VibeLog.notice("[VibeSecure] cleared every peer identity pin — they re-pin on next contact")
+    }
+  }
+
   /// The digits two people compare out of band, or `nil` if either side's key
   /// is unknown.
   ///

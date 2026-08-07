@@ -115,12 +115,36 @@ final class VibeSecureSessions {
 
   private init() {}
 
-  /// This device's MLS identity, generated once per process.
+  /// Where this device's **public** signature key is remembered between
+  /// launches, so the private half can be found again in the MLS store.
+  ///
+  /// `UserDefaults` for the same reason group ids are: this is an address, not
+  /// a secret. It is the public half of a keypair whose private half never
+  /// leaves the Rust store, and peers are handed this exact value inside every
+  /// KeyPackage we publish.
+  private static let signaturePublicKeyKey = "vibe.mls.identityPublicKey"
+
+  /// Set when this device's signing key changed, so the next network pass
+  /// retires the server-side artifacts that still name the old one.
+  private static let identityResetPendingKey = "vibe.mls.identityResetPending"
+
+  /// This device's MLS identity, resolved once per process.
   ///
   /// The device id is Keychain-backed and stable across launches, because it is
   /// carried in the MLS credential and is what a safety-number UI will hash. A
   /// per-launch UUID would make this device look like a different party to every
   /// peer on every launch.
+  ///
+  /// **A stable device id was never enough**, and this shipped without the rest
+  /// of it: the old code called `generate`, which mints a fresh signing key
+  /// every time, so every cold launch gave this device a new key while keeping
+  /// every group it was in. MLS verifies an application message against the
+  /// signing key recorded in the sender's leaf node, so from that launch on the
+  /// peer could not open a single message — and neither side could tell, because
+  /// sealing still succeeded and the group still loaded. Two devices, one group
+  /// id, both healthy-looking, neither readable. `load_or_generate` resolves the
+  /// key already in the store instead; `core/vibe_secure/tests/identity_persistence.rs`
+  /// pins both the failure and the fix.
   ///
   /// The handle is constructed against the on-disk store at `storePath()`, so
   /// key material and group state outlive the process.
@@ -134,14 +158,90 @@ final class VibeSecureSessions {
       VibeLog.error("[VibeSecure] no store path — MLS unavailable")
       return nil
     }
+    let remembered = UserDefaults.standard.data(forKey: Self.signaturePublicKeyKey)
     do {
-      let handle = try VibeSecureIdentityHandle.generate(deviceId: deviceId, dbPath: dbPath)
+      let handle = try VibeSecureIdentityHandle.loadOrGenerate(
+        deviceId: deviceId, dbPath: dbPath, signaturePublicKey: remembered)
+      let current = handle.signatureKey()
+
+      // Written on every construction, not only the first. A restore from
+      // backup brings this default back while the backup-excluded MLS store
+      // stays gone, so the remembered key stops resolving and Rust mints a new
+      // one — and if the stale value survived, the next launch would repeat it
+      // forever.
+      if current != remembered {
+        retireStateForNewIdentityLocked(hadRememberedKey: remembered != nil)
+        UserDefaults.standard.set(current, forKey: Self.signaturePublicKeyKey)
+      }
+
       identityCache = handle
       return handle
     } catch {
-      VibeLog.error("[VibeSecure] identity generation failed: \(error)")
+      VibeLog.error("[VibeSecure] identity load failed: \(error)")
       return nil
     }
+  }
+
+  /// Drops everything that is only meaningful under the *previous* signing key.
+  ///
+  /// A new signing key does not damage the groups on disk — it orphans them.
+  /// Every peer's copy of our leaf still names the key we no longer hold, so
+  /// those groups can never carry a readable message again in either direction.
+  /// Keeping them is strictly worse than dropping them: `hasSession` would keep
+  /// answering yes, so establishment would keep short-circuiting and the chat
+  /// would stay silently broken forever. Discarding them makes every chat look
+  /// unestablished, which is the one state the rest of this file knows how to
+  /// recover from.
+  ///
+  /// **Peer pins go too, and that is the uncomfortable part.** Peers were
+  /// regenerating their keys on every launch as well, so every pin we hold names
+  /// a key its owner will never sign with again — and `verifyPeer` fails closed
+  /// on a changed key, which would make every existing conversation permanently
+  /// unable to re-establish. There is no safety-number screen yet for a human to
+  /// accept the change through, so clearing the pins is the only route back. It
+  /// costs exactly one re-pin per peer: the first-contact substitution window
+  /// reopens once, and closes again on the next claim.
+  ///
+  /// **Retained plaintext is deliberately kept.** It is our own sent text, not
+  /// key material, and it is the only source for rendering our own MLS history —
+  /// dropping it would blank those rows for no security gain.
+  ///
+  /// Must not touch `queue`: every caller is already inside it.
+  private func retireStateForNewIdentityLocked(hadRememberedKey: Bool) {
+    let defaults = UserDefaults.standard
+    let groupKeys = defaults.dictionaryRepresentation().keys.filter {
+      $0.hasPrefix("vibe.mls.group.") || $0.hasPrefix("vibe.mls.peerKeysMissing.")
+    }
+    for key in groupKeys { defaults.removeObject(forKey: key) }
+    defaults.removeObject(forKey: Self.peerConfirmedKey)
+    sessions.removeAll()
+
+    // `vibe.mls.ineligible.*` survives on purpose: it records that a chat has
+    // more members than MLS is wired for here, which is a fact about the chat,
+    // not about this device's key.
+
+    VibeSecureTrust.clearAllPins()
+
+    let orphanedGroups = groupKeys.filter { $0.hasPrefix("vibe.mls.group.") }.count
+    let hadPriorState = hadRememberedKey || orphanedGroups > 0
+    if hadPriorState {
+      // The server still holds KeyPackages signed by the dead key, and
+      // `claim` hands out the oldest first — so a peer would claim one, build a
+      // group around a leaf we can no longer sign as, and reproduce this bug
+      // exactly. Pending Welcomes are the same trap from the other side.
+      // `VibeSecureEstablishment` clears both on the next network pass.
+      defaults.set(true, forKey: Self.identityResetPendingKey)
+      VibeLog.notice(
+        "[VibeSecure] device signing key changed — discarded \(orphanedGroups) orphaned"
+          + " group(s) and every peer pin; chats will re-establish from scratch")
+    }
+  }
+
+  /// Whether server-side artifacts naming a retired signing key still need
+  /// clearing. Cleared by `VibeSecureEstablishment` once they are.
+  static var identityResetPending: Bool {
+    get { UserDefaults.standard.bool(forKey: identityResetPendingKey) }
+    set { UserDefaults.standard.set(newValue, forKey: identityResetPendingKey) }
   }
 
   /// Where the MLS ratchet state lives.

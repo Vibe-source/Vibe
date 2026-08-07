@@ -13322,7 +13322,9 @@ final class ChatEngine {
     let token = authHeaderTokenLocked()
     mlsProvisionedAtMs = now
     VibeSecureEstablishment.ensureKeyPackagesPublished(apiBase: apiBase, token: token)
-    VibeSecureEstablishment.drainPendingWelcomes(apiBase: apiBase, token: token) {
+    VibeSecureEstablishment.drainPendingWelcomes(
+      apiBase: apiBase, token: token, selfUserId: currentUserIdLocked()
+    ) {
       [weak self] joinedChatIds in
       guard let self = self, !joinedChatIds.isEmpty else { return }
       self.queue.async {
