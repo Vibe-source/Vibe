@@ -121,6 +121,8 @@ defmodule VibeWeb.Router do
     get "/mls/welcomes", MlsController, :pending_welcomes
     post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
     get "/mls/chats/:chat_id/members", MlsController, :chat_members
+    # Whether the peer applied our Welcome — the signal that sealing is safe.
+    get "/mls/chats/:chat_id/welcome-status", MlsController, :welcome_status
     # Group epoch keys — channels and groups past the MLS member cap.
     post "/group-keys", MlsController, :post_epoch_keys
     get "/group-keys", MlsController, :pending_epoch_keys

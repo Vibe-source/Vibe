@@ -154,6 +154,19 @@ defmodule VibeWeb.MlsController do
     end
   end
 
+  @doc """
+  Whether the Welcomes this caller sent for a chat have been applied.
+
+  The client uses this to decide whether sealing with MLS is safe yet: a sender
+  cannot decrypt its own message, so without this it has no way to tell an
+  established session from one the peer never joined, and would happily produce
+  a conversation nobody can read.
+  """
+  def welcome_status(conn, %{"chat_id" => chat_id}) do
+    status = Mls.welcome_status(conn.assigns.current_user.id, chat_id)
+    json(conn, %{chatId: chat_id, pending: status.pending, delivered: status.delivered})
+  end
+
   # ── group epoch keys ───────────────────────────────────────────────────────
   #
   # The epoch-key layer covers channels and groups past the MLS member cap. See

@@ -61,6 +61,54 @@ final class VibeSecureSessions {
     return UserDefaults.standard.bool(forKey: "vibe.mls.sendEnabled")
   }
 
+  /// Chats whose peer has confirmed it applied our Welcome.
+  ///
+  /// # Why sealing is gated on this and not just on "a session exists"
+  ///
+  /// MLS gives a sender **no feedback whatsoever**. `create_message` succeeds
+  /// whether or not the other side ever joined, and — because a sender cannot
+  /// decrypt its own message — a device can seal, store and display an entire
+  /// conversation that nobody alive can open. Nothing in the protocol notices,
+  /// and nothing in the UI does either: the messages look sent, they ack, they
+  /// get delivery ticks.
+  ///
+  /// That is not hypothetical. On 2026-08-06 sealing was switched on before
+  /// establishment had been confirmed end-to-end and every DM went blank on both
+  /// sides simultaneously. The server knows the answer — it records `delivered_at`
+  /// when the recipient acks the Welcome — the sender simply had no way to ask.
+  /// Now it asks, and until the answer is yes it uses the path that already
+  /// works.
+  ///
+  /// Persisted rather than in-memory: confirmation is a fact about the peer's
+  /// device, not about this process, and re-deriving it on every launch would
+  /// mean a relaunch silently drops back to the older envelope.
+  private static let peerConfirmedKey = "vibe.mls.peerConfirmed"
+
+  /// True when the peer for `chatId` has applied our Welcome and can therefore
+  /// read what we seal.
+  func isPeerConfirmed(chatId: String) -> Bool {
+    let confirmed =
+      UserDefaults.standard.array(forKey: Self.peerConfirmedKey) as? [String] ?? []
+    return confirmed.contains(chatId)
+  }
+
+  /// Records that the peer for `chatId` confirmed the join.
+  ///
+  /// One-way on purpose. A peer that joined stays joined; a transient failure to
+  /// reach the status endpoint must not revoke a conversation's encryption,
+  /// because that would silently downgrade an established chat back to the older
+  /// envelope on a bad network.
+  func markPeerConfirmed(chatId: String) {
+    queue.sync {
+      var confirmed =
+        UserDefaults.standard.array(forKey: Self.peerConfirmedKey) as? [String] ?? []
+      guard !confirmed.contains(chatId) else { return }
+      confirmed.append(chatId)
+      UserDefaults.standard.set(confirmed, forKey: Self.peerConfirmedKey)
+      VibeLog.notice("[VibeSecure] peer confirmed for \(chatId) — sealing with MLS from now on")
+    }
+  }
+
   private let queue = DispatchQueue(label: "vibe.secure.sessions")
   private var identityCache: VibeSecureIdentityHandle?
   private var sessions: [String: VibeSecureSessionHandle] = [:]
@@ -385,21 +433,59 @@ final class VibeSecureSessions {
   ///
   /// Returns `nil` on every failure — no session, wrong session, tampered
   /// ciphertext — and the caller renders the existing decryption-failed state.
-  /// Failures are deliberately indistinguishable here; the Rust side already
-  /// collapses them so that "wrong key" and "tampered" cannot be told apart.
-  func open(chatId: String, envelope: String) -> String? {
+  /// Failures are deliberately indistinguishable *to the caller*; the Rust side
+  /// already collapses them so that "wrong key" and "tampered" cannot be told
+  /// apart.
+  ///
+  /// `isMine` and `messageId` exist only for the log line, and they matter more
+  /// than they look. A self-authored message can never be opened — MLS encrypts
+  /// to the group's *other* members — so a failure on our own message is
+  /// **expected** and means the retained plaintext was missing, while a failure
+  /// on a peer's message means the session genuinely disagrees and is a real
+  /// bug. Without that distinction the log is a wall of identical "open failed"
+  /// lines that cannot tell those two apart, which is exactly what it was on
+  /// 2026-08-06.
+  func open(chatId: String, envelope: String, isMine: Bool = false, messageId: String? = nil)
+    -> String?
+  {
     queue.sync {
+      let who = isMine ? "own" : "peer"
+      let mid = messageId.map { String($0.prefix(8)) } ?? "?"
       guard let session = sessionLocked(chatId: chatId) else {
-        VibeLog.info("[VibeSecure] vmls1 envelope for \(chatId) with no session")
+        VibeLog.info(
+          "[VibeSecure] vmls1 for \(chatId) mid=\(mid) from=\(who) — NO SESSION"
+            + " (group=\(groupIdHexLocked(chatId: chatId) ?? "none"))")
         return nil
       }
       do {
         return String(decoding: try session.open(envelope: envelope), as: UTF8.self)
       } catch {
-        VibeLog.error("[VibeSecure] open failed for \(chatId): \(error)")
+        // Split by author, because the two mean completely different things.
+        if isMine {
+          VibeLog.info(
+            "[VibeSecure] own message \(mid) in \(chatId) is not self-openable (expected);"
+              + " retained plaintext missing")
+        } else {
+          VibeLog.error(
+            "[VibeSecure] PEER open failed chat=\(chatId) mid=\(mid)"
+              + " group=\(groupIdHexLocked(chatId: chatId) ?? "none") — session disagrees: \(error)"
+          )
+        }
         return nil
       }
     }
+  }
+
+  /// The MLS group id for a chat, hex-truncated, for logs only.
+  ///
+  /// Two devices that each created their own group for the same chat is the
+  /// failure that looks identical to every other decrypt failure from the
+  /// outside — both sides hold a valid session, both seal happily, and neither
+  /// can read the other. Printing the group id is what makes that visible
+  /// instead of merely suspected.
+  private func groupIdHexLocked(chatId: String) -> String? {
+    guard let id = groupId(chatId: chatId) else { return nil }
+    return id.prefix(8).map { String(format: "%02x", $0) }.joined()
   }
 
   /// True when `raw` is an MLS envelope. Prefix test only — matches how the Rust

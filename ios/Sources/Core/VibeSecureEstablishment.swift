@@ -534,6 +534,46 @@ enum VibeSecureEstablishment {
   /// unparseable body. Callers here treat "no answer" and "no" identically:
   /// both mean the session is not established, and the only safe response to
   /// that is to keep the message queued.
+  /// Asks the server whether the peer applied the Welcome we sent for `chatId`,
+  /// and records the answer so the send path can start sealing.
+  ///
+  /// This is the missing half of establishment. Creating a group and posting a
+  /// Welcome tells us nothing about whether the peer *received* it — MLS reports
+  /// no such thing, and a sender cannot test by decrypting its own message. The
+  /// server is the only party that knows, because it is the one holding the
+  /// undelivered row.
+  ///
+  /// Cheap and idempotent, so it can hang off chat join beside the rest of
+  /// provisioning. Once confirmed it never asks again.
+  static func refreshPeerConfirmation(chatId: String, apiBase: URL, token: String?) {
+    guard !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) else { return }
+    guard VibeSecureSessions.shared.groupId(chatId: chatId) != nil else { return }
+
+    establishmentQueue.async {
+      request(
+        method: "GET",
+        path: "api/mls/chats/\(escaped(chatId))/welcome-status",
+        apiBase: apiBase,
+        token: token,
+        body: nil
+      ) { object in
+        guard let object else { return }
+        let pending = (object["pending"] as? Int) ?? 0
+        let delivered = (object["delivered"] as? Int) ?? 0
+        // Confirmed only when something was actually applied and nothing is
+        // still outstanding. `delivered > 0` alone is not enough for a group:
+        // one member joining does not mean the rest can read.
+        if delivered > 0, pending == 0 {
+          VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
+        } else {
+          VibeLog.info(
+            "[VibeSecure] \(chatId) not sealing yet — welcomes pending=\(pending)"
+              + " delivered=\(delivered)")
+        }
+      }
+    }
+  }
+
   private static func request(
     method: String,
     path: String,
