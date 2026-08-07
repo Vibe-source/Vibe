@@ -270,6 +270,24 @@ defmodule Vibe.MlsTest do
     assert [_still_pending] = Mls.pending_welcomes(recipient.id)
   end
 
+  test "the response says whether the retirement actually happened", %{user: user} do
+    # The client cannot otherwise tell this server from one that predates the
+    # flag and silently ignored it — and assuming success against an old server
+    # clears its pending retirement while every stale KeyPackage stays claimable.
+    assert {:ok, %{retired: false}} =
+             Mls.publish_key_packages(user.id, %{
+               "deviceId" => "device-a",
+               "keyPackages" => [fake_key_package("plain")]
+             })
+
+    assert {:ok, %{retired: true}} =
+             Mls.publish_key_packages(user.id, %{
+               "deviceId" => "device-a",
+               "keyPackages" => [fake_key_package("fresh")],
+               "retireDeviceKeys" => true
+             })
+  end
+
   test "publishing without the flag retires nothing", %{user: user} do
     {:ok, _} =
       Mls.publish_key_packages(user.id, %{

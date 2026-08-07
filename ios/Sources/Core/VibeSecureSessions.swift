@@ -238,8 +238,26 @@ final class VibeSecureSessions {
     }
   }
 
+  /// Resolves this device's identity if it has not been resolved yet.
+  ///
+  /// **Every reader of `identityResetPending` must call this first.** Resolving
+  /// the identity is what *sets* that flag — the two are the same act — so a
+  /// caller that reads the flag on a launch where nothing has touched MLS yet
+  /// reads `false` from a device whose key is about to change. That is not a
+  /// missed opportunity: it means the KeyPackage pool looks healthy while every
+  /// entry in it names the dead key, and the Welcome drain adopts a Welcome
+  /// built on one. Both of those are the original bug, rebuilt.
+  ///
+  /// Deliberately not folded into the flag's getter: that would hide a SQLite
+  /// open and a possible state wipe inside a property read.
+  func ensureIdentityResolved() {
+    queue.sync { _ = identityHandleLocked() }
+  }
+
   /// Whether server-side artifacts naming a retired signing key still need
   /// clearing. Cleared by `VibeSecureEstablishment` once they are.
+  ///
+  /// Only meaningful after `ensureIdentityResolved()` — see its doc.
   static var identityResetPending: Bool {
     get { UserDefaults.standard.bool(forKey: identityResetPendingKey) }
     set { UserDefaults.standard.set(newValue, forKey: identityResetPendingKey) }
@@ -311,9 +329,14 @@ final class VibeSecureSessions {
   /// orphan every message sealed before the restart.
   private func sessionLocked(chatId: String) -> VibeSecureSessionHandle? {
     if let live = sessions[chatId] { return live }
+    // Identity first, group id second, and the order is load-bearing. Resolving
+    // the identity is what discovers a changed signing key and wipes the
+    // group mappings it orphaned — reading the id first would capture the
+    // pre-wipe value and reload the very group the wipe just condemned, which
+    // is the whole bug wearing a different hat.
     guard
-      let groupId = Self.storedGroupId(chatId: chatId),
-      let identity = identityHandleLocked()
+      let identity = identityHandleLocked(),
+      let groupId = Self.storedGroupId(chatId: chatId)
     else { return nil }
     do {
       guard let restored = try identity.loadSession(groupId: groupId)

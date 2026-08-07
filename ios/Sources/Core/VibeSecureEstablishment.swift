@@ -69,6 +69,11 @@ enum VibeSecureEstablishment {
   /// remain first and does nothing when the pool is healthy.
   static func ensureKeyPackagesPublished(apiBase: URL, token: String?) {
     establishmentQueue.async {
+      // Resolving the identity is what discovers a changed signing key and sets
+      // the flag below, so reading the flag without this can read `false` on the
+      // one launch it matters — see `ensureIdentityResolved`.
+      VibeSecureSessions.shared.ensureIdentityResolved()
+
       // A retired signing key must **not** consult the count. Every package the
       // server holds for this device names the dead key, so the pool looks
       // perfectly healthy at exactly the moment its entire contents are
@@ -545,6 +550,10 @@ enum VibeSecureEstablishment {
     apiBase: URL, token: String?, selfUserId: String?, completion: (([String]) -> Void)? = nil
   ) {
     establishmentQueue.async {
+      // Same ordering requirement as `ensureKeyPackagesPublished`: the flag is
+      // only true once the identity has been resolved.
+      VibeSecureSessions.shared.ensureIdentityResolved()
+
       // Every Welcome on the server right now targets a KeyPackage signed by
       // the key this device just retired — and the matching private init key is
       // still in the store, so joining would *succeed* and mint a session that
@@ -581,7 +590,11 @@ enum VibeSecureEstablishment {
               ack(id: id, apiBase: apiBase, token: token)
               continue
             }
-            VibeSecureSessions.shared.discard(chatId: chatId)
+            // Deliberately no `discard` here. `joinSession` overwrites both the
+            // live session and the stored group id on success, so discarding
+            // first buys nothing — and on a *failed* join it would have thrown
+            // away a working group in exchange for none at all, leaving the
+            // chat worse off than before the Welcome arrived.
           }
 
           guard
