@@ -47,6 +47,10 @@ enum VibeSecureEstablishment {
   /// why that is the only workable signal here and what it costs.
   static let maxGroupMembers = 256
 
+  /// How old a group must be before "the server has no Welcome for it" is
+  /// treated as abandonment rather than a Welcome still in flight.
+  private static let orphanGraceSeconds: TimeInterval = 120
+
   private static let establishmentQueue = DispatchQueue(
     label: "vibe.secure.establishment", qos: .utility)
 
@@ -172,9 +176,12 @@ enum VibeSecureEstablishment {
         // Confirmed against the 2026-08-07 server log: neither call appears once, while
         // `welcome-status` is polled all day.
         //
-        // Not self-healing yet. Recovery means discarding the orphan and re-establishing,
-        // which is safe only because nothing was ever sealed under it (the send path
-        // requires `isPeerConfirmed`). Naming the state is the prerequisite for that.
+        // Recovery lives in `refreshPeerConfirmation`, which is the only place that can
+        // tell this state apart from an ordinary wait: `pending == 0 && delivered == 0`
+        // means the server holds no Welcome row at all. It discards the orphan there, so
+        // the next call through here finds no session and establishes properly. This
+        // branch only reports it — a chat sitting on the log line below for more than
+        // one confirmation pass means that repair is not running.
         if !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) {
           VibeLog.error(
             "MLS session exists but peer never confirmed — chat cannot seal",
@@ -685,11 +692,45 @@ enum VibeSecureEstablishment {
         // one member joining does not mean the rest can read.
         if delivered > 0, pending == 0 {
           VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
-        } else {
-          VibeLog.info(
-            "[VibeSecure] \(chatId) not sealing yet — welcomes pending=\(pending)"
-              + " delivered=\(delivered)")
+          return
         }
+
+        // `pending == 0 && delivered == 0` is not "still waiting" — it means the
+        // server holds no Welcome row for this chat at all, while we sit on a
+        // group. The peer was never told this group exists and never will be.
+        //
+        // Two ways in, both real: a kill between `createSession` and `POST
+        // /welcomes`, and a peer that retired its signing key (which deletes the
+        // Welcomes addressed to it) after we had already posted one. Either way
+        // `hasSession` keeps answering yes, so `establishDirectMessage`
+        // short-circuits and the chat never reaches MLS again — the state this
+        // file has been describing as "not self-healing yet".
+        //
+        // Discarding is free, and only here: an unconfirmed group has never
+        // sealed a message, because the send path requires `isPeerConfirmed`
+        // first. So there is nothing to lose and nothing to downgrade — the next
+        // attempt starts clean and re-establishes.
+        //
+        // Gated on age, because a group mid-establishment looks exactly like an
+        // abandoned one from here: `createSession` stores the group id before
+        // `POST /welcomes` is even sent, so a status query racing that window
+        // reads pending=0 delivered=0 for a group that is seconds from working.
+        // Discarding that would break establishment rather than repair it. The
+        // grace period is far longer than any round-trip and costs only a delay
+        // on a genuinely dead group.
+        if delivered == 0, pending == 0 {
+          let age = VibeSecureSessions.shared.groupAge(chatId: chatId) ?? 0
+          guard age > orphanGraceSeconds else { return }
+          VibeLog.notice(
+            "[VibeSecure] \(chatId) holds a group the server never had a Welcome for"
+              + " — discarding it so establishment can start over")
+          VibeSecureSessions.shared.discard(chatId: chatId)
+          return
+        }
+
+        VibeLog.info(
+          "[VibeSecure] \(chatId) not sealing yet — welcomes pending=\(pending)"
+            + " delivered=\(delivered)")
       }
     }
   }

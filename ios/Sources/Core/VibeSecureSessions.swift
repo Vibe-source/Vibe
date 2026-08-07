@@ -210,7 +210,8 @@ final class VibeSecureSessions {
   private func retireStateForNewIdentityLocked(hadRememberedKey: Bool) {
     let defaults = UserDefaults.standard
     let groupKeys = defaults.dictionaryRepresentation().keys.filter {
-      $0.hasPrefix("vibe.mls.group.") || $0.hasPrefix("vibe.mls.peerKeysMissing.")
+      $0.hasPrefix("vibe.mls.group.") || $0.hasPrefix("vibe.mls.groupSince.")
+        || $0.hasPrefix("vibe.mls.peerKeysMissing.")
     }
     for key in groupKeys { defaults.removeObject(forKey: key) }
     defaults.removeObject(forKey: Self.peerConfirmedKey)
@@ -280,6 +281,26 @@ final class VibeSecureSessions {
 
   private static func storeGroupId(_ groupId: Data, chatId: String) {
     UserDefaults.standard.set(groupId, forKey: "vibe.mls.group.\(chatId)")
+    UserDefaults.standard.set(
+      Date().timeIntervalSince1970, forKey: "vibe.mls.groupSince.\(chatId)")
+  }
+
+  /// How long this chat has held its current group, or `nil` if it holds none.
+  ///
+  /// Exists so a repair path can tell "the server has no Welcome for this group"
+  /// from "the Welcome is still in flight". Both look identical in a
+  /// welcome-status answer, and acting on the second would discard a group that
+  /// was about to work — see `VibeSecureEstablishment.refreshPeerConfirmation`.
+  func groupAge(chatId: String) -> TimeInterval? {
+    queue.sync {
+      guard Self.storedGroupId(chatId: chatId) != nil else { return nil }
+      let since = UserDefaults.standard.double(forKey: "vibe.mls.groupSince.\(chatId)")
+      // A group stored before this timestamp existed reads as 0. Treating that
+      // as "brand new" would make it permanently unrepairable, so it reads as
+      // old instead: those are exactly the groups that predate the fix.
+      guard since > 0 else { return .greatestFiniteMagnitude }
+      return Date().timeIntervalSince1970 - since
+    }
   }
 
   /// Returns the session for `chatId`, reloading it from disk on first use
@@ -471,6 +492,7 @@ final class VibeSecureSessions {
     queue.sync {
       sessions.removeValue(forKey: chatId)
       UserDefaults.standard.removeObject(forKey: "vibe.mls.group.\(chatId)")
+      UserDefaults.standard.removeObject(forKey: "vibe.mls.groupSince.\(chatId)")
     }
   }
 
