@@ -163,6 +163,147 @@ defmodule Vibe.MlsTest do
     Base.encode64("mls-keypkg-#{label}-#{System.unique_integer([:positive])}")
   end
 
+  # ── Retiring a device's signing key ────────────────────────────────────
+  #
+  # These are not housekeeping. A device asks for this when its MLS signing key
+  # changed, and everything left on file names the key it no longer holds: a
+  # peer claiming one of those KeyPackages builds a group around a leaf the
+  # device cannot sign as, and neither side can read the other afterwards while
+  # both look perfectly healthy. `claim_key_package/1` hands out the *oldest*
+  # first, so without this the stale ones are the ones that get used.
+
+  test "retiring drops this device's unclaimed packages and leaves only the fresh batch", %{
+    user: user
+  } do
+    stale = for i <- 1..3, do: fake_key_package("stale-#{i}")
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{"deviceId" => "device-a", "keyPackages" => stale})
+
+    fresh = for i <- 1..2, do: fake_key_package("fresh-#{i}")
+
+    assert {:ok, %{count: 2}} =
+             Mls.publish_key_packages(user.id, %{
+               "deviceId" => "device-a",
+               "keyPackages" => fresh,
+               "retireDeviceKeys" => true
+             })
+
+    assert Mls.count_available(user.id) == 2
+
+    # Every claim must come from the fresh batch — a single stale one leaking
+    # through is enough to wedge a conversation permanently.
+    for _ <- 1..2 do
+      assert {:ok, claimed} = Mls.claim_key_package(user.id)
+      assert Base.encode64(claimed.key_package) in fresh
+    end
+
+    assert {:error, :not_found} = Mls.claim_key_package(user.id)
+  end
+
+  test "retiring leaves another device's packages alone", %{user: user} do
+    other_device = for i <- 1..2, do: fake_key_package("other-#{i}")
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{"deviceId" => "device-b", "keyPackages" => other_device})
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("fresh")],
+        "retireDeviceKeys" => true
+      })
+
+    assert Mls.count_available(user.id) == 3
+  end
+
+  test "retiring leaves a claimed package's record intact", %{user: user} do
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("spent")]
+      })
+
+    {:ok, spent} = Mls.claim_key_package(user.id)
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("fresh")],
+        "retireDeviceKeys" => true
+      })
+
+    # A claim is single-use and irreversible; deleting the row would destroy the
+    # only record that this package was already spent.
+    assert Repo.get(MlsKeyPackage, spent.id)
+  end
+
+  test "retiring drops pending welcomes addressed to this user", %{user: user} do
+    sender = insert_user("mls_sender")
+    {:ok, _} = post_welcome(sender.id, user.id, "chat-1")
+    assert [_pending] = Mls.pending_welcomes(user.id)
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("fresh")],
+        "retireDeviceKeys" => true
+      })
+
+    # A pending Welcome targets a KeyPackage signed by the retired key, and the
+    # matching private init key is still in the device's store — so the join
+    # would SUCCEED and produce a session that is unreadable from birth.
+    assert [] = Mls.pending_welcomes(user.id)
+  end
+
+  test "retiring does not touch welcomes this user sent to someone else", %{user: user} do
+    recipient = insert_user("mls_recipient")
+    {:ok, _} = post_welcome(user.id, recipient.id, "chat-1")
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("fresh")],
+        "retireDeviceKeys" => true
+      })
+
+    assert [_still_pending] = Mls.pending_welcomes(recipient.id)
+  end
+
+  test "the response says whether the retirement actually happened", %{user: user} do
+    # The client cannot otherwise tell this server from one that predates the
+    # flag and silently ignored it — and assuming success against an old server
+    # clears its pending retirement while every stale KeyPackage stays claimable.
+    assert {:ok, %{retired: false}} =
+             Mls.publish_key_packages(user.id, %{
+               "deviceId" => "device-a",
+               "keyPackages" => [fake_key_package("plain")]
+             })
+
+    assert {:ok, %{retired: true}} =
+             Mls.publish_key_packages(user.id, %{
+               "deviceId" => "device-a",
+               "keyPackages" => [fake_key_package("fresh")],
+               "retireDeviceKeys" => true
+             })
+  end
+
+  test "publishing without the flag retires nothing", %{user: user} do
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("first")]
+      })
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package("second")]
+      })
+
+    assert Mls.count_available(user.id) == 2
+  end
+
   # ── Welcome relay ──────────────────────────────────────────────────────
   #
   # A Welcome carries the group secrets for whoever it is addressed to, so the
