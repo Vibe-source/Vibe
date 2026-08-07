@@ -712,6 +712,27 @@ final class ChatEngine {
 
   private init() {
     queue.setSpecific(key: queueSpecificKey, value: queueSpecificValue)
+    // Arm the lock-free main-thread reads before anything can ask for them.
+    //
+    // `getStatus` and `liveBridgeSessionId` both answer from a published snapshot on
+    // main and only fall through to `queue.sync` when nothing has been published yet.
+    // That "yet" is the whole problem: the window where nothing is published is the
+    // first seconds after launch, which is also when the queue is decrypting the entire
+    // backlog. One device session, one second after launch, ingesting 1,229 rows across
+    // four chats, opening one chat:
+    //   [engine] main-thread stall … callSite=liveBridgeSessionId ms=151
+    //   [engine] main-thread stall … callSite=getChatRows          ms=168
+    //   [engine] main-thread stall … callSite=getChatRows          ms=139
+    //   [chatopen] chat=saved_messag tap→content=361ms hang=0.87s DEGRADED
+    // Publishing the initial (empty/disconnected) snapshots here makes the fast path
+    // live from the first read. Empty is the correct answer at t=0 — there are no live
+    // bridge sessions and the socket is not up — and every consumer re-reads on the
+    // change notification that follows.
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.publishBridgeSessionIds()
+      self.publishStatus(self.statusSnapshotLocked())
+    }
     // Clear cached private key when the app moves to the background
     // to reduce the window of exposure to memory dump attacks.
     NotificationCenter.default.addObserver(
@@ -6058,6 +6079,55 @@ final class ChatEngine {
   private let publishedChatRowsLock = NSLock()
   private var publishedChatRowsByChat: [String: [[String: Any]]] = [:]
 
+  /// Rows for a chat, without ever blocking the caller.
+  ///
+  /// `getChatRows` still falls back to `queue.sync` when nothing has been published for
+  /// this chat yet, and from the main thread that means waiting behind whatever the
+  /// engine is doing. One device session logged 31 such stalls, worst 238ms, three of
+  /// them inside a single chat open — the biggest single contributor to "opening a chat
+  /// blocks the main thread" left in the app.
+  ///
+  /// Home does not need a synchronous answer. It is projecting a preview into a list
+  /// row, and it re-projects on the next change notification regardless. So it asks
+  /// here: same-turn when the snapshot exists (the overwhelmingly common case), one
+  /// engine turn later when it does not. The completion always runs on the main thread.
+  func chatRows(chatId rawChatId: String, completion: @escaping ([[String: Any]]) -> Void) {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else {
+      completion([])
+      return
+    }
+    publishedChatRowsLock.lock()
+    let published = publishedChatRowsByChat[chatId]
+    publishedChatRowsLock.unlock()
+    if let published {
+      // Same-turn answer keeps Home's ordering identical to the old blocking read.
+      // Off-main callers still get main delivery, so the contract holds for everyone.
+      if Thread.isMainThread {
+        completion(published)
+      } else {
+        DispatchQueue.main.async { completion(published) }
+      }
+      queue.async { [weak self] in
+        guard let self else { return }
+        _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
+        self.restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
+        self.publishChatRows(self.mergedChatRowsLocked(chatId: chatId), for: chatId)
+      }
+      return
+    }
+    queue.async { [weak self] in
+      guard let self else {
+        DispatchQueue.main.async { completion([]) }
+        return
+      }
+      _ = self.restoreCachedHistoryRowsLocked(chatId: chatId)
+      self.restoreVolatileBridgeRowsIfNeededLocked(chatId: chatId)
+      let merged = self.mergedChatRowsLocked(chatId: chatId)
+      self.publishChatRows(merged, for: chatId)
+      DispatchQueue.main.async { completion(merged) }
+    }
+  }
+
   func getChatRows(_ payload: [String: Any]) -> [[String: Any]] {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     guard let chatId else { return [] }
@@ -8084,6 +8154,21 @@ final class ChatEngine {
         self.joinNativeChatTopicIfNeededLocked(chatId: chatId)
       }
       self.expireStaleQueuedOutboundLocked(trigger: "socket_open")
+      // Publish KeyPackages as soon as this device is connected, not only once
+      // it opens a chat.
+      //
+      // `chat_joined` used to be the ONLY trigger, which meant a freshly
+      // registered account had published nothing and could not be added to an
+      // MLS group by anyone — and a new account has no chats to open, so the
+      // one event that would have fixed it could not fire. Two people who both
+      // signed up and then messaged each other therefore started their first
+      // conversation unencryptable, and stayed that way until whoever received
+      // the first message happened to open it.
+      //
+      // Being addressable has nothing to do with having a conversation open,
+      // so it should not wait on one. The 60s throttle inside makes the extra
+      // trigger free on reconnect churn.
+      self.ensureMlsProvisionedLocked(trigger: "socket_open")
       // Pending bubbles with no draft behind them can only be resolved here — the
       // queue-walking paths cannot see a message the queue has forgotten.
       self.sweepOrphanedPendingLocked(trigger: "socket_open")
