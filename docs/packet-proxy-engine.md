@@ -33,6 +33,20 @@ media blocking, 384 KB image / 2 MB voice caps, `phantom_start_mesh`) is gone. L
 sessions carrying `transportMode=packet_mesh` migrate to `direct` at launch.
 `/packet/bootstrap` is still fetched, but only for the proxy entries the server offers.
 
+## Entries are the user's
+
+Vibe ships no proxy configurations. The list starts empty; the user pastes a `vless://`
+or `trojan://` link. Three rules protect what they store:
+
+- A Keychain read that fails returns "unreadable", not "empty", and `mutate` refuses to
+  write on top of it — an update can never save an empty list over real entries.
+- `mergeServerProfiles` is additive only. Deleting an entry records its endpoint, so a
+  later `/packet/bootstrap` refresh cannot bring it back.
+- The engine no longer substitutes its built-in node (`RealityConfig::iran_default`) for a
+  link it cannot parse — an invalid link is an error. It also rotates SNIs only among the
+  names the config declares; rotating onto one the server's `serverNames` omits fails
+  REALITY auth every time and restarts Xray in a loop.
+
 ## Start paths
 
 `PacketProxyEngine.start(profile:)` picks the FFI entry point from the profile's stack:
@@ -51,7 +65,13 @@ Transport raw values are read by the Rust side — `reality` must stay `7`.
 
 ```sh
 cd ~/Desktop/packet
-./scripts/build-ios.sh            # phantom_client + packet_xray, arm64 device + sim
+./scripts/build-packet-xray.sh
+# --crate-type staticlib: the cdylib does not link on iOS (tun2socks), and cargo
+# fails the whole --lib build with it.
+cargo rustc -p phantom-client --release --target aarch64-apple-ios \
+  --features embedded-xray --lib --crate-type staticlib
+cargo rustc -p phantom-client --release --target aarch64-apple-ios-sim \
+  --features embedded-xray --lib --crate-type staticlib
 ./scripts/copy-vibe-artifacts.sh  # copies both archives into ios/Vendor/Packet
 ```
 
