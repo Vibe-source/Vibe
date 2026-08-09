@@ -1966,7 +1966,8 @@ private final class ChatsViewModel: ObservableObject {
           }
           // The engine projection is already authoritative and instant. Do not start a
           // list fetch whose response may have been generated before the delete commit.
-        case "chatMessageInserted", "chatMessageEdited", "chatMessageChanged", "messageStatusChanged":
+        case "chatMessageInserted", "chatMessageEdited", "chatMessageChanged",
+          "chatMessageReactionChanged", "messageStatusChanged":
           if let chatID {
             // Mutations can arrive from a mounted chat topic or from the user topic
             // while the conversation is closed. Only insert/new-message reasons can
@@ -8039,7 +8040,15 @@ final class ChatHomeNativeListController: UIViewController, UITableViewDataSourc
     let status = token(
       newestMessage["status"] ?? newestMessage["deliveryStatus"]
         ?? newestMessage["delivery_status"])
-    return "tail:\(tail.count):\(firstID):\(newestID):\(revision):\(status)"
+    let reactions = ((newestMessage["reactions"] as? [[String: Any]]) ?? [])
+      .map { reaction in
+        let emoji = token(reaction["emoji"] ?? reaction["reaction"])
+        let count = token(reaction["count"])
+        let selected = token(reaction["isSelected"] ?? reaction["is_selected"])
+        return "\(emoji):\(count):\(selected)"
+      }
+      .joined(separator: ",")
+    return "tail:\(tail.count):\(firstID):\(newestID):\(revision):\(status):\(reactions)"
   }
 
   private func previewDebugLog(_ message: String) {
@@ -9742,7 +9751,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
       mainView.setIsOnline(Self.isOnline(for: row))
       mainView.setProfileHandle(Self.profileHandle(for: row))
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
-      "chatMessageChanged", "messageStatusChanged":
+      "chatMessageChanged", "chatMessageReactionChanged", "messageStatusChanged":
       scheduleEngineRowsRefresh()
     default:
       break
@@ -10463,8 +10472,8 @@ final class ChatProfileRootController: UIViewController {
 
     switch changeReason {
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
-      "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
-      "chatMuteChanged":
+      "chatMessageChanged", "chatMessageReactionChanged", "messageStatusChanged",
+      "presenceChanged", "peerTyping", "chatMuteChanged":
       refreshRows()
     default:
       break
@@ -13288,8 +13297,8 @@ final class ChatConversationController: UIViewController {
         AppToastController.shared.show(message)
       }
     case "chatRowsReloaded", "chatMessageInserted", "chatMessageEdited", "chatMessageDeleted",
-      "chatMessageChanged", "messageStatusChanged", "presenceChanged", "peerTyping",
-      "chatMuteChanged":
+      "chatMessageChanged", "chatMessageReactionChanged", "messageStatusChanged",
+      "presenceChanged", "peerTyping", "chatMuteChanged":
       refreshRows(allowAuthoritativeEmpty: changeReason == "chatMessageDeleted")
     default:
       break

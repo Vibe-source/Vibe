@@ -117,6 +117,32 @@ defmodule VibeWeb.ChatController do
     end
   end
 
+  def message_reactions(conn, %{"chat_id" => chat_id, "message_id" => message_id}) do
+    user_id = conn.assigns.current_user.id
+
+    case Chat.message_reaction_detail(chat_id, message_id, user_id) do
+      {:ok, groups} ->
+        json(conn, %{
+          chatId: chat_id,
+          messageId: message_id,
+          total: Enum.reduce(groups, 0, &(&1.count + &2)),
+          reactions: groups
+        })
+
+      {:error, :invalid_id} ->
+        conn |> put_status(:bad_request) |> json(%{error: "Invalid message id"})
+
+      {:error, :forbidden} ->
+        conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: "Message not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:bad_request) |> json(%{error: inspect(reason)})
+    end
+  end
+
   def report_message(conn, %{"chat_id" => chat_id, "message_id" => message_id} = params) do
     user_id = conn.assigns.current_user.id
 

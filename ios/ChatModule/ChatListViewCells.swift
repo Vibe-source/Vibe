@@ -2061,22 +2061,23 @@ private func compactEngagementCount(_ count: Int) -> String {
   return String(count)
 }
 
-private func reactionChipWidth(_ reaction: ChatListRow.Reaction) -> CGFloat {
+private func reactionChipWidth(_ reaction: ChatListRow.Reaction, showsCount: Bool) -> CGFloat {
   let emoji = ceil((reaction.emoji as NSString).size(withAttributes: [.font: reactionEmojiFont]).width)
+  guard showsCount else { return max(36.0, emoji + 18.0) }
   let count = ceil((compactEngagementCount(reaction.count) as NSString).size(
     withAttributes: [.font: reactionCountFont]).width)
   return max(42.0, emoji + count + 21.0)
 }
 
 private func reactionStripMeasuredSize(
-  _ reactions: [ChatListRow.Reaction], maxWidth: CGFloat
+  _ reactions: [ChatListRow.Reaction], maxWidth: CGFloat, showsCount: Bool
 ) -> CGSize {
   guard !reactions.isEmpty, maxWidth > 0 else { return .zero }
   var rowWidth: CGFloat = 0.0
   var widest: CGFloat = 0.0
   var rows = 1
   for reaction in reactions {
-    let width = min(maxWidth, reactionChipWidth(reaction))
+    let width = min(maxWidth, reactionChipWidth(reaction, showsCount: showsCount))
     let proposed = rowWidth == 0.0 ? width : rowWidth + reactionChipGap + width
     if proposed > maxWidth, rowWidth > 0.0 {
       widest = max(widest, rowWidth)
@@ -2123,6 +2124,8 @@ private final class ChatRollingCounterLabel: UILabel {
 private final class ChatReactionChipView: UIView {
   let emojiLabel = UILabel()
   let countLabel = ChatRollingCounterLabel()
+  var onHold: ((String, CGPoint) -> Void)?
+  private var emoji = ""
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -2135,36 +2138,52 @@ private final class ChatReactionChipView: UIView {
     countLabel.textAlignment = .center
     addSubview(emojiLabel)
     addSubview(countLabel)
+    let hold = UILongPressGestureRecognizer(target: self, action: #selector(handleHold(_:)))
+    hold.minimumPressDuration = 0.32
+    addGestureRecognizer(hold)
   }
 
   required init?(coder: NSCoder) { nil }
 
   func apply(
-    reaction: ChatListRow.Reaction, appearance: ChatListAppearance, isMe: Bool, animated: Bool
+    reaction: ChatListRow.Reaction, appearance: ChatListAppearance, isMe: Bool,
+    showsCount: Bool, hidesEmoji: Bool, animated: Bool
   ) {
+    emoji = reaction.emoji
     emojiLabel.text = reaction.emoji
+    emojiLabel.isHidden = hidesEmoji
+    alpha = hidesEmoji ? 0.0 : 1.0
+    countLabel.isHidden = !showsCount
     countLabel.textColor = reaction.isSelected ? appearance.accent : UIColor.white.withAlphaComponent(0.86)
     countLabel.setCounterText(compactEngagementCount(reaction.count), animated: animated)
     backgroundColor = reaction.isSelected
-      ? appearance.accent.withAlphaComponent(appearance.isDark ? 0.28 : 0.18)
-      : UIColor(white: isMe ? 1.0 : 0.0, alpha: isMe ? 0.15 : 0.24)
+      ? appearance.accent.withAlphaComponent(appearance.isDark ? 0.36 : 0.25)
+      : UIColor(white: isMe ? 1.0 : 0.0, alpha: isMe ? 0.20 : 0.16)
     layer.borderColor = (reaction.isSelected ? appearance.accent : UIColor.white)
-      .withAlphaComponent(reaction.isSelected ? 0.50 : 0.20).cgColor
+      .withAlphaComponent(reaction.isSelected ? 0.58 : 0.16).cgColor
+  }
+
+  @objc private func handleHold(_ gesture: UILongPressGestureRecognizer) {
+    guard gesture.state == .began, !emoji.isEmpty, let window else { return }
+    let point = convert(CGPoint(x: bounds.midX, y: bounds.midY), to: window)
+    onHold?(emoji, point)
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
     layer.cornerRadius = bounds.height * 0.5
     let emojiWidth = ceil(emojiLabel.intrinsicContentSize.width)
-    let countWidth = ceil(countLabel.intrinsicContentSize.width)
-    let contentWidth = emojiWidth + 5.0 + countWidth
+    let countWidth = countLabel.isHidden ? 0.0 : ceil(countLabel.intrinsicContentSize.width)
+    let spacing = countLabel.isHidden ? 0.0 : 5.0
+    let contentWidth = emojiWidth + spacing + countWidth
     let startX = floor((bounds.width - contentWidth) * 0.5)
     emojiLabel.frame = CGRect(x: startX, y: 0.0, width: emojiWidth, height: bounds.height)
     countLabel.frame = CGRect(
-      x: emojiLabel.frame.maxX + 5.0, y: 0.0, width: countWidth, height: bounds.height)
+      x: emojiLabel.frame.maxX + spacing, y: 0.0, width: countWidth, height: bounds.height)
   }
 
   func playLandingPulse() {
+    alpha = 1.0
     layer.removeAnimation(forKey: "reactionLanding")
     let pulse = CAKeyframeAnimation(keyPath: "transform.scale")
     pulse.values = [1.0, 1.24, 0.96, 1.0]
@@ -2179,12 +2198,15 @@ private final class ChatReactionStripView: UIView {
   private var chips: [String: ChatReactionChipView] = [:]
   private var reactions: [ChatListRow.Reaction] = []
   private var animatesNextLayout = false
+  private var showsCount = true
+  var onHold: ((String, CGPoint) -> Void)?
 
   func configure(
     reactions: [ChatListRow.Reaction], appearance: ChatListAppearance, isMe: Bool,
-    animated: Bool
+    chatId: String, messageId: String, showsCount: Bool, animated: Bool
   ) {
     self.reactions = reactions
+    self.showsCount = showsCount
     animatesNextLayout = animated
     let live = Set(reactions.map(\.emoji))
     let stale = chips.keys.filter { !live.contains($0) }
@@ -2195,7 +2217,12 @@ private final class ChatReactionStripView: UIView {
       let chip = chips[reaction.emoji] ?? ChatReactionChipView()
       if chip.superview == nil { addSubview(chip) }
       chips[reaction.emoji] = chip
-      chip.apply(reaction: reaction, appearance: appearance, isMe: isMe, animated: animated)
+      chip.onHold = { [weak self] emoji, point in self?.onHold?(emoji, point) }
+      let hidesEmoji = ChatReactionTransitionCoordinator.shared.isFlying(
+        chatId: chatId, messageId: messageId, emoji: reaction.emoji)
+      chip.apply(
+        reaction: reaction, appearance: appearance, isMe: isMe, showsCount: showsCount,
+        hidesEmoji: hidesEmoji, animated: animated)
     }
     setNeedsLayout()
   }
@@ -2208,7 +2235,7 @@ private final class ChatReactionStripView: UIView {
     var y: CGFloat = 0.0
     for reaction in reactions {
       guard let chip = chips[reaction.emoji] else { continue }
-      let width = min(bounds.width, reactionChipWidth(reaction))
+      let width = min(bounds.width, reactionChipWidth(reaction, showsCount: showsCount))
       if x > 0.0, x + width > bounds.width {
         x = 0.0
         y += reactionChipHeight + reactionChipRowGap
@@ -2239,6 +2266,7 @@ private final class ChatReactionStripView: UIView {
   }
 
   func playLandingPulse(for emoji: String) {
+    chips[emoji]?.emojiLabel.isHidden = false
     chips[emoji]?.playLandingPulse()
   }
 }
@@ -5112,8 +5140,9 @@ func measureMessageBubbleLayout(
       showsLoaderView: agentTurnBubbleShowsWorkedSummary(row)
     )
     let reactionSize = reactionStripMeasuredSize(
-      row.reactions, maxWidth: max(1.0, agentMaxBubbleWidth - 12.0))
-    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
+      row.reactions, maxWidth: max(1.0, agentMaxBubbleWidth - 12.0),
+      showsCount: row.isGroupOrChannel)
+    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
     let bubbleWidth = min(
       agentMaxBubbleWidth,
       max(
@@ -5367,8 +5396,9 @@ func measureMessageBubbleLayout(
       ? (isEdgeCaption ? captionMaxWidth : max(contentWidth, captionWidth))
       : contentWidth
     let reactionSize = reactionStripMeasuredSize(
-      row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0))
-    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
+      row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0),
+      showsCount: row.isGroupOrChannel)
+    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
     let bodyHeight: CGFloat
     var bubbleWidth: CGFloat
     let bubbleHeight: CGFloat
@@ -5538,7 +5568,8 @@ func measureMessageBubbleLayout(
     desiredContentWidth = max(textWidth + bubbleMetaInlineSpacing + meta.total, replyPreviewWidth)
   }
   let reactionSize = reactionStripMeasuredSize(
-    row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0))
+    row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0),
+    showsCount: row.isGroupOrChannel)
   let contentWidth = max(
     meta.total,
     min(maxContentWidth, max(desiredContentWidth, reactionSize.width)))
@@ -5560,7 +5591,7 @@ func measureMessageBubbleLayout(
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
     : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
-  let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
+  let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
   // No fudge: the plate is exactly the content box plus its two paddings. Shaving 4pt here
   // made the bubble narrower than the content it advertises, so the body label (laid out at
   // contentX + contentWidth) ended 4pt to the right of the meta (right-aligned to
@@ -10389,6 +10420,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// Tapped the centered "Something went wrong · Try again" agent-error notice pill.
   var onAgentErrorRetryTap: ((ChatListRow) -> Void)?
   var onAgentAction: (([String: Any]) -> Void)?
+  var onReactionHold: ((ChatListRow, String, CGPoint) -> Void)?
   /// Claim a sender-declared decision action (opaque token).
   var onServiceDecisionAction: ((ChatListRow, ChatServiceAction) -> Void)?
   var onSelectionToggle: ((ChatListRow) -> Void)?
@@ -10553,6 +10585,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // `agentTurnContentView` is built and wired on first use, not here.
 
     contentView.addSubview(reactionStripView)
+    reactionStripView.onHold = { [weak self] emoji, point in
+      guard let self, let row = self.row else { return }
+      self.onReactionHold?(row, emoji, point)
+    }
     contentView.addSubview(selectionCircleView)
     selectionCircleView.addTarget(self, action: #selector(handleSelectionToggle), for: .touchUpInside)
 
@@ -11577,7 +11613,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         reactionStripView.isHidden = isGhostHidden || usesTransparentAgentStreaming
         reactionStripView.configure(
           reactions: row.reactions, appearance: appearance, isMe: row.isMe,
-          animated: isSameMessageIdentity)
+          chatId: hostChatId, messageId: row.messageId ?? row.key,
+          showsCount: row.isGroupOrChannel, animated: isSameMessageIdentity)
         reactionDebugLog(
           "configure id=\(row.messageId ?? "nil") reactions=\(row.reactions.count) hidden=\(isGhostHidden ? "Y" : "N")"
         )
@@ -16021,6 +16058,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return CGPoint(x: frame.midX, y: frame.midY)
   }
 
+  func containsReactionPoint(_ point: CGPoint, in view: UIView) -> Bool {
+    guard !reactionStripView.isHidden else { return false }
+    return reactionStripView.convert(reactionStripView.bounds, to: view).contains(point)
+  }
+
   func playReactionLandingEffect(_ emoji: String, in view: UIView) -> Bool {
     guard !reactionStripView.isHidden,
       let point = reactionStripView.landingCenter(for: emoji, in: view)
@@ -16113,7 +16155,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       20.0,
       bubbleFrame.width - Self.reactionBadgeInsetLeft - 4.0
     )
-    let measured = reactionStripMeasuredSize(row?.reactions ?? [], maxWidth: maxBadgeWidth)
+    let measured = reactionStripMeasuredSize(
+      row?.reactions ?? [], maxWidth: maxBadgeWidth,
+      showsCount: row?.isGroupOrChannel == true)
     let width = measured.width
     let height = measured.height
     return CGRect(

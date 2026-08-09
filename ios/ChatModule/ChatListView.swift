@@ -1544,6 +1544,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   var contextMenuHostCellOriginalTransform: CGAffineTransform = .identity
   var customContextMenuOverlay: ChatContextMenuOverlay?
   var customContextMenuWindow: UIWindow?
+  var reactionDetailOverlay: ChatReactionDetailOverlay?
 
   /// Thumbnail hidden while the photo-only transition is in flight. A direct
   /// reference guarantees restoration even if the collection cell is reused.
@@ -2340,6 +2341,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       selected
       ?? (row.messageId.map { selectedMessageIds.contains($0) } ?? false)
     cell.hostChatId = engineChatId
+    cell.onReactionHold = { [weak self] heldRow, emoji, sourcePoint in
+      self?.presentReactionDetails(for: heldRow, emoji: emoji, sourcePoint: sourcePoint)
+    }
     cell.configure(
       row: row,
       hiddenMessageId: hiddenMessageId ?? self.hiddenMessageId,

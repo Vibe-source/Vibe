@@ -802,6 +802,19 @@ struct ChatHomeListRow {
     }
   }
 
+  var latestReactionPreview: String? {
+    let tail = initialMessages.isEmpty ? previewRows : initialMessages
+    guard let rawRow = tail.last else { return nil }
+    let message = (rawRow["message"] as? [String: Any]) ?? rawRow
+    let rawReactions = message["reactions"] ?? rawRow["reactions"]
+    guard let reactions = rawReactions as? [[String: Any]] else { return nil }
+    let emojis = reactions.compactMap { reaction in
+      Self.normalizedString(reaction["emoji"] ?? reaction["reaction"])
+    }
+    guard !emojis.isEmpty else { return nil }
+    return emojis.prefix(3).joined()
+  }
+
   static func isBuiltInAgentChatId(_ rawChatId: String) -> Bool {
     switch rawChatId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
     case "vibe", "vibe_agent", "vibeagent", "vibe-ai", "vibe_ai":

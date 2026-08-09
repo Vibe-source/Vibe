@@ -21,10 +21,14 @@ func makeChatContextLiquidGlassView(
   interactive: Bool = false
 ) -> UIVisualEffectView {
   let view = UIVisualEffectView(effect: nil)
+  view.backgroundColor = .clear
+  view.contentView.backgroundColor = .clear
+  view.layer.borderWidth = 0
+  view.layer.borderColor = UIColor.clear.cgColor
   if #available(iOS 26.0, *) {
     let effect = UIGlassEffect(style: .regular)
     effect.isInteractive = interactive
-    effect.tintColor = nil
+    effect.tintColor = .clear
     view.effect = effect
     if capsuleCorners {
       view.cornerConfiguration = .capsule()
@@ -46,10 +50,434 @@ private func makeBlurMaterialView(
   cornerRadius: CGFloat
 ) -> UIVisualEffectView {
   let view = UIVisualEffectView(effect: UIBlurEffect(style: style))
+  view.backgroundColor = .clear
+  view.contentView.backgroundColor = .clear
   view.layer.cornerRadius = cornerRadius
   view.layer.cornerCurve = .continuous
+  view.layer.borderWidth = 0
+  view.layer.borderColor = UIColor.clear.cgColor
   view.clipsToBounds = true
   return view
+}
+
+struct ChatReactionDetailActor {
+  let id: String
+  let displayName: String
+  let subtitle: String
+  let emoji: String
+  let avatarURL: String?
+
+  init(
+    id: String,
+    displayName: String,
+    subtitle: String,
+    emoji: String,
+    avatarURL: String? = nil
+  ) {
+    self.id = id
+    self.displayName = displayName
+    self.subtitle = subtitle
+    self.emoji = emoji
+    self.avatarURL = avatarURL
+  }
+}
+
+final class ChatReactionDetailOverlay: UIView {
+  var onDismiss: (() -> Void)?
+  var onActorSelected: ((ChatReactionDetailActor) -> Void)?
+
+  private let backdropView = UIVisualEffectView(
+    effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+  private let dimView = UIView()
+  private let dismissControl = UIControl()
+  private let contentView = UIView()
+  private let emojiLabel = UILabel()
+  private let selectorGlass = makeChatContextLiquidGlassView(
+    style: .systemThinMaterialDark, cornerRadius: 26, capsuleCorners: true)
+  private let selectorScrollView = UIScrollView()
+  private let selectorStack = UIStackView()
+  private let actorCard = makeChatContextLiquidGlassView(
+    style: .systemMaterialDark, cornerRadius: 24)
+  private let avatarView = ChatAvatarNodeView()
+  private let actorNameLabel = UILabel()
+  private let actorSubtitleLabel = UILabel()
+  private let cardEmojiLabel = UILabel()
+  private var actors: [ChatReactionDetailActor] = []
+  private var selectedActorID: String?
+  private var fallbackEmoji: String
+  private var isDismissing = false
+
+  init(emoji: String, actors: [ChatReactionDetailActor] = [], selectedActorID: String? = nil) {
+    self.fallbackEmoji = emoji
+    self.actors = actors
+    self.selectedActorID = selectedActorID
+    super.init(frame: .zero)
+    setupReactionDetailViews()
+    update(emoji: emoji, actors: actors, selectedActorID: selectedActorID, animated: false)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  func update(
+    emoji: String,
+    actors: [ChatReactionDetailActor],
+    selectedActorID: String? = nil,
+    animated: Bool = true
+  ) {
+    fallbackEmoji = emoji
+    self.actors = actors
+    let preferredID = selectedActorID ?? self.selectedActorID
+    let preferredActor = preferredID.flatMap { id in actors.first(where: { $0.id == id }) }
+    self.selectedActorID = preferredActor?.id ?? actors.first?.id
+
+    let changes = {
+      self.rebuildActorSelector()
+      self.renderSelectedActor()
+    }
+    if animated, window != nil {
+      UIView.transition(
+        with: contentView,
+        duration: 0.18,
+        options: [.transitionCrossDissolve, .beginFromCurrentState, .allowAnimatedContent],
+        animations: changes
+      )
+    } else {
+      changes()
+    }
+  }
+
+  func present(in hostView: UIView, animated: Bool = true) {
+    frame = hostView.bounds
+    autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    alpha = 1
+    contentView.transform = .identity
+    isUserInteractionEnabled = true
+    isDismissing = false
+    hostView.addSubview(self)
+    guard animated else { return }
+    alpha = 0
+    contentView.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
+    UIView.animate(
+      withDuration: 0.24,
+      delay: 0,
+      usingSpringWithDamping: 0.86,
+      initialSpringVelocity: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.alpha = 1
+      self.contentView.transform = .identity
+    }
+  }
+
+  func dismiss(animated: Bool = true) {
+    guard !isDismissing else { return }
+    isDismissing = true
+    isUserInteractionEnabled = false
+    let completion: (Bool) -> Void = { _ in
+      self.removeFromSuperview()
+      self.onDismiss?()
+    }
+    guard animated else {
+      completion(true)
+      return
+    }
+    UIView.animate(
+      withDuration: 0.18,
+      delay: 0,
+      options: [.curveEaseIn, .beginFromCurrentState]
+    ) {
+      self.alpha = 0
+      self.contentView.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
+    } completion: { finished in
+      completion(finished)
+    }
+  }
+
+  private func setupReactionDetailViews() {
+    backgroundColor = .clear
+    backdropView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(backdropView)
+
+    dimView.backgroundColor = UIColor.black.withAlphaComponent(0.50)
+    dimView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(dimView)
+
+    dismissControl.translatesAutoresizingMaskIntoConstraints = false
+    dismissControl.accessibilityLabel = "Close reaction details"
+    dismissControl.accessibilityTraits = .button
+    dismissControl.addTarget(self, action: #selector(didTapBackdrop), for: .touchUpInside)
+    addSubview(dismissControl)
+
+    contentView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(contentView)
+
+    emojiLabel.font = UIFont.systemFont(ofSize: 88)
+    emojiLabel.textAlignment = .center
+    emojiLabel.adjustsFontSizeToFitWidth = true
+    emojiLabel.minimumScaleFactor = 0.75
+    emojiLabel.translatesAutoresizingMaskIntoConstraints = false
+    contentView.addSubview(emojiLabel)
+
+    selectorGlass.translatesAutoresizingMaskIntoConstraints = false
+    contentView.addSubview(selectorGlass)
+
+    selectorScrollView.showsHorizontalScrollIndicator = false
+    selectorScrollView.alwaysBounceHorizontal = false
+    selectorScrollView.translatesAutoresizingMaskIntoConstraints = false
+    selectorGlass.contentView.addSubview(selectorScrollView)
+
+    selectorStack.axis = .horizontal
+    selectorStack.spacing = 6
+    selectorStack.alignment = .center
+    selectorStack.translatesAutoresizingMaskIntoConstraints = false
+    selectorScrollView.addSubview(selectorStack)
+
+    actorCard.translatesAutoresizingMaskIntoConstraints = false
+    contentView.addSubview(actorCard)
+    setupActorCard()
+
+    let guide = selectorScrollView.contentLayoutGuide
+    let frameGuide = selectorScrollView.frameLayoutGuide
+    NSLayoutConstraint.activate([
+      backdropView.topAnchor.constraint(equalTo: topAnchor),
+      backdropView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      backdropView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      backdropView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      dimView.topAnchor.constraint(equalTo: topAnchor),
+      dimView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      dimView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      dimView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      dismissControl.topAnchor.constraint(equalTo: topAnchor),
+      dismissControl.bottomAnchor.constraint(equalTo: bottomAnchor),
+      dismissControl.leadingAnchor.constraint(equalTo: leadingAnchor),
+      dismissControl.trailingAnchor.constraint(equalTo: trailingAnchor),
+
+      contentView.centerXAnchor.constraint(equalTo: centerXAnchor),
+      contentView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
+      contentView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 20),
+      contentView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
+      contentView.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
+
+      emojiLabel.topAnchor.constraint(equalTo: contentView.topAnchor),
+      emojiLabel.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      emojiLabel.widthAnchor.constraint(equalToConstant: 116),
+      emojiLabel.heightAnchor.constraint(equalToConstant: 116),
+
+      selectorGlass.topAnchor.constraint(equalTo: emojiLabel.bottomAnchor, constant: 18),
+      selectorGlass.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      selectorGlass.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.leadingAnchor),
+      selectorGlass.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor),
+      selectorGlass.widthAnchor.constraint(lessThanOrEqualToConstant: 336),
+      selectorGlass.heightAnchor.constraint(equalToConstant: 52),
+
+      selectorScrollView.topAnchor.constraint(equalTo: selectorGlass.contentView.topAnchor),
+      selectorScrollView.bottomAnchor.constraint(equalTo: selectorGlass.contentView.bottomAnchor),
+      selectorScrollView.leadingAnchor.constraint(equalTo: selectorGlass.contentView.leadingAnchor),
+      selectorScrollView.trailingAnchor.constraint(equalTo: selectorGlass.contentView.trailingAnchor),
+      selectorStack.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 6),
+      selectorStack.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -6),
+      selectorStack.topAnchor.constraint(equalTo: guide.topAnchor),
+      selectorStack.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
+      selectorStack.heightAnchor.constraint(equalTo: frameGuide.heightAnchor),
+
+      actorCard.topAnchor.constraint(equalTo: selectorGlass.bottomAnchor, constant: 14),
+      actorCard.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+      actorCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+      actorCard.heightAnchor.constraint(equalToConstant: 82),
+      actorCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+    ])
+
+    let contentWidth = contentView.widthAnchor.constraint(equalToConstant: 340)
+    contentWidth.priority = .defaultHigh
+    contentWidth.isActive = true
+    let selectorWidth = selectorGlass.widthAnchor.constraint(
+      equalTo: selectorStack.widthAnchor, constant: 12)
+    selectorWidth.priority = .defaultHigh
+    selectorWidth.isActive = true
+  }
+
+  private func setupActorCard() {
+    avatarView.translatesAutoresizingMaskIntoConstraints = false
+    actorCard.contentView.addSubview(avatarView)
+
+    actorNameLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+    actorNameLabel.textColor = .white
+    actorNameLabel.translatesAutoresizingMaskIntoConstraints = false
+    actorCard.contentView.addSubview(actorNameLabel)
+
+    actorSubtitleLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
+    actorSubtitleLabel.textColor = UIColor.white.withAlphaComponent(0.68)
+    actorSubtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+    actorCard.contentView.addSubview(actorSubtitleLabel)
+
+    cardEmojiLabel.font = UIFont.systemFont(ofSize: 25)
+    cardEmojiLabel.textAlignment = .center
+    cardEmojiLabel.translatesAutoresizingMaskIntoConstraints = false
+    actorCard.contentView.addSubview(cardEmojiLabel)
+
+    NSLayoutConstraint.activate([
+      avatarView.leadingAnchor.constraint(equalTo: actorCard.contentView.leadingAnchor, constant: 14),
+      avatarView.centerYAnchor.constraint(equalTo: actorCard.contentView.centerYAnchor),
+      avatarView.widthAnchor.constraint(equalToConstant: 46),
+      avatarView.heightAnchor.constraint(equalToConstant: 46),
+
+      actorNameLabel.leadingAnchor.constraint(equalTo: avatarView.trailingAnchor, constant: 12),
+      actorNameLabel.trailingAnchor.constraint(lessThanOrEqualTo: cardEmojiLabel.leadingAnchor, constant: -8),
+      actorNameLabel.bottomAnchor.constraint(equalTo: actorCard.contentView.centerYAnchor, constant: -2),
+      actorSubtitleLabel.leadingAnchor.constraint(equalTo: actorNameLabel.leadingAnchor),
+      actorSubtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cardEmojiLabel.leadingAnchor, constant: -8),
+      actorSubtitleLabel.topAnchor.constraint(equalTo: actorCard.contentView.centerYAnchor, constant: 3),
+      cardEmojiLabel.trailingAnchor.constraint(equalTo: actorCard.contentView.trailingAnchor, constant: -16),
+      cardEmojiLabel.centerYAnchor.constraint(equalTo: actorCard.contentView.centerYAnchor),
+      cardEmojiLabel.widthAnchor.constraint(equalToConstant: 34),
+      cardEmojiLabel.heightAnchor.constraint(equalToConstant: 34),
+    ])
+  }
+
+  private func rebuildActorSelector() {
+    for arranged in selectorStack.arrangedSubviews {
+      selectorStack.removeArrangedSubview(arranged)
+      arranged.removeFromSuperview()
+    }
+    if actors.isEmpty {
+      let loading = ChatReactionDetailActorControl(emoji: fallbackEmoji)
+      selectorStack.addArrangedSubview(loading)
+      return
+    }
+    for actor in actors {
+      let control = ChatReactionDetailActorControl(actor: actor)
+      control.isSelected = actor.id == selectedActorID
+      control.addTarget(self, action: #selector(didSelectActor(_:)), for: .touchUpInside)
+      selectorStack.addArrangedSubview(control)
+    }
+  }
+
+  private func renderSelectedActor() {
+    guard let actor = actors.first(where: { $0.id == selectedActorID }) else {
+      emojiLabel.text = fallbackEmoji
+      actorNameLabel.text = "Loading reactions…"
+      actorSubtitleLabel.text = "Reaction details will appear here"
+      cardEmojiLabel.text = fallbackEmoji
+      avatarView.configure(
+        with: Self.avatarDescriptor(name: "Reaction", id: nil, avatarURL: nil),
+        isDark: true,
+        renderingSide: 46
+      )
+      return
+    }
+    emojiLabel.text = actor.emoji
+    actorNameLabel.text = actor.displayName
+    actorSubtitleLabel.text = actor.subtitle
+    cardEmojiLabel.text = actor.emoji
+    avatarView.configure(
+      with: Self.avatarDescriptor(
+        name: actor.displayName, id: actor.id, avatarURL: actor.avatarURL),
+      isDark: true,
+      renderingSide: 46
+    )
+  }
+
+  @objc private func didTapBackdrop() {
+    dismiss()
+  }
+
+  @objc private func didSelectActor(_ sender: ChatReactionDetailActorControl) {
+    guard let actorID = sender.actorID,
+      let actor = actors.first(where: { $0.id == actorID })
+    else { return }
+    selectedActorID = actor.id
+    for case let control as ChatReactionDetailActorControl in selectorStack.arrangedSubviews {
+      control.isSelected = control.actorID == actor.id
+    }
+    renderSelectedActor()
+    onActorSelected?(actor)
+  }
+
+  fileprivate static func avatarDescriptor(
+    name: String,
+    id: String?,
+    avatarURL: String?
+  ) -> ChatAvatarDescriptor {
+    ChatAvatarDescriptor(
+      title: name,
+      rawAvatarURI: avatarURL,
+      peerUserId: id,
+      chatId: nil,
+      kind: .standard,
+      isGroup: false,
+      members: [],
+      preferPushAvatar: false,
+      gradientColors: nil
+    )
+  }
+}
+
+private final class ChatReactionDetailActorControl: UIControl {
+  let actorID: String?
+  private let avatarView = ChatAvatarNodeView()
+  private let emojiLabel = UILabel()
+
+  init(actor: ChatReactionDetailActor) {
+    self.actorID = actor.id
+    super.init(frame: .zero)
+    setup(emoji: actor.emoji, name: actor.displayName, id: actor.id, avatarURL: actor.avatarURL)
+    accessibilityLabel = "\(actor.displayName), \(actor.emoji)"
+  }
+
+  init(emoji: String) {
+    self.actorID = nil
+    super.init(frame: .zero)
+    setup(emoji: emoji, name: "Reaction", id: nil, avatarURL: nil)
+    isUserInteractionEnabled = false
+    accessibilityLabel = "Loading reaction details"
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  deinit {
+    avatarView.prepareForReuse()
+  }
+
+  override var isSelected: Bool {
+    didSet {
+      backgroundColor = isSelected ? UIColor.white.withAlphaComponent(0.14) : .clear
+    }
+  }
+
+  private func setup(emoji: String, name: String, id: String?, avatarURL: String?) {
+    translatesAutoresizingMaskIntoConstraints = false
+    layer.cornerRadius = 20
+    layer.cornerCurve = .continuous
+    accessibilityTraits = .button
+
+    avatarView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(avatarView)
+    avatarView.configure(
+      with: ChatReactionDetailOverlay.avatarDescriptor(
+        name: name, id: id, avatarURL: avatarURL),
+      isDark: true,
+      renderingSide: 32
+    )
+
+    emojiLabel.text = emoji
+    emojiLabel.font = UIFont.systemFont(ofSize: 15)
+    emojiLabel.textAlignment = .center
+    emojiLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(emojiLabel)
+
+    NSLayoutConstraint.activate([
+      widthAnchor.constraint(equalToConstant: 46),
+      heightAnchor.constraint(equalToConstant: 40),
+      avatarView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+      avatarView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      avatarView.widthAnchor.constraint(equalToConstant: 32),
+      avatarView.heightAnchor.constraint(equalToConstant: 32),
+      emojiLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1),
+      emojiLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 1),
+      emojiLabel.widthAnchor.constraint(equalToConstant: 20),
+      emojiLabel.heightAnchor.constraint(equalToConstant: 20),
+    ])
+  }
 }
 
 // MARK: - ChatContextMenuOverlay
@@ -183,7 +611,7 @@ public final class ChatContextMenuOverlay: UIView {
     addSubview(bubbleSnapshot)
 
     // 3. Reaction picker (above bubble)
-    reactionPicker.alpha = 0
+    reactionPicker.alpha = 1
     reactionPicker.delegate = self
     reactionPicker.onContentSizeChange = { [weak self] in
       guard let self, !self.isDismissing else { return }
@@ -417,7 +845,7 @@ public final class ChatContextMenuOverlay: UIView {
     )
     reactionPicker.transform = CGAffineTransform(
       scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
-    reactionPicker.alpha = 0
+    reactionPicker.alpha = 1
 
     // --- Context menu: top edge pinned under the bubble, scaling up in place
     // as it pours downward — no horizontal travel.
@@ -432,10 +860,6 @@ public final class ChatContextMenuOverlay: UIView {
       scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
     contextMenu.alpha = 1
 
-    // Only the blur picker fades; the glass card stays at one resolved opacity.
-    let fadeAnimator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
-      self.reactionPicker.alpha = 1
-    }
     // One under-damped spring drives bubble, picker, and menu together: both
     // menus grow out of the bubble's edges with a visible expansion overshoot.
     let springAnimator = UIViewPropertyAnimator(duration: 0.38, dampingRatio: 0.78) {
@@ -446,7 +870,6 @@ public final class ChatContextMenuOverlay: UIView {
       self.contextMenu.transform = .identity
       self.contextMenu.center = menuFinalCenter
     }
-    fadeAnimator.startAnimation()
     springAnimator.startAnimation()
     // Emoji tiles cascade in from the anchored side while the pill grows.
     reactionPicker.animateIconsIn(fromTrailing: isRightAligned)
@@ -469,7 +892,6 @@ public final class ChatContextMenuOverlay: UIView {
     UIView.animate(
       withDuration: 0.18, delay: 0, options: [.curveEaseIn, .beginFromCurrentState]
     ) {
-      self.reactionPicker.alpha = 0
       self.bubbleSnapshot.transform = .identity
       self.bubbleSnapshot.bounds = CGRect(origin: .zero, size: self.originalBubbleFrame.size)
       self.bubbleSnapshot.center = CGPoint(
@@ -627,7 +1049,6 @@ final class ReactionPickerView: UIView {
   var onContentSizeChange: (() -> Void)?
 
   private let blurView: UIVisualEffectView
-  private let blurTintView = UIView()
   private let tailBlobLarge: UIVisualEffectView
   private let tailBlobSmall: UIVisualEffectView
   private let iconsHost = UIView()
@@ -704,10 +1125,6 @@ final class ReactionPickerView: UIView {
     addSubview(tailBlobLarge)
     addSubview(tailBlobSmall)
 
-    blurTintView.backgroundColor = .clear
-    blurTintView.translatesAutoresizingMaskIntoConstraints = false
-    blurView.contentView.addSubview(blurTintView)
-
     iconsHost.translatesAutoresizingMaskIntoConstraints = false
     iconsHost.backgroundColor = .clear
     blurView.contentView.addSubview(iconsHost)
@@ -719,11 +1136,6 @@ final class ReactionPickerView: UIView {
       blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
       blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
       blurHeightConstraint,
-
-      blurTintView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
-      blurTintView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
-      blurTintView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
-      blurTintView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
 
       iconsHost.topAnchor.constraint(
         equalTo: blurView.contentView.topAnchor, constant: Self.pickerVerticalInset),
@@ -738,7 +1150,9 @@ final class ReactionPickerView: UIView {
     tailBlobLarge.bounds = CGRect(x: 0.0, y: 0.0, width: 11.0, height: 11.0)
     tailBlobSmall.bounds = CGRect(x: 0.0, y: 0.0, width: 7.0, height: 7.0)
     tailBlobLarge.layer.borderWidth = 0
+    tailBlobLarge.layer.borderColor = UIColor.clear.cgColor
     tailBlobSmall.layer.borderWidth = 0
+    tailBlobSmall.layer.borderColor = UIColor.clear.cgColor
 
     for emoji in ChatReactionCatalog.allEmojis {
       let node = ChatReactionIconNode(emoji: emoji)
@@ -758,8 +1172,10 @@ final class ReactionPickerView: UIView {
     let config = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
     expandControl.setImage(UIImage(systemName: "chevron.down", withConfiguration: config), for: .normal)
     expandControl.tintColor = isDark ? UIColor.white.withAlphaComponent(0.72) : .secondaryLabel
-    expandControl.backgroundColor = UIColor.label.withAlphaComponent(0.08)
+    expandControl.backgroundColor = .clear
     expandControl.layer.cornerRadius = Self.pickerButtonSize * 0.5
+    expandControl.layer.borderWidth = 0
+    expandControl.layer.borderColor = UIColor.clear.cgColor
     expandControl.clipsToBounds = true
     expandControl.accessibilityTraits = .button
     expandControl.addTarget(self, action: #selector(didTapExpand), for: .touchUpInside)

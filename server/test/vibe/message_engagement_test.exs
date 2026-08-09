@@ -197,6 +197,110 @@ defmodule Vibe.MessageEngagementTest do
     end
   end
 
+  describe "home seed payload" do
+    test "seeds the same reactions summary as paged history", %{alice: alice, bob: bob} do
+      {:ok, room} = Chat.create_group(alice.id, "Seed", [bob.id])
+      message = insert_message(room.id, alice.id)
+
+      assert [%{reactions: []}] = seeded_messages(bob.id, room.id)
+      assert {:ok, _} = Chat.toggle_reaction(room.id, message.id, bob.id, "👍")
+
+      assert seeds = seeded_messages(bob.id, room.id)
+      assert [%{id: seeded_id, reactions: reactions}] = seeds
+      assert seeded_id == message.id
+      assert reactions == [%{emoji: "👍", count: 1, isSelected: true}]
+
+      page = Chat.get_messages_for_user_page(room.id, bob.id, limit: 30)
+      assert [%{reactions: ^reactions}] = page.messages
+
+      # The author sees the same counts with their own bucket unset.
+      assert [%{reactions: [%{emoji: "👍", count: 1, isSelected: false}]}] =
+               seeded_messages(alice.id, room.id)
+    end
+
+    test "seeds an empty reactions list when nobody reacted", %{alice: alice, bob: bob} do
+      {chat_id, message} = dm_with_message(alice, bob)
+
+      assert [%{id: seeded_id, reactions: []}] = seeded_messages(bob.id, chat_id)
+      assert seeded_id == message.id
+    end
+  end
+
+  describe "message_reaction_detail/3" do
+    test "groups actors per emoji with identity, avatar, and timestamp", %{
+      alice: alice,
+      bob: bob,
+      carol: carol
+    } do
+      {:ok, room} = Chat.create_group(alice.id, "Detail", [bob.id, carol.id])
+      message = insert_message(room.id, alice.id)
+
+      assert {:ok, _} = Chat.toggle_reaction(room.id, message.id, alice.id, "👍")
+      assert {:ok, _} = Chat.toggle_reaction(room.id, message.id, bob.id, "👍")
+      assert {:ok, _} = Chat.toggle_reaction(room.id, message.id, carol.id, "🔥")
+
+      assert {:ok, [top, second]} = Chat.message_reaction_detail(room.id, message.id, bob.id)
+
+      assert %{emoji: "👍", count: 2, isSelected: true, users: users} = top
+      assert %{emoji: "🔥", count: 1, isSelected: false, users: [carol_actor]} = second
+
+      assert Enum.sort(Enum.map(users, & &1.userId)) == Enum.sort([alice.id, bob.id])
+      assert carol_actor.userId == carol.id
+      assert carol_actor.name == carol.name
+      assert carol_actor.username == carol.username
+      assert carol_actor.avatarUrl == carol.profile_image
+      assert is_integer(carol_actor.reactedAt)
+
+      # A member who reacted with neither sees the same groups, unselected.
+      dave = insert_user("engage_dave")
+      Repo.insert!(%Participant{chat_id: room.id, user_id: dave.id, role: "member"})
+
+      assert {:ok, [%{isSelected: false}, %{isSelected: false}]} =
+               Chat.message_reaction_detail(room.id, message.id, dave.id)
+    end
+
+    test "falls back to the username when a reactor has no display name", %{
+      alice: alice,
+      bob: bob
+    } do
+      {chat_id, message} = dm_with_message(alice, bob)
+      Repo.update!(Ecto.Changeset.change(bob, name: nil, profile_image: ""))
+
+      assert {:ok, _} = Chat.toggle_reaction(chat_id, message.id, bob.id, "👍")
+
+      assert {:ok, [%{users: [actor]}]} =
+               Chat.message_reaction_detail(chat_id, message.id, alice.id)
+
+      assert actor.name == bob.username
+      assert actor.avatarUrl == nil
+    end
+
+    test "returns an empty list for a message nobody reacted to", %{alice: alice, bob: bob} do
+      {chat_id, message} = dm_with_message(alice, bob)
+      assert {:ok, []} = Chat.message_reaction_detail(chat_id, message.id, bob.id)
+    end
+
+    test "refuses non-members, foreign messages, and malformed ids", %{
+      alice: alice,
+      bob: bob,
+      carol: carol
+    } do
+      {chat_id, message} = dm_with_message(alice, bob)
+      {_other_chat_id, other_message} = dm_with_message(alice, carol)
+
+      assert {:error, :forbidden} = Chat.message_reaction_detail(chat_id, message.id, carol.id)
+
+      # A member asking about another chat's message gets no existence oracle.
+      assert {:error, :not_found} =
+               Chat.message_reaction_detail(chat_id, other_message.id, bob.id)
+
+      assert {:error, :invalid_id} = Chat.message_reaction_detail(chat_id, "not-a-uuid", bob.id)
+
+      assert {:error, :forbidden} =
+               Chat.message_reaction_detail(chat_id, message.id, Ecto.UUID.generate())
+    end
+  end
+
   describe "edit_message/5" do
     test "preserves the original timestamp and persists editedAt", %{alice: alice, bob: bob} do
       {chat_id, message} = dm_with_message(alice, bob)
@@ -267,10 +371,18 @@ defmodule Vibe.MessageEngagementTest do
     Repo.insert!(%User{
       id: Ecto.UUID.generate(),
       username: "#{prefix}_#{suffix}",
+      name: "Engage #{suffix}",
+      profile_image: "https://cdn.example/#{prefix}_#{suffix}.png",
       password_hash: "hash",
       public_key: "key",
       device_id: "device-#{suffix}",
       is_agent: false
     })
+  end
+
+  defp seeded_messages(user_id, chat_id) do
+    chat = Enum.find(Chat.list_chats(user_id), &(&1.chatId == chat_id))
+    assert chat, "chat #{chat_id} missing from the home list"
+    chat.messages
   end
 end

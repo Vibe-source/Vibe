@@ -425,6 +425,10 @@ defmodule Vibe.Chat do
             |> Enum.group_by(& &1.chat_id)
           end
 
+        # Same reaction contract as paged history, batched across every seeded
+        # message so the home list never falls back to a per-message query.
+        seed_reactions = batched_reaction_summaries(top_message_ids, user_id)
+
         # Batch-fetch member counts for group/channel chats
         group_channel_ids =
           Enum.filter(chat_ids, fn id ->
@@ -513,7 +517,10 @@ defmodule Vibe.Chat do
               nil
             end
 
-          messages_for_client = Enum.map(chat_messages, &to_client_message/1)
+          messages_for_client =
+            chat_messages
+            |> Enum.map(&to_client_message/1)
+            |> apply_reaction_summaries(seed_reactions)
 
           # A single comparable "last activity" instant (epoch ms) so the client can
           # sort the home list newest-first. Newest visible message wins; an empty
@@ -1124,26 +1131,38 @@ defmodule Vibe.Chat do
   # ── Reactions, views, reports ───────────────────────────────────
 
   @engagement_batch_limit 200
+  # Ceiling on actor rows returned for one message's reaction detail.
+  @reaction_detail_limit 500
   @no_user_uuid "00000000-0000-0000-0000-000000000000"
 
   @doc "Toggles the same reaction off or replaces it, then returns fresh counts."
   def toggle_reaction(chat_id, message_id, user_id, emoji) do
-    with {:ok, normalized} <- normalize_emoji(emoji),
-         {:ok, uuid} <- cast_message_uuid(message_id) do
-      RepoRLS.with_user(user_id, fn ->
-        with :ok <- ensure_participant(chat_id, user_id),
-             {:ok, _message} <- fetch_chat_message(chat_id, uuid),
-             :ok <- ensure_reactions_enabled(chat_id) do
-          action = apply_reaction(chat_id, uuid, user_id, normalized)
+    result =
+      with {:ok, normalized} <- normalize_emoji(emoji),
+           {:ok, uuid} <- cast_message_uuid(message_id) do
+        RepoRLS.with_user(user_id, fn ->
+          with :ok <- ensure_participant(chat_id, user_id),
+               {:ok, _message} <- fetch_chat_message(chat_id, uuid),
+               :ok <- ensure_reactions_enabled(chat_id) do
+            action = apply_reaction(chat_id, uuid, user_id, normalized)
 
-          {:ok,
-           %{
-             action: action,
-             emoji: normalized,
-             reactions: message_reactions(uuid, user_id)
-           }}
-        end
-      end)
+            {:ok,
+             %{
+               action: action,
+               emoji: normalized,
+               reactions: message_reactions(uuid, user_id)
+             }}
+          end
+        end)
+      end
+
+    case result do
+      {:ok, _payload} = success ->
+        invalidate_chat_home_cache(chat_id)
+        success
+
+      other ->
+        other
     end
   end
 
@@ -1181,6 +1200,18 @@ defmodule Vibe.Chat do
            |> Enum.sort_by(&{-&1.count, &1.emoji})
            |> Enum.map(&%{emoji: &1.emoji, count: &1.count, isSelected: &1.selected == true})}
         end)
+    end
+  end
+
+  @doc "Emoji-grouped actors for one message; the caller must be a participant."
+  def message_reaction_detail(chat_id, message_id, user_id) do
+    with {:ok, uuid} <- cast_message_uuid(message_id) do
+      RepoRLS.with_user(user_id, fn ->
+        with :ok <- ensure_participant(chat_id, user_id),
+             {:ok, _message} <- fetch_chat_message(chat_id, uuid) do
+          {:ok, reaction_detail_groups(uuid, user_id)}
+        end
+      end)
     end
   end
 
@@ -1304,6 +1335,56 @@ defmodule Vibe.Chat do
     |> UserBlock.changeset(%{user_id: user_id, blocked_user_id: blocked_user_id})
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:user_id, :blocked_user_id])
   end
+
+  # Two queries, never per actor: the summary carries the exact counts, this
+  # carries the (capped) actor rows. `count` above `length(users)` means capped.
+  defp reaction_detail_groups(message_uuid, user_id) do
+    actors =
+      Repo.all(
+        from(r in MessageReaction,
+          join: u in User,
+          on: u.id == r.user_id,
+          where: r.message_id == ^message_uuid,
+          order_by: [desc: r.updated_at, asc: r.user_id],
+          limit: @reaction_detail_limit,
+          select: %{
+            emoji: r.emoji,
+            user_id: r.user_id,
+            name: u.name,
+            username: u.username,
+            avatar_url: u.profile_image,
+            reacted_at: r.updated_at
+          }
+        )
+      )
+      |> Enum.group_by(& &1.emoji)
+
+    message_uuid
+    |> message_reactions(user_id)
+    |> Enum.map(fn summary ->
+      users =
+        actors
+        |> Map.get(summary.emoji, [])
+        |> Enum.map(&reaction_actor_payload/1)
+
+      Map.put(summary, :users, users)
+    end)
+  end
+
+  defp reaction_actor_payload(actor) do
+    %{
+      userId: actor.user_id,
+      name: present_string(actor.name) || present_string(actor.username),
+      username: actor.username,
+      avatarUrl: present_string(actor.avatar_url),
+      reactedAt: naive_to_epoch_ms(actor.reacted_at)
+    }
+  end
+
+  defp naive_to_epoch_ms(%NaiveDateTime{} = at),
+    do: at |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:millisecond)
+
+  defp naive_to_epoch_ms(_at), do: nil
 
   defp apply_reaction(chat_id, message_uuid, user_id, emoji) do
     existing =
@@ -3886,25 +3967,48 @@ defmodule Vibe.Chat do
     if ids == [] do
       client_messages
     else
-      chunks = Enum.chunk_every(ids, @engagement_batch_limit)
-      reactions = chunks |> Enum.map(&message_reaction_summaries(&1, user_id)) |> merge_maps()
-      views? = get_room_type(chat_id) in ["group", "channel"]
+      decorated =
+        apply_reaction_summaries(client_messages, batched_reaction_summaries(ids, user_id))
 
-      counts =
-        if views?, do: chunks |> Enum.map(&message_view_counts/1) |> merge_maps(), else: %{}
+      if get_room_type(chat_id) in ["group", "channel"] do
+        counts =
+          ids
+          |> Enum.chunk_every(@engagement_batch_limit)
+          |> Enum.map(&message_view_counts/1)
+          |> merge_maps()
 
-      Enum.map(client_messages, fn
-        %{id: id} = message when is_binary(id) ->
-          message
-          |> Map.put(:reactions, Map.get(reactions, id, []))
-          |> then(fn m ->
-            if views?, do: Map.put(m, :viewCount, Map.get(counts, id, 0)), else: m
-          end)
+        Enum.map(decorated, fn
+          %{id: id} = message when is_binary(id) ->
+            Map.put(message, :viewCount, Map.get(counts, id, 0))
 
-        other ->
-          other
-      end)
+          other ->
+            other
+        end)
+      else
+        decorated
+      end
     end
+  end
+
+  # Chunked so a large page stays one query per chunk, never one per message.
+  defp batched_reaction_summaries([], _user_id), do: %{}
+
+  defp batched_reaction_summaries(message_ids, user_id) do
+    message_ids
+    |> Enum.chunk_every(@engagement_batch_limit)
+    |> Enum.map(&message_reaction_summaries(&1, user_id))
+    |> merge_maps()
+  end
+
+  # Every client message carries `reactions`, empty list included.
+  defp apply_reaction_summaries(client_messages, reactions) do
+    Enum.map(client_messages, fn
+      %{id: id} = message when is_binary(id) ->
+        Map.put(message, :reactions, Map.get(reactions, id, []))
+
+      other ->
+        other
+    end)
   end
 
   defp merge_maps(maps), do: Enum.reduce(maps, %{}, &Map.merge(&2, &1))

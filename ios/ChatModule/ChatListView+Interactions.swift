@@ -8,6 +8,14 @@ private let swipeReplyMaxOffset: CGFloat = 80.0
 private let chatHoldDebugLogs = true
 private var chatRestrictSavingContentKey: UInt8 = 0
 
+private struct ChatReactionActorDescriptor {
+  let id: String
+  let name: String
+  let subtitle: String
+  let emoji: String
+  let avatarURL: String?
+}
+
 /// Vibe's reply mark — NOT a frosted disc with an arrow in it (that is Telegram's, and
 /// every client that copied Telegram has one). The idea here is our own and it is a single
 /// sentence: **a reply is a fragment of your bubble reaching back to their message.**
@@ -364,6 +372,15 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       let v = pan.velocity(in: pan.view)
       if abs(t.x) > 2.0 || abs(t.y) > 2.0 { return abs(t.x) > abs(t.y) }
       return abs(v.x) > abs(v.y)
+    }
+    if gestureRecognizer === contextMenuLongPressGesture {
+      let point = gestureRecognizer.location(in: collectionView)
+      if let indexPath = collectionView.indexPathForItem(at: point),
+        let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell,
+        cell.containsReactionPoint(point, in: collectionView)
+      {
+        return false
+      }
     }
     guard gestureRecognizer === swipeReplyPanGesture,
       let pan = gestureRecognizer as? UIPanGestureRecognizer
@@ -846,6 +863,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       "contextMenuDidSelectReaction id=\(messageId) emoji=\(reaction) source=\(sourcePoint.map { NSCoder.string(for: $0) } ?? "nil")"
     )
     guard let window else { return }
+    let flightHost = customContextMenuOverlay?.superview ?? window
     let resolvedMessageId = messageId
     let chatId = contextMenuChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     let coordinator = ChatReactionTransitionCoordinator.shared
@@ -854,9 +872,12 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     let previous = applyLocalReactionEmoji(reaction, toMessageId: resolvedMessageId)
     let hostCell = visibleReactionCell(messageId: resolvedMessageId)
       ?? contextMenuHostCell as? ChatListCell
-    let targetPoint = hostCell?.reactionBadgeCenter(for: reaction, in: window)
-      ?? sourcePoint ?? CGPoint(x: bounds.midX, y: bounds.midY)
-    let flightSource = sourcePoint ?? targetPoint
+    let targetInWindow = hostCell?.reactionBadgeCenter(for: reaction, in: window)
+      ?? convert(CGPoint(x: bounds.midX, y: bounds.midY), to: window)
+    let sourceWindow = customContextMenuOverlay?.window ?? window
+    let sourceInWindow = sourcePoint.map { window.convert($0, from: sourceWindow) } ?? targetInWindow
+    let targetPoint = flightHost.convert(targetInWindow, from: window)
+    let flightSource = flightHost.convert(sourceInWindow, from: window)
 
     var payload: [String: Any] = [
       "type": "contextMenuReaction",
@@ -872,28 +893,158 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     )
     onNativeEvent(payload)
     submitContextMenuReaction(reaction, messageId: resolvedMessageId) { [weak self] accepted in
-      guard let self, !accepted, coordinator.isCurrent(token) else { return }
-      if let previous {
-        self.restoreLocalReactionSnapshot(previous, toMessageId: resolvedMessageId)
-      }
-      coordinator.cancel(token)
+      guard coordinator.resolveTransport(token, accepted: accepted), !accepted,
+        let self
+      else { return }
+      if let previous { self.restoreLocalReactionSnapshot(previous, toMessageId: resolvedMessageId) }
     }
 
     ChatReactionFxModule.shared.animateReactionFlight(
       emoji: reaction,
       from: flightSource,
       to: targetPoint,
-      in: window,
+      in: flightHost,
       bubbleView: nil
     ) { [weak self, weak window] in
       guard let self, let window, coordinator.isCurrent(token) else { return }
+      coordinator.finishFlight(token)
       let cell = self.visibleReactionCell(messageId: resolvedMessageId)
       if cell?.playReactionLandingEffect(reaction, in: window) != true {
         ChatReactionFxModule.shared.playLandingEffect(
-          emoji: reaction, at: targetPoint, in: window, tintOverride: nil)
+          emoji: reaction, at: targetInWindow, in: window, tintOverride: nil)
       }
-      coordinator.finish(token)
     }
+  }
+
+  func presentReactionDetails(
+    for row: ChatListRow, emoji: String, sourcePoint _: CGPoint
+  ) {
+    guard let hostView = window, let messageId = row.messageId else { return }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    if let current = reactionDetailOverlay {
+      current.onDismiss = nil
+      current.dismiss(animated: false)
+    }
+
+    let placeholder = localReactionDetailActors(for: row, emoji: emoji)
+    let overlay = ChatReactionDetailOverlay(emoji: emoji, actors: placeholder)
+    reactionDetailOverlay = overlay
+    overlay.onDismiss = { [weak self, weak overlay] in
+      guard let self, self.reactionDetailOverlay === overlay else { return }
+      self.reactionDetailOverlay = nil
+    }
+    overlay.present(in: hostView)
+
+    let chatId = contextMenuChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard chatId != "saved_messages" else { return }
+    ChatEngine.shared.fetchReactionDetails(chatId: chatId, messageId: messageId) {
+      [weak self, weak overlay] body in
+      guard let self, let overlay, self.reactionDetailOverlay === overlay, let body else { return }
+      let descriptors = self.reactionActorDescriptors(from: body, selectedEmoji: emoji)
+      guard !descriptors.isEmpty else { return }
+      self.installReactionDetailActors(descriptors, in: overlay, selectedEmoji: emoji)
+    }
+  }
+
+  private func localReactionDetailActors(
+    for row: ChatListRow, emoji: String
+  ) -> [ChatReactionDetailActor] {
+    guard row.reactions.first(where: { $0.emoji == emoji })?.isSelected == true,
+      let config = AppSessionConfig.current
+    else { return [] }
+    let name = config.name ?? config.username ?? "You"
+    return [
+      ChatReactionDetailActor(
+        id: config.userID, displayName: name, subtitle: "You reacted",
+        emoji: emoji, avatarURL: config.profileImage)
+    ]
+  }
+
+  private func reactionActorDescriptors(
+    from body: [String: Any], selectedEmoji: String
+  ) -> [ChatReactionActorDescriptor] {
+    let payload = (body["data"] as? [String: Any]) ?? body
+    let groups = (payload["reactions"] as? [[String: Any]])
+      ?? (payload["reactionGroups"] as? [[String: Any]])
+      ?? (payload["reaction_groups"] as? [[String: Any]])
+      ?? []
+    var selected: [ChatReactionActorDescriptor] = []
+    var fallback: [ChatReactionActorDescriptor] = []
+    for group in groups {
+      let groupEmoji = reactionDetailString(group["emoji"] ?? group["reaction"]) ?? selectedEmoji
+      let actors = (group["actors"] as? [[String: Any]])
+        ?? (group["users"] as? [[String: Any]]) ?? []
+      let parsed = actors.compactMap { reactionActorDescriptor($0, emoji: groupEmoji) }
+      fallback.append(contentsOf: parsed)
+      if groupEmoji == selectedEmoji { selected.append(contentsOf: parsed) }
+    }
+    if !selected.isEmpty { return selected }
+    if !fallback.isEmpty { return fallback }
+    let actors = (payload["actors"] as? [[String: Any]])
+      ?? (payload["users"] as? [[String: Any]]) ?? []
+    return actors.compactMap { reactionActorDescriptor($0, emoji: selectedEmoji) }
+  }
+
+  private func reactionActorDescriptor(
+    _ raw: [String: Any], emoji: String
+  ) -> ChatReactionActorDescriptor? {
+    guard let id = reactionDetailString(
+      raw["userId"] ?? raw["user_id"] ?? raw["id"]), !id.isEmpty
+    else { return nil }
+    let name = reactionDetailString(
+      raw["displayName"] ?? raw["display_name"] ?? raw["name"] ?? raw["username"])
+      ?? "Vibegram User"
+    let avatarURL = reactionDetailString(
+      raw["avatarUrl"] ?? raw["avatar_url"] ?? raw["profileImage"] ?? raw["profile_image"])
+    let reactedAt = raw["reactedAt"] ?? raw["reacted_at"] ?? raw["timestamp"]
+    return ChatReactionActorDescriptor(
+      id: id, name: name, subtitle: reactionDetailSubtitle(reactedAt),
+      emoji: emoji, avatarURL: avatarURL)
+  }
+
+  private func installReactionDetailActors(
+    _ descriptors: [ChatReactionActorDescriptor], in overlay: ChatReactionDetailOverlay,
+    selectedEmoji: String
+  ) {
+    let initial = descriptors.map { descriptor in
+      ChatReactionDetailActor(
+        id: descriptor.id, displayName: descriptor.name, subtitle: descriptor.subtitle,
+        emoji: descriptor.emoji, avatarURL: descriptor.avatarURL)
+    }
+    overlay.update(emoji: selectedEmoji, actors: initial)
+  }
+
+  private func reactionDetailString(_ value: Any?) -> String? {
+    let text: String?
+    if let value = value as? String { text = value }
+    else if let value = value as? NSNumber { text = value.stringValue }
+    else { text = nil }
+    let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private func reactionDetailSubtitle(_ value: Any?) -> String {
+    let date: Date? = {
+      if let number = value as? NSNumber {
+        let raw = number.doubleValue
+        return Date(timeIntervalSince1970: raw > 100_000_000_000 ? raw / 1_000 : raw)
+      }
+      guard let text = reactionDetailString(value) else { return nil }
+      if let raw = Double(text) {
+        return Date(timeIntervalSince1970: raw > 100_000_000_000 ? raw / 1_000 : raw)
+      }
+      return ISO8601DateFormatter().date(from: text)
+    }()
+    guard let date else { return "Reacted" }
+    let formatter = DateFormatter()
+    formatter.locale = .current
+    if Calendar.current.isDateInToday(date) {
+      formatter.timeStyle = .short
+      return "today at \(formatter.string(from: date))"
+    }
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    return formatter.string(from: date)
   }
 
   public func contextMenuDidSelectAction(_ actionId: String, messageId _: String) {

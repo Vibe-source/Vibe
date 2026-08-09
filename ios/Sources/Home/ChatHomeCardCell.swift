@@ -59,6 +59,7 @@ final class ChatHomeCardCell: UITableViewCell {
   private let titleLabel = UILabel()
   private let tierBadgeImageView = UIImageView()
   private let previewLabel = UILabel()
+  private let reactionPreviewLabel = UILabel()
   private let timeLabel = UILabel()
   private let receiptStatusView = UIImageView()
   private let unreadBadge = UIView()
@@ -138,6 +139,8 @@ final class ChatHomeCardCell: UITableViewCell {
     avatarHeightConstraint?.constant = 60
     compactForwardStyle = false
     previewLabel.isHidden = false
+    reactionPreviewLabel.text = nil
+    reactionPreviewLabel.isHidden = true
     receiptStatusView.image = nil
     receiptStatusView.isHidden = false
     receiptStatusWidthConstraint?.constant = 20
@@ -278,6 +281,12 @@ final class ChatHomeCardCell: UITableViewCell {
       previewLabel.text = row.isTyping ? "typing..." : row.preview
       previewLabel.textColor = row.isTyping ? typingColor : secondary
     }
+    reactionPreviewLabel.text = row.latestReactionPreview
+    reactionPreviewLabel.isHidden = compactForwardStyle || row.isTyping || row.latestReactionPreview == nil
+    reactionPreviewLabel.textColor = primary
+    reactionPreviewLabel.backgroundColor = isDark
+      ? UIColor.white.withAlphaComponent(0.12)
+      : UIColor.black.withAlphaComponent(0.07)
 
     timeLabel.isHidden = showsRightCheckmark || compactForwardStyle
     timeLabel.text = row.timeLabel
@@ -606,6 +615,15 @@ final class ChatHomeCardCell: UITableViewCell {
     previewLabel.font = .systemFont(ofSize: 15, weight: .regular)
     previewLabel.numberOfLines = 1
 
+    reactionPreviewLabel.translatesAutoresizingMaskIntoConstraints = false
+    reactionPreviewLabel.font = .systemFont(ofSize: 13)
+    reactionPreviewLabel.textAlignment = .center
+    reactionPreviewLabel.layer.cornerRadius = 9
+    reactionPreviewLabel.layer.cornerCurve = .continuous
+    reactionPreviewLabel.clipsToBounds = true
+    reactionPreviewLabel.setContentHuggingPriority(.required, for: .horizontal)
+    reactionPreviewLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
     timeLabel.translatesAutoresizingMaskIntoConstraints = false
     timeLabel.font = .systemFont(ofSize: 13, weight: .regular)
     timeLabel.textAlignment = .right
@@ -657,13 +675,24 @@ final class ChatHomeCardCell: UITableViewCell {
     titleRowStack.spacing = 6
     titleRowStack.alignment = .center
 
-    let textStack = UIStackView(arrangedSubviews: [titleRowStack, previewLabel])
+    let previewStack = UIStackView(arrangedSubviews: [reactionPreviewLabel, previewLabel])
+    previewStack.translatesAutoresizingMaskIntoConstraints = false
+    previewStack.axis = .horizontal
+    previewStack.spacing = 5
+    previewStack.alignment = .center
+
+    let textStack = UIStackView(arrangedSubviews: [titleRowStack, previewStack])
     textStack.translatesAutoresizingMaskIntoConstraints = false
     textStack.axis = .vertical
     textStack.spacing = 2
     textStack.alignment = .fill
     textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
     textStack.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+    NSLayoutConstraint.activate([
+      reactionPreviewLabel.heightAnchor.constraint(equalToConstant: 18),
+      reactionPreviewLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 28),
+    ])
 
     let iconStack = UIStackView(arrangedSubviews: [muteIconView, pinIconView])
     iconStack.translatesAutoresizingMaskIntoConstraints = false

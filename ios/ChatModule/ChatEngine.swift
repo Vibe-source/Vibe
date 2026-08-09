@@ -1634,11 +1634,11 @@ final class ChatEngine {
     syncOnQueue { resolveURLForOpenLocked(raw) }
   }
 
+  /// Reads the store's lock-guarded config snapshot directly.
+  /// Avoids blocking cell configuration behind the engine queue.
   func authorizationHeaderForAPI() -> String? {
-    syncOnQueue {
-      guard let token = authHeaderTokenLocked(), !token.isEmpty else { return nil }
-      return "Bearer \(token)"
-    }
+    guard let token = authHeaderTokenLocked(), !token.isEmpty else { return nil }
+    return "Bearer \(token)"
   }
 
   func decryptMediaDataIfNeeded(_ data: Data, mediaKey: String?) -> Data? {
@@ -16345,6 +16345,40 @@ final class ChatEngine {
       guard let apiBase = apiBaseURLLocked() else { return nil }
       let token = authHeaderTokenLocked() ?? ""
       return (apiBase, token)
+    }
+  }
+
+  func fetchReactionDetails(
+    chatId: String, messageId: String, completion: @escaping ([String: Any]?) -> Void
+  ) {
+    queue.async { [weak self] in
+      guard let self, let (apiBase, token) = self.requestContext else {
+        DispatchQueue.main.async { completion(nil) }
+        return
+      }
+      let url = apiBase
+        .appendingPathComponent("api")
+        .appendingPathComponent("chat")
+        .appendingPathComponent(chatId)
+        .appendingPathComponent("messages")
+        .appendingPathComponent(messageId)
+        .appendingPathComponent("reactions")
+      var request = URLRequest(url: url)
+      request.setValue("application/json", forHTTPHeaderField: "Accept")
+      request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+      if !token.isEmpty {
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+      }
+      ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) { data, response, error in
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard error == nil, (200...299).contains(status), let data,
+          let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+          DispatchQueue.main.async { completion(nil) }
+          return
+        }
+        DispatchQueue.main.async { completion(body) }
+      }.resume()
     }
   }
 
