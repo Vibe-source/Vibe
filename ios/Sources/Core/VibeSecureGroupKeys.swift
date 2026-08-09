@@ -1,6 +1,5 @@
 import Foundation
 import Security
-import VibeCoreFFI
 
 /// Custody of group epoch keys — the layer that covers what MLS cannot.
 ///

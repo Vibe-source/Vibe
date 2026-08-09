@@ -253,7 +253,8 @@ enum VibeCoreStoreBridge {
     guard isEnabled else { completion?(); return }
     guard !userId.isEmpty, !chatId.isEmpty else { completion?(); return }
 
-    queue.async {
+    // The historical walk and its verify unseal rows; both yield to a live open.
+    queue.asyncAfter(deadline: .now() + VibeChatOpenGate.delay) {
       defer { completion?() }
       let key = "\(userId)|\(chatId)"
       guard !backfilledChats.contains(key) else { return }
@@ -318,6 +319,21 @@ enum VibeCoreStoreBridge {
           "[CoreStore] backfill chat=%@ FAILED after %ld batches in %.0fms error=%@",
           chatId, batches, ms, String(describing: error))
         VibeLog.error("[CoreStore] backfill failed chat=\(chatId): \(error)", category: "core")
+        // The marker above is a flood guard — "do not rescan a chat that already failed
+        // on every single open" — and it is right whenever the walk left *something*
+        // behind. It is wrong when the table is empty, and `repairChat` is exactly how
+        // that happens: it prunes to zero and relies on this walk to rebuild. A transient
+        // failure there (the app writing to the same SQLite file from the engine queue is
+        // enough) would otherwise turn a three-row disagreement into a permanently empty
+        // chat — a strictly worse state than the one the repair was fixing. So: keep the
+        // guard when there is data, drop it when refusing to retry guarantees nothing.
+        let stored = (try? core.count(userId: userId, chatId: chatId)) ?? 0
+        if stored == 0 {
+          backfilledChats.remove(key)
+          NSLog(
+            "[CoreStore] backfill chat=%@ — core is empty after the failure, will retry",
+            chatId)
+        }
       }
     }
   }
@@ -347,6 +363,94 @@ enum VibeCoreStoreBridge {
         VibeLog.error("[CoreStore] clear failed chat=\(chatId): \(error)", category: "core")
       }
     }
+  }
+
+  /// Marks message ids deleted, durably, so no later write can bring them back.
+  ///
+  /// The store has carried `core_tombstones_v1` — plus `tombstone()`, `is_tombstoned()`,
+  /// FFI bindings and round-trip tests — since it was written, and until now **nothing
+  /// called it**: an audit of every `open func` in the generated bindings against
+  /// non-generated Swift found zero call sites. The reads did not consult it either, so
+  /// the delete half of the store was designed, bound, and then left inert at both ends.
+  ///
+  /// It is now the durable half of the delete contract, and it is what `repairChat`
+  /// alone cannot do. A rebuild re-derives the core table from the legacy one *at that
+  /// moment*; it has no memory. The case in the device log is a message the user deleted
+  /// that the server keeps re-sending — every history page re-inserts it, and a rebuild
+  /// would faithfully copy it back. A tombstone is remembered, so the re-delivery is
+  /// refused by the store rather than re-filtered by every caller.
+  ///
+  /// Transient ids (`stream-`, `lan-`) are dropped inside the store, not here.
+  static func tombstoneMessages(userId: String, chatId: String, messageIds: [String]) {
+    guard isEnabled, !userId.isEmpty, !chatId.isEmpty, !messageIds.isEmpty else { return }
+    let atMs = Int64(Date().timeIntervalSince1970 * 1000)
+    queue.async {
+      guard openIfNeeded(), let core = coreStore else { return }
+      do {
+        // `forEveryone: false` — this records that THIS device should not show the row.
+        // A delete-for-everyone is a server fact that arrives as its own frame; claiming
+        // it here would overstate what a local delete decided.
+        try core.tombstone(
+          userId: userId, chatId: chatId, ids: messageIds, atMs: atMs, forEveryone: false)
+        NSLog(
+          "[CoreStore] tombstone chat=%@ ids=%ld — deleted rows can no longer be re-admitted",
+          chatId, messageIds.count)
+      } catch {
+        NSLog(
+          "[CoreStore] tombstone chat=%@ FAILED error=%@", chatId, String(describing: error))
+        VibeLog.error("[CoreStore] tombstone failed chat=\(chatId): \(error)", category: "core")
+      }
+    }
+  }
+
+  /// Rebuilds a chat's sealed rows from the legacy table after rows were DELETED there.
+  ///
+  /// `mirrorRows` keeps the two tables in step for writes, and `clearChat` covers the full
+  /// wipe — but nothing covered a *partial* delete, and the engine has four of them: a
+  /// single-message delete, the twin-generation dedup on restore, the locally-deleted-id
+  /// sweep at the persist choke, and the canonical ghost purge. Each one removed rows from
+  /// `messages` and left the sealed copies behind, so the core table accumulated rows the
+  /// app had already decided the user should not see. Device log 2026-08-08, chat
+  /// 71312111f04b: `verify … MISMATCH missingFromCore=3 extraInCore=3`, stable across
+  /// three minutes and a send — a fixed set of rows the two tables disagree about, not a
+  /// race that settles.
+  ///
+  /// That is a correctness bug today (verify can never reach MATCH, which is the gate for
+  /// migrating reads) and a user-visible one the moment reads move onto this store: a
+  /// deleted message would come back.
+  ///
+  /// # Why rebuild rather than delete
+  ///
+  /// `VibeStoreHandle` exposes upsert / prune / count / backfill and no per-row delete, so
+  /// a targeted removal would mean new Rust, new bindgen and a new xcframework. Deletes
+  /// are rare events on a path already doing SQLite work, and `prune(keepNewest: 0)` +
+  /// re-backfill is exact by construction — it re-derives the core table from the legacy
+  /// one *after* the deletion, so it cannot leave a straggler the way a targeted delete
+  /// with a missed call site would. Proportionate beats clever here.
+  static func repairChat(userId: String, chatId: String, reason: String) {
+    guard isEnabled, !userId.isEmpty, !chatId.isEmpty else { return }
+    queue.async {
+      guard openIfNeeded(), let core = coreStore else { return }
+      do {
+        let before = try core.count(userId: userId, chatId: chatId)
+        try core.prune(userId: userId, chatId: chatId, keepNewest: 0)
+        try core.resetBackfillCursor(userId: userId, chatId: chatId)
+        // Backfill refuses a chat it has already walked; this delete IS the reason to
+        // walk it again.
+        backfilledChats.remove("\(userId)|\(chatId)")
+        NSLog(
+          "[CoreStore] repair chat=%@ reason=%@ dropped=%llu sealed rows — rebuilding from legacy",
+          chatId, reason, before)
+      } catch {
+        NSLog(
+          "[CoreStore] repair chat=%@ reason=%@ FAILED error=%@",
+          chatId, reason, String(describing: error))
+        VibeLog.error("[CoreStore] repair failed chat=\(chatId): \(error)", category: "core")
+        return
+      }
+    }
+    // Same serial queue, so this lands strictly after the prune above.
+    backfillChat(userId: userId, chatId: chatId)
   }
 
   // MARK: - Incremental mirror
@@ -521,10 +625,17 @@ enum VibeCoreStoreBridge {
         let extra = Set(coreTail).subtracting(legacyTail)
         let firstDiff = zip(legacyTail, coreTail).enumerated()
           .first { $0.element.0 != $0.element.1 }?.offset ?? window
+        // The raw counts belong on this line, not just on MATCH. Without them a 3/3
+        // difference has two readings that need opposite fixes and cannot be told apart:
+        // core is SHORT three rows the mirror never wrote (a write path that skips the
+        // choke), or core is LONG three rows the legacy table deleted (a delete path with
+        // no core counterpart), whose oldest three then fall out of the compared tail and
+        // show up as "missing". `legacy > core` says the first; `core > legacy` the second.
         NSLog(
           "[CoreStore] verify chat=%@ MISMATCH window=%ld firstDiffAt=%ld "
-            + "missingFromCore=%ld extraInCore=%ld read=%.1fms",
-          chatId, window, firstDiff, missing.count, extra.count, readMs)
+            + "missingFromCore=%ld extraInCore=%ld legacy=%ld core=%ld read=%.1fms",
+          chatId, window, firstDiff, missing.count, extra.count,
+          legacyIds.count, coreIds.count, readMs)
         if let sample = missing.first {
           NSLog("[CoreStore] verify chat=%@ sample missing id=%@", chatId, sample)
         }

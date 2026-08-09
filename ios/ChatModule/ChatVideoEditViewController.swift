@@ -789,19 +789,22 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     drawingView.frame = previewView.bounds
 
     let safe = view.safeAreaInsets
+    // 44pt: the app's header control size everywhere else, and what the image
+    // viewer's header and bottom bar now use.
+    let headerSide: CGFloat = 44.0
     topContainer.frame = CGRect(
       x: 16.0,
       y: safe.top + 8.0,
       width: view.bounds.width - 32.0,
-      height: 40.0
+      height: headerSide
     )
-    backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: 40.0, height: 40.0)
+    backGlassView.frame = CGRect(x: 0.0, y: 0.0, width: headerSide, height: headerSide)
     backButton.frame = backGlassView.bounds
     menuGlassView.frame = CGRect(
-      x: max(0.0, topContainer.bounds.width - 40.0),
+      x: max(0.0, topContainer.bounds.width - headerSide),
       y: 0.0,
-      width: 40.0,
-      height: 40.0
+      width: headerSide,
+      height: headerSide
     )
     menuButton.frame = menuGlassView.bounds
 
@@ -813,7 +816,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       x: (topContainer.bounds.width - titleWidth) * 0.5,
       y: 0.0,
       width: titleWidth,
-      height: 40.0
+      height: headerSide
     )
     titleLabel.frame = titleGlassView.bounds.insetBy(dx: 14.0, dy: 0.0)
 
@@ -1213,9 +1216,12 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private func updateChromeAppearance() {
     let neutralFill = UIColor.black.withAlphaComponent(0.16)
     let accentFill = UIColor.systemBlue.withAlphaComponent(0.28)
-    backGlassView.contentView.backgroundColor = neutralFill
-    titleGlassView.contentView.backgroundColor = neutralFill
-    menuGlassView.contentView.backgroundColor = neutralFill
+    // Header pills carry no fill: a wash over the material is what made them read
+    // grey rather than as glass. The scrim behind them already keeps the glyphs
+    // legible over a bright frame.
+    backGlassView.contentView.backgroundColor = .clear
+    titleGlassView.contentView.backgroundColor = .clear
+    menuGlassView.contentView.backgroundColor = .clear
     playerProgressGlassView.contentView.backgroundColor = UIColor.black.withAlphaComponent(0.22)
     replyGlassView.contentView.backgroundColor = neutralFill
     textGlassView.contentView.backgroundColor = neutralFill
@@ -1820,7 +1826,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
         request.setValue(authHeader, forHTTPHeaderField: "Authorization")
       }
 
-      URLSession.shared.downloadTask(with: request) { [weak self] tempURL, _, error in
+      VibeHTTP.shared.downloadTask(with: request) { [weak self] tempURL, _, error in
         guard let self else { return }
         if let error {
           DispatchQueue.main.async {
@@ -2195,8 +2201,12 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     // was being worked on.
     aiProcessingOverlay.onCancel = { [weak self] in self?.cancelVideoAIEdit() }
     aiProcessingOverlay.setCaption("Editing with AI")
+    // Over the clip, not over the screen: the trim bar and the prompt stay
+    // readable, and the blur lands on the thing being edited.
     aiProcessingOverlay.present(
       in: view,
+      over: previewView.convert(previewView.bounds, to: view),
+      shape: .rect(cornerRadius: previewView.layer.cornerRadius),
       frame: currentPlayerFrameImage(),
       detail: "Sent to Google · this step is not end-to-end encrypted"
     )

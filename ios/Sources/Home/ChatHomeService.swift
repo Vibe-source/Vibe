@@ -114,46 +114,17 @@ enum ChatHomeService {
       throw ChatHomeServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatHomeServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      do {
-        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        return try await loadRows(
-          config: config,
-          request: request,
-          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot),
-          archived: archived
-        )
-      } catch {
-        // Packet mesh unavailable — fall back to direct HTTP so the home
-        // list still loads instead of showing a permanent "Connecting" state.
-        NSLog("[ChatHomeService] packetMesh failed, falling back to direct: %@", error.localizedDescription)
-        return try await loadRows(config: config, request: request, session: .shared, archived: archived)
-      }
     case .direct:
-      do {
-        let rows = try await loadRows(
-          config: config,
-          request: request,
-          session: .shared,
-          archived: archived
-        )
-        PacketRuntime.shared.stop(resetToDirect: true)
-        Task.detached {
-          await PacketBootstrapService.prefetchIfNeeded(config: config)
-        }
-        return rows
-      } catch {
-        guard shouldAttemptPacketFallback(for: error) else {
-          throw error
-        }
-        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        return try await loadRows(
-          config: config,
-          request: request,
-          session: PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot),
-          archived: archived
-        )
+      let rows = try await loadRows(
+        config: config,
+        request: request,
+        session: PacketRuntime.shared.session(),
+        archived: archived
+      )
+      Task.detached {
+        await PacketBootstrapService.prefetchIfNeeded(config: config)
       }
+      return rows
     }
   }
 
@@ -323,20 +294,6 @@ enum ChatHomeService {
     } catch {
       return nil
     }
-  }
-
-  private static func shouldAttemptPacketFallback(for error: Error) -> Bool {
-    if let homeError = error as? ChatHomeServiceError {
-      switch homeError {
-      case let .http(statusCode, _):
-        return statusCode >= 500
-      case .transportUnavailable:
-        return false
-      default:
-        return true
-      }
-    }
-    return true
   }
 
   private static func parsePayload(_ data: Data) throws -> [[String: Any]] {

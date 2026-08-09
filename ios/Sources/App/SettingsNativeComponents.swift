@@ -216,10 +216,12 @@ final class SettingsNativeRowView: UIView, UIGestureRecognizerDelegate {
       hasAccent
       ? row.iconColor.withAlphaComponent(theme.isDark ? 0.78 : 0.88)
       : (theme.isDark ? UIColor.white : UIColor.black).withAlphaComponent(theme.isDark ? 0.10 : 0.08)
-    iconView.image = UIImage(
-      systemName: row.icon,
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
-    )
+    // Falls back to the asset catalog so a row can ship its own vector glyph.
+    iconView.image =
+      UIImage(
+        systemName: row.icon,
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+      ) ?? UIImage(named: row.icon)?.withRenderingMode(.alwaysTemplate)
     iconView.tintColor = hasAccent ? .white : theme.secondaryText.withAlphaComponent(theme.isDark ? 0.92 : 0.78)
     titleLabel.text = row.label
     titleLabel.textColor =
@@ -616,7 +618,7 @@ enum SettingsAvatarImageLoader {
       }
 
       do {
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await VibeHTTP.shared.data(from: url)
         settingsNativeUITrace("SettingsAvatarImageLoader fetched source=remote bytes=\(data.count)")
         return await decodeImageData(data, source: "remote", startedAt: startedAt)
       } catch {

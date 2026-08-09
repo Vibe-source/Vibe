@@ -7,6 +7,8 @@ enum ChatImageEditEventType: String {
   case sendNew = "mediaSendNewRequested"
   case showInChat = "mediaShowInChatRequested"
   case delete = "mediaDeleteRequested"
+  /// Forward inside the app — the chat's own share sheet, not the system one.
+  case share = "mediaShareRequested"
 }
 
 struct ChatImageEditActionPayload {
@@ -55,6 +57,9 @@ enum ChatImageEditModule {
     /// Only a multi-image *message* gets the thumbnail strip; swiping across a
     /// whole chat would turn it into a scroll bar for hundreds of photos.
     allowsFilmstrip: Bool = true,
+    /// Supplies the cell the photo should grow out of and shrink back into. Held
+    /// weakly by the transition, so the chat owning it is enough to keep it alive.
+    zoomSourceProvider: ChatMediaZoomSourceProviding? = nil,
     onAction: @escaping (ChatImageEditActionPayload) -> Void
   ) {
     let pages: [ChatImageEditGalleryPage] = {
@@ -75,13 +80,12 @@ enum ChatImageEditModule {
       startInEditMode: startInEditMode,
       allowsFilmstrip: allowsFilmstrip
     )
-    // Opaque full-screen so chat / cell message never shows through.
-    controller.modalPresentationStyle = .fullScreen
-    // Deliberately NOT the iOS 18 zoom transition: it shrinks the presenting
-    // chat behind the viewer, and that root scale-down is not wanted here. A
-    // cross dissolve leaves the chat exactly where the user left it.
+    controller.modalPresentationStyle = .overFullScreen
     _ = sourceView
-    controller.modalTransitionStyle = .crossDissolve
+    let transition = ChatMediaZoomTransition()
+    transition.sourceProvider = zoomSourceProvider
+    controller.zoomTransition = transition
+    controller.transitioningDelegate = transition
     controller.onAction = onAction
     presenter.present(controller, animated: true)
   }

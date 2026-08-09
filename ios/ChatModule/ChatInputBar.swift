@@ -52,7 +52,8 @@ protocol ChatInputBarDelegate: AnyObject {
     url: String,
     previewUrl: String,
     width: Int,
-    height: Int
+    height: Int,
+    localData: Data?
   )
   func inputBarDidSelectSticker(
     stickerId: String,
@@ -1164,14 +1165,31 @@ final class ChatInputBar: UIView {
   /// Built only when the user opens the GIF panel. Eager creation stalled chat open
   /// (~3s on main) via Auto Layout thrash at zero height.
   private var gifPanelIfLoaded: ChatGifPanelView?
-  private var gifOverlayWindow: UIWindow?
-  private weak var gifOverlayController: ChatGifPanelOverlayController?
+  private weak var gifPanelHostController: UIViewController?
   private var gifPanelVisible = false
-  private var pendingGifPanelCloseForKeyboard = false
+  /// Open was requested while a keyboard still owned the slot; present when height hits 0.
+  private var pendingGifPanelOpen = false
   private var lastGifPanelGeometrySignature: String?
-  /// Compact default — closer to content; search focus still expands via scaleBoost.
-  private let defaultGifPanelHeight: CGFloat = 268
-  private var lastKnownKeyboardHeight: CGFloat = 0
+  /// Only ever used before this device has measured a real keyboard even once. Every
+  /// other path goes through ``matchedKeyboardPanelHeight()``.
+  private let defaultGifPanelHeight: CGFloat = 336
+  private var lastKnownKeyboardHeight: CGFloat = 0 {
+    didSet {
+      guard lastKnownKeyboardHeight > 0, lastKnownKeyboardHeight != oldValue else { return }
+      Self.persistedKeyboardHeight = lastKnownKeyboardHeight
+    }
+  }
+  /// The last keyboard height this device measured, surviving relaunch. The very first
+  /// GIF-panel open of a launch happens before any keyboard has appeared, and without a
+  /// remembered number that open is the one that gets the wrong height.
+  private static var persistedKeyboardHeight: CGFloat {
+    get { CGFloat(UserDefaults.standard.double(forKey: "vibe.inputbar.keyboardHeight")) }
+    set { UserDefaults.standard.set(Double(newValue), forKey: "vibe.inputbar.keyboardHeight") }
+  }
+  /// True while a show/hide transition owns `panel.frame`. Layout runs on every pass and
+  /// would otherwise reassign the frame from mid-animation input-bar bounds, fighting the
+  /// transition — which is what the old `alpha >= 0.99` guard was working around.
+  private var gifPanelTransitionInFlight = false
   private var isVideoMode: Bool = false
   // Width progress for right action morph: 0 = mic, 1 = send.
   private var sendProgress: CGFloat = 0
@@ -1321,8 +1339,8 @@ final class ChatInputBar: UIView {
   private let gapDebugLabel = UILabel()
 
   // Appearance
-  private var appearance = ChatListAppearance.fallback
-  private var pillTint: UIColor? = ChatListAppearance.fallback.bubbleThemColor.withAlphaComponent(
+  private var appearance = ChatListAppearance.current
+  private var pillTint: UIColor? = ChatListAppearance.current.bubbleThemColor.withAlphaComponent(
     0.14)
 
   // MARK: Layout constants
@@ -1341,14 +1359,21 @@ final class ChatInputBar: UIView {
   var keyboardProgress: CGFloat = 0 {
     didSet { if abs(oldValue - keyboardProgress) > 0.01 { setNeedsLayout() } }
   }
+  /// Duration and curve from the last keyboard notification. The panel animates with
+  /// these, not a constant — two surfaces sharing one slot on different curves wobble.
+  var keyboardAnimation: (duration: TimeInterval, options: UIView.AnimationOptions) = (
+    0.25, UIView.AnimationOptions(rawValue: 7 << 16)
+  )
+
   var keyboardHeightForPanels: CGFloat = 0 {
     didSet {
       if keyboardHeightForPanels > 0 {
         lastKnownKeyboardHeight = keyboardHeightForPanels
       }
-      if pendingGifPanelCloseForKeyboard, keyboardHeightForPanels > 0 {
-        pendingGifPanelCloseForKeyboard = false
-        setGifPanelVisible(false, animated: true)
+      // Deferred GIF open: only present after the keyboard fully yields the slot.
+      if pendingGifPanelOpen, keyboardHeightForPanels <= 0 {
+        pendingGifPanelOpen = false
+        setGifPanelVisible(true, animated: true)
       }
     }
   }
@@ -1390,6 +1415,15 @@ final class ChatInputBar: UIView {
     textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
   }
   var isGifPanelPresented: Bool { gifPanelVisible }
+  var isGifPanelPresentationPending: Bool { pendingGifPanelOpen }
+  var reservedGifPanelHeight: CGFloat {
+    gifPanelVisible || pendingGifPanelOpen ? preferredGifPanelHeight() : 0
+  }
+  /// True while the GIF panel search field is first responder (host lifts the whole bar).
+  var isGifPanelSearchActive: Bool {
+    gifPanelVisible
+      && (gifPanelIfLoaded?.isSearchExpanded == true || keyboardHeightForPanels > 0)
+  }
   var presentedBottomAccessoryHeight: CGFloat { gifPanelVisible ? preferredGifPanelHeight() : 0 }
 
   // Recording state
@@ -1811,6 +1845,17 @@ final class ChatInputBar: UIView {
   override func didMoveToWindow() {
     super.didMoveToWindow()
     if window == nil {
+      // The panel lives in its own window ABOVE the app's, so leaving the chat does not
+      // take it with you — it stayed floating over Home until something else knocked it
+      // down. It belongs to this composer and to nothing else, so it goes when the
+      // composer goes, the way the keyboard does: immediately, with no animation to
+      // outlive the screen it belonged to.
+      if gifPanelVisible || pendingGifPanelOpen {
+        gifPanelVisible = false
+        pendingGifPanelOpen = false
+        gifButton.tintColor = appearance.textColorThem.withAlphaComponent(0.85)
+      }
+      tearDownGifPanelHostIfNeeded()
       gifPanelIfLoaded?.hostViewController = nil
       return
     }
@@ -2876,8 +2921,10 @@ final class ChatInputBar: UIView {
 
     // Keep the composer slightly closer to the bottom while still respecting
     // the home indicator area.
-    let safeBottomReduction = gifPanelVisible ? 0 : composerSafeBottomReduction
-    let safeBottom = max(0, bottomSafeAreaInset - safeBottomReduction)
+    // Same reduction whichever surface owns the bottom slot. The panel used to take the
+    // full inset while the keyboard took inset−6, so the composer sat 6pt lower over the
+    // panel — visible as a dip on every keyboard↔panel swap.
+    let safeBottom = max(0, bottomSafeAreaInset - composerSafeBottomReduction)
     let clampedSendProgress = max(0.0, min(1.0, sendProgress))
     let clampedRecordingExpand = max(0.0, min(1.0, recordingExpandProgress))
     let micVisibility = max(0.0, min(1.0, 1.0 - clampedSendProgress))
@@ -2924,11 +2971,14 @@ final class ChatInputBar: UIView {
         + pendingQueueGap)
       : 0
 
-    // When the GIF panel is open it owns the bottom of the screen — no extra
-    // composer bottom pad (was leaving a visible strip between pill and panel).
+    // The panel stands in for the keyboard, so the composer keeps the SAME gap above
+    // either one. This used to be 2.0 for the panel against 6.0 for the keyboard, which
+    // is the seam the composer appeared to sit 2–3pt lower over the panel than over the
+    // keyboard. One value, both cases.
     let composerBottomVPad: CGFloat = {
-      if gifPanelVisible { return 2.0 }
-      return keyboardHeightForPanels > 0 || keyboardProgress > 0.01 ? 6.0 : bottomVPad
+      let occupiesBottomSlot =
+        gifPanelVisible || keyboardHeightForPanels > 0 || keyboardProgress > 0.01
+      return occupiesBottomSlot ? 6.0 : bottomVPad
     }()
     let composerHeight = topVPad + pendingQueueExtra + pillH + composerBottomVPad + safeBottom
     let panelHeight = gifPanelVisible ? preferredGifPanelHeight() : 0
@@ -2996,7 +3046,7 @@ final class ChatInputBar: UIView {
       // TOP of the viewport. Overlay frames are owned by updateGifPanelOverlayFrame.
       if panel.superview === self {
         panel.frame = CGRect(x: 0, y: composerHeight, width: w, height: panelHeight)
-      } else if gifPanelVisible, gifOverlayWindow != nil {
+      } else if gifPanelVisible, gifPanelHostController != nil {
         updateGifPanelOverlayFrame()
       }
       panel.isHidden = !gifPanelVisible && panel.alpha <= 0.01
@@ -3446,49 +3496,34 @@ final class ChatInputBar: UIView {
     placeholderLabel.isHidden = !(textView.text ?? "").isEmpty
   }
 
+  /// Matches the keyboard intersection and aligns both surfaces to one device-pixel edge.
+  private func matchedKeyboardPanelHeight() -> CGFloat {
+    let scale = max(traitCollection.displayScale, 1)
+    func aligned(_ height: CGFloat) -> CGFloat {
+      (height * scale).rounded() / scale
+    }
+    if keyboardHeightForPanels > 0 { return aligned(keyboardHeightForPanels) }
+    if lastKnownKeyboardHeight > 0 { return aligned(lastKnownKeyboardHeight) }
+    // Nothing this launch — fall back to the last height this device actually measured.
+    // Without this a cold launch has no keyboard number at all and lands on a constant
+    // that matches no real keyboard, which is the state the log above was captured in.
+    if Self.persistedKeyboardHeight > 0 { return aligned(Self.persistedKeyboardHeight) }
+    return defaultGifPanelHeight
+  }
+
+  /// Panel height always matches the keyboard slot. Search focus does not grow the panel
+  /// (that shoved the composer offscreen); the host lifts the bar via `isGifPanelSearchActive`.
   private func preferredGifPanelHeight() -> CGFloat {
-    let expansion = gifPanelIfLoaded?.preferredHeightExpansion ?? 0
-    let scaleBoost = gifPanelIfLoaded?.preferredHeightScaleBoost ?? 0
-    let matchedKeyboardHeight: CGFloat?
-    if keyboardHeightForPanels > 0 {
-      matchedKeyboardHeight = max(220, keyboardHeightForPanels)
-    } else if lastKnownKeyboardHeight > 0 {
-      matchedKeyboardHeight = max(220, lastKnownKeyboardHeight)
-    } else {
-      matchedKeyboardHeight = nil
-    }
-    let referenceHeight = matchedKeyboardHeight ?? defaultGifPanelHeight
-    let viewportHeight =
-      max(
-        bounds.height,
-        superview?.bounds.height ?? 0,
-        window?.bounds.height ?? UIScreen.main.bounds.height
-      )
-    let maxFocusedHeight = max(620, floor(viewportHeight * 0.9))
-    let baseHeight = referenceHeight + expansion
-    let boostedHeight = baseHeight + (referenceHeight * scaleBoost)
-    if scaleBoost > 0 {
-      return min(maxFocusedHeight, max(220, boostedHeight))
-    }
-    if let matchedKeyboardHeight {
-      return matchedKeyboardHeight
-    }
-    return min(560, max(220, baseHeight))
+    matchedKeyboardPanelHeight()
   }
 
   private func handleGifPanelPreferredHeightChange() {
     guard gifPanelVisible else { return }
-    UIView.animate(
-      withDuration: 0.24,
-      delay: 0,
-      options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState],
-      animations: {
-        self.setNeedsLayout()
-        self.layoutIfNeeded()
-        self.superview?.setNeedsLayout()
-        self.superview?.layoutIfNeeded()
-      }
-    )
+    setNeedsLayout()
+    layoutIfNeeded()
+    superview?.setNeedsLayout()
+    superview?.layoutIfNeeded()
+    delegate?.inputBarHeightDidChange()
   }
 
   /// Creates the GIF panel on first use. Must only be called from present paths.
@@ -3508,19 +3543,9 @@ final class ChatInputBar: UIView {
 
   private func maybePrepareGifPanel() {
     guard window != nil, let panel = gifPanelIfLoaded else { return }
-    // Host MUST match the VC that owns the panel's view hierarchy.
-    // When using the overlay window, that is ChatGifPanelOverlayController —
-    // never ChatConversationController. Stomping host after ensureGifOverlayHost
-    // caused: "child GiphyGridController should have parent Overlay but actual
-    // parent is ChatConversationController" → crash.
-    if let overlay = gifOverlayController {
-      panel.hostViewController = overlay
-    } else if panel.superview === self {
-      panel.hostViewController = findViewController()
-    } else {
-      // Panel already reparented under overlay view but controller ref missing.
-      panel.hostViewController = gifOverlayController ?? findViewController()
-    }
+    // Host MUST own the panel's superview or the Giphy child controller asserts on
+    // its parent. The panel is a subview of the conversation's view, so that is the host.
+    panel.hostViewController = gifPanelHostController ?? findViewController()
     panel.prepareIfNeeded()
   }
 
@@ -3533,115 +3558,77 @@ final class ChatInputBar: UIView {
   }
 
 
+  /// Hosts the panel inside the conversation's own view.
+  ///
+  /// It used to live in a separate `UIWindow` above alert level, which is why it painted
+  /// over Home, outlived the chat, and sat above system alerts. Containment removes all
+  /// three: pop takes the panel with it.
+  ///
+  /// Host must be set BEFORE `prepareIfNeeded`, and must own the panel's superview — the
+  /// Giphy child controller asserts on its parent otherwise.
   @discardableResult
-  private func ensureGifOverlayHost() -> ChatGifPanelOverlayController? {
-    guard let hostWindow = window ?? findViewController()?.view.window else { return nil }
+  private func ensureGifPanelHost() -> UIViewController? {
+    guard let host = findViewController() else { return nil }
     let panel = loadGifPanelIfNeeded()
-    if let overlayWindow = gifOverlayWindow,
-      let overlayController = gifOverlayController,
-      overlayWindow.windowScene === hostWindow.windowScene
-    {
-      overlayWindow.frame = hostWindow.windowScene?.coordinateSpace.bounds ?? hostWindow.bounds
-      overlayWindow.windowLevel = UIWindow.Level(
-        rawValue: max(hostWindow.windowLevel.rawValue + 1, UIWindow.Level.alert.rawValue + 1))
-      if panel.superview !== overlayController.view {
-        panel.removeFromSuperview()
-        overlayController.view.addSubview(panel)
-      }
-      panel.hostViewController = overlayController
-      return overlayController
-    }
-
-    tearDownGifOverlayWindowIfNeeded()
-
-    guard let windowScene = hostWindow.windowScene else { return nil }
-    let overlayWindow = ChatGifPanelPassthroughWindow(windowScene: windowScene)
-    overlayWindow.frame = windowScene.coordinateSpace.bounds
-    overlayWindow.backgroundColor = .clear
-    overlayWindow.windowLevel = UIWindow.Level(
-      rawValue: max(hostWindow.windowLevel.rawValue + 1, UIWindow.Level.alert.rawValue + 1))
-    let overlayController = ChatGifPanelOverlayController()
-    overlayWindow.rootViewController = overlayController
-    overlayWindow.isHidden = false
-
-    gifOverlayWindow = overlayWindow
-    gifOverlayController = overlayController
-    panel.hostViewController = overlayController
-    if panel.superview !== overlayController.view {
+    if panel.superview !== host.view {
       panel.removeFromSuperview()
-      overlayController.view.addSubview(panel)
+      // Below the composer so the bar keeps reading on top of the panel.
+      host.view.insertSubview(panel, belowSubview: self)
     }
-    return overlayController
+    panel.hostViewController = host
+    gifPanelHostController = host
+    return host
   }
 
-  private func tearDownGifOverlayWindowIfNeeded() {
-    if let panel = gifPanelIfLoaded {
-      panel.setPanelVisible(false)
-      if panel.superview != nil {
-        panel.removeFromSuperview()
-      }
-      panel.isHidden = true
-      panel.alpha = 0
-      panel.transform = .identity
-      panel.hostViewController = nil
-    }
-    gifOverlayWindow?.isHidden = true
-    gifOverlayWindow?.rootViewController = nil
-    gifOverlayWindow = nil
-    gifOverlayController = nil
+  private func tearDownGifPanelHostIfNeeded() {
+    guard let panel = gifPanelIfLoaded else { return }
+    panel.setPanelVisible(false)
+    panel.removeFromSuperview()
+    panel.isHidden = true
+    panel.transform = .identity
+    panel.hostViewController = nil
+    gifPanelHostController = nil
   }
 
   private func desiredGifPanelFrame() -> CGRect {
     let panelHeight = preferredGifPanelHeight()
-    guard let hostWindow = window,
-      let overlayWindow = gifOverlayWindow
-    else {
+    guard let host = gifPanelHostController?.view else {
       // Inline: occupy the reserved bottom slice of the bar (flush, no gap).
       return CGRect(
         x: 0, y: max(0, bounds.height - panelHeight), width: max(1, bounds.width),
         height: panelHeight)
     }
-
-    let overlayBounds = overlayWindow.bounds
-    // Panel top = bottom of composer row (bar height minus reserved panel slice).
-    // Panel bottom = physical screen/overlay bottom. This fills the reserved zone
-    // exactly — no 8–12pt strip of wallpaper under the glass.
-    let panelTopInBar = CGPoint(x: 0, y: max(0, bounds.height - panelHeight))
-    let panelTopInHost = convert(panelTopInBar, to: hostWindow)
-    let panelTopInOverlay = overlayWindow.convert(panelTopInHost, from: hostWindow)
-    let bottomY = overlayBounds.maxY
-    let topY = min(panelTopInOverlay.y, bottomY - panelHeight)
-    let height = max(panelHeight, bottomY - topY)
-    return CGRect(x: 0, y: topY, width: overlayBounds.width, height: height)
+    return CGRect(
+      x: 0,
+      y: host.bounds.maxY - (isGifPanelSearchActive ? keyboardHeightForPanels : 0) - panelHeight,
+      width: host.bounds.width,
+      height: panelHeight
+    )
   }
 
   private func updateGifPanelOverlayFrame() {
-    guard gifPanelVisible, let overlayController = ensureGifOverlayHost() else { return }
+    guard gifPanelVisible, ensureGifPanelHost() != nil else { return }
     let panel = loadGifPanelIfNeeded()
-    let sceneBounds = window?.windowScene?.coordinateSpace.bounds
-      ?? window?.bounds
-      ?? overlayController.view.bounds
-    gifOverlayWindow?.frame = sceneBounds
-    overlayController.view.frame = gifOverlayWindow?.bounds ?? sceneBounds
-    overlayController.additionalSafeAreaInsets = .zero
-    panel.frame = desiredGifPanelFrame()
-    panel.isHidden = false
-    // Keep glass flush: no residual transform after show animation.
-    if panel.alpha >= 0.99 {
-      panel.transform = .identity
+    // During a show/hide the transition owns the frame — see `gifPanelTransitionInFlight`.
+    // Reassigning it here mid-slide is what let the panel jump between sizes on open.
+    if !gifPanelTransitionInFlight {
+      panel.frame = desiredGifPanelFrame()
     }
+    panel.isHidden = false
     debugLogGifPanelGeometryIfNeeded(context: "updateGifPanelOverlayFrame")
   }
 
   private func debugLogGifPanelGeometryIfNeeded(context: String) {
-    guard gifPanelVisible, let overlayWindow = gifOverlayWindow, let panel = gifPanelIfLoaded else { return }
+    guard gifPanelVisible, let host = gifPanelHostController?.view,
+      let panel = gifPanelIfLoaded
+    else { return }
     let signature = [
       context,
       NSCoder.string(for: frame),
       NSCoder.string(for: bounds),
       NSCoder.string(for: safeAreaInsets),
       NSCoder.string(for: panel.frame),
-      NSCoder.string(for: overlayWindow.frame),
+      NSCoder.string(for: host.bounds),
       String(format: "%.1f", preferredGifPanelHeight()),
       String(format: "%.1f", bottomSafeAreaInset),
       String(format: "%.1f", keyboardHeightForPanels),
@@ -3655,7 +3642,7 @@ final class ChatInputBar: UIView {
       NSCoder.string(for: bounds),
       NSCoder.string(for: safeAreaInsets),
       NSCoder.string(for: panel.frame),
-      NSCoder.string(for: overlayWindow.frame),
+      NSCoder.string(for: host.bounds),
       preferredGifPanelHeight(),
       bottomSafeAreaInset,
       keyboardHeightForPanels
@@ -3663,6 +3650,25 @@ final class ChatInputBar: UIView {
   }
 
   private func setGifPanelVisible(_ visible: Bool, animated: Bool) {
+    if !visible {
+      // A second close cancels a deferred open before the keyboard finishes hiding.
+      if pendingGifPanelOpen {
+        pendingGifPanelOpen = false
+        gifButton.tintColor = appearance.textColorThem.withAlphaComponent(0.85)
+        if !gifPanelVisible {
+          return
+        }
+      }
+    } else if keyboardHeightForPanels > 0 {
+      // Keyboard still owns the slot — dismiss it and present only after height hits zero.
+      pendingGifPanelOpen = true
+      window?.endEditing(true)
+      gifButton.tintColor = appearance.textColorThem.withAlphaComponent(1.0)
+      return
+    } else {
+      pendingGifPanelOpen = false
+    }
+
     guard visible != gifPanelVisible else { return }
     // Hide path must not force-create the panel.
     if !visible, gifPanelIfLoaded == nil {
@@ -3670,14 +3676,7 @@ final class ChatInputBar: UIView {
       return
     }
     let panel = loadGifPanelIfNeeded()
-    let panelOffset = max(18, min(48, preferredGifPanelHeight() * 0.12))
     gifPanelVisible = visible
-    if visible {
-      pendingGifPanelCloseForKeyboard = false
-      if textView.isFirstResponder {
-        textView.resignFirstResponder()
-      }
-    }
     gifButton.tintColor = appearance.textColorThem.withAlphaComponent(visible ? 1.0 : 0.85)
 
     let applyChanges = {
@@ -3687,64 +3686,77 @@ final class ChatInputBar: UIView {
       self.superview?.layoutIfNeeded()
     }
 
-    let shouldAnimate = animated
+    // The keyboard's real duration and curve, as reported by its last notification.
+    let motionDuration = keyboardAnimation.duration
+    let motionOptions: UIView.AnimationOptions = [
+      keyboardAnimation.options, .allowUserInteraction, .beginFromCurrentState,
+    ]
+    let entryOptions: UIView.AnimationOptions = [
+      keyboardAnimation.options, .allowUserInteraction,
+    ]
 
     if visible {
-      // Overlay first (correct host), then prepare — never reverse this order.
-      _ = ensureGifOverlayHost()
+      // Panel and keyboard share one slot — never present while a keyboard is still up.
+      window?.endEditing(true)
+      let shouldAnimate = animated
+
+      // Host first, then prepare — never reverse this order.
+      _ = ensureGifPanelHost()
       maybePrepareGifPanel()
-      // Re-assert overlay host after prepare (defensive).
-      if let overlay = gifOverlayController {
-        panel.hostViewController = overlay
-      }
       panel.setPanelVisible(true)
       panel.layer.removeAllAnimations()
-      panel.transform = shouldAnimate ? CGAffineTransform(translationX: 0, y: panelOffset) : .identity
-      panel.alpha = shouldAnimate ? 0 : 1
+
+      gifPanelTransitionInFlight = true
+      panel.alpha = 1
       panel.isHidden = false
+      panel.transform = .identity
+      let finalFrame = desiredGifPanelFrame()
+      panel.frame = shouldAnimate
+        ? finalFrame.offsetBy(dx: 0, dy: finalFrame.height)
+        : finalFrame
+      panel.layoutIfNeeded()
+
       if shouldAnimate {
         UIView.animate(
-          withDuration: 0.25,
-          delay: 0,
-          options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState],
+          withDuration: motionDuration, delay: 0, options: entryOptions,
           animations: {
             applyChanges()
-            panel.alpha = 1
-            panel.transform = .identity
+            panel.frame = finalFrame
+          },
+          completion: { [weak self] _ in
+            panel.frame = finalFrame
+            self?.gifPanelTransitionInFlight = false
           }
         )
       } else {
         applyChanges()
-        panel.alpha = 1
-        panel.transform = .identity
+        panel.frame = finalFrame
+        gifPanelTransitionInFlight = false
       }
       return
-    } else {
-      panel.setPanelVisible(false)
     }
 
+    panel.setPanelVisible(false)
     panel.layer.removeAllAnimations()
-    let cleanupPanel = {
-      panel.alpha = 0
-      panel.transform = CGAffineTransform(translationX: 0, y: panelOffset)
-    }
-    let finishHide = {
+    gifPanelTransitionInFlight = true
+    let finishHide = { [weak self] in
       panel.transform = .identity
       panel.isHidden = true
+      if let self {
+        panel.frame = self.desiredGifPanelFrame()
+      }
+      self?.gifPanelTransitionInFlight = false
     }
 
-    if shouldAnimate {
+    if animated {
+      let exitFrame = panel.frame.offsetBy(dx: 0, dy: max(1, panel.bounds.height))
       UIView.animate(
-        withDuration: 0.25,
-        delay: 0,
-        options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState],
+        withDuration: motionDuration, delay: 0, options: motionOptions,
         animations: {
           applyChanges()
-          cleanupPanel()
+          panel.frame = exitFrame
         },
-        completion: { _ in
-          finishHide()
-        }
+        completion: { _ in finishHide() }
       )
     } else {
       applyChanges()
@@ -3755,7 +3767,17 @@ final class ChatInputBar: UIView {
   // MARK: - Actions
 
   @objc private func gifTapped() {
+    if pendingGifPanelOpen {
+      setGifPanelVisible(false, animated: true)
+      return
+    }
     setGifPanelVisible(!gifPanelVisible, animated: true)
+  }
+
+  /// Close the panel from outside — used the moment a pick is committed, so the panel
+  /// leaves on the same beat the message appears rather than after the send round-trips.
+  func dismissGifPanel(animated: Bool) {
+    setGifPanelVisible(false, animated: animated)
   }
 
 
@@ -5373,6 +5395,19 @@ final class ChatInputBar: UIView {
   }
 }  // End Class
 
+// MARK: - UIGestureRecognizerDelegate
+
+extension ChatInputBar: UIGestureRecognizerDelegate {
+  /// The panel swipe shares its touches with the GIF/sticker/emoji grids underneath it.
+  /// Without this the pan wins outright and the grids stop scrolling.
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+  ) -> Bool {
+    true
+  }
+}
+
 // MARK: - ChatGifPanelViewDelegate
 
 extension ChatInputBar: ChatGifPanelViewDelegate {
@@ -5382,7 +5417,8 @@ extension ChatInputBar: ChatGifPanelViewDelegate {
       url: gif.url,
       previewUrl: gif.previewUrl,
       width: gif.width,
-      height: gif.height
+      height: gif.height,
+      localData: gif.localData
     )
   }
 
@@ -5430,13 +5466,9 @@ extension ChatInputBar: ChatGifPanelViewDelegate {
 
 extension ChatInputBar: UITextViewDelegate {
   func textViewDidBeginEditing(_ textView: UITextView) {
-    if gifPanelVisible {
-      if keyboardHeightForPanels > 0 || keyboardProgress > 0.01 {
-        setGifPanelVisible(false, animated: true)
-      } else {
-        pendingGifPanelCloseForKeyboard = true
-      }
-    }
+    // Same slot, one occupant. Focusing the composer cancels a pending open or hides the panel.
+    guard gifPanelVisible || pendingGifPanelOpen else { return }
+    setGifPanelVisible(false, animated: true)
   }
 
   func textViewDidChange(_ tv: UITextView) {

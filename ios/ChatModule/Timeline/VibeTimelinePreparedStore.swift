@@ -1,6 +1,42 @@
 import Foundation
 import UIKit
 
+/// The one answer to "is a chat open in flight", for background work that must yield to it.
+///
+/// A launch fan-out measured other chats' transcripts (1000 rows, 818ms) and unsealed
+/// store rows inside someone's push. Self-expiring, so a lost `noteFinished` cannot
+/// wedge background work for the rest of the session.
+enum VibeChatOpenGate {
+  private static let lock = NSLock()
+  private static var inFlightUntil: TimeInterval = 0
+  private static let maxSeconds: TimeInterval = 1.5
+
+  static func noteStarted() {
+    lock.lock()
+    inFlightUntil = ProcessInfo.processInfo.systemUptime + maxSeconds
+    lock.unlock()
+  }
+
+  static func noteFinished() {
+    lock.lock()
+    inFlightUntil = 0
+    lock.unlock()
+  }
+
+  /// How long to wait so the work lands after the push instead of inside it.
+  static var delay: TimeInterval {
+    lock.lock()
+    defer { lock.unlock() }
+    return max(0, inFlightUntil - ProcessInfo.processInfo.systemUptime)
+  }
+
+  /// `launch` is exempt: its whole job is to be ready BEFORE the tap, and it is already
+  /// bounded to a few chats' tails. Delaying it starves the open it exists to serve.
+  static func delay(forPrepareReason reason: String) -> TimeInterval {
+    reason == "launch" ? 0 : delay
+  }
+}
+
 /// A transcript that was parsed and measured **before** the push, so opening a chat
 /// costs a dictionary lookup per row instead of a measurement per row.
 ///
@@ -121,7 +157,14 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
 
   /// Width the list last reported. Preparation is skipped until it is known, because
   /// measuring against a guessed width and correcting on mount is the shift.
-  private var measurementWidth: CGFloat = 0
+  ///
+  /// Seeded from disk so a launch can prepare before the first list reports a width —
+  /// otherwise nothing is preparable until a chat has already been opened, which is the
+  /// one open that needed it.
+  private var measurementWidth: CGFloat = CGFloat(
+    UserDefaults.standard.double(forKey: VibeTimelinePreparedStore.widthDefaultsKey))
+
+  private static let widthDefaultsKey = "vibe.timeline.prepared.width"
 
   /// Serial so two persists for the same chat cannot interleave into a half-old,
   /// half-new height map. Utility QoS: this is work that must not compete with the
@@ -151,6 +194,7 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     guard abs(measurementWidth - width) > 0.5 else { return }
     let previous = measurementWidth
     measurementWidth = width
+    UserDefaults.standard.set(Double(width), forKey: Self.widthDefaultsKey)
     guard !byChat.isEmpty else { return }
     byChat.removeAll(keepingCapacity: true)
     order.removeAll(keepingCapacity: true)
@@ -182,7 +226,8 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // Newest rows are the ones a chat opens on, so a transcript longer than the cap
     // keeps its tail rather than its head.
     let bounded = rawRows.count > Self.maxRows ? Array(rawRows.suffix(Self.maxRows)) : rawRows
-    queue.async { [weak self] in
+    queue.asyncAfter(deadline: .now() + VibeChatOpenGate.delay(forPrepareReason: reason)) {
+      [weak self] in
       self?.prepareNow(
         chatId: trimmed, rawRows: bounded, width: width, reason: reason, scope: scope)
     }
@@ -201,7 +246,8 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
     // Bounded before the hop as well as inside `prepareNow`, so a long transcript is not
     // copied across a queue boundary only to have most of it thrown away.
     let bounded = rows.count > Self.maxRows ? Array(rows.suffix(Self.maxRows)) : rows
-    queue.async { [weak self] in
+    queue.asyncAfter(deadline: .now() + VibeChatOpenGate.delay(forPrepareReason: reason)) {
+      [weak self] in
       self?.prepareNow(
         chatId: trimmed, rows: bounded, width: width, reason: reason, scope: scope)
     }
@@ -337,6 +383,14 @@ final class VibeTimelinePreparedStore: @unchecked Sendable {
       prepared.deferredKeys.count, width, prepared.measureMs, reason,
       scope == .fullTranscript ? "full" : "page", total)
     return prepared
+  }
+
+  /// Whether a chat already has coverage at the current width — lets the launch restore
+  /// skip a chat a persist has already prepared since launch.
+  func hasCoverage(chatId: String) -> Bool {
+    let width = currentMeasurementWidth
+    guard width > 0 else { return false }
+    return prepared(chatId: chatId, width: width) != nil
   }
 
   /// Forgets one chat. Called when its transcript is structurally healed — prepared

@@ -214,8 +214,10 @@ final class ChatAgentsMainViewController: UIViewController {
   private static let vectorIconPointSize: CGFloat = 22
 
   private let apiContext: ChatNativeAgentConfigAPIContext
-  private let appearance: ChatListAppearance
-  private let theme: ChatNativeAgentConfigTheme
+  /// Re-read on theme changes. Both were `let`, so this screen kept whatever appearance
+  /// was current when the Agents tab was built at launch and never followed a switch.
+  private var appearance: ChatListAppearance
+  private var theme: ChatNativeAgentConfigTheme
   private let showsCloseButton: Bool
   private let editState = ChatAgentsListEditState()
   private let skeletonView: ChatNativeAgentSkeletonView
@@ -291,9 +293,33 @@ final class ChatAgentsMainViewController: UIViewController {
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
+    reapplyThemeIfChanged()
     applyNavigationAppearance()
     // Re-apply edit tab-bar fade if we return mid-edit from a pushed screen.
     setTabBarFaded(editState.isEditing, animated: false)
+  }
+
+  override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+    super.traitCollectionDidChange(previous)
+    guard traitCollection.userInterfaceStyle != previous?.userInterfaceStyle else { return }
+    reapplyThemeIfChanged()
+  }
+
+  /// Repaints when the plate or light/dark changed under us. Cheap and idempotent —
+  /// `visualKey` is the same identity the chat surface compares appearances by.
+  private func reapplyThemeIfChanged() {
+    let next = ChatListAppearance.current
+    guard next.visualKey != appearance.visualKey else { return }
+    appearance = next
+    theme = ChatNativeAgentConfigTheme(appearance: next)
+    view.backgroundColor = theme.backgroundColor
+    listHostingController?.view.backgroundColor = theme.backgroundColor
+    skeletonView.applyTheme(theme)
+    emptyStateView.applyTheme(theme)
+    refreshListView()
+    applyNavigationAppearance()
+    updateTrailingChrome()
+    updateFilterBarButton()
   }
 
   override func viewWillDisappear(_ animated: Bool) {

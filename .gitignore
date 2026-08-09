@@ -188,6 +188,11 @@ core/vibe_core_ffi/generated/
 # fresh clone: no binary in git, and no script to rebuild one.
 !scripts/build-core-xcframework.sh
 
+# Packet engine archives (~240 MB). Built from the packet repo, not from this one:
+# `packet-ios/scripts/build-rust-ios.sh` then `scripts/copy-vibe-artifacts.sh`.
+# See docs/packet-proxy-engine.md.
+ios/Vendor/Packet/**/*.a
+
 # Diagnostics exports shared off the device for triage — per-run, often >250 KB,
 # and already redacted copies of a log that lives on the phone.
 vibe-diagnostics-*.txt

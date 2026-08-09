@@ -1673,7 +1673,7 @@ enum AgentPairingService {
   }
 
   private static func perform(_ request: URLRequest) async throws -> [String: Any] {
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
       throw AgentPairingError.invalidResponse
     }

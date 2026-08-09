@@ -81,3 +81,81 @@ struct AppVectorIcon: View {
     return path
   }
 }
+
+/// The proxy shield, traced from the shipped 24×24 artwork. Active fills the crest and
+/// knocks the check out of it; off strokes the same outlines.
+struct AppProxyShieldIcon: View {
+  let isActive: Bool
+  let tint: Color
+
+  var body: some View {
+    GeometryReader { geometry in
+      let scale = min(geometry.size.width, geometry.size.height) / 24
+      let origin = CGPoint(
+        x: (geometry.size.width - 24 * scale) / 2,
+        y: (geometry.size.height - 24 * scale) / 2
+      )
+
+      if isActive {
+        ZStack {
+          shieldPath(scale: scale, origin: origin).fill(tint)
+          checkPath(scale: scale, origin: origin)
+            .stroke(
+              style: StrokeStyle(lineWidth: 2 * scale, lineCap: .round, lineJoin: .round)
+            )
+            .blendMode(.destinationOut)
+        }
+        .compositingGroup()
+      } else {
+        ZStack {
+          shieldPath(scale: scale, origin: origin)
+            .stroke(
+              tint,
+              style: StrokeStyle(lineWidth: 1.6 * scale, lineCap: .round, lineJoin: .round)
+            )
+          checkPath(scale: scale, origin: origin)
+            .stroke(
+              tint,
+              style: StrokeStyle(lineWidth: 1.6 * scale, lineCap: .round, lineJoin: .round)
+            )
+        }
+      }
+    }
+    .aspectRatio(1, contentMode: .fit)
+  }
+
+  private func shieldPath(scale: CGFloat, origin: CGPoint) -> Path {
+    func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+      CGPoint(x: origin.x + x * scale, y: origin.y + y * scale)
+    }
+    var path = Path()
+    path.move(to: point(11.887, 21.98))
+    path.addCurve(
+      to: point(12.113, 21.98), control1: point(11.963, 22.006), control2: point(12.037, 22.007))
+    path.addCurve(to: point(20, 11.253), control1: point(13.084, 21.65), control2: point(20, 19.018))
+    path.addLine(to: point(20, 4.304))
+    path.addCurve(
+      to: point(19.697, 3.915), control1: point(20, 4.12), control2: point(19.875, 3.96))
+    path.addLine(to: point(12.097, 2.012))
+    path.addCurve(
+      to: point(11.903, 2.012), control1: point(12.033, 1.996), control2: point(11.967, 1.996))
+    path.addLine(to: point(4.303, 3.915))
+    path.addCurve(to: point(4, 4.304), control1: point(4.125, 3.96), control2: point(4, 4.12))
+    path.addLine(to: point(4, 11.252))
+    path.addCurve(
+      to: point(11.887, 21.98), control1: point(4, 18.939), control2: point(10.918, 21.639))
+    path.closeSubpath()
+    return path
+  }
+
+  private func checkPath(scale: CGFloat, origin: CGPoint) -> Path {
+    func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+      CGPoint(x: origin.x + x * scale, y: origin.y + y * scale)
+    }
+    var path = Path()
+    path.move(to: point(8, 12))
+    path.addLine(to: point(11, 15))
+    path.addLine(to: point(16, 8))
+    return path
+  }
+}

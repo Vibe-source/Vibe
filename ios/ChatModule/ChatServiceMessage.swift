@@ -154,7 +154,7 @@ enum ChatServiceDecisionClient {
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
     request.httpBody = try? JSONSerialization.data(withJSONObject: ["token": token])
 
-    URLSession.shared.dataTask(with: request) { data, response, error in
+    VibeHTTP.shared.dataTask(with: request) { data, response, error in
       if let error {
         DispatchQueue.main.async { completion(.failure(error)) }
         return

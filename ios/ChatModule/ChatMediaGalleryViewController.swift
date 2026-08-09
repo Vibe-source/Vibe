@@ -228,7 +228,7 @@ final class ChatMediaGalleryViewController: UIViewController, UIScrollViewDelega
     }
 
     guard let url = URL(string: raw) else { return }
-    URLSession.shared.dataTask(with: url) { data, _, _ in
+    VibeHTTP.shared.dataTask(with: url) { data, _, _ in
       guard let data, let img = UIImage(data: data) else { return }
       DispatchQueue.main.async {
         imageView.image = img

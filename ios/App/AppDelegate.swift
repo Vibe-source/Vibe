@@ -40,10 +40,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     VibeCoreStoreBridge.runSelfTest()
     // Giphy SDK key for native GIF panel (Info.plist / env GIPHY_API_KEY).
     ChatGifPanelConfig.shared.reloadFromEnvironment()
-    // Packet mesh is now opt-in (default direct). Downgrade any legacy
-    // packet_mesh session to direct before the UI binds to the config so large
-    // media sends (music/video/files) no longer fail immediately on mesh.
+    // Legacy packet_mesh sessions carry a transport that no longer exists — drop them to
+    // direct before the UI binds to the config.
     ChatEngineStore.shared.migrateLegacyPacketMeshToDirectIfNeeded()
+    // Settings → Proxy is the source of truth for the route; re-assert it here so a
+    // session config restored from disk can't route through a proxy the user turned off.
+    PacketProxyStore.shared.reassertProxyStateOnLaunch()
     // Remembered media pixel sizes — read off-main before any chat can open, because the
     // first lookup lands inside a sizing pass and a media row with no known aspect ratio is
     // mounted as a square and then corrected (a visible list shift).

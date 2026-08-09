@@ -370,6 +370,17 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       return true
     }
 
+    // A drag that starts on a multi-image deck belongs to that deck. Reply swipe
+    // is leftward, and so is "next picture", so without this the two fire on the
+    // same gesture and the message slides away instead of turning the card.
+    let point = pan.location(in: collectionView)
+    if let hit = collectionView.hitTest(point, with: nil),
+      hit.isDescendant(of: collectionView),
+      firstMediaStackAncestor(of: hit) != nil
+    {
+      return false
+    }
+
     let translation = pan.translation(in: collectionView)
     let velocity = pan.velocity(in: collectionView)
     let translationVertical = abs(translation.y)
@@ -383,6 +394,16 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
     let velocityVertical = abs(velocity.y)
     return velocity.x < -8.0 && -velocity.x > velocityVertical * 0.9
+  }
+
+  /// Nearest multi-image deck above `view`, or nil if the touch landed anywhere else.
+  private func firstMediaStackAncestor(of view: UIView) -> ChatMediaStackView? {
+    var node: UIView? = view
+    while let current = node, current !== collectionView {
+      if let stack = current as? ChatMediaStackView, stack.imageCount > 1 { return stack }
+      node = current.superview
+    }
+    return nil
   }
 
   public func gestureRecognizer(

@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AVKit
+import ImageIO
 import OSLog
 import PDFKit
 import QuickLook
@@ -298,7 +299,7 @@ final class ChatWallpaperEdgeEffectView: UIView {
   private let sampleMaskLayer = CAGradientLayer()
   private let blurView = UIVisualEffectView(effect: nil)
   private let blurMaskLayer = CAGradientLayer()
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   private var sampleRect: CGRect = .zero
   private var containerSize: CGSize = .zero
   private var backdropSnapshot: CGImage?
@@ -334,7 +335,7 @@ final class ChatWallpaperEdgeEffectView: UIView {
     self.appearance = appearance
 
     let isDark = appearance.isDark
-    let topBase = appearance.wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
+    let topBase = appearance.wallpaperBase
     let bottomBase = appearance.wallpaperGradient.last ?? topBase
     let tintBase = edge == .top ? topBase : bottomBase
     let tintColor = blendedWallpaperEdgeTint(color: tintBase, isDark: isDark)
@@ -627,7 +628,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// can only ever answer for the transcript currently mounted. A stale row here would
   /// be a *wrong* height rather than a missing one, which is the worse failure.
   private var coreRowLookup: [String: ChatListRow]?
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   private var lastRawAppearance: [String: Any]?
   private var queuedAppearanceAfterSendTransition: ChatListAppearance?
   private var shouldAutoScroll = true
@@ -1364,6 +1365,18 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     case exactMeasure = "exact-measure"
   }
   private var rowHeightOriginByKey: [String: RowHeightOrigin] = [:]
+  /// What kind each row was the LAST time it was sized, so a row that changes classification
+  /// can be caught doing it.
+  ///
+  /// `visualKind` picks the sizing branch AND decides whether the natural-media-size lookup
+  /// runs at all (`chatMediaNaturalSizeSourceLabel` answers "-" for anything outside
+  /// media/video/sticker). A row that is `.media` on one pass and `.document` on the next is
+  /// therefore sized by two different rules, and the height cannot settle: whichever pass
+  /// ran last is overwritten by the other. The 2026-08-07 export shows row `8-16f4a794ac1d`
+  /// correcting 412→612 twice inside one second — once as `kind=media mediaSize=memo`, once
+  /// as `kind=document` with no size source at all. This map is what turns that inference
+  /// into a stated fact.
+  private var rowVisualKindByKey: [String: String] = [:]
   /// Per-key slack from the reporting cell, so the coalesced repair log describes each row
   /// instead of reprinting the first one's number for all of them.
   private var pendingSlotRepairSlack: [String: CGFloat] = [:]
@@ -1466,6 +1479,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   var contextMenuHostCellOriginalTransform: CGAffineTransform = .identity
   var customContextMenuOverlay: ChatContextMenuOverlay?
   var customContextMenuWindow: UIWindow?
+
+  /// Thumbnail hidden while the photo-only transition is in flight. A direct
+  /// reference guarantees restoration even if the collection cell is reused.
+  weak var zoomHiddenAnchorView: UIImageView?
 
   // --- Native input bar ---
   private(set) var inputBar: ChatInputBar?
@@ -1572,14 +1589,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var debugOffsetLabel: UILabel?
   private var debugStatsLabel: UILabel?
 
-  private static let cachedThemeIdDefaultsKey = "vibe.chat.native.themeId.v1"
-  private static let cachedThemeIsDarkDefaultsKey = "vibe.chat.native.themeIsDark.v1"
-  private static let documentPreviewSession: URLSession = {
-    if #available(iOS 13.0, *) {
-      return ChatPhoenixClient.makePinnedURLSession()
-    }
-    return URLSession.shared
-  }()
+  /// Computed, not cached: a stored session would pin the proxy route it was built with.
+  private static var documentPreviewSession: URLSession {
+    ChatPhoenixClient.makePinnedURLSession()
+  }
   private static let documentPagePreviewCache = NSCache<NSString, UIImage>()
   private static let documentPageCountCache = NSCache<NSString, NSNumber>()
   private static let documentByteSizeCache = NSCache<NSString, NSNumber>()
@@ -1654,6 +1667,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard !rows.isEmpty else { return }
     liveHeightStore.removeAll(keepingCapacity: true)
     rowHeightOriginByKey.removeAll(keepingCapacity: true)
+    rowVisualKindByKey.removeAll(keepingCapacity: true)
     flowLayout.invalidateLayout()
     reconfigureVisibleMessageCells(reason: "setIsGroupOrChannel")
     if value {
@@ -2069,7 +2083,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // against a width the cells never use, which is a wrong height rather than a
     // missing one. Guarded by a local compare so this stays a float test on the
     // sizing hot path rather than a lock acquisition per row.
-    if abs(publishedMeasurementWidth - width) > 0.5, width > 0 {
+    // …but NOT from the home long-press preview, which sizes at the narrow card width.
+    //
+    // `VibeTimelinePreparedStore` is a singleton and `setMeasurementWidth` **drops every
+    // prepared transcript** when the width changes — correctly, since heights measured
+    // against another width are wrong rather than stale. So publishing the card width
+    // here meant one peek at a home card destroyed the prepared heights of every chat,
+    // and the next real open re-measured them during the push. That is why the device
+    // log reports `prepared=0hit/1361miss` — the entire "measure before the push" path
+    // (the reason this funnel publishes at all) was disabled in practice by the preview
+    // that is not even allowed to contribute to it.
+    //
+    // Every other height seam already excludes this list for the same reason — see
+    // `schedulePersistRowHeights`, `flushPendingRowHeightPersist` and the seed's trust
+    // gate. This one was missed.
+    if abs(publishedMeasurementWidth - width) > 0.5, width > 0, !isEphemeralPreview {
       publishedMeasurementWidth = width
       VibeTimelinePreparedStore.shared.setMeasurementWidth(width)
     }
@@ -2534,11 +2562,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     super.init(frame: frame)
     clipsToBounds = false
 
-    if var cachedRawAppearance = Self.bootstrapCachedRawAppearance() {
-      cachedRawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
-      lastRawAppearance = cachedRawAppearance
-      appearance = ChatListAppearance.from(raw: cachedRawAppearance)
-    }
+    // No theme derivation here. ChatMainView owns light/dark for the page and pushes it
+    // down via setAppearance; this view read its own detached traitCollection and won
+    // the race, which is how a dark system rendered a light list.
 
     // No wallpaper here. `ChatMainView` owns the one `ChatWallpaperView`, behind every
     // page and outside this view's box, so it cannot be resized, re-themed or animated by
@@ -2704,14 +2730,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
-  }
-
-  override public func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-    super.traitCollectionDidChange(previousTraitCollection)
-    guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
-      return
-    }
-    reapplyNativeThemeForCurrentInterfaceStyle()
   }
 
   private func pixelAlignedValue(_ value: CGFloat) -> CGFloat {
@@ -2987,13 +3005,65 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // `presentation-complete` is the "shift" that made changing wallpaper feel delayed.
     // `visualKey` already covers every painted colour, the pattern and its mask, so
     // folding it in scopes each raster to the appearance it was actually captured under.
-    return NSString(
-      string: "\(chatId)|w\(width)|\(theme)|a\(Self.stableAppearanceDigest(appearance.visualKey))|v4"
-    )
+    return Self.reopenSnapshotKey(
+      chatId: chatId, width: width, theme: theme, visualKey: appearance.visualKey)
   }
 
   /// FNV-1a over the visual key. `hashValue` is seeded per process, so it cannot be used
   /// here — this key also names the on-disk raster, which must stay valid across launches.
+  /// The **one** place a reopen-raster cache key is built.
+  ///
+  /// It exists because there were four, and they drifted. The reader and the capture
+  /// path moved to `v4` and folded in the appearance digest; the prewarm and the
+  /// invalidator kept building `"<chat>|w<width>|<theme>|v2"` under a comment that said
+  /// "keep in sync with reopenSnapshotKey()". They were in sync — at v2.
+  ///
+  /// The consequence was the whole dead tap. The prewarm's entire job is to have the
+  /// raster in memory *before* the tap, and it was looking for filenames nothing had
+  /// written since the v4 change, so it always missed. Only a chat reopened inside one
+  /// session was covered — the capture path had left that one in memory directly. Device
+  /// export 2026-08-07, same chat twice: `raster=N` → push at 166ms, `raster=Y` → push at
+  /// **40ms**. Every first open of a chat paid the full pre-push seed for a file that was
+  /// sitting on disk the whole time (`raster-miss … file=Y`).
+  ///
+  /// The invalidator was deleting `v2` names too, so it has never actually evicted a
+  /// stale raster either.
+  ///
+  /// Callers pass their own `visualKey` because the two themes have different
+  /// appearances; nothing else about the key is theirs to choose.
+  /// # v5 — orphan the backlog the broken invalidator left behind
+  ///
+  /// Repairing the key above had a consequence that had to be paid once. Because
+  /// `invalidateReopenSnapshot` was *also* spelling the key by hand at `v2`, it has never
+  /// deleted a single raster: every capture the app ever decided was invalid — a cleared
+  /// chat, deleted messages, a healed transcript, and the `v2` "rows set but zero cells"
+  /// captures that are just wallpaper — is still sitting in Caches under a `v4` name.
+  ///
+  /// None of it mattered while the prewarm was looking for files nothing had written.
+  /// The moment the prewarm started finding them, that entire pile became eligible to be
+  /// shown as a cover, and a wallpaper-only capture reads as **a convincing empty chat** —
+  /// the exact bug the `v2` bump was introduced to kill, reported again on device
+  /// 2026-08-07 within minutes of the key fix landing.
+  ///
+  /// So the generation moves once more. Old names are never read again and age out of
+  /// Caches; from here the invalidator actually works, so the pile cannot rebuild.
+  static func reopenSnapshotKey(
+    chatId: String, width: Int, theme: String, visualKey: String
+  ) -> NSString {
+    NSString(
+      string: "\(chatId)|w\(width)|\(theme)|a\(stableAppearanceDigest(visualKey))|v5")
+  }
+
+  /// The visual key the next open of a chat will use for `theme`, for the static
+  /// prewarm/invalidate paths that have no `ChatListView` to read it off.
+  ///
+  /// Same source the view bootstraps its own appearance from, so the key this produces
+  /// is the key the reader will ask for.
+  static func reopenSnapshotVisualKey(isDark: Bool) -> String {
+    ChatListAppearance.from(raw: ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark))
+      .visualKey
+  }
+
   private static func stableAppearanceDigest(_ value: String) -> String {
     var hash: UInt64 = 0xcbf2_9ce4_8422_2325
     for byte in value.utf8 {
@@ -3249,12 +3319,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // A capture with no drawable content (drawHierarchy teardown race → flat frame)
     // must never poison a good raster: overlaying a flat frame for the next open's
     // first ~200-700ms IS the reported "empty chat" + image-opacity flash.
-    guard let lumaRange = Self.rasterLumaRange(image), lumaRange >= 4 else {
-      NSLog(
-        "[ChatOpen] reopen-snapshot CAPTURE-BLANK chat=%@ luma=%d — kept previous",
-        String(engineChatId.prefix(12)), Self.rasterLumaRange(image) ?? -1)
-      return
-    }
+    //
+    // That check used to run HERE, synchronously, on the main thread — and
+    // `rasterLumaRange` draws a screen-sized CGImage into a bitmap context, which forces
+    // a full decode. It ran TWICE: once for the guard, once more inside the failure
+    // branch to build its own log line. Device 2026-08-07: `[mainhang]` stacks of 1.38s
+    // and 0.86s with `rasterLumaRange` on top. Closing a chat cannot cost a second of
+    // frozen UI to validate a picture nothing will read until the next open.
+    //
+    // So store optimistically and verify off-main (`verifyCapturedRasterOffMain`). The
+    // ordering property the preload depends on is preserved exactly: **disk is still
+    // written only after the probe passes**, so a file on disk has always been verified.
+    // The memory copy is briefly unverified, which is bounded by the IO queue turn
+    // against a user tap that has not happened yet — and the probe evicts it either way.
     // The overlay is BOTTOM-pinned (`contentMode = .bottom`), so a raster captured
     // mid-history is pasted against the bottom of a list that opens at the true bottom:
     // the image shows one set of rows, the mount replaces it with another, and the swap
@@ -3276,6 +3353,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         return
       }
       Self.reopenSnapshotCache.setObject(image, forKey: midKey)
+      // Memory-only key (see above), so there is no file to remove — but a flat frame
+      // still has to be evicted before the next open can paint it.
+      Self.verifyCapturedRasterOffMain(image, key: midKey, chatId: engineChatId, url: nil)
       // The picture and the record that decides where the next open LANDS must describe
       // the same frame, or the twin can never be found. They used to be taken at two
       // different moments — this raster at `viewWillDisappear`, the viewport at
@@ -3286,24 +3366,45 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // just photographed, and let the later call stand down.
       persistViewportState(anchorOverride: anchor)
       viewportPersistedForCurrentClose = true
+      // No `luma=` here any more: the probe now runs off-main and reports its own
+      // verdict as `CAPTURE-BLANK … evicted` when it fails.
       NSLog(
-        "[ChatOpen] reopen-snapshot CAPTURE-MID chat=%@ anchor=%@ screenY=%.0f luma=%d",
-        String(engineChatId.prefix(12)), String(anchor.messageId.prefix(8)), anchor.screenY,
-        lumaRange)
+        "[ChatOpen] reopen-snapshot CAPTURE-MID chat=%@ anchor=%@ screenY=%.0f",
+        String(engineChatId.prefix(12)), String(anchor.messageId.prefix(8)), anchor.screenY)
       return
     }
     Self.reopenSnapshotCache.setObject(image, forKey: key)
-    if let url = Self.reopenSnapshotFileURL(for: key) {
-      Self.reopenSnapshotIOQueue.async {
-        guard let data = image.jpegData(compressionQuality: 0.75) else { return }
-        try? data.write(
-          to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-      }
-    }
+    Self.verifyCapturedRasterOffMain(
+      image, key: key, chatId: engineChatId, url: Self.reopenSnapshotFileURL(for: key))
     NSLog(
-      "[ChatOpen] reopen-snapshot CAPTURE chat=%@ size=%.0fx%.0f atBottom=%@ luma=%d",
+      "[ChatOpen] reopen-snapshot CAPTURE chat=%@ size=%.0fx%.0f atBottom=%@ key=%@",
       String(engineChatId.prefix(12)), size.width, size.height,
-      capturedAtBottom ? "Y" : "N", lumaRange)
+      capturedAtBottom ? "Y" : "N", key)
+  }
+
+  /// Probes a freshly captured raster off the main thread, then persists it.
+  ///
+  /// Order matters and is the contract `preloadReopenSnapshotFromDiskIfNeeded` relies on:
+  /// the JPEG is written **only after** the probe passes, so any file on disk has been
+  /// verified. A flat frame is evicted from memory and its stale file removed, which is
+  /// what keeps a bad capture from covering the next open.
+  private static func verifyCapturedRasterOffMain(
+    _ image: UIImage, key: NSString, chatId: String, url: URL?
+  ) {
+    reopenSnapshotIOQueue.async {
+      let luma = rasterLumaRange(image) ?? -1
+      guard luma >= 4 else {
+        reopenSnapshotCache.removeObject(forKey: key)
+        if let url { try? FileManager.default.removeItem(at: url) }
+        NSLog(
+          "[ChatOpen] reopen-snapshot CAPTURE-BLANK chat=%@ luma=%d — evicted",
+          String(chatId.prefix(12)), luma)
+        return
+      }
+      guard let url, let data = image.jpegData(compressionQuality: 0.75) else { return }
+      try? data.write(
+        to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
   }
 
   /// 8×8 luminance spread of a raster — a screenful of transcript always spans more
@@ -3360,18 +3461,24 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let raw = UIImage(data: data, scale: screenScale)
       else { return }
       let readAt = ProcessInfo.processInfo.systemUptime
-      let image = raw.preparingForDisplay() ?? raw
+      // PUBLISH the raw decode; prepare afterwards.
+      //
+      // This whole function is a race it is documented as losing — device 2026-08-07 shows
+      // `raster-miss cache-miss file=Y` at 50ms and `covered=N` at 72ms on a THREE-row
+      // chat, meaning the file was sitting on disk and the open went uncovered anyway.
+      // Every step between the read and the publish is margin handed to the shell commit,
+      // and `preparingForDisplay()` is a full-screen decode. UIKit will decode on first
+      // draw if we skip it, and the overlay is drawn exactly once — so preparing early
+      // buys one frame and can cost the entire cover.
+      let image = raw
       let decodedAt = ProcessInfo.processInfo.systemUptime
-      // Probe HERE (IO queue, off the open's critical path): a flat disk twin from an
-      // older build must never reach the overlay cache — covering the mount with it is
-      // the "empty chat" flash. Captures are probed before store, so disk is the only
-      // unverified source.
-      guard (Self.rasterLumaRange(image) ?? -1) >= 4 else {
-        try? FileManager.default.removeItem(at: url)
-        NSLog("[ChatOpen] reopen-snapshot DISK-BLANK dropped chat=%@", String(chatId.prefix(12)))
-        return
-      }
-      let probedAt = ProcessInfo.processInfo.systemUptime
+      // The blank probe used to run HERE, ahead of the publish — a second full-image draw
+      // on the critical path. It is redundant now: it existed for flat `v2`-era twins
+      // written before captures were probed, and the `v5` key generation cannot name one
+      // of those files. Captures are still probed before store, so a v5 file on disk has
+      // already passed. Kept below the publish as a self-heal for anything that slips
+      // through, where it costs the open nothing.
+      let probedAt = decodedAt
       // Publish HERE, on the IO queue, not after a hop to main.
       //
       // `reopenSnapshotCache` is an NSCache — thread-safe by contract — and the fence is
@@ -3395,12 +3502,36 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         Int((startedAt - kickedAt) * 1000), Int((readAt - startedAt) * 1000),
         Int((decodedAt - readAt) * 1000), Int((probedAt - decodedAt) * 1000),
         Int((publishedAt - probedAt) * 1000), data.count)
+      // THE race margin, in the log that leaves the device.
+      //
+      // Until now this was `NSLog` only, so an export could say `raster-miss … file=Y`
+      // — the file existed and the open went uncovered — without saying by how much the
+      // preload lost, or which stage spent it. Reconstructing that from inference is
+      // exactly what this line removes.
+      VibeLog.info(
+        "reopen raster disk load", category: "chatopen",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "totalMs": String(Int((publishedAt - kickedAt) * 1000)),
+          "queueMs": String(Int((startedAt - kickedAt) * 1000)),
+          "readMs": String(Int((readAt - startedAt) * 1000)),
+          "publishMs": String(Int((publishedAt - decodedAt) * 1000)),
+          "kb": String(data.count / 1024),
+        ])
       // Only the overlay attach needs main — it touches the view hierarchy. The cache is
       // already populated, so a prestage running right now finds the cover even if this
       // hop is still queued.
       DispatchQueue.main.async {
         guard let self, self.engineChatId == chatId, self.window != nil else { return }
         self.installReopenSnapshotOverlayIfAvailable()
+      }
+      // Self-heal, AFTER the cover is already available. A flat twin can now be shown
+      // once — for the remainder of this one open — which is strictly better than making
+      // every open pay a full-image draw to rule out a file shape that `v5` cannot name.
+      if (Self.rasterLumaRange(image) ?? -1) < 4 {
+        try? FileManager.default.removeItem(at: url)
+        Self.reopenSnapshotCache.removeObject(forKey: key)
+        NSLog("[ChatOpen] reopen-snapshot DISK-BLANK dropped chat=%@", String(chatId.prefix(12)))
       }
     }
   }
@@ -5972,6 +6103,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, !sourceRows.isEmpty else { return }
     DispatchQueue.main.async {
+      let startedAt = CACurrentMediaTime()
       guard let snapshot = warmTranscriptSnapshots[trimmed], !snapshot.rows.isEmpty else {
         return
       }
@@ -5980,21 +6112,46 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       // on MESSAGE rows alone so both shapes qualify, and keep any existing separators
       // exactly where they are — a message appended across midnight simply waits for the
       // post-push reconcile to gain its date pill, which is a chip, not content.
-      let incomingMessageRows = sourceRows.filter {
-        ($0["kind"] as? String)?.lowercased() != "day"
+      //
+      // This used to make six full passes over `sourceRows` — a filter, three `Set`
+      // builds, a subset test and a second filter — every time the engine reported a
+      // change. During a history ingest that is six passes over a thousand-plus
+      // dictionaries per batch, on the main thread, for a chat that is not even on
+      // screen. The shape below is the same decision made in two counting passes that
+      // allocate nothing, and only the genuinely-growing case pays for a `Set`.
+      func isDayRow(_ raw: [String: Any]) -> Bool {
+        // `count == 3` first so "message" never reaches `lowercased()`; only a
+        // three-character kind can be "day", whatever its casing.
+        guard let kind = raw["kind"] as? String, kind.count == 3 else { return false }
+        return kind.lowercased() == "day"
       }
-      let existingKeys = Set(snapshot.rows.map(\.key))
-      let existingMessageKeys = Set(snapshot.rows.filter { $0.kind == .message }.map(\.key))
-      let incomingKeys = Set(incomingMessageRows.compactMap { $0["key"] as? String })
-      guard existingMessageKeys.isSubset(of: incomingKeys),
-        incomingKeys.count > existingMessageKeys.count
-      else { return }
 
-      let appendedRaw = incomingMessageRows.filter { raw in
-        guard let key = raw["key"] as? String, !key.isEmpty else { return false }
-        return !existingKeys.contains(key)
+      let existingMessageCount = snapshot.rows.lazy.filter { $0.kind == .message }.count
+      var incomingMessageCount = 0
+      for raw in sourceRows where !isDayRow(raw) { incomingMessageCount += 1 }
+      // Growth only. Nothing below can succeed without strictly more message rows than
+      // the snapshot already holds, and this is the overwhelmingly common outcome — so
+      // it is the one that has to be cheap.
+      guard incomingMessageCount > existingMessageCount else { return }
+
+      let existingMessageKeys = Set(
+        snapshot.rows.lazy.filter { $0.kind == .message }.map(\.key))
+      var appendedRaw: [[String: Any]] = []
+      var matchedExistingKeys = 0
+      for raw in sourceRows where !isDayRow(raw) {
+        guard let key = raw["key"] as? String, !key.isEmpty else { continue }
+        if existingMessageKeys.contains(key) {
+          matchedExistingKeys += 1
+        } else {
+          appendedRaw.append(raw)
+        }
       }
-      guard !appendedRaw.isEmpty else { return }
+      // The subset test, without the second `Set`: row keys are unique, so matching every
+      // existing key at least once IS containment. A bounded tail that dropped older rows
+      // matches fewer and is refused here, exactly as before.
+      guard matchedExistingKeys >= existingMessageKeys.count, !appendedRaw.isEmpty else {
+        return
+      }
       let resolvedAppended = rowsByResolvingReplyPreviews(
         appendedRaw,
         peerDisplayName: peerDisplayName,
@@ -6009,9 +6166,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         sourceRows: snapshot.sourceRows + resolvedAppended,
         liveHeightStore: snapshot.liveHeightStore
       )
-      NSLog(
-        "[ChatOpen] warm-snapshot GROW chat=%@ was=%d added=%d",
-        String(trimmed.prefix(12)), snapshot.rows.count, parsedAppended.count)
+      // Through VibeLog, not NSLog: a raw NSLog never reaches the diagnostics export, so
+      // the absence of this line in an export said nothing at all about whether a grow
+      // ran. `parsedMs` is the number that matters — appending means parsing rows on the
+      // main thread, and that is the cost this line exists to make visible.
+      VibeLog.info(
+        "warm-snapshot grow", category: "chatopen",
+        metadata: [
+          "chat": String(trimmed.prefix(12)),
+          "was": String(snapshot.rows.count),
+          "added": String(parsedAppended.count),
+          "source": String(sourceRows.count),
+          "parsedMs": String(Int((CACurrentMediaTime() - startedAt) * 1000)),
+        ])
     }
   }
 
@@ -6198,7 +6365,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     bumpReopenSnapshotGeneration(for: trimmed)
     let width = Int(UIScreen.main.bounds.width.rounded())
     for theme in ["dark", "light"] {
-      let key = NSString(string: "\(trimmed)|w\(width)|\(theme)|v2")
+      let key = reopenSnapshotKey(
+        chatId: trimmed, width: width, theme: theme,
+        visualKey: reopenSnapshotVisualKey(isDark: theme == "dark"))
       reopenSnapshotCache.removeObject(forKey: key)
       if let url = reopenSnapshotFileURL(for: key) {
         reopenSnapshotIOQueue.async { try? FileManager.default.removeItem(at: url) }
@@ -6217,8 +6386,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let width = Int(UIScreen.main.bounds.width.rounded())
     let screenScale = UIScreen.main.scale
     for theme in ["dark", "light"] {
-      // Keep in sync with reopenSnapshotKey() — including the v2 poisoned-raster bump.
-      let key = NSString(string: "\(trimmed)|w\(width)|\(theme)|v2")
+      // Built by the shared builder, never spelled out here — see
+      // ``reopenSnapshotKey(chatId:width:theme:visualKey:)`` for what a hand-rolled copy
+      // of this string cost.
+      let key = reopenSnapshotKey(
+        chatId: trimmed, width: width, theme: theme,
+        visualKey: reopenSnapshotVisualKey(isDark: theme == "dark"))
       guard reopenSnapshotCache.object(forKey: key) == nil,
         let url = reopenSnapshotFileURL(for: key)
       else { continue }
@@ -6228,9 +6401,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         // closed with content on screen and its next open CANNOT be covered.
         guard FileManager.default.fileExists(atPath: url.path) else {
           if theme == "dark" {
+            // Key is logged on both sides: a no-file whose key differs from the last
+            // CAPTURE is appearance churn orphaning the pile, not a missing capture.
             NSLog(
-              "[ChatOpen] reopen-snapshot PREWARM-MISS chat=%@ reason=no-file",
-              String(trimmed.prefix(12)))
+              "[ChatOpen] reopen-snapshot PREWARM-MISS chat=%@ reason=no-file key=%@",
+              String(trimmed.prefix(12)), key)
           }
           return
         }
@@ -7633,9 +7808,29 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   /// Build once per rows application. `scrollViewDidScroll` only asks for the already
   /// formatted label of its top visible row; it never parses dates or payloads mid-fling.
+  /// Day labels for every row, computed once per DAY rather than once per row.
+  ///
+  /// `scrollingDateLabel(for:)` resolves `Calendar.autoupdatingCurrent`, asks it for
+  /// today/yesterday, and computes `component(.year, from: Date())` — all of which are
+  /// the same answer for the whole batch, and all of which were being redone for every
+  /// message. Over a 1,387-row transcript that is the 1.84s main-thread block in the
+  /// 2026-08-08 export (`scrollingDateLabels ← applyRows ← setRows ← refreshPreviewRows`,
+  /// i.e. it lands on the home long-press preview too).
+  ///
+  /// A transcript has far fewer distinct days than rows, so the fix is to hoist the
+  /// per-batch facts and memoize the rest by start-of-day. Same labels, same order.
   private static func scrollingDateLabels(from rawRows: [[String: Any]]) -> [String: String] {
     var result: [String: String] = [:]
+    result.reserveCapacity(rawRows.count)
     var currentLabel: String?
+
+    let calendar = Calendar.autoupdatingCurrent
+    let now = Date()
+    let currentYear = calendar.component(.year, from: now)
+    let todayStart = calendar.startOfDay(for: now)
+    let yesterdayStart = calendar.date(byAdding: .day, value: -1, to: todayStart)
+    var labelByDayStart: [Date: String] = [:]
+
     for raw in rawRows {
       let key = (raw["key"] as? String) ?? ""
       if (raw["kind"] as? String) == "day" {
@@ -7646,7 +7841,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         continue
       }
       if let date = rawMessageDate(from: raw) {
-        currentLabel = scrollingDateLabel(for: date)
+        let dayStart = calendar.startOfDay(for: date)
+        if let memoized = labelByDayStart[dayStart] {
+          currentLabel = memoized
+        } else {
+          let label: String
+          if dayStart == todayStart {
+            label = "Today"
+          } else if let yesterdayStart, dayStart == yesterdayStart {
+            label = "Yesterday"
+          } else if calendar.component(.year, from: date) == currentYear {
+            label = scrollingDayFormatter.string(from: date)
+          } else {
+            label = scrollingDayYearFormatter.string(from: date)
+          }
+          labelByDayStart[dayStart] = label
+          currentLabel = label
+        }
       }
       if !key.isEmpty, let currentLabel { result[key] = currentLabel }
     }
@@ -8144,6 +8355,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // nothing and the chat arrives empty behind its own raster.
     if !value { mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED") }
     defersTranscriptUpdatesForPresentation = value
+    // Background measurement yields for the length of the push.
+    value ? VibeChatOpenGate.noteStarted() : VibeChatOpenGate.noteFinished()
     guard !value else { return }
     if let stagedBottom = navigationPrestageSafeAreaBottom {
       let finalBottom = safeAreaInsets.bottom
@@ -8417,14 +8630,49 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// underneath it. `mountCoveredPresentationSeedIfOwed` is idempotent, so the later
   /// presentation-complete call is a no-op, and the timer stays as a watchdog for the
   /// case where this view never gets another main turn.
+  /// Largest stashed seed still mounted DURING the push rather than after it.
+  ///
+  /// Chosen from measured `seed-cost`, not taste: 9 rows cost 41ms and 24 rows 43ms —
+  /// both fit inside a 350ms spring without a visible hitch — while 1103 rows cost 161ms
+  /// and visibly ate the animation. 256 sits well above every ordinary conversation and
+  /// well below the transcripts that hurt, so the common open keeps its early
+  /// interactivity and only the genuinely expensive ones wait for an idle main thread.
+  private static let coveredEagerSeedMountRowBudget = 256
+
   private func scheduleCoveredPresentationSeedMount() {
     coveredPresentationSeedMountToken &+= 1
     let token = coveredPresentationSeedMountToken
-    DispatchQueue.main.async { [weak self] in
-      guard let self, self.coveredPresentationSeedMountToken == token else { return }
-      guard self.defersPresentationSeedMountUnderRaster else { return }
-      self.mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED")
+    // …but only while the mount actually IS a couple of frames. The comment above says
+    // `ChatTimelineLayout` made this cheap, and for an ordinary chat it did — device
+    // 2026-08-07: 9 rows `seed-cost 41ms`, 24 rows `43ms`, both invisible inside a 350ms
+    // spring. It did NOT for a large transcript: 1103 rows measured
+    // `seed-cost 161ms (layout=118 mount=133)`, landing at t=261ms — squarely mid-slide,
+    // where it eats ~10 frames of an animation the user is watching. That open reported
+    // `will-appear 52ms` but `did-appear 633ms`, and the ~230ms gap over the animation's
+    // own duration is this mount stealing its frames. A hitching push reads as tap delay,
+    // which is exactly the "still feeling delay" report.
+    //
+    // Above the budget the mount waits for the transition to finish, where line 8251
+    // already runs it on an idle main thread. The reader loses nothing they can act on:
+    // the raster is a photograph of this very list, so the chat still LOOKS present and
+    // final for the ~300ms it is not yet interactive — no empty list, ever, which is the
+    // whole point of the cover.
+    let stashedRows = deferredPresentationSeedSourceRows?.count ?? 0
+    let mountsEagerly = stashedRows <= Self.coveredEagerSeedMountRowBudget
+    if mountsEagerly {
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.coveredPresentationSeedMountToken == token else { return }
+        guard self.defersPresentationSeedMountUnderRaster else { return }
+        self.mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED")
+      }
+    } else {
+      NSLog(
+        "[ChatOpen] seed-mount DEFER-TO-TRANSITION chat=%@ rows=%d > budget=%d",
+        String(engineChatId.prefix(12)), stashedRows, Self.coveredEagerSeedMountRowBudget)
     }
+    // The watchdog is scheduled either way, and deferring makes it MORE load-bearing, not
+    // less: it is now the only thing standing between "the transition never reported
+    // complete" and a chat that sits under its raster with no rows behind it.
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
       guard let self, self.coveredPresentationSeedMountToken == token else { return }
       guard self.defersPresentationSeedMountUnderRaster else { return }
@@ -9264,7 +9512,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       PresentationSeedRank(
         source: source, count: sourceRows.count, fingerprint: fingerprint())
     }
-    let stashesInsteadOfMounting = window == nil || defersPresentationSeedMountUnderRaster
+    // The raster itself, not just the flag prestage sets from it: the agent surface is
+    // window-attached and stages BEFORE prestage, so it mounted 164 rows ahead of the push.
+    let stashesInsteadOfMounting =
+      window == nil || defersPresentationSeedMountUnderRaster
+      || (isNavigationPushPrestaging && reopenSnapshotOverlay != nil)
     let benchmark =
       stashesInsteadOfMounting
       ? (stashedPresentationSeedRank ?? mountedPresentationSeedRank) : mountedPresentationSeedRank
@@ -9667,6 +9919,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           + "pos=\(seedPositionMs) layout=\(seedLayoutMs) mount=\(seedMountMs) "
           + "sizing=\(usesProgressiveTranscriptSizing ? "estimated" : "exact") "
           + "heights=\(liveHeightStore.count)")
+      // WHERE the layout milliseconds went, durably.
+      //
+      // `layout=` is the biggest term in every slow open and it is nearly independent of
+      // row count — 31 rows cost 66-122ms while 1,379 rows cost 136ms — so it is not the
+      // transcript, it is the handful of cells the viewport materialises. That attribution
+      // already existed, but only as `NSLog`, which no diagnostics export carries: every
+      // reader's log showed a 100ms hole with nothing inside it. Emitted only alongside a
+      // seed that already cost something, so a fast open still adds one line.
+      VibeOpenTrace.shared.mark(
+        "seed-where",
+        "sizeCalls=\(seedProfSizeCalls)/\(Int(seedProfSizeNs / 1_000_000))ms "
+          + "trust=\(seedProfTrustHits) sig=\(seedProfSigHits) cacheHit=\(seedProfCacheHits) "
+          + "measure=\(seedProfMeasures)/\(Int(seedProfMeasureNs / 1_000_000))ms "
+          + "configure=\(seedProfConfigures)/\(Int(seedProfConfigureNs / 1_000_000))ms "
+          + "cell=\(seedProfCellCalls)/\(Int(seedProfCellNs / 1_000_000))ms "
+          + "inset=\(Int(seedProfInsetNs / 1_000_000))ms "
+          + "contentSize=\(Int(seedProfContentSizeNs / 1_000_000))ms "
+          + "offset=\(Int(seedProfOffsetNs / 1_000_000))ms "
+          + "prepared=\(seedPreparedHits)hit/\(seedPreparedMisses)miss "
+          + "width=\(Int(publishedMeasurementWidth))")
     }
     // One-open attribution for posMs/layoutMs: how many sizeForItemAt calls and where
     // their time went (trust promotes vs signature-validated promotes vs in-memory
@@ -12486,7 +12758,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   func setAppearance(_ rawAppearance: [String: Any]) {
     lastRawAppearance = rawAppearance
-    Self.cacheNativeThemeSeed(from: rawAppearance)
     let next = ChatListAppearance.from(raw: rawAppearance)
     let visualChanged = appearance.visualKey != next.visualKey
     let hasPendingOrActiveSendTransition =
@@ -12503,25 +12774,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     appearance
   }
 
-  private func reapplyNativeThemeForCurrentInterfaceStyle() {
-    var rawAppearance: [String: Any]
-    if let lastRawAppearance,
-      lastRawAppearance["nativeThemeId"] != nil
-    {
-      rawAppearance = lastRawAppearance
-    } else if let cachedRawAppearance = Self.bootstrapCachedRawAppearance() {
-      rawAppearance = cachedRawAppearance
-    } else {
-      return
-    }
-
-    rawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
-    setAppearance(rawAppearance)
-  }
-
   private func applyResolvedAppearance(_ next: ChatListAppearance) {
     let visualChanged = appearance.visualKey != next.visualKey
     appearance = next
+    // The cover is keyed on the appearance, so a key spelled before this landed named a
+    // file nothing had written — one open probing twice and disagreeing (`file=N` then
+    // `file=Y`) is what left first opens uncovered. Re-kick while there is still nothing
+    // on screen; the load self-dedupes against the cache.
+    if visualChanged, rows.isEmpty, reopenSnapshotOverlay == nil {
+      preloadReopenSnapshotFromDiskIfNeeded()
+    }
     // Lock list chrome materials to chat theme dark/light (not ambient system style).
     overrideUserInterfaceStyle = next.isDark ? .dark : .light
     collectionView.overrideUserInterfaceStyle = next.isDark ? .dark : .light
@@ -12551,45 +12813,6 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     queuedAppearanceAfterSendTransition = nil
     applyResolvedAppearance(queued)
-  }
-
-  private static func cacheNativeThemeSeed(from rawAppearance: [String: Any]) {
-    guard let themeIdRaw = rawAppearance["nativeThemeId"] else { return }
-    let themeId: String
-    if let value = themeIdRaw as? String {
-      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else { return }
-      themeId = trimmed
-    } else {
-      return
-    }
-
-    let isDark: Bool = {
-      if let value = rawAppearance["nativeThemeIsDark"] as? Bool { return value }
-      if let value = rawAppearance["nativeThemeIsDark"] as? NSNumber { return value.boolValue }
-      if let value = rawAppearance["nativeThemeIsDark"] as? String {
-        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes"].contains(normalized)
-      }
-      return true
-    }()
-
-    let defaults = UserDefaults.standard
-    defaults.set(themeId, forKey: cachedThemeIdDefaultsKey)
-    defaults.set(isDark, forKey: cachedThemeIsDarkDefaultsKey)
-  }
-
-  private static func bootstrapCachedRawAppearance() -> [String: Any]? {
-    let defaults = UserDefaults.standard
-    guard let themeId = defaults.string(forKey: cachedThemeIdDefaultsKey), !themeId.isEmpty else {
-      return nil
-    }
-    let isDark = defaults.bool(forKey: cachedThemeIsDarkDefaultsKey)
-    return [
-      "backgroundMode": "gradient",
-      "nativeThemeId": themeId,
-      "nativeThemeIsDark": isDark,
-    ]
   }
 
   func setContentPaddingBottom(_ value: Double) {
@@ -13750,6 +13973,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       }
       return
     }
+    // Opening happens from the media, not from anywhere in the row. In-place controls
+    // above (upload cancel, voice, video note) stay tappable across the whole bubble.
+    if let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell,
+      !cell.lastTouchWasOnMediaContent()
+    {
+      return
+    }
     let isImageVisual = row.visualKind == .media && row.messageType != "file"
     if isImageVisual {
       let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
@@ -14907,6 +15137,34 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return index[identity]
   }
 
+  /// A height this list already measured for `row` at `width`, or `nil`.
+  ///
+  /// The core's answer to "why is the push still stalling after the core landed". Its
+  /// `mount` measures every row in the window with `VibeRowMetrics.mainThreadHeight` —
+  /// the exact sizing path, a full text layout, and on an agent turn a template view and
+  /// `systemLayoutSizeFitting` — synchronously, on the main thread, during the
+  /// navigation transition. Device export 2026-08-07, chat `176cdf92eec5`: 999 rows,
+  /// `hangSeconds=0.57`, `hangDuring=…/will-appear`, against a transition that is only
+  /// ~560ms long. The animation was not janky, it was absent.
+  ///
+  /// Meanwhile this list sized the identical 999 rows in **13ms** — `seed-where
+  /// sizeCalls=999/13ms trust=999 measure=0/0ms` — because `promotePersistedHeightIfAvailable`
+  /// answers them from the persisted-height file. The core was re-deriving, at 40× the
+  /// cost and at the worst possible moment, a number already sitting in a dictionary.
+  ///
+  /// Same rule as the seed's fast path, deliberately: promote on a **width** match and
+  /// let `auditSeedTrustedHeights` re-check the content signature off-main after the
+  /// push. Anything stricter here would re-introduce the per-row `String(describing:)`
+  /// this exists to avoid, and anything looser would hand out a height measured at a
+  /// width the cells never use.
+  func coreKnownHeight(for row: ChatListRow, width: CGFloat) -> CGFloat? {
+    guard width > 0, !persistedHeightsByKey.isEmpty else { return nil }
+    guard let entry = persistedHeightsByKey[row.key] else { return nil }
+    guard abs(entry.w - Double(width)) < 0.5 else { return nil }
+    guard entry.h > 0, entry.h.isFinite else { return nil }
+    return CGFloat(entry.h)
+  }
+
   /// The one place a row's height is decided, for the layout and for anyone auditing it.
   ///
   /// `ChatTimelineLayout` calls this only for rows it has not already measured at this
@@ -15667,6 +15925,33 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   ) -> CGFloat {
     // Diagnostic map kept in sync with liveHeightStore.origin for [HeightShift] logs.
     rowHeightOriginByKey[row.key] = origin
+    // A row that changed classification since it was last sized was sized by a different
+    // rule than the height now cached for it, which is a shift that no amount of caching
+    // can absorb. Every sizing decision funnels through here, so this catches the flip at
+    // the moment it happens rather than inferring it from two shift lines afterwards.
+    let kindNow = "\(row.visualKind)"
+    if let kindBefore = rowVisualKindByKey[row.key], kindBefore != kindNow {
+      VibeLog.warning(
+        "row changed visual kind between sizing passes", category: "shift",
+        metadata: [
+          "chat": String(engineChatId.prefix(12)), "row": String(row.key.suffix(14)),
+          "was": kindBefore, "now": kindNow, "origin": origin.rawValue,
+          "h": String(format: "%.0f", height),
+          "sizeSource": chatMediaNaturalSizeSourceLabel(for: row),
+          "mediaUrl": row.mediaUrl?.isEmpty == false ? "Y" : "N",
+          "mediaWH": row.mediaWidth != nil && row.mediaHeight != nil ? "Y" : "N",
+          // `visualKind` is a pure function of exactly these three inputs (see
+          // `ChatListRow.visualKind`), so whichever one differs between two passes IS the
+          // cause of the flip. Without them the previous run proved a flip was happening
+          // but could not say which field moved — `mediaUrl=Y` on both sides ruled out
+          // presence, and the extension parser is query-string safe, which leaves the
+          // declared type and the filename as the only remaining suspects.
+          "msgType": row.messageType.isEmpty ? "-" : row.messageType,
+          "fileName": row.fileName?.isEmpty == false ? "Y" : "N",
+          "urlExt": row.mediaUrl.flatMap { URL(string: $0)?.pathExtension } ?? "-",
+        ])
+    }
+    rowVisualKindByKey[row.key] = kindNow
     if let entry = liveHeightStore[row.key], entry.origin != origin {
       liveHeightStore[row.key] = RowHeightCacheEntry(
         row: entry.row, rowWidth: entry.rowWidth, state: entry.state,
@@ -15692,7 +15977,17 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       parts.append("nodes=\(row.agentProgressNodes.count)")
     }
     let mediaSize = chatMediaNaturalSizeSourceLabel(for: row)
-    if mediaSize != "-" { parts.append("mediaSize=\(mediaSize)") }
+    // Always emit this, including the "-" that media/video/sticker are the only kinds to
+    // avoid. A `.document` row is sized through the SAME branch as `.media` (which needs a
+    // natural aspect) but is excluded from every natural-size source, so "-" on a row that
+    // just corrected by +200pt is not a missing field — it is the reason.
+    parts.append("mediaSize=\(mediaSize)")
+    // Whether the height that is about to be replaced was a GUESS awaiting a real aspect.
+    // `prov=Y` means the correction was always going to come; `prov=N` means two sizing
+    // paths simply disagreed, which is a different bug with a different fix.
+    if let entry = liveHeightStore[row.key] {
+      parts.append("prov=\(entry.isProvisional ? "Y" : "N")")
+    }
     if row.reactionEmoji?.isEmpty == false { parts.append("react=Y") }
     return parts.joined(separator: " ")
   }
@@ -16371,25 +16666,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard let messageId = normalizedMessageId(row.messageId) else {
       return nil
     }
-    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
-    let liveEngineRow: [String: Any]? = {
-      guard !chatId.isEmpty else { return nil }
-      return ChatEngine.shared.getLiveMessageRow([
-        "chatId": chatId,
-        "messageId": messageId,
-      ])
-    }()
-    let candidates: [[String: Any]?] = [
+    // Local candidates first; the engine only when every one of them misses.
+    //
+    // `getLiveMessageRow` is a `syncOnQueue` hop — it blocks the main thread for as long
+    // as the engine happens to be busy — and it was the LOWEST-priority candidate yet was
+    // evaluated eagerly, before the array was even walked. So a row whose key the very
+    // first local lookup already held still paid the full wait. One device export
+    // measured 11 of these hops totalling 1504ms of blocked main thread. The priority
+    // order below is unchanged; only the point at which the engine is asked has moved.
+    let localCandidates: [[String: Any]?] = [
       rawRow(messageId: messageId, in: sourceRowsPayload),
       nativeOutgoingRowsById[messageId],
       nativeEngineRowsById[messageId],
-      liveEngineRow,
     ]
-    for candidate in candidates {
+    for candidate in localCandidates {
       guard let candidate, let mediaKey = mediaKey(fromRawRow: candidate) else { continue }
       return mediaKey
     }
-    return nil
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty,
+      let liveEngineRow = ChatEngine.shared.getLiveMessageRow([
+        "chatId": chatId,
+        "messageId": messageId,
+      ])
+    else { return nil }
+    return mediaKey(fromRawRow: liveEngineRow)
   }
 
   private func rowByApplyingReactionEmoji(
@@ -17128,6 +17429,62 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self.nativeOutgoingRowsById[messageId] = row
       self.setRows(self.sourceRowsPayload)
     }
+  }
+
+  /// Optimistic row for a sticker send.
+  ///
+  /// Deliberately mirrors ``queueNativeOutgoingMediaMessage`` field for field, minus the
+  /// media-file keys a sticker has none of. The sticker identity is written at BOTH the
+  /// message level and inside `metadata` because the row parser reads whichever container
+  /// it finds first, and a field present in only one of them renders now and disappears on
+  /// the next cold open — which is the failure this shape exists to avoid.
+  private func queueNativeOutgoingStickerMessage(
+    messageId: String,
+    timestamp: String,
+    timestampMs: Double,
+    metadata: [String: Any],
+    replyToId: String?
+  ) {
+    let isPreviousMe: Bool = {
+      if let lastMessageRow = rows.last(where: { $0.kind == .message }) {
+        return lastMessageRow.isMe
+      }
+      return false
+    }()
+    let borderTopRightRadius: CGFloat =
+      isPreviousMe ? nativeSendMorphTopRightLegacyRadius : 18.0
+
+    var message: [String: Any] = [
+      "id": messageId,
+      "text": "",
+      "timestamp": timestamp,
+      "timestampMs": timestampMs,
+      "isMe": true,
+      "status": "pending",
+      "type": "sticker",
+      "metadata": metadata,
+      "bubbleShape": [
+        "showTail": true,
+        "borderTopLeftRadius": 18,
+        "borderTopRightRadius": borderTopRightRadius,
+        "borderBottomRightRadius": 18,
+        "borderBottomLeftRadius": 18,
+      ],
+    ]
+    for (key, value) in metadata where message[key] == nil {
+      message[key] = value
+    }
+    if let replyToId { message["replyToId"] = replyToId }
+
+    nativeOutgoingRowsById[messageId] = [
+      "kind": "message",
+      "key": "m-\(messageId)",
+      "message": message,
+    ]
+    if !nativeOutgoingOrder.contains(messageId) {
+      nativeOutgoingOrder.append(messageId)
+    }
+    setRows(sourceRowsPayload)
   }
 
   private func queueNativeOutgoingMediaMessage(
@@ -18734,6 +19091,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
 
     keyboardHeight = kbHeight
+    inputBar?.keyboardAnimation = (duration, options)
     inputBar?.keyboardHeightForPanels = kbHeight
     inputBar?.keyboardProgress = kbHeight > 0 ? 1.0 : 0.0
     agentComposerView?.setKeyboardPaddingProgress(
@@ -18757,6 +19115,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let options = UIView.AnimationOptions(rawValue: curveRaw << 16)
 
     keyboardHeight = 0
+    inputBar?.keyboardAnimation = (duration, options)
     inputBar?.keyboardHeightForPanels = 0
     inputBar?.keyboardProgress = 0.0
     agentComposerView?.setKeyboardPaddingProgress(
@@ -18827,7 +19186,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let effectiveKeyboardHeight: CGFloat
     let safeBottom: CGFloat
     if bar.isGifPanelPresented {
-      effectiveKeyboardHeight = 0
+      effectiveKeyboardHeight = bar.isGifPanelSearchActive ? keyboardHeight : 0
+      safeBottom = 0
+    } else if bar.isGifPanelPresentationPending {
+      effectiveKeyboardHeight = max(keyboardHeight, bar.reservedGifPanelHeight)
       safeBottom = 0
     } else {
       effectiveKeyboardHeight = keyboardHeight
@@ -20222,7 +20584,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       handleNativeAttachmentSend(uri: first, caption: caption, transitionCapture: transitionCapture)
       return
     }
-    if currentBridgeProvider != nil || groupHasBridgeAgents() {
+    // One message carries the whole set, in every chat. Videos still go one per
+    // message: a message has a single duration/poster, and the deck is a picture
+    // stack — mixing a video into it would need a player per card.
+    let allImages = cleaned.allSatisfy { !isVideoAttachmentURI($0) }
+    if allImages {
       handleNativeAttachmentSend(
         uri: first,
         caption: caption,
@@ -20244,7 +20610,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     uri: String,
     caption: String?,
     transitionCapture: ChatAttachmentTransitionCapture?,
-    extraImageURIs: [String] = []
+    extraImageURIs: [String] = [],
+    typeOverride: String? = nil
   ) {
     let messageId = UUID().uuidString.lowercased()
     let now = Date()
@@ -20254,7 +20621,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let timestamp = formatter.string(from: now)
     let replyToMessageId = inputBar?.activeReplyToMessageId
     let isVideo = isVideoAttachmentURI(uri)
-    let type = isVideo ? "video" : "image"
+    let type = typeOverride ?? (isVideo ? "video" : "image")
     let fileName = localAttachmentFileName(for: uri)
     let fileSize = localAttachmentFileSize(for: uri)
     let duration = isVideo ? localMediaDurationSeconds(for: uri) : nil
@@ -20281,13 +20648,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Durable micro-thumb (Telegram-style, ≤~4KB): paints the bubble instantly while
     // full media uploads/downloads. Server keeps thumbnailBase64; sealed blobs stripped.
+    //
+    // Encoded ONCE per picture here, then read by every consumer below. `uri` used to be
+    // encoded twice on a multi-image send — once for the optimistic row and again in the
+    // per-attachment loop — so the first photo paid the whole cost twice. Both loops now
+    // look the answer up.
+    let microThumbsByURI: [String: String] = {
+      guard type == "image" else { return [:] }
+      var encoded: [String: String] = [:]
+      for rawURI in [uri] + extraImageURIs where encoded[rawURI] == nil {
+        guard let fileURL = localAttachmentFileURL(for: rawURI),
+          let thumb = chatMicroThumbnailJPEGBase64(contentsOf: fileURL)
+        else { continue }
+        encoded[rawURI] = thumb
+      }
+      return encoded
+    }()
     let optimisticThumb: String? = {
       if let thumbnailBase64, !thumbnailBase64.isEmpty { return thumbnailBase64 }
-      guard type == "image",
-        let fileURL = localAttachmentFileURL(for: uri),
-        let image = UIImage(contentsOfFile: fileURL.path)
-      else { return nil }
-      return chatMicroThumbnailJPEGBase64(from: image)
+      return microThumbsByURI[uri]
     }()
 
     queueNativeOutgoingMediaMessage(
@@ -20349,6 +20728,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     var bridgeImageBody = effectiveText
     let shouldSealForAgents =
       type == "image" && (currentBridgeProvider != nil || groupHasBridgeAgents())
+
+    // Plain chat, several pictures: no agent to seal for, so the set travels as
+    // uploads. The engine uploads these after the first and writes the durable
+    // `attachmentUrls`/`attachmentMediaKeys` back; the micro-thumbs go now so the
+    // recipient can shape and paint every card before any of the bytes land.
+    if type == "image", !extraImageURIs.isEmpty, !shouldSealForAgents {
+      metadata["extraLocalMediaUrls"] = extraImageURIs
+      let thumbs = ([uri] + extraImageURIs).compactMap { microThumbsByURI[$0] }
+      if thumbs.count > 1 {
+        metadata["attachmentThumbnailsB64"] = thumbs
+        if metadata["thumbnailBase64"] == nil { metadata["thumbnailBase64"] = thumbs[0] }
+      }
+    }
+
     if shouldSealForAgents {
       let allURIs = [uri] + extraImageURIs
       let blobs = allURIs.compactMap { sealedBridgeImageBlob(forLocalURI: $0) }
@@ -20370,12 +20763,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         metadata["agentBridgeAttachmentsEnc"] = blobs
         metadata["attachmentsEnc"] = blobs
         // Durable multi-image micro-thumbs (server strips sealed blobs; these stay).
-        let thumbs = allURIs.compactMap { raw -> String? in
-          guard let fileURL = localAttachmentFileURL(for: raw),
-            let image = UIImage(contentsOfFile: fileURL.path)
-          else { return nil }
-          return chatMicroThumbnailJPEGBase64(from: image)
-        }
+        let thumbs = allURIs.compactMap { microThumbsByURI[$0] }
         if !thumbs.isEmpty {
           metadata["attachmentThumbnailsB64"] = thumbs
           if metadata["thumbnailBase64"] == nil {
@@ -21739,6 +22127,82 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return localURL
   }
 
+  /// Bytes the origin delivered that we could not read yet, kept instead of deleted.
+  ///
+  /// Keyed by the remote key so the next attempt for the same media finds them. The value
+  /// is the file on disk plus the `mediaKey` that was in hand when it was written — a
+  /// retry is only worth running when a DIFFERENT key is available now, which is exactly
+  /// the "key arrived late" case this exists for.
+  private static var quarantinedMediaByRemoteKey: [String: (url: URL, mediaKeyAtWrite: String?)] =
+    [:]
+
+  private func quarantineUndecodableMedia(_ url: URL, remoteKey: String, row: ChatListRow) {
+    Self.quarantinedMediaByRemoteKey[remoteKey] = (url, resolvedMediaKey(for: row))
+    NSLog(
+      "[ChatMediaIntegrity] RETAINED msgId=%@ bytes=%lld path=%@ — delivered but unreadable, kept for retry",
+      row.messageId ?? "-", localFileSize(at: url), url.path)
+  }
+
+  /// Re-reads quarantined bytes once a media key exists that we did not have at download
+  /// time. Returns the file when it is now readable, having promoted it into the normal
+  /// cache; `nil` means still unreadable, and the bytes stay quarantined either way.
+  ///
+  /// This is what makes a late key cost zero network: the ciphertext is already on disk.
+  private func recoverQuarantinedMediaIfKeyArrived(remoteKey: String, row: ChatListRow) -> URL? {
+    guard let entry = Self.quarantinedMediaByRemoteKey[remoteKey] else { return nil }
+    let keyNow = resolvedMediaKey(for: row)
+    guard let keyNow, !keyNow.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      keyNow != entry.mediaKeyAtWrite
+    else { return nil }
+    guard FileManager.default.fileExists(atPath: entry.url.path) else {
+      Self.quarantinedMediaByRemoteKey.removeValue(forKey: remoteKey)
+      return nil
+    }
+    guard
+      let recovered = decryptQuarantinedMedia(
+        at: entry.url, mediaKey: keyNow, row: row),
+      usableLocalMediaURL(
+        from: recovered.absoluteString, for: row, logContext: "quarantine_recover",
+        allowVideoPlaybackFallback: false) != nil
+    else {
+      // Record the attempt so a key that changes again still gets a turn.
+      Self.quarantinedMediaByRemoteKey[remoteKey] = (entry.url, keyNow)
+      return nil
+    }
+    Self.quarantinedMediaByRemoteKey.removeValue(forKey: remoteKey)
+    cacheDownloadedMediaURL(recovered, for: row)
+    NSLog(
+      "[ChatMediaIntegrity] RECOVERED msgId=%@ path=%@ — decrypted from retained bytes, no re-download",
+      row.messageId ?? "-", recovered.path)
+    VibeLog.warning(
+      "media recovered from retained bytes", category: "media",
+      metadata: [
+        "chat": String(engineChatId.prefix(12)),
+        "msg": String((row.messageId ?? "-").suffix(12)),
+        "kind": "\(row.visualKind)",
+      ])
+    return recovered
+  }
+
+  /// Decrypts retained ciphertext in place, using the same primitive
+  /// `persistDownloadedDocument` uses at download time. Writes beside the quarantined file
+  /// so the ciphertext survives a failed attempt and can be retried against a later key.
+  private func decryptQuarantinedMedia(at url: URL, mediaKey: String, row: ChatListRow) -> URL? {
+    guard let encrypted = try? Data(contentsOf: url), !encrypted.isEmpty else { return nil }
+    guard
+      let decrypted = ChatEngine.shared.decryptMediaDataIfNeeded(encrypted, mediaKey: mediaKey),
+      !decrypted.isEmpty
+    else { return nil }
+    let destination = url.deletingLastPathComponent()
+      .appendingPathComponent("recovered-" + url.lastPathComponent)
+    do {
+      try decrypted.write(to: destination, options: [.atomic])
+    } catch {
+      return nil
+    }
+    return destination
+  }
+
   private func validatedCachedDownloadedMediaURL(
     remoteURL: URL,
     row: ChatListRow,
@@ -21767,6 +22231,26 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     let remoteKey = remoteMediaCacheKey(remoteURL: remoteURL, mediaKey: mediaKey)
     documentPreviewCacheByRemoteURL.removeValue(forKey: remoteKey)
+    // Bytes under quarantine are NOT ours to delete, and this line is where the retain
+    // contract was being broken four milliseconds after it was made. Device log
+    // 2026-08-08, msg 2345041e:
+    //
+    //   11:04:35.439  [ChatMediaIntegrity] RETAINED … 1786111299556_O2mNJX4metQ.png
+    //   11:04:35.444  [ChatMediaChoice] cached invalid … removed=1786111299556_O2mNJX4metQ.png
+    //
+    // `quarantineUndecodableMedia` kept 2,044,249 delivered bytes so a late `mediaKey`
+    // could decrypt them without touching the network; this path then asked the same file
+    // the same question (`UIImage(contentsOfFile:)` → nil), called it unusable, and
+    // deleted it. `recoverQuarantinedMediaIfKeyArrived`'s `fileExists` guard then dropped
+    // the entry, so the retain never survived long enough to be worth anything — and the
+    // only remaining copy was the remote URL, re-fetched in full on every single open.
+    // That is the 2 MB re-download four times in two minutes in that same log.
+    if Self.quarantinedMediaByRemoteKey[remoteKey]?.url == cachedURL {
+      NSLog(
+        "[ChatMediaIntegrity] cached unusable but QUARANTINED msgId=%@ path=%@ — kept, not deleted",
+        row.messageId ?? "-", cachedURL.lastPathComponent)
+      return nil
+    }
     // A file the app can prove is unusable — the one case where a stored file is dropped.
     VibeMediaVault.shared.forget(remoteKey, kind: .document)
     try? FileManager.default.removeItem(at: cachedURL)
@@ -22206,6 +22690,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           return nil
         }()
         let url: String = {
+          // A plain-chat set gives every picture its own durable URL; an agent
+          // set carries only sealed blobs, so only its first has one.
+          if index < row.attachmentUrls.count {
+            let candidate = row.attachmentUrls[index]
+              .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty { return candidate }
+          }
           if index == 0 {
             return resolvedPreferredMediaURL(for: row) ?? row.mediaUrl ?? ""
           }
@@ -22248,6 +22739,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     allowsFilmstrip: Bool = true
   ) {
     guard let presenter = topPresentingViewController() else { return }
+    zoomHiddenAnchorView?.alpha = 1
+    zoomHiddenAnchorView = nil
     ChatImageEditModule.presentEditor(
       from: presenter,
       sourceView: sourceView,
@@ -22259,7 +22752,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       headerSubtitle: mediaHeaderDateText(for: row),
       galleryPages: galleryPages,
       startIndex: startIndex,
-      allowsFilmstrip: allowsFilmstrip
+      allowsFilmstrip: allowsFilmstrip,
+      zoomSourceProvider: self
     ) { [weak self] payload in
       guard let self else { return }
       // The viewer swipes across messages, so these act on the photo that was on
@@ -22276,6 +22770,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
       if payload.eventType == .delete {
         self.presentMediaViewerDeletion(for: targetRow)
+        return
+      }
+
+      // Forward through the app's own chat picker, the same event the selection
+      // bar's share button emits, so both routes land on one sheet.
+      if payload.eventType == .share {
+        guard let messageId = payload.messageId else { return }
+        self.onNativeEvent([
+          "type": "inputActionPressed",
+          "action": "shareInside",
+          "messageIds": [messageId],
+          "messages": [self.forwardPayload(for: targetRow, messageId: messageId)],
+        ])
         return
       }
 
@@ -22434,6 +22941,43 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     guard !documentPreviewInFlightURLs.contains(remoteKey) else { return }
+    // Bytes we already have beat bytes we would fetch again. If a previous attempt
+    // downloaded this media before its key existed, the ciphertext is still on disk and a
+    // key that has since arrived makes it readable without touching the network — which is
+    // the whole point of retaining it instead of deleting it.
+    if let recovered = recoverQuarantinedMediaIfKeyArrived(remoteKey: remoteKey, row: row) {
+      documentPreviewCacheByRemoteURL[remoteKey] = recovered
+      onDemandRemoteMediaDownloadKeys.remove(remoteKey)
+      mediaDownloadProgressByRemoteKey.removeValue(forKey: remoteKey)
+      VibeMediaVault.shared.noteFetchSucceeded(remoteKey)
+      updateVisibleMediaDownloadState(for: row, reloadCell: true)
+      return
+    }
+    // Quarantined bytes with the SAME key that was in hand when they were written: the
+    // transfer already succeeded and nothing about this row has changed, so re-fetching
+    // can only produce the identical undecodable payload. Refuse the network.
+    //
+    // Without this, the row is in a loop with no exit: a 2xx is deliberately not counted
+    // as a fetch failure (see the download completion — counting it would let `giveUp`
+    // silence a row whose key is merely late), so `isUnavailable` never fires and every
+    // visible pass re-armed the same download. Device log 2026-08-08, msg 2345041e: four
+    // full 2 MB fetches in 150 seconds, each one ending `invalid local after download
+    // hasMediaKey=N`, each one flipping the row's height 252→380→252 under the reader.
+    // A user-initiated tap still gets through — `allowRetry` above is the deliberate
+    // override, and `recoverQuarantined…` runs first whenever a new key HAS arrived.
+    if !userInitiated, let quarantined = Self.quarantinedMediaByRemoteKey[remoteKey],
+      quarantined.mediaKeyAtWrite == mediaKey,
+      FileManager.default.fileExists(atPath: quarantined.url.path)
+    {
+      mediaDownloadProgressByRemoteKey.removeValue(forKey: remoteKey)
+      onDemandRemoteMediaDownloadKeys.remove(remoteKey)
+      chatListDebugLog(
+        chatListMediaVerboseDebugLogs,
+        "[ChatMediaIntegrity] skip re-download msgId=%@ — retained bytes, key unchanged",
+        row.messageId ?? "-")
+      updateVisibleMediaDownloadState(for: row)
+      return
+    }
     documentPreviewInFlightURLs.insert(remoteKey)
     if shouldTrackOnDemandState {
       onDemandRemoteMediaDownloadKeys.insert(remoteKey)
@@ -22516,15 +23060,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             )
           }
         } else {
+          let status = (response as? HTTPURLResponse)?.statusCode
+          let transferSucceeded = (200...299).contains(status ?? -1)
+          let bytes = localURL.map { self.localFileSize(at: $0) } ?? 0
+          let hasKey = (mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+
           if let localURL {
             NSLog(
               "[ChatMediaDownload] invalid local after download msgId=%@ remote=%@ local=%@ hasMediaKey=%@",
               row.messageId ?? "-",
               remoteURL.absoluteString,
               localURL.path,
-              (mediaKey?.isEmpty == false) ? "Y" : "N"
+              hasKey ? "Y" : "N"
             )
-            try? FileManager.default.removeItem(at: localURL)
+            // NEVER delete bytes the origin actually gave us.
+            //
+            // This used to `removeItem(at:)` here, and that line is how a delivered image
+            // was permanently lost. The sequence, straight out of the 2026-08-07 device
+            // log: `startRemoteMediaDownload` runs before the row's `mediaKey` has arrived
+            // (it shows up in the very next parse as a CHANGED field), so
+            // `persistDownloadedDocument` writes the CIPHERTEXT undecrypted;
+            // `usableLocalMediaURL` asks `UIImage(contentsOfFile:)`, gets nil, and calls it
+            // "unusable" — and 2,044,249 bytes of a real photo, fetched with status 200,
+            // were deleted. The only remaining copy was the same remote URL, which re-ran
+            // the identical race on every reopen. That is both the lost image and the
+            // "I reopen the chat and it downloads again".
+            //
+            // A payload we cannot read YET is not a payload we may destroy. Keep it; the
+            // retry below can decrypt it the moment the key lands.
+            if transferSucceeded, bytes > 1024 {
+              self.quarantineUndecodableMedia(localURL, remoteKey: remoteKey, row: row)
+            } else {
+              try? FileManager.default.removeItem(at: localURL)
+            }
           }
           self.documentPreviewInFlightURLs.remove(remoteKey)
           self.onDemandRemoteMediaDownloadKeys.remove(remoteKey)
@@ -22532,14 +23100,35 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           // A non-2xx is the origin telling us the file is not there — retrying it on the
           // next scroll pass cannot change the answer. A transport error may be a passing
           // blip, so it gets a couple more tries before the row goes quiet.
-          let status = (response as? HTTPURLResponse)?.statusCode
-          let gaveUp = VibeMediaVault.shared.noteFetchFailed(remoteKey, httpStatus: status)
+          //
+          // A 2xx is NOT a fetch failure and must never be counted as one: the transfer
+          // worked, we simply could not read the result yet. Counting it here let
+          // `noteFetchFailed` reach `giveUp` and silence the row for good, so the retry
+          // that WOULD have succeeded once the key arrived never ran.
+          let gaveUp =
+            transferSucceeded
+            ? false
+            : VibeMediaVault.shared.noteFetchFailed(remoteKey, httpStatus: status)
           self.updateVisibleMediaDownloadState(for: row)
           NSLog(
             "[ChatListView] remote media download failed status=%d giveUp=%@ url=%@",
             status ?? -1,
             gaveUp ? "Y" : "N",
             remoteURL.absoluteString)
+          // The exportable record. A lost image is the worst thing this app can do, and
+          // until now it left only `NSLog` lines that no one has a console attached to see.
+          VibeLog.error(
+            "media delivered but unreadable", category: "media",
+            metadata: [
+              "chat": String(self.engineChatId.prefix(12)),
+              "msg": String((row.messageId ?? "-").suffix(12)),
+              "status": String(status ?? -1),
+              "bytes": String(bytes),
+              "hasMediaKey": hasKey ? "Y" : "N",
+              "kind": "\(row.visualKind)",
+              "retained": (transferSucceeded && bytes > 1024) ? "Y" : "N",
+              "fileName": row.fileName ?? "-",
+            ])
         }
       }
     }
@@ -23095,6 +23684,65 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   }
 }
 
+// MARK: - Media viewer shared-element anchor
+
+extension ChatListView: ChatMediaZoomSourceProviding {
+  /// The thumbnail the open viewer's current photo belongs to. Resolved fresh on
+  /// every leg of the transition: the viewer swipes across messages, so the cell
+  /// it lands on is rarely the one it was opened from.
+  func chatMediaZoomSource(forMessageId messageId: String?, pageIndex: Int)
+    -> ChatMediaZoomSource?
+  {
+    guard let anchor = zoomAnchorView(forMessageId: messageId, pageIndex: pageIndex),
+      anchor.window != nil
+    else { return nil }
+
+    return makeChatMediaZoomSource(for: anchor)
+  }
+
+  func chatMediaZoomSetSourceHidden(
+    _ hidden: Bool,
+    forMessageId messageId: String?,
+    pageIndex: Int
+  ) {
+    if hidden {
+      zoomHiddenAnchorView?.alpha = 1
+      let anchor = zoomAnchorView(forMessageId: messageId, pageIndex: pageIndex)
+      anchor?.alpha = 0
+      zoomHiddenAnchorView = anchor
+    } else {
+      zoomHiddenAnchorView?.alpha = 1
+      zoomHiddenAnchorView = nil
+    }
+  }
+
+  func chatMediaZoomInstallFlightView(_ flightView: UIView, frameInWindow: CGRect) -> UIView? {
+    // `transitionOverlayHost` belongs to the scrolling content controller. The
+    // conversation header is owned above `ChatListView`, so a flight mounted
+    // here naturally passes behind it instead of covering it and snapping back.
+    transitionOverlayHost.addSubview(flightView)
+    flightView.frame = transitionOverlayHost.convert(frameInWindow, from: nil)
+    return transitionOverlayHost
+  }
+
+  private func zoomAnchorView(forMessageId messageId: String?, pageIndex: Int) -> UIImageView? {
+    guard let messageId, !messageId.isEmpty else { return nil }
+    guard
+      let cell = collectionView.visibleCells.compactMap({ $0 as? ChatListCell })
+        .first(where: { $0.row?.messageId == messageId })
+    else { return nil }
+
+    // `pageIndex` is a grid tile only when the viewer is paging inside one
+    // multi-image message; for chat-wide paging it counts messages, so feeding it
+    // to the grid would pick an unrelated tile.
+    let tileCount = cell.row.map {
+      max($0.agentBridgeAttachmentsEnc.count, $0.attachmentThumbnailsB64.count)
+    } ?? 0
+    let gridIndex = tileCount > 1 ? pageIndex : 0
+    return cell.mediaImageView(atGridIndex: gridIndex)
+  }
+}
+
 // MARK: - ChatInputBarDelegate
 
 extension ChatListView: ChatInputBarDelegate {
@@ -23229,41 +23877,7 @@ extension ChatListView: ChatInputBarDelegate {
   private func selectedRowsAsForwardPayloads() -> [[String: Any]] {
     let payloads: [[String: Any]] = rows.compactMap { row -> [String: Any]? in
       guard let mid = row.messageId, selectedMessageIds.contains(mid) else { return nil }
-      var payload: [String: Any] = [
-        "messageId": mid,
-        "id": mid,
-        "type": row.messageType,
-        "text": row.text,
-        "isMe": row.isMe,
-      ]
-      if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty { payload["mediaUrl"] = mediaUrl }
-      // Prefer an on-disk cache file so share/forward does not re-download then re-upload.
-      let resolvedLocal = resolvedLocalMediaForShare(row: row)
-      if let local = resolvedLocal, !local.isEmpty {
-        payload["localMediaUrl"] = local
-      } else if let local = row.localMediaUrl, !local.isEmpty {
-        payload["localMediaUrl"] = local
-      }
-      if let fileName = row.fileName, !fileName.isEmpty { payload["fileName"] = fileName }
-      if let duration = row.duration { payload["duration"] = duration }
-      if let thumb = row.thumbnailBase64, !thumb.isEmpty { payload["thumbnailBase64"] = thumb }
-      if let mediaKey = row.mediaKey, !mediaKey.isEmpty { payload["mediaKey"] = mediaKey }
-      var metadata: [String: Any] = [:]
-      if let cover = row.musicCoverURL { metadata["cover"] = cover }
-      if let artist = row.musicArtist { metadata["artist"] = artist }
-      if let source = row.musicSource { metadata["source"] = source }
-      if let local = resolvedLocal ?? row.localMediaUrl, !local.isEmpty {
-        metadata["localMediaUrl"] = local
-      }
-      // Prefer a readable title for music / empty-text bubbles.
-      if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        let plain = row.plainContent, !plain.isEmpty
-      {
-        payload["text"] = plain
-      }
-      if !metadata.isEmpty { payload["metadata"] = metadata }
-      if let plain = row.plainContent, !plain.isEmpty { payload["plainContent"] = plain }
-      return payload
+      return forwardPayload(for: row, messageId: mid)
     }
     NSLog(
       "[ChatShare] selectedRowsAsForwardPayloads built=%d selectedIds=%d totalRows=%d",
@@ -23272,6 +23886,46 @@ extension ChatListView: ChatInputBarDelegate {
       rows.count
     )
     return payloads
+  }
+
+  /// One row as a forward payload. Shared by selection-mode share and by the
+  /// media viewer's share button so both hand the sheet the same shape.
+  private func forwardPayload(for row: ChatListRow, messageId mid: String) -> [String: Any] {
+    var payload: [String: Any] = [
+      "messageId": mid,
+      "id": mid,
+      "type": row.messageType,
+      "text": row.text,
+      "isMe": row.isMe,
+    ]
+    if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty { payload["mediaUrl"] = mediaUrl }
+    // Prefer an on-disk cache file so share/forward does not re-download then re-upload.
+    let resolvedLocal = resolvedLocalMediaForShare(row: row)
+    if let local = resolvedLocal, !local.isEmpty {
+      payload["localMediaUrl"] = local
+    } else if let local = row.localMediaUrl, !local.isEmpty {
+      payload["localMediaUrl"] = local
+    }
+    if let fileName = row.fileName, !fileName.isEmpty { payload["fileName"] = fileName }
+    if let duration = row.duration { payload["duration"] = duration }
+    if let thumb = row.thumbnailBase64, !thumb.isEmpty { payload["thumbnailBase64"] = thumb }
+    if let mediaKey = row.mediaKey, !mediaKey.isEmpty { payload["mediaKey"] = mediaKey }
+    var metadata: [String: Any] = [:]
+    if let cover = row.musicCoverURL { metadata["cover"] = cover }
+    if let artist = row.musicArtist { metadata["artist"] = artist }
+    if let source = row.musicSource { metadata["source"] = source }
+    if let local = resolvedLocal ?? row.localMediaUrl, !local.isEmpty {
+      metadata["localMediaUrl"] = local
+    }
+    // Prefer a readable title for music / empty-text bubbles.
+    if row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      let plain = row.plainContent, !plain.isEmpty
+    {
+      payload["text"] = plain
+    }
+    if !metadata.isEmpty { payload["metadata"] = metadata }
+    if let plain = row.plainContent, !plain.isEmpty { payload["plainContent"] = plain }
+    return payload
   }
 
   /// Local file for share/forward: row.localMediaUrl, durable voice-cache, or doc cache.
@@ -23694,27 +24348,70 @@ extension ChatListView: ChatInputBarDelegate {
     }
   }
 
+  /// Send a picked GIF as ordinary sealed media — never as a third-party link.
+  ///
+  /// The bytes are fetched HERE, on the sender's device, and then handed to the same
+  /// attachment path every photo uses: encrypted with the chat's media key, uploaded to
+  /// our own storage, and sent with our own `mediaUrl`. The recipient therefore never
+  /// contacts Giphy, and nothing on the wire says a GIF provider was ever involved.
+  ///
+  /// Shipping the provider URL instead — which is what the dead `attachmentGif` event was
+  /// shaped to do — would have leaked on both ends: the recipient's IP and the moment they
+  /// opened the message go to a third party, and the URL itself names the content in a
+  /// message whose whole point is that its content is sealed. `id` and `previewUrl` are
+  /// deliberately dropped rather than carried as metadata, for the same reason.
   func inputBarDidSelectGif(
     id: String,
     url: String,
     previewUrl: String,
     width: Int,
-    height: Int
+    height: Int,
+    localData: Data?
   ) {
-    // Prefetch the GIF into the media cache so it displays instantly
-    // when the optimistic row appears.
-    chatMediaPrefetch(urlString: url, animated: true)
-    if previewUrl != url {
-      chatMediaPrefetch(urlString: previewUrl, animated: true)
+    if let localData, !localData.isEmpty {
+      stageAndSendGif(data: localData, id: id, width: width, height: height)
+      return
     }
-    onNativeEvent([
-      "type": "attachmentGif",
-      "id": id,
-      "url": url,
-      "previewUrl": previewUrl,
-      "width": width,
-      "height": height,
-    ])
+    guard let remoteURL = URL(string: url) else { return }
+    // Ephemeral: no cookie jar, no credential store, no disk cache shared with anything
+    // else — the fetch leaves nothing behind that ties this device to the provider.
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.httpCookieAcceptPolicy = .never
+    configuration.httpShouldSetCookies = false
+    configuration.timeoutIntervalForRequest = 20
+    let session = URLSession(configuration: configuration)
+    session.dataTask(with: remoteURL) { [weak self] data, _, error in
+      session.finishTasksAndInvalidate()
+      guard let data, !data.isEmpty, error == nil else {
+        NSLog("[ChatGifSend] fetch failed bytes=%d err=%@",
+          data?.count ?? 0, error?.localizedDescription ?? "-")
+        DispatchQueue.main.async { AppToastController.shared.show("Couldn't send that GIF.") }
+        return
+      }
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.stageAndSendGif(data: data, id: id, width: width, height: height)
+      }
+    }.resume()
+  }
+
+  private func stageAndSendGif(data: Data, id: String, width: Int, height: Int) {
+    let fileName = "gif-\(UUID().uuidString.lowercased()).gif"
+    let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+    do {
+      try data.write(to: fileURL, options: .atomic)
+    } catch {
+      NSLog("[ChatGifSend] stage failed err=%@", error.localizedDescription)
+      AppToastController.shared.show("Couldn't send that GIF.")
+      return
+    }
+    ChatGifRecentsStore.shared.record(id: id, data: data, width: width, height: height)
+    handleNativeAttachmentSend(
+      uri: fileURL.absoluteString,
+      caption: nil,
+      transitionCapture: nil,
+      typeOverride: "gif"
+    )
   }
 
   private func isVideoAttachmentURI(_ raw: String, fileNameHint: String? = nil) -> Bool {
@@ -23873,6 +24570,26 @@ extension ChatListView: ChatInputBarDelegate {
     guard !trimmed.isEmpty else { return nil }
     let fileURL = localAttachmentFileURL(for: trimmed)
     guard let fileURL else { return nil }
+    // A header read, not a decode. `UIImage(contentsOfFile:)` was materializing the whole
+    // bitmap of a 12MP photo to report two integers that sit in the file header — on the
+    // same main-thread send pass as the micro-thumb, which was doing it again.
+    if let source = CGImageSourceCreateWithURL(
+      fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+      let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+      let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+      width > 0, height > 0
+    {
+      // Orientations 5–8 are the quarter turns, and for those the STORED pixel dimensions
+      // are transposed against how the image is displayed. Every consumer of this size
+      // wants the displayed shape — it is what sets the bubble's aspect — and that is what
+      // `UIImage.size` used to hand back, orientation already applied. Dropping this would
+      // ship every portrait photo with a landscape bubble.
+      let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+      return (5...8).contains(orientation)
+        ? CGSize(width: height, height: width)
+        : CGSize(width: width, height: height)
+    }
     if let image = UIImage(contentsOfFile: fileURL.path) {
       return CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
     }
@@ -24053,16 +24770,65 @@ extension ChatListView: ChatInputBarDelegate {
     width: Int,
     height: Int
   ) {
-    var payload: [String: Any] = [
-      "type": "attachmentSticker",
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    let messageId = UUID().uuidString.lowercased()
+    let now = Date()
+    let timestampMs = now.timeIntervalSince1970 * 1000
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm"
+
+    // Identity only — no bytes on the wire at all. The packs ship inside the app, so both
+    // devices already hold the artwork and the message needs to carry nothing but which
+    // sticker it is. That is strictly less to leak than uploading an image would be, and
+    // it is also what the row parser reads back.
+    var metadata: [String: Any] = [
       "stickerId": stickerId,
-      "packId": packId,
+      "stickerPackId": packId,
       "width": width,
       "height": height,
     ]
-    if let bundleFileName { payload["bundleFileName"] = bundleFileName }
-    if let emoji { payload["emoji"] = emoji }
-    onNativeEvent(payload)
+    if let bundleFileName, !bundleFileName.isEmpty {
+      metadata["stickerBundleFileName"] = bundleFileName
+    }
+    if let emoji, !emoji.isEmpty { metadata["emoji"] = emoji }
+
+    inputBar?.dismissGifPanel(animated: true)
+    queueNativeOutgoingStickerMessage(
+      messageId: messageId,
+      timestamp: formatter.string(from: now),
+      timestampMs: timestampMs,
+      metadata: metadata,
+      replyToId: inputBar?.activeReplyToMessageId
+    )
+
+    var sendPayload: [String: Any] = [
+      "chatId": chatId,
+      "messageId": messageId,
+      "type": "sticker",
+      "text": "",
+      "timestampMs": timestampMs,
+      "metadata": metadata,
+      "myUserId": engineMyUserId.trimmingCharacters(in: .whitespacesAndNewlines),
+      "peerUserId": enginePeerUserId.trimmingCharacters(in: .whitespacesAndNewlines),
+      "peerAgentId": enginePeerAgentId.trimmingCharacters(in: .whitespacesAndNewlines),
+      "isGroup": isGroupOrChannel,
+      "isChannel": isChannel,
+    ]
+    if let replyToId = inputBar?.activeReplyToMessageId {
+      sendPayload["replyToId"] = replyToId
+    }
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let result = ChatEngine.shared.sendMessage(sendPayload)
+      let accepted = (result["accepted"] as? Bool) == true
+      DispatchQueue.main.async {
+        self?.setNativeOutgoingMessageStatus(messageId, status: accepted ? "sent" : "error")
+      }
+    }
+  }
+
+  func dismissGifPanel() {
+    inputBar?.dismissGifPanel(animated: false)
   }
 
   func inputBarDidSelectFile(uri: String, name: String) {
@@ -24147,6 +24913,7 @@ extension ChatListView: ChatInputBarDelegate {
     activityOverlay.addSubview(activityTextLabel)
 
     insertSubview(activityOverlay, belowSubview: transitionOverlayHost)
+    applyActivityOverlayTheme()
   }
 
   private func applyActivityOverlayTheme() {

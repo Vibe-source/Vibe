@@ -25,6 +25,12 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private let galleryCollectionView: UICollectionView
   private let galleryLayout = GalleryGridLayout()
   private let galleryEmptyLabel = UILabel()
+  /// "Open Settings" when access was denied, "Select More Photos" under limited
+  /// access — the grid cannot fix either state on its own.
+  private let galleryPermissionButton = UIButton(type: .system)
+  /// Thumbnail the editor was opened from, so it can grow out of it and shrink
+  /// back into it. Weak because the grid may recycle the cell meanwhile.
+  private weak var zoomAnchorCellImageView: UIImageView?
   private let fileView = UIView()
   private let fileActionButton = UIButton(type: .system)
   private let locationView = UIView()
@@ -269,8 +275,17 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     galleryEmptyLabel.textAlignment = .center
     galleryEmptyLabel.numberOfLines = 0
 
+    // Denied access and limited access both need a way forward from inside the
+    // sheet; a label alone leaves the user with nothing to do about it.
+    galleryPermissionButton.isHidden = true
+    galleryPermissionButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+    galleryPermissionButton.setTitleColor(accentColor, for: .normal)
+    galleryPermissionButton.addTarget(
+      self, action: #selector(handleGalleryPermissionTap), for: .touchUpInside)
+
     contentView.addSubview(galleryCollectionView)
     contentView.addSubview(galleryEmptyLabel)
+    contentView.addSubview(galleryPermissionButton)
 
     // File Rows
     let fileStack = UIStackView()
@@ -535,8 +550,19 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       top: topInset, left: 0, bottom: tabBarOverlap, right: 0)
     galleryCollectionView.scrollIndicatorInsets = UIEdgeInsets(
       top: topInset, left: 0, bottom: tabBarOverlap, right: 0)
+    // Under limited access the grid still shows, so the button sits just under the
+    // header rather than in the middle of the (non-empty) list.
+    let permissionIsInline = !galleryAssets.isEmpty
+    galleryPermissionButton.frame = CGRect(
+      x: 20,
+      y: permissionIsInline ? topInset + 6 : topInset + 64,
+      width: w - 40,
+      height: 34)
     galleryEmptyLabel.frame = CGRect(
       x: 20, y: topInset + 20, width: w - 40, height: h - topInset - tabBarOverlap - 40)
+    if permissionIsInline {
+      contentView.bringSubviewToFront(galleryPermissionButton)
+    }
 
     // ── Soft gradient masks ──
     let topMaskH: CGFloat = topInset + 16  // covers header + fade zone
@@ -615,9 +641,10 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     let from = hostView(for: previous)
 
     // Hide all first, then just show target and from
-    [galleryCollectionView, galleryEmptyLabel, fileView, locationView].forEach {
-      $0.isHidden = true
-    }
+    [galleryCollectionView, galleryEmptyLabel, galleryPermissionButton, fileView, locationView]
+      .forEach {
+        $0.isHidden = true
+      }
     from.isHidden = false
     target.isHidden = false
     let targetEmptyLabelVisible = (section == .gallery && galleryAssets.isEmpty)
@@ -661,8 +688,18 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private func showHostView(for section: MenuSection) {
     galleryCollectionView.isHidden = section != .gallery
     galleryEmptyLabel.isHidden = section != .gallery || !galleryAssets.isEmpty
+    galleryPermissionButton.isHidden = section != .gallery || !galleryNeedsPermissionAction
     fileView.isHidden = section != .file
     locationView.isHidden = section != .location
+  }
+
+  /// Limited access can add more, denied access can be changed in Settings; full
+  /// access has nothing to offer.
+  private var galleryNeedsPermissionAction: Bool {
+    switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
+    case .authorized, .notDetermined: return false
+    default: return true
+    }
   }
 
   private func hostView(for section: MenuSection) -> UIView {
@@ -908,9 +945,18 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private func refreshGalleryAssets() {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     switch status {
-    case .authorized, .limited:
+    case .authorized:
+      galleryPermissionButton.isHidden = true
+      loadGalleryAssets()
+    case .limited:
+      // Only some of the library is visible, and the grid cannot say so on its
+      // own — a short library reads as an empty one.
+      galleryPermissionButton.isHidden = false
+      galleryPermissionButton.setTitle("Select More Photos", for: .normal)
       loadGalleryAssets()
     case .notDetermined:
+      // `.readWrite` covers photos *and* videos; asking for `.addOnly` or a
+      // narrower scope is what leaves the Videos tab permanently empty.
       PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] _ in
         DispatchQueue.main.async { self?.refreshGalleryAssets() }
       }
@@ -918,31 +964,58 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       allGalleryAssets = []
       galleryAssets = []
       galleryCollectionView.reloadData()
-      galleryEmptyLabel.text = "Allow Photos access to show gallery"
+      galleryEmptyLabel.text = "Vibe needs access to your photos and videos"
       galleryEmptyLabel.isHidden = false
+      galleryPermissionButton.isHidden = false
+      galleryPermissionButton.setTitle("Open Settings", for: .normal)
     }
   }
 
+  /// Fetches the *active filter* from the library rather than slicing a
+  /// pre-truncated list. The old version pulled the 300 newest assets of any type
+  /// and filtered in memory, so "Videos" was empty for anyone whose 300 most
+  /// recent items happened to be photos.
   private func loadGalleryAssets() {
     let opts = PHFetchOptions()
     opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
     opts.fetchLimit = 300
+    let image = PHAssetMediaType.image.rawValue
+    let video = PHAssetMediaType.video.rawValue
+    switch activeGalleryFilter {
+    case .recent:
+      // Explicit, so audio and whatever else the library holds stay out of a grid
+      // that can only send pictures and video.
+      opts.predicate = NSPredicate(
+        format: "mediaType == %d || mediaType == %d", image, video)
+    case .photos:
+      opts.predicate = NSPredicate(format: "mediaType == %d", image)
+    case .videos:
+      opts.predicate = NSPredicate(format: "mediaType == %d", video)
+    }
+
     let fetch = PHAsset.fetchAssets(with: opts)
     var next: [PHAsset] = []
     next.reserveCapacity(fetch.count)
     fetch.enumerateObjects { asset, _, _ in next.append(asset) }
     allGalleryAssets = next
-    applyGalleryFilter()
+    galleryAssets = next
+    galleryCollectionView.reloadData()
+    galleryEmptyLabel.text =
+      activeGalleryFilter == .videos ? "No videos found" : "No photos found"
+    galleryEmptyLabel.isHidden = !galleryAssets.isEmpty
   }
 
   private func applyGalleryFilter() {
-    switch activeGalleryFilter {
-    case .recent: galleryAssets = allGalleryAssets
-    case .videos: galleryAssets = allGalleryAssets.filter { $0.mediaType == .video }
-    case .photos: galleryAssets = allGalleryAssets.filter { $0.mediaType == .image }
+    loadGalleryAssets()
+  }
+
+  @objc private func handleGalleryPermissionTap() {
+    if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited {
+      PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: self)
+      return
     }
-    galleryCollectionView.reloadData()
-    galleryEmptyLabel.isHidden = !galleryAssets.isEmpty
+    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+    UIApplication.shared.open(url)
   }
 
   private func currentCaption() -> String? {
@@ -1000,7 +1073,10 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       from: self, messageId: nil, mediaURL: url.absoluteString,
       initialImage: initialImage,
       initialCaption: currentCaption(),
-      dismissPresenterOnSend: true
+      dismissPresenterOnSend: true,
+      // Same shared-element open as the chat: the picture grows out of the
+      // thumbnail that was tapped instead of arriving from nowhere.
+      zoomSourceProvider: self
     ) { [weak self] payload in
       if payload.eventType == .sendNew {
         let finalURL = payload.editedImageURL ?? url
@@ -1361,6 +1437,35 @@ extension ChatAttachmentMenuController: UIDocumentPickerDelegate {
   }
 }
 
+// MARK: - Shared-element anchor for the editor
+
+extension ChatAttachmentMenuController: ChatMediaZoomSourceProviding {
+  /// The picker has no message ids — there is exactly one photo in flight, the
+  /// one whose thumbnail was tapped, so both arguments are ignored here.
+  func chatMediaZoomSource(forMessageId messageId: String?, pageIndex: Int)
+    -> ChatMediaZoomSource?
+  {
+    guard let anchor = zoomAnchorCellImageView, anchor.window != nil else { return nil }
+    return makeChatMediaZoomSource(for: anchor)
+  }
+
+  func chatMediaZoomSetSourceHidden(
+    _ hidden: Bool,
+    forMessageId messageId: String?,
+    pageIndex: Int
+  ) {
+    zoomAnchorCellImageView?.alpha = hidden ? 0 : 1
+  }
+
+  func chatMediaZoomInstallFlightView(_ flightView: UIView, frameInWindow: CGRect) -> UIView? {
+    // The picker header is a sibling above `contentView`; mounting the flight in
+    // content keeps the same invariant as the chat list.
+    contentView.addSubview(flightView)
+    flightView.frame = contentView.convert(frameInWindow, from: nil)
+    return contentView
+  }
+}
+
 // MARK: - Collection View
 
 extension ChatAttachmentMenuController:
@@ -1425,6 +1530,9 @@ extension ChatAttachmentMenuController:
     }
     let assetIdx = indexPath.item - 1
     guard assetIdx < galleryAssets.count else { return }
+    // Remember the thumbnail so the editor can grow out of it. Held weakly: the
+    // grid can recycle the cell while the asset's full-size data is still loading.
+    zoomAnchorCellImageView = (cv.cellForItem(at: indexPath) as? ChatAttachmentAssetCell)?.imageView
     // Direct tap = open editor
     sendSelectedAsset(galleryAssets[assetIdx])
   }

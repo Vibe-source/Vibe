@@ -48,7 +48,8 @@ final class ChatWallpaperView: UIView {
 
   // MARK: - State
 
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
+  private var hasPainted = false
 
   /// Flat raster of the current wallpaper, used by cells for the frosted backdrop behind
   /// bubbles. Sampling the live layers per cell per frame is what this replaces.
@@ -102,7 +103,10 @@ final class ChatWallpaperView: UIView {
   // MARK: - Theme
 
   func apply(_ appearance: ChatListAppearance) {
-    guard self.appearance.visualKey != appearance.visualKey else { return }
+    // `appearance` starts at a real value, so an identical first apply left the layers
+    // colourless — a transparent wallpaper over the host's plain fill.
+    guard !hasPainted || self.appearance.visualKey != appearance.visualKey else { return }
+    hasPainted = true
     self.appearance = appearance
 
     let transparent = appearance.backgroundMode == "transparent"
@@ -112,15 +116,40 @@ final class ChatWallpaperView: UIView {
     gradientLayer.opacity = Float(max(0.0, min(1.0, appearance.wallpaperOpacity)))
     gradientLayer.isHidden = transparent
 
-    let maskImage = appearance.wallpaperMaskKey.flatMap {
-      ChatWallpaperMaskStore.image(
-        forKey: $0, bundles: [Bundle.main, Bundle(for: ChatWallpaperView.self)])
-    }
+    // NEVER the rasterising `image(forKey:)` here. That renders a full-screen vector on
+    // a miss — 0.43s of blocked main thread, sampled directly out of a `[mainhang]`
+    // stack — and `apply` runs inside the navigation push.
+    //
+    // `cachedImage` is memory-then-disk, so after the first ever render this hits and
+    // the pattern is live on the first frame. Only a genuinely first run falls through
+    // to the branch below, which paints the plain gradient now and re-applies one turn
+    // later — that path is what the user saw as "solid background, then the wallpaper
+    // appears", and it used to run on EVERY launch because both tiers were `NSCache`.
+    let maskKey = appearance.wallpaperMaskKey
+    let maskImage = maskKey.flatMap { ChatWallpaperMaskStore.cachedImage(forKey: $0) }
     let canShowPattern =
       !transparent
       && appearance.wallpaperPatternGradient.count >= 2
       && appearance.wallpaperPatternOpacity > 0.001
       && maskImage != nil
+
+    if maskImage == nil, let maskKey, !maskKey.isEmpty, !transparent,
+      appearance.wallpaperPatternGradient.count >= 2,
+      appearance.wallpaperPatternOpacity > 0.001
+    {
+      let wantedVisualKey = appearance.visualKey
+      ChatWallpaperMaskStore.prewarm(
+        key: maskKey, bundles: [Bundle.main, Bundle(for: ChatWallpaperView.self)]
+      ) { [weak self] ok in
+        guard ok else { return }
+        DispatchQueue.main.async {
+          guard let self, self.appearance.visualKey == wantedVisualKey else { return }
+          // `apply` early-returns on an unchanged visualKey, so re-drive the pattern
+          // directly rather than re-entering it.
+          self.applyCachedPatternMask()
+        }
+      }
+    }
 
     guard canShowPattern, let maskImage else {
       patternLayer.isHidden = true
@@ -141,6 +170,28 @@ final class ChatWallpaperView: UIView {
     patternLayer.isHidden = false
     snapshotCacheKey = ""
     refreshSnapshotIfNeeded()
+  }
+
+  /// Second half of `apply`'s pattern branch, for when the mask decode finishes after
+  /// the push has already painted the plain gradient.
+  private func applyCachedPatternMask() {
+    guard appearance.backgroundMode != "transparent",
+      appearance.wallpaperPatternGradient.count >= 2,
+      appearance.wallpaperPatternOpacity > 0.001,
+      let maskKey = appearance.wallpaperMaskKey,
+      let maskImage = ChatWallpaperMaskStore.cachedImage(forKey: maskKey)
+    else { return }
+    patternLayer.colors = appearance.wallpaperPatternGradient.map(\.cgColor)
+    patternLayer.locations = appearance.wallpaperPatternLocations
+    patternLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
+    patternLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
+    patternLayer.opacity = Float(max(0.0, min(1.0, appearance.wallpaperPatternOpacity)))
+    patternMaskLayer.contents = maskImage
+    patternLayer.isHidden = false
+    setNeedsLayout()
+    layoutIfNeeded()
+    snapshotCacheKey = ""
+    refreshSnapshotIfNeeded(force: true)
   }
 
   // MARK: - Snapshot
@@ -167,7 +218,11 @@ final class ChatWallpaperView: UIView {
     let key = cacheKey(scale: scale)
     if !force, snapshotCacheKey == key, snapshot != nil { return }
 
-    if let cached = Self.snapshotCache.object(forKey: key as NSString)?.cgImage {
+    // `force` means the INPUTS changed (the mask finished decoding), so the entry under
+    // this key is stale by definition. Adopting it here is how a gradient-only raster
+    // captured during a mask miss used to become the cells' backdrop for the rest of
+    // the session, even after the pattern was on screen.
+    if !force, let cached = Self.snapshotCache.object(forKey: key as NSString)?.cgImage {
       snapshot = cached
       snapshotSize = bounds.size
       snapshotCacheKey = key
@@ -175,29 +230,115 @@ final class ChatWallpaperView: UIView {
       return
     }
 
-    let startedAt = ProcessInfo.processInfo.systemUptime
+    // NEVER rasterise here. This runs from `layoutSubviews`, and compositing a
+    // full-screen masked gradient through `CALayer.render(in:)` is 43–222ms warm —
+    // and 3.38s of blocked main thread when the home hold-preview drives it repeatedly
+    // at fresh sizes (`refreshSnapshotIfNeeded ← layoutSubviews ← prewarmLayout`,
+    // straight out of a `[mainhang]` stack).
+    //
+    // Nothing on screen is waiting for this. The visible wallpaper is `gradientLayer` +
+    // `patternLayer`, which are live and already correct; `snapshot` only feeds the
+    // frosted backdrop behind bubbles, which rebinds via `onSnapshotChanged`.
+    let size = bounds.size
+    let appearance = self.appearance
+    let maskImage = appearance.wallpaperMaskKey.flatMap {
+      ChatWallpaperMaskStore.cachedImage(forKey: $0)
+    }
+    Self.renderCompositeOffMain(
+      appearance: appearance, size: size, scale: scale, maskImage: maskImage, key: key
+    ) { [weak self] cgImage in
+      guard let self, self.snapshotCacheKey != key || self.snapshot == nil else { return }
+      // Bounds or theme may have moved on while the worker ran; that turn scheduled its
+      // own render, so drop this one rather than publish a mismatched image.
+      guard self.cacheKey(scale: max(self.window?.screen.scale ?? UIScreen.main.scale, 1.0))
+        == key
+      else { return }
+      self.snapshot = cgImage
+      self.snapshotSize = size
+      self.snapshotCacheKey = key
+      self.onSnapshotChanged?()
+    }
+  }
+
+  /// Composites the wallpaper from DETACHED layers on a worker.
+  ///
+  /// Detached is not an optimisation — `self`'s layers belong to the render server and
+  /// may not be read off the main thread. Building throwaway copies from the same
+  /// appearance is what lets this leave main at all, and is why `prewarm` already
+  /// worked this way.
+  private static func renderCompositeOffMain(
+    appearance: ChatListAppearance,
+    size: CGSize,
+    scale: CGFloat,
+    maskImage: CGImage?,
+    key: String,
+    completion: @escaping (CGImage) -> Void
+  ) {
+    guard size.width > 1, size.height > 1, scale > 0 else { return }
+    prewarmLock.lock()
+    let inserted = prewarmKeys.insert(key).inserted
+    prewarmLock.unlock()
+    guard inserted else { return }
+
+    prewarmQueue.async {
+      let startedAt = ProcessInfo.processInfo.systemUptime
+      let composed = composite(
+        appearance: appearance, size: size, scale: scale, maskImage: maskImage)
+      let renderMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+      prewarmLock.lock()
+      prewarmKeys.remove(key)
+      prewarmLock.unlock()
+      guard let composed else { return }
+      if renderMs >= 8 {
+        NSLog("[Wallpaper] raster %dms key=%@ (off-main)", renderMs, key)
+      }
+      snapshotCache.setObject(
+        UIImage(cgImage: composed, scale: scale, orientation: .up),
+        forKey: key as NSString,
+        cost: composed.bytesPerRow * composed.height)
+      DispatchQueue.main.async { completion(composed) }
+    }
+  }
+
+  /// The gradient-plus-masked-pattern composite, from detached layers. Safe off-main.
+  private static func composite(
+    appearance: ChatListAppearance, size: CGSize, scale: CGFloat, maskImage: CGImage?
+  ) -> CGImage? {
+    let box = CGRect(origin: .zero, size: size)
+
+    let baseLayer = CAGradientLayer()
+    baseLayer.frame = box
+    baseLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
+    baseLayer.startPoint = CGPoint(x: 0, y: 0)
+    baseLayer.endPoint = CGPoint(x: 1, y: 1)
+    baseLayer.opacity = Float(max(0, min(1, appearance.wallpaperOpacity)))
+
+    let pattern = CAGradientLayer()
+    pattern.frame = box
+    let colors = appearance.wallpaperPatternGradient
+    if colors.count >= 2, appearance.wallpaperPatternOpacity > 0.001, let maskImage {
+      pattern.colors = colors.map(\.cgColor)
+      pattern.locations = appearance.wallpaperPatternLocations
+      pattern.startPoint = CGPoint(x: 0, y: 0)
+      pattern.endPoint = CGPoint(x: 1, y: 1)
+      pattern.opacity = Float(max(0, min(1, appearance.wallpaperPatternOpacity)))
+      let maskLayer = CALayer()
+      maskLayer.frame = box
+      maskLayer.contents = maskImage
+      maskLayer.contentsGravity = .resizeAspectFill
+      maskLayer.contentsScale = scale
+      pattern.mask = maskLayer
+    } else {
+      pattern.isHidden = true
+    }
+
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = scale
     format.opaque = false
-    let image = UIGraphicsImageRenderer(size: bounds.size, format: format).image { context in
-      gradientLayer.render(in: context.cgContext)
-      if !patternLayer.isHidden {
-        patternLayer.render(in: context.cgContext)
-      }
-    }
-    let renderMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
-    if renderMs >= 8 {
-      NSLog("[Wallpaper] raster %dms key=%@", renderMs, key)
-    }
-    guard let cgImage = image.cgImage else { return }
-    Self.snapshotCache.setObject(
-      UIImage(cgImage: cgImage, scale: scale, orientation: .up),
-      forKey: key as NSString,
-      cost: cgImage.bytesPerRow * cgImage.height)
-    snapshot = cgImage
-    snapshotSize = bounds.size
-    snapshotCacheKey = key
-    onSnapshotChanged?()
+    return UIGraphicsImageRenderer(size: size, format: format).image { context in
+      baseLayer.render(in: context.cgContext)
+      if !pattern.isHidden { pattern.render(in: context.cgContext) }
+    }.cgImage
   }
 
   /// Pre-render the wallpaper while Home is idle. A cold 3x patterned raster measured
@@ -217,9 +358,31 @@ final class ChatWallpaperView: UIView {
 
     let appearance = ChatListAppearance.from(raw: rawAppearance)
     guard appearance.backgroundMode != "transparent" else { return }
-    let maskImage = appearance.wallpaperMaskKey.flatMap {
-      ChatWallpaperMaskStore.image(
-        forKey: $0, bundles: [Bundle.main, Bundle(for: ChatWallpaperView.self)])
+    // Take the mask from the cache only. Rasterising it here is what this whole
+    // function exists to avoid, and doing it above the `prewarmQueue.async` put the
+    // single most expensive step in the app back on the main thread: `renderAlphaOnly
+    // ← loadVector ← image(forKey:) ← ChatWallpaperView.prewarm` sat at the top of a
+    // 0.43s `[mainhang]` stack one second after launch, immediately before the open
+    // that then reported `hang=0.87s`.
+    let maskKey = appearance.wallpaperMaskKey
+    ChatWallpaperMaskStore.primeScreenPixelSize()
+    let maskImage = maskKey.flatMap { ChatWallpaperMaskStore.cachedImage(forKey: $0) }
+    if maskImage == nil, let maskKey, !maskKey.isEmpty,
+      appearance.wallpaperPatternGradient.count >= 2, appearance.wallpaperPatternOpacity > 0.001
+    {
+      // Decode off-main and come back. Building the snapshot NOW would cache a
+      // pattern-less render under this appearance's key — `snapshotCache` is consulted
+      // before anything else, so that wrong image would be the wallpaper for the rest
+      // of the session. Skipping one prewarm turn costs nothing; the retry does it all.
+      ChatWallpaperMaskStore.prewarm(
+        key: maskKey, bundles: [Bundle.main, Bundle(for: ChatWallpaperView.self)]
+      ) { ok in
+        guard ok else { return }
+        DispatchQueue.main.async {
+          prewarm(rawAppearance: rawAppearance, size: size, scale: scale)
+        }
+      }
+      return
     }
     let pixelWidth = Int((size.width * scale).rounded())
     let pixelHeight = Int((size.height * scale).rounded())
@@ -233,43 +396,9 @@ final class ChatWallpaperView: UIView {
 
     prewarmQueue.async {
       let startedAt = ProcessInfo.processInfo.systemUptime
-      let box = CGRect(origin: .zero, size: size)
-
-      let baseLayer = CAGradientLayer()
-      baseLayer.frame = box
-      baseLayer.colors = appearance.wallpaperGradient.map(\.cgColor)
-      baseLayer.startPoint = CGPoint(x: 0, y: 0)
-      baseLayer.endPoint = CGPoint(x: 1, y: 1)
-      baseLayer.opacity = Float(max(0, min(1, appearance.wallpaperOpacity)))
-
-      let pattern = CAGradientLayer()
-      pattern.frame = box
-      let colors = appearance.wallpaperPatternGradient
-      if colors.count >= 2, appearance.wallpaperPatternOpacity > 0.001, let maskImage {
-        pattern.colors = colors.map(\.cgColor)
-        pattern.locations = appearance.wallpaperPatternLocations
-        pattern.startPoint = CGPoint(x: 0, y: 0)
-        pattern.endPoint = CGPoint(x: 1, y: 1)
-        pattern.opacity = Float(max(0, min(1, appearance.wallpaperPatternOpacity)))
-        let maskLayer = CALayer()
-        maskLayer.frame = box
-        maskLayer.contents = maskImage
-        maskLayer.contentsGravity = .resizeAspectFill
-        maskLayer.contentsScale = scale
-        pattern.mask = maskLayer
-      } else {
-        pattern.isHidden = true
-      }
-
-      let format = UIGraphicsImageRendererFormat.default()
-      format.scale = scale
-      format.opaque = false
-      let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
-        baseLayer.render(in: context.cgContext)
-        if !pattern.isHidden { pattern.render(in: context.cgContext) }
-      }
-
-      if let cgImage = image.cgImage {
+      if let cgImage = composite(
+        appearance: appearance, size: size, scale: scale, maskImage: maskImage)
+      {
         snapshotCache.setObject(
           UIImage(cgImage: cgImage, scale: scale, orientation: .up),
           forKey: key as NSString,

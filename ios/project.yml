@@ -10,11 +10,16 @@ settings:
     CURRENT_PROJECT_VERSION: 1
     MARKETING_VERSION: 1.0.0
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Packet/Packet-Bridging-Header.h
+    # libpacket_xray.a is the embedded REALITY engine the packet client calls
+    # through PacketXray*; arm64 only, so the x86_64 simulator slice links the
+    # phantom archive built without that feature.
     OTHER_LDFLAGS[sdk=iphoneos*][arch=arm64]:
       - "$(SRCROOT)/Vendor/Packet/ios-arm64/libphantom_client.a"
+      - "$(SRCROOT)/Vendor/Packet/ios-arm64/libpacket_xray.a"
       - "-lresolv"
     OTHER_LDFLAGS[sdk=iphonesimulator*][arch=arm64]:
       - "$(SRCROOT)/Vendor/Packet/ios-sim-arm64/libphantom_client.a"
+      - "$(SRCROOT)/Vendor/Packet/ios-sim-arm64/libpacket_xray.a"
       - "-lresolv"
     OTHER_LDFLAGS[sdk=iphonesimulator*][arch=x86_64]:
       - "$(SRCROOT)/Vendor/Packet/ios-sim-x86_64/libphantom_client.a"

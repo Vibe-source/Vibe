@@ -571,7 +571,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
   private let historyTableView = UITableView(frame: .zero, style: .plain)
   private let historyEmptyLabel = UILabel()
 
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   private var currentPage: ChatNativeAgentPage = .chat
   private var conversations: [ChatNativeAgentConversation] = []
   private var activeConversationId: String?
@@ -3200,7 +3200,7 @@ public final class ChatNativeAgentView: UIView, UITableViewDataSource, UITableVi
 
     let cardTitle = card.displayName
 
-    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+    VibeHTTP.shared.dataTask(with: request) { [weak self] data, response, error in
       DispatchQueue.main.async {
         guard let self else { return }
 

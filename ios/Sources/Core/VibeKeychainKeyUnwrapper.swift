@@ -106,6 +106,13 @@ final class VibeKeychainKeyUnwrapper: VibeFfiKeyUnwrapper {
       // Locked Keychain or signed-out session. Exactly one slot per request, so
       // the core sees "none of these opened" rather than a length mismatch.
       recordLocked(opened: 0, refused: requests.count)
+      // Named, because this is the one failure mode that looks identical to "sealed to
+      // another device" from the render side and has a completely different fix. Both
+      // arrive as `decryptFailed=N` in `[VibeCore] window` with nothing to tell them
+      // apart — that number has been unactionable for exactly this reason.
+      NSLog(
+        "[CoreCrypto] unwrap batch=%ld REFUSED ALL — no private key (locked Keychain "
+          + "or signed-out session)", requests.count)
       return Array(repeating: nil, count: requests.count)
     }
 
@@ -133,7 +140,24 @@ final class VibeKeychainKeyUnwrapper: VibeFfiKeyUnwrapper {
       results.append(unwrapped)
     }
 
-    recordLocked(opened: openedCount, refused: requests.count - openedCount)
+    let refusedCount = requests.count - openedCount
+    recordLocked(opened: openedCount, refused: refusedCount)
+    // The counters above have existed since this file was written and have never been
+    // printed anywhere, which is why `decryptFailed=12` was a dead end: it says twelve
+    // rows render as failures, not whether the private key refused them here or the
+    // AES-GCM open refused them in the core afterwards. Those have different causes
+    // (a key this device does not hold vs. a corrupt/ill-formed envelope) and different
+    // fixes. `refused > 0` is the discriminator, and it belongs at the seam.
+    //
+    // Counts only. Never a message id, never which candidate opened — the doc on this
+    // type is explicit that revealing which slot succeeded leaks send-vs-receive to
+    // anything watching the boundary.
+    if refusedCount > 0 {
+      NSLog(
+        "[CoreCrypto] unwrap batch=%ld opened=%ld refused=%ld — refused means no candidate "
+          + "unwrapped (message sealed to a key this device does not hold)",
+        requests.count, openedCount, refusedCount)
+    }
     // Invariant the core depends on. Cheap to assert, catastrophic to violate.
     assert(results.count == requests.count, "unwrapper must answer positionally")
     return results

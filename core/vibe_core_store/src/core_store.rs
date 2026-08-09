@@ -170,10 +170,24 @@ impl VibeCoreStore {
             let mut stmt = tx
                 .prepare(
                     r"
+                    -- A tombstoned id is never re-admitted, on either write path.
+                    --
+                    -- This is the difference between a delete that holds and one that
+                    -- has to be re-applied forever: the server keeps re-sending a
+                    -- message the user deleted locally, and a plain upsert re-inserts
+                    -- it on every history page — while the backfill walk would drag it
+                    -- back out of the legacy table on the next rebuild. The tombstone is
+                    -- the durable memory of the decision, so the refusal belongs in the
+                    -- store rather than in a filter each caller has to remember.
                     INSERT INTO core_messages_v1(
                       user_id, chat_id, message_id, ts, order_key,
                       flags, sealed_body, seal_nonce
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    )
+                    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM core_tombstones_v1
+                      WHERE user_id = ?1 AND chat_id = ?2 AND message_id = ?3
+                    )
                     ON CONFLICT(user_id, chat_id, message_id) DO UPDATE SET
                       ts = excluded.ts,
                       order_key = excluded.order_key,
@@ -227,10 +241,15 @@ impl VibeCoreStore {
             None => self.query_rows(
                 r"
                 SELECT message_id, ts, flags, sealed_body, seal_nonce FROM (
-                  SELECT message_id, ts, flags, sealed_body, seal_nonce
-                  FROM core_messages_v1
-                  WHERE user_id = ?1 AND chat_id = ?2
-                  ORDER BY ts DESC, message_id DESC
+                  SELECT m.message_id, m.ts, m.flags, m.sealed_body, m.seal_nonce
+                  FROM core_messages_v1 m
+                  WHERE m.user_id = ?1 AND m.chat_id = ?2
+                    AND NOT EXISTS (
+                      SELECT 1 FROM core_tombstones_v1 t
+                      WHERE t.user_id = m.user_id AND t.chat_id = m.chat_id
+                        AND t.message_id = m.message_id
+                    )
+                  ORDER BY m.ts DESC, m.message_id DESC
                   LIMIT ?3
                 )
                 ORDER BY ts ASC, message_id ASC
@@ -240,11 +259,16 @@ impl VibeCoreStore {
             Some(cursor) => self.query_rows(
                 r"
                 SELECT message_id, ts, flags, sealed_body, seal_nonce FROM (
-                  SELECT message_id, ts, flags, sealed_body, seal_nonce
-                  FROM core_messages_v1
-                  WHERE user_id = ?1 AND chat_id = ?2
-                    AND (ts < ?3 OR (ts = ?3 AND message_id < ?4))
-                  ORDER BY ts DESC, message_id DESC
+                  SELECT m.message_id, m.ts, m.flags, m.sealed_body, m.seal_nonce
+                  FROM core_messages_v1 m
+                  WHERE m.user_id = ?1 AND m.chat_id = ?2
+                    AND (m.ts < ?3 OR (m.ts = ?3 AND m.message_id < ?4))
+                    AND NOT EXISTS (
+                      SELECT 1 FROM core_tombstones_v1 t
+                      WHERE t.user_id = m.user_id AND t.chat_id = m.chat_id
+                        AND t.message_id = m.message_id
+                    )
+                  ORDER BY m.ts DESC, m.message_id DESC
                   LIMIT ?5
                 )
                 ORDER BY ts ASC, message_id ASC
@@ -273,21 +297,31 @@ impl VibeCoreStore {
         match after {
             None => self.query_rows(
                 r"
-                SELECT message_id, ts, flags, sealed_body, seal_nonce
-                FROM core_messages_v1
-                WHERE user_id = ?1 AND chat_id = ?2
-                ORDER BY ts ASC, message_id ASC
+                SELECT m.message_id, m.ts, m.flags, m.sealed_body, m.seal_nonce
+                FROM core_messages_v1 m
+                WHERE m.user_id = ?1 AND m.chat_id = ?2
+                  AND NOT EXISTS (
+                    SELECT 1 FROM core_tombstones_v1 t
+                    WHERE t.user_id = m.user_id AND t.chat_id = m.chat_id
+                      AND t.message_id = m.message_id
+                  )
+                ORDER BY m.ts ASC, m.message_id ASC
                 LIMIT ?3
                 ",
                 params![user_id, chat_id, limit],
             ),
             Some(cursor) => self.query_rows(
                 r"
-                SELECT message_id, ts, flags, sealed_body, seal_nonce
-                FROM core_messages_v1
-                WHERE user_id = ?1 AND chat_id = ?2
-                  AND (ts > ?3 OR (ts = ?3 AND message_id > ?4))
-                ORDER BY ts ASC, message_id ASC
+                SELECT m.message_id, m.ts, m.flags, m.sealed_body, m.seal_nonce
+                FROM core_messages_v1 m
+                WHERE m.user_id = ?1 AND m.chat_id = ?2
+                  AND (m.ts > ?3 OR (m.ts = ?3 AND m.message_id > ?4))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM core_tombstones_v1 t
+                    WHERE t.user_id = m.user_id AND t.chat_id = m.chat_id
+                      AND t.message_id = m.message_id
+                  )
+                ORDER BY m.ts ASC, m.message_id ASC
                 LIMIT ?5
                 ",
                 params![user_id, chat_id, cursor.ts_ms, cursor.message_id, limit],
@@ -366,6 +400,24 @@ impl VibeCoreStore {
         chat_id: &str,
         keep_newest: u32,
     ) -> Result<(), VibeStoreError> {
+        // Prune never touches tombstones, and the reason is the opposite of the
+        // intuitive one.
+        //
+        // "A tombstone whose row is gone is dead weight" is exactly backwards: a
+        // tombstone for an ABSENT row is the load-bearing case. Its entire job is to
+        // refuse re-admission of a row that is not there. The one next to a present row
+        // is the transitional state.
+        //
+        // Concretely, this is the flow at every delete site: tombstone the id, then
+        // `VibeCoreStoreBridge.repairChat`, which is `prune(keep_newest: 0)` plus a
+        // re-backfill. A prune that cleared tombstones would destroy the guard two calls
+        // after it was set, and the next server re-delivery of that message would find
+        // nothing to refuse it — the delete would have to be re-applied forever, which is
+        // the exact failure the tombstone exists to end. Pinned by
+        // `a_tombstone_survives_prune_and_still_refuses_re_delivery`.
+        //
+        // Unbounded growth is the right thing to worry about, but the bound belongs on
+        // age (`at_ms`), never on row presence.
         if keep_newest == 0 {
             self.conn
                 .execute(
@@ -377,6 +429,10 @@ impl VibeCoreStore {
         }
 
         // Delete everything that is not among the newest `keep_newest` rows.
+        //
+        // The newest-N subquery deliberately does NOT exclude tombstoned rows: prune is
+        // about physical storage, and a tombstoned row still occupies a slot. Filtering
+        // it here would let masked rows push live ones out of the retained window.
         self.conn
             .execute(
                 r"
@@ -590,10 +646,24 @@ impl VibeCoreStore {
             let mut insert = tx
                 .prepare(
                     r"
+                    -- A tombstoned id is never re-admitted, on either write path.
+                    --
+                    -- This is the difference between a delete that holds and one that
+                    -- has to be re-applied forever: the server keeps re-sending a
+                    -- message the user deleted locally, and a plain upsert re-inserts
+                    -- it on every history page — while the backfill walk would drag it
+                    -- back out of the legacy table on the next rebuild. The tombstone is
+                    -- the durable memory of the decision, so the refusal belongs in the
+                    -- store rather than in a filter each caller has to remember.
                     INSERT INTO core_messages_v1(
                       user_id, chat_id, message_id, ts, order_key,
                       flags, sealed_body, seal_nonce
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    )
+                    SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM core_tombstones_v1
+                      WHERE user_id = ?1 AND chat_id = ?2 AND message_id = ?3
+                    )
                     ON CONFLICT(user_id, chat_id, message_id) DO UPDATE SET
                       ts = excluded.ts,
                       order_key = excluded.order_key,

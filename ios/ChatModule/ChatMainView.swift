@@ -236,7 +236,8 @@ public final class ChatMainView: UIView,
   /// Broadcast channel (not a multi-member group). Drives header/profile copy.
   private var isChannel = false
 
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
+  private var lastAppliedSystemStyleIsDark: Bool?
   private var lastRawAppearance: [String: Any]?
   private var headerMode: ChatMainHeaderMode = .default
   private var builtInAgentChatMode = false
@@ -408,9 +409,22 @@ public final class ChatMainView: UIView,
 
   override public func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
     super.traitCollectionDidChange(previousTraitCollection)
-    guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
-      return
-    }
+    reapplyNativeThemeIfSystemStyleChanged()
+  }
+
+  override public func didMoveToWindow() {
+    super.didMoveToWindow()
+    reapplyNativeThemeIfSystemStyleChanged()
+  }
+
+  /// This page owns light/dark for everything inside it. The list used to derive it too,
+  /// from its own detached traitCollection, and whichever ran last won.
+  private func reapplyNativeThemeIfSystemStyleChanged() {
+    guard window != nil else { return }
+    let isDarkNow = ChatListAppearance.resolvedSystemStyle() == .dark
+    guard lastAppliedSystemStyleIsDark != isDarkNow else { return }
+    lastAppliedSystemStyleIsDark = isDarkNow
+    ChatListAppearance.invalidateBootstrap()
     reapplyNativeThemeForCurrentInterfaceStyle()
   }
 
@@ -532,6 +546,10 @@ public final class ChatMainView: UIView,
   /// See `ChatListView.setGeometryFrozenForDismissal`.
   func setGeometryFrozenForDismissal(_ frozen: Bool) {
     chatListView.setGeometryFrozenForDismissal(frozen)
+  }
+
+  func dismissGifPanel() {
+    chatListView.dismissGifPanel()
   }
 
   func setEngineStateUpdatesSuspended(_ suspended: Bool) {
@@ -782,16 +800,12 @@ public final class ChatMainView: UIView,
   }
 
   private func reapplyNativeThemeForCurrentInterfaceStyle() {
-    guard var rawAppearance = lastRawAppearance,
-      rawAppearance["nativeThemeId"] != nil
-    else {
-      applyTheme()
-      updateHeaderTexts()
-      updateProfileTexts()
-      return
+    let isDark = ChatListAppearance.resolvedSystemStyle() == .dark
+    var rawAppearance = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
+    if let last = lastRawAppearance, last["nativeThemeId"] != nil {
+      rawAppearance = last
     }
-
-    rawAppearance["nativeThemeIsDark"] = traitCollection.userInterfaceStyle == .dark
+    rawAppearance["nativeThemeIsDark"] = isDark
     setAppearance(rawAppearance)
   }
 
@@ -4188,7 +4202,7 @@ public final class ChatMainView: UIView,
   private func applyTheme() {
     let text = appearance.textColorThem
     let secondary = appearance.timeColorThem.withAlphaComponent(0.85)
-    let chatBackground = appearance.wallpaperGradient.first ?? UIColor.black
+    let chatBackground = appearance.wallpaperBase
     let isDarkTheme = appearance.isDark
     let profileBackground = isDarkTheme ? Self.themeDarkBg : Self.themeLightBg
     let profileCardBg = isDarkTheme ? Self.themeDarkCard : Self.themeLightCard

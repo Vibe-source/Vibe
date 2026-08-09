@@ -692,7 +692,7 @@ final class VibeNativeCallScreenController: UIViewController {
 
     guard let url = URL(string: normalized) else { return }
 
-    let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+    let task = VibeHTTP.shared.dataTask(with: url) { [weak self] data, _, _ in
       guard
         let self,
         let data,

@@ -52,11 +52,38 @@ final class VibeCoreListDriver {
   /// transcript back to the engine.
   private(set) var windowFollowsTail = true
 
+  /// Main-thread text layouts one mount may run for rows nothing else can size.
+  ///
+  /// Sized against the two numbers that bound it. Below: the core's geometry is only
+  /// ever read on chats of 12 rows or fewer, so anything comfortably above 12 leaves
+  /// that case measuring exactly as it did. Above: a cold mount of a 999-row chat ran
+  /// ~0.57s, so ≈0.6ms a row — 64 caps the worst case near 40ms, which fits inside a
+  /// push instead of replacing it.
+  private static let exactMeasurementBudget = 64
+
+  /// Whether a host diagnostic describes something that went wrong.
+  ///
+  /// An allow-list of the benign ones rather than a list of the failures, so a new
+  /// diagnostic is loud by default. A message that should have been ERROR and was
+  /// filed as INFO is invisible; the reverse is merely noisy.
+  private static func diagnosticIsFailure(_ message: String) -> Bool {
+    !(message.hasPrefix("mount skipped") || message.hasPrefix("mount cost"))
+  }
+
   init(chatId: String, listHost: VibeMessageListHost) {
     self.chatId = chatId
     self.timelineHost = VibeTimelineHost(chatId: chatId, listHost: listHost)
     timelineHost.onNeedsResync = { [weak self] in self?.requestWindow() }
     timelineHost.onDiagnostic = { message, meta in
+      // Not everything this host reports is a failure, and logging it as one is not a
+      // harmless overstatement: `mount skipped: window already applied` is the dedup
+      // guard doing its job, and it alone filed **110 ERROR lines** in a single
+      // diagnostics export — enough to bury the handful of lines that were real. Route
+      // by what the message means.
+      guard Self.diagnosticIsFailure(message) else {
+        VibeLog.info("core list adapter: \(message)", category: "core", metadata: meta)
+        return
+      }
       VibeLog.error("core list adapter: \(message)", category: "core", metadata: meta)
       // Also to the device console, and that is not redundancy. A rejected snapshot
       // means `apply(snapshot:)` never runs, so the host's generation stays 0 and every
@@ -80,13 +107,19 @@ final class VibeCoreListDriver {
   func start(
     ownUserId: String,
     rowProvider: @escaping (String) -> ChatListRow?,
-    agentStateProvider: @escaping (ChatListRow) -> AgentTurnBubbleState
+    agentStateProvider: @escaping (ChatListRow) -> AgentTurnBubbleState,
+    knownHeightProvider: @escaping (ChatListRow, CGFloat) -> CGFloat?
   ) {
     guard handle == nil else { return }
     timelineHost.setRowProvider(rowProvider)
     // Measured with the SAME inputs the list uses, or the two can never agree on an agent
     // row's height. Set together with the provider — never one without the other.
     timelineHost.setAgentStateProvider(agentStateProvider)
+    // Ask the list before measuring. The list already holds a persisted height for most
+    // rows and answers in a dictionary lookup; re-deriving it cost 0.57s of main thread
+    // inside the push on a 999-row chat.
+    timelineHost.setKnownHeightProvider(knownHeightProvider)
+    timelineHost.setExactMeasurementBudget(Self.exactMeasurementBudget)
 
     guard let core = VibeCoreBridge.sharedCore(ownUserId: ownUserId) else { return }
     handle = core

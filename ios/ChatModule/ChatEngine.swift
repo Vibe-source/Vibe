@@ -35,6 +35,12 @@ extension ChatEngine {
   fileprivate static let ingestTransientMessageKeys: Set<String> = [
     "isStreaming", "is_streaming", "uploadProgress", "upload_progress",
   ]
+
+  /// Metadata keys that decide `visualKind`. A thinner server copy must never clear them:
+  /// the row drops .media→.document and re-measures by up to 223pt.
+  fileprivate static let ingestDurableAttachmentKeys: [String] = [
+    "agentBridgeAttachmentsEnc", "attachmentThumbnailsB64",
+  ]
 }
 
 private func chatEngineReadDERLength(bytes: [UInt8], offset: inout Int) -> Int? {
@@ -1309,54 +1315,42 @@ final class ChatEngine {
     _ = connectNativePresence()
   }
 
+  /// Brings the proxy hop up when it is on but has no port yet. Never falls back to direct:
+  /// a proxy the user switched on must not be bypassed by a failed start.
   @discardableResult
   private func ensurePacketRuntimeAsync(trigger: String) -> Bool {
     var shouldStart = false
     var handled = false
-    let configPayload = syncOnQueue { () -> [String: Any]? in
+    syncOnQueue { () -> Void in
       let config = store.getConfig()
-      if transportModeLocked(config: config) == "packet_mesh" && packetProxyPortLocked(config: config) == nil {
-        handled = true
-        if !packetRuntimeStartInFlight {
-          packetRuntimeStartInFlight = true
-          shouldStart = true
-          state["state"] = "starting-packet-mesh"
-          state["connected"] = false
-          state["updatedAt"] = nowMs()
-          state["transportMode"] = "packet_mesh"
-          state["note"] = "Starting Packet mesh for native chat transport"
-          appendJournalLocked(event: "packet-runtime-start", payload: ["trigger": trigger])
-          postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": statusSnapshotLocked()])
-        }
-        return config
-      }
-      return nil
+      guard packetProxyEnabledLocked(config: config),
+        packetProxyPortLocked(config: config) == nil
+      else { return }
+      handled = true
+      guard !packetRuntimeStartInFlight else { return }
+      packetRuntimeStartInFlight = true
+      shouldStart = true
+      state["state"] = "starting-proxy"
+      state["connected"] = false
+      state["updatedAt"] = nowMs()
+      state["note"] = "Starting the proxy for the chat transport"
+      appendJournalLocked(event: "packet-runtime-start", payload: ["trigger": trigger])
+      postChangeLocked(reason: "connectionStateChanged", userInfo: ["state": statusSnapshotLocked()])
     }
 
     guard handled else { return false }
     guard shouldStart else { return true }
-    guard let configPayload, let config = AppSessionConfig(payload: configPayload) else {
-      queue.async {
-        self.packetRuntimeStartInFlight = false
-        self.appendJournalLocked(
-          event: "packet-runtime-start-skip",
-          payload: ["trigger": trigger, "reason": "missing_native_auth_config"]
-        )
-      }
-      return true
-    }
 
     Task.detached(priority: .utility) { [weak self] in
       guard let self else { return }
       do {
-        let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
+        let snapshot = try PacketRuntime.shared.ensureStarted()
         self.queue.async {
           self.packetRuntimeStartInFlight = false
-          self.state["state"] = "packet-runtime-ready"
+          self.state["state"] = "proxy-ready"
           self.state["connected"] = false
           self.state["updatedAt"] = self.nowMs()
-          self.state["transportMode"] = "packet_mesh"
-          self.state["note"] = "Packet mesh ready for native chat transport"
+          self.state["note"] = "Proxy ready for the chat transport"
           self.state["packetProxyPort"] = snapshot.proxyPort
           self.appendJournalLocked(
             event: "packet-runtime-ready",
@@ -1364,7 +1358,6 @@ final class ChatEngine {
               "trigger": trigger,
               "proxyHost": snapshot.proxyHost,
               "proxyPort": snapshot.proxyPort,
-              "activeBridgeId": snapshot.activeBridgeID as Any,
             ]
           )
           self.postChangeLocked(
@@ -1381,22 +1374,20 @@ final class ChatEngine {
         }
       } catch {
         let errorText = error.localizedDescription
-        NSLog("[ChatEngine] Packet runtime start failed trigger=%@ error=%@", trigger, errorText)
+        NSLog("[ChatEngine] proxy start failed trigger=%@ error=%@", trigger, errorText)
         self.store.updateConfig([
-          "transportMode": "direct",
           "packetStatus": "failed",
           "packetProxyPort": nil,
           "packetLastError": errorText,
         ])
         self.queue.async {
           self.packetRuntimeStartInFlight = false
-          self.state["state"] = "packet-runtime-direct-fallback"
+          self.state["state"] = "proxy-unavailable"
           self.state["connected"] = false
           self.state["updatedAt"] = self.nowMs()
-          self.state["transportMode"] = "direct"
-          self.state["note"] = "Packet mesh failed; falling back to direct native chat transport"
+          self.state["note"] = "Proxy is on but did not start; chat stays offline"
           self.appendJournalLocked(
-            event: "packet-runtime-direct-fallback",
+            event: "packet-runtime-failed",
             payload: ["trigger": trigger, "error": String(errorText.prefix(180))]
           )
           self.postChangeLocked(
@@ -1404,7 +1395,6 @@ final class ChatEngine {
             userInfo: ["state": self.statusSnapshotLocked()]
           )
         }
-        self.ensureNativeTransport(trigger: "packet_runtime_direct_fallback:\(trigger)")
       }
     }
     return true
@@ -1594,6 +1584,42 @@ final class ChatEngine {
 
   func getTransportStatus() -> [String: Any] {
     getStatus()
+  }
+
+  /// Status for a caller that must not wait, answered on the main thread.
+  ///
+  /// ``getStatus()`` has a lock-free fast path, but only once something has been
+  /// published — the *first* read of a session still falls through to `syncOnQueue` and
+  /// waits behind whatever the engine is doing. At launch that is a bootstrap, a
+  /// decrypt, a SQLite restore; device export 2026-08-07 caught it at **0.57s** of
+  /// blocked main thread, `getStatus() ← isEngineConnected()`, to answer one Bool.
+  ///
+  /// Waiting was never the point. Every caller of this is a UI observer reacting to a
+  /// notification the engine itself posted, so the answer already exists on the engine
+  /// queue — it just has to be *fetched* rather than *awaited*. Answering a beat later
+  /// on main is identical for them and free for the thread that is drawing.
+  func status(_ completion: @escaping ([String: Any]) -> Void) {
+    publishedStatusLock.lock()
+    let published = publishedStatus
+    publishedStatusLock.unlock()
+    if let published {
+      queue.async { [weak self] in
+        guard let self else { return }
+        self.publishStatus(self.statusSnapshotLocked())
+      }
+      if Thread.isMainThread {
+        completion(published)
+      } else {
+        DispatchQueue.main.async { completion(published) }
+      }
+      return
+    }
+    queue.async { [weak self] in
+      guard let self else { return }
+      let snapshot = self.statusSnapshotLocked()
+      self.publishStatus(snapshot)
+      DispatchQueue.main.async { completion(snapshot) }
+    }
   }
 
   /// Records the current status for the lock-free read above. Engine queue only.
@@ -4036,10 +4062,6 @@ final class ChatEngine {
     if transportMode == "bridge_text" && type != "text" {
       return ["accepted": false, "reason": "media_disabled_in_blackout", "type": type]
     }
-    if transportMode == "packet_mesh", !["text", "voice", "image"].contains(type) {
-      return ["accepted": false, "reason": "type_disabled_in_packet_mesh", "type": type]
-    }
-
     let metadataValue: (String, [String]) -> Any? = { key, aliases in
       if let value = payload[key] { return value }
       for alias in aliases {
@@ -4590,7 +4612,24 @@ final class ChatEngine {
             // the file. They ride inside the same envelope as everything else (sealed to
             // `friendPublicKey`, dual-wrapped so both parties can open it), so this adds
             // nothing to what the server can see.
-            if ["image", "gif"].contains(type),
+            // `type` is the WRONG gate, and it is why this still happens.
+            //
+            // It read `["image", "gif"].contains(type)`, but the receiver does not decide
+            // by `type` — `ChatListRow.visualKind` sends `case "file"` through
+            // `isImageMediaReference(mediaUrl:fileName:)` and renders `.media` whenever the
+            // name or url looks like an image. So a photo shared as a FILE renders as media
+            // on the far side while being denied the dimensions that let it be sized, which
+            // is exactly the failure the comment above describes. Device 2026-08-07: the
+            // shifting rows all report `msgType=file mediaWH=N`, and their heights then
+            // swing ±200pt as the download resolves an aspect that should never have been
+            // in question.
+            //
+            // Gate on the bytes instead of the label: `chatMediaImageHeaderSize` reads a
+            // header and answers nil for anything that is not an image, so attempting the
+            // recovery for `file` costs one header read and cannot misfire. Sender and
+            // receiver now agree on one predicate — "does this decode as an image" —
+            // instead of two that disagree.
+            if ["image", "gif", "file"].contains(type),
               finalWidth == nil || finalHeight == nil || finalThumbnailBase64 == nil
             {
               let localPath: String? = {
@@ -4598,14 +4637,22 @@ final class ChatEngine {
                 return localMediaUrl.hasPrefix("/") ? localMediaUrl : nil
               }()
               if let localPath {
+                let headerSize = chatMediaImageHeaderSize(atPath: localPath)
                 if finalWidth == nil || finalHeight == nil,
-                  let headerSize = chatMediaImageHeaderSize(atPath: localPath),
-                  headerSize.width > 1.0, headerSize.height > 1.0
+                  let headerSize, headerSize.width > 1.0, headerSize.height > 1.0
                 {
                   finalWidth = Int64(headerSize.width)
                   finalHeight = Int64(headerSize.height)
                 }
-                if finalThumbnailBase64 == nil, let image = UIImage(contentsOfFile: localPath) {
+                // The header is the proof this decodes as an image. Without that gate the
+                // `file` type added above would hand every PDF, zip and video to
+                // `UIImage(contentsOfFile:)` on the send path — it answers nil for all of
+                // them, but only after reading the file, and a document can be large.
+                let decodesAsImage =
+                  headerSize.map { $0.width > 1.0 && $0.height > 1.0 } ?? false
+                if finalThumbnailBase64 == nil, decodesAsImage || type != "file",
+                  let image = UIImage(contentsOfFile: localPath)
+                {
                   finalThumbnailBase64 = chatMicroThumbnailJPEGBase64(from: image)
                 }
               }
@@ -4639,6 +4686,55 @@ final class ChatEngine {
 
             var nextMetadata = (localEffectivePayload["metadata"] as? [String: Any]) ?? [:]
             nextMetadata["mediaUrl"] = uploadResult.remoteUrl
+
+            // A multi-image send is ONE message carrying several pictures. The
+            // first is the message's own media (uploaded above); the rest are
+            // uploaded here so every picture has a durable URL of its own. Each
+            // gets its own media key — media is encrypted per file, so a single
+            // shared key would be a lie about what opens what.
+            let extraLocalUrls =
+              (nextMetadata["extraLocalMediaUrls"] as? [String])?
+              .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? []
+            nextMetadata.removeValue(forKey: "extraLocalMediaUrls")
+            if !extraLocalUrls.isEmpty {
+              var urls: [String] = [uploadResult.remoteUrl]
+              var keys: [String] = [finalMediaKey ?? ""]
+              for extraUri in extraLocalUrls {
+                let outcome = self.uploadLocalMediaLocked(
+                  localUri: extraUri,
+                  messageType: type,
+                  fileNameHint: nil,
+                  userId: userId,
+                  token: token,
+                  apiBase: apiBase,
+                  messageId: messageId
+                )
+                guard let extraResult = outcome.result else {
+                  NSLog(
+                    "[MultiImage] extra upload FAILED msgId=%@ reason=%@",
+                    messageId, outcome.reason ?? "-")
+                  continue
+                }
+                urls.append(extraResult.remoteUrl)
+                keys.append(extraResult.mediaKey ?? "")
+                chatMediaSeedRemoteCacheFromLocalFile(
+                  localURI: extraUri,
+                  remoteURL: extraResult.remoteUrl,
+                  mediaKey: extraResult.mediaKey
+                )
+              }
+              // Only claim a set when more than one picture actually made it; a
+              // partial failure falls back to a plain single-image message rather
+              // than a deck with dead cards in it.
+              if urls.count > 1 {
+                nextMetadata["attachmentUrls"] = urls
+                nextMetadata["attachmentMediaKeys"] = keys
+              }
+              NSLog(
+                "[MultiImage] msgId=%@ uploaded=%d of %d", messageId, urls.count,
+                extraLocalUrls.count + 1)
+            }
+
             if let localPlaybackMediaUrl { nextMetadata["localMediaUrl"] = localPlaybackMediaUrl }
             if let finalFileName { nextMetadata["fileName"] = finalFileName }
             if let finalFileSize { nextMetadata["fileSize"] = finalFileSize }
@@ -6305,6 +6401,26 @@ final class ChatEngine {
   /// strands mobile follow-ups in the pending queue for already-settled sessions.
   func bridgeRunIsActive(chatId: String?) -> Bool {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
+    // Read the mirror first, like every other hot getter on this type.
+    //
+    // This one was left on `syncOnQueue`, and it is called from `syncComposerStopState`
+    // — which `applyRows` calls on the main thread, on every rows commit. So the main
+    // thread took a synchronous hop onto the engine's serial queue in the middle of
+    // rendering, and waited for whatever the engine happened to be doing. Device export
+    // 2026-08-08T07:29: `main thread STILL blocked 20.95s during idle`, the same stack
+    // sampled once a second for twenty-one seconds:
+    //
+    //   syncOnQueue ← bridgeRunIsActive ← agentComposerHasLiveTask
+    //               ← syncComposerStopState ← applyRows
+    //
+    // The composer's SEND/STOP state is the least urgent thing on screen and the only
+    // reason this was ever synchronous. A mirrored answer is at worst one engine turn
+    // stale, and the next publish corrects it.
+    if let published = uiMirror.bridgeRunIsActive(
+      chatId: chatId, nowMs: Int64(nowMs()), graceMs: Self.agentTurnRunningGraceMs)
+    {
+      return published
+    }
     return syncOnQueue {
       if agentProgressByChatId[chatId] != nil { return true }
       let now = Int64(nowMs())
@@ -7979,9 +8095,10 @@ final class ChatEngine {
     let resolvedTarget =
       transportMode == "bridge_text" ? bridgeBaseURL?.absoluteString : socketUrlString
     let packetProxyPort = packetProxyPortLocked(config: config)
-    let packetProxyHost = packetProxyHostLocked(config: config)
-    let hasRequiredPacketProxy = transportMode != "packet_mesh" || packetProxyPort != nil
-    if transportMode == "packet_mesh", resolvedTarget != nil, userTopic != nil, packetProxyPort == nil {
+    let proxyEnabled = packetProxyEnabledLocked(config: config)
+    // The socket must not open direct while the proxy is on — wait for the hop.
+    let hasRequiredPacketProxy = !proxyEnabled || packetProxyPort != nil
+    if proxyEnabled, resolvedTarget != nil, userTopic != nil, packetProxyPort == nil {
       _ = ensurePacketRuntimeAsync(trigger: "connect_missing_packet_proxy")
       return getStatus()
     }
@@ -7994,8 +8111,8 @@ final class ChatEngine {
         state["note"] =
           transportMode == "bridge_text"
           ? "ChatEngine blackout bridge missing bridgeBaseUrl/userTopic config"
-          : transportMode == "packet_mesh"
-            ? "ChatEngine packet mesh missing socketUrl/userTopic/packetProxyPort config"
+          : proxyEnabled
+            ? "ChatEngine proxy missing socketUrl/userTopic/packetProxyPort config"
             : "ChatEngine native presence missing socketUrl/userTopic config"
         appendJournalLocked(
           event: "connect-native-missing-config",
@@ -8013,7 +8130,9 @@ final class ChatEngine {
       }
     }
 
-    let signature = "\(transportMode)|\(resolvedTarget ?? "")|\(authToken ?? "")|\(userTopic)"
+    // Proxy port is part of the signature: toggling the hop has to rebuild the socket.
+    let signature =
+      "\(transportMode)|\(resolvedTarget ?? "")|\(authToken ?? "")|\(userTopic)|\(packetProxyPort ?? 0)"
     let callbacks = ChatTransportCallbacks(
       onOpen: { [weak self] in self?.handleNativeSocketOpened(userTopic: userTopic) },
       onClose: { [weak self] code, reason in
@@ -8061,21 +8180,10 @@ final class ChatEngine {
             callbacks: callbacks
           )
           phoenixClient = client
-        } else if transportMode == "packet_mesh",
-          let socketURL,
-          let packetProxyPort
-        {
-          let client = ChatPacketTransport(
-            socketURL: socketURL,
-            authToken: authToken,
-            proxyHost: packetProxyHost,
-            proxyPort: packetProxyPort,
-            callbacks: callbacks
-          )
-          phoenixClient = client
-        } else if transportMode != "packet_mesh", let socketURL {
+        } else if let socketURL {
           // Pass auth token separately so it goes in the Authorization header,
           // not as a URL query parameter (prevents token leakage in logs/proxies).
+          // The client picks up the proxy hop itself when one is running.
           let client = ChatPhoenixClient(
             baseURL: socketURL,
             params: [:],
@@ -8098,8 +8206,8 @@ final class ChatEngine {
       state["note"] =
         transportMode == "bridge_text"
         ? "ChatEngine blackout bridge connecting"
-        : transportMode == "packet_mesh"
-          ? "ChatEngine Packet mesh connecting"
+        : proxyEnabled
+          ? "ChatEngine connecting through proxy"
           : "ChatEngine native Phoenix presence connecting"
       state["presenceSource"] = nativePresenceActive ? "native" : "shadow"
       var connectPayload: [String: Any] = [
@@ -9269,11 +9377,16 @@ final class ChatEngine {
         in: .whitespacesAndNewlines
       ).lowercased()
     switch mode {
-    case "direct", "packet_mesh", "bridge_text", "offline":
-      return mode ?? "packet_mesh"
+    case "bridge_text", "offline":
+      return mode ?? "direct"
     default:
       return "direct"
     }
+  }
+
+  private func packetProxyEnabledLocked(config: [String: Any]? = nil) -> Bool {
+    let resolvedConfig = config ?? store.getConfig()
+    return parseBooleanLike(resolvedConfig["packetProxyEnabled"]) ?? false
   }
 
   private func isBridgeTextModeLocked(config: [String: Any]? = nil) -> Bool {
@@ -9305,7 +9418,7 @@ final class ChatEngine {
   private func disableCallsLocked(config: [String: Any]? = nil) -> Bool {
     let resolvedConfig = config ?? store.getConfig()
     return parseBooleanLike(resolvedConfig["disableCalls"])
-      ?? ["bridge_text", "packet_mesh"].contains(transportModeLocked(config: resolvedConfig))
+      ?? isBridgeTextModeLocked(config: resolvedConfig)
   }
 
   private func disableRemoteAvatarsLocked(config: [String: Any]? = nil) -> Bool {
@@ -9667,6 +9780,24 @@ final class ChatEngine {
 
   private func currentUserIdLocked() -> String? {
     normalizedUpper(getConfigValueLocked("userId"))
+  }
+
+  /// One decrypt-failure line per message, ever.
+  ///
+  /// The same rows are re-parsed on every history load, refresh and reconcile, so an
+  /// unguarded log here would emit the same dozen failures dozens of times and bury the
+  /// rare NEW one — the exact failure mode the height-shift diagnostic was capped for.
+  private static let decryptFailureLogLock = NSLock()
+  private static var decryptFailureLoggedIds: Set<String> = []
+
+  static func noteDecryptFailureOnce(messageId: String) -> Bool {
+    guard !messageId.isEmpty else { return false }
+    decryptFailureLogLock.lock()
+    defer { decryptFailureLogLock.unlock() }
+    // Bounded: a device that somehow fails thousands of messages must not turn this
+    // diagnostic into the memory leak.
+    if decryptFailureLoggedIds.count > 512 { return false }
+    return decryptFailureLoggedIds.insert(messageId).inserted
   }
 
   private func decryptPrivateKeyLocked() -> SecKey? {
@@ -10358,6 +10489,17 @@ final class ChatEngine {
                 mergedMessage["metadata"] = meta
               }
             }
+            // Same never-clobber rule, field-level: the carry-forward above only fires when
+            // `metadata` is absent, so a present-but-thinner copy silently dropped these.
+            var meta = mergedMessage["metadata"] as? [String: Any] ?? [:]
+            var carriedAttachment = false
+            for key in Self.ingestDurableAttachmentKeys
+            where meta[key] == nil || meta[key] is NSNull {
+              guard let value = existingMeta[key] else { continue }
+              meta[key] = value
+              carriedAttachment = true
+            }
+            if carriedAttachment { mergedMessage["metadata"] = meta }
           }
           mergedRow["message"] = mergedMessage
         }
@@ -10929,6 +11071,15 @@ final class ChatEngine {
         chatId: chatId,
         messageIds: [messageId]
       )
+      // A message the user deleted must not survive in the sealed table. Two calls,
+      // because they answer different questions: the tombstone is the durable memory
+      // that keeps a server re-delivery from re-admitting it, and the repair converges
+      // the rows already in there. Tombstone FIRST — the rebuild that follows walks the
+      // legacy table, and the store must already know to refuse this id.
+      VibeCoreStoreBridge.tombstoneMessages(
+        userId: userId, chatId: chatId, messageIds: [messageId])
+      VibeCoreStoreBridge.repairChat(
+        userId: userId, chatId: chatId, reason: "message-deleted")
       sqliteAfter = messageStore.messageCount(userId: userId, chatId: chatId)
     }
 
@@ -11266,6 +11417,36 @@ final class ChatEngine {
     let decryptionFailed =
       !isAgentMessage && hadEncryptedContent && (encryptedLooksHybrid || encryptedIsMls)
       && decryptedText.isEmpty
+
+    // A message that failed to open is the single most consequential thing this parser
+    // can produce, and until now it produced it SILENTLY — the only trace was a count
+    // (`decryptFailed=12`) logged much later by the render host, with no message id, no
+    // envelope kind, and no way to tell a locked Keychain from a key mismatch.
+    //
+    // It matters most for media. `mediaUrl` survives a failed decrypt because the server
+    // carries it as a plaintext wire field (see the fallback just below), but `mediaKey`
+    // exists ONLY inside the sealed payload — so a failed decrypt yields a row that still
+    // looks like media, still renders a bubble, and still downloads bytes that can never
+    // be decrypted. That is how a delivered image becomes a permanent empty box.
+    if decryptionFailed, ChatEngine.noteDecryptFailureOnce(messageId: messageId) {
+      VibeLog.error(
+        "message failed to decrypt", category: "crypto",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "msg": String(messageId.suffix(12)),
+          "envelope": encryptedIsMls ? "mls" : (encryptedLooksHybrid ? "hybrid" : "plain"),
+          "mine": isMe ? "Y" : "N",
+          "type": normalizedString(type) ?? "-",
+          // The two fields that decide whether this shows up as an empty bubble or as a
+          // media row that downloads forever.
+          "wireMediaUrl": (rawMediaUrl?.isEmpty == false) ? "Y" : "N",
+          "wireMediaKey": (rawMediaKey?.isEmpty == false) ? "Y" : "N",
+          // Distinguishes "this device cannot decrypt anything right now" (locked or
+          // missing private key — every hybrid open returns "" from the guard above)
+          // from "this particular message was sealed to a key we do not hold".
+          "privateKey": (decryptPrivateKeyLocked() != nil) ? "present" : "MISSING",
+        ])
+    }
 
     var decryptedFields = parseDecryptedMessagePayload(decryptedText)
     // Always merge server/wire metadata in (forward chrome, covers, etc.). Decrypted
@@ -12171,6 +12352,15 @@ final class ChatEngine {
     }
     guard !entries.isEmpty else { return 0 }
     messageStore.upsertMessages(userId: userId, chatId: chatId, entries: entries)
+    // Mirror the rewritten status, or the two tables disagree about content rather than
+    // membership: `verifyAgainstLegacy` compares ids and would keep reporting MATCH while
+    // the sealed copy still says "sending". A core-authoritative read would then paint the
+    // clock this repair exists to clear — and it would survive every relaunch, because
+    // the repair only runs for rows the legacy table still reports as stranded.
+    // `keepNewest: 0` because this rewrites existing rows in place; pruning is the persist
+    // choke's job and this is not a new-row path.
+    VibeCoreStoreBridge.mirrorRows(
+      userId: userId, chatId: chatId, entries: entries, keepNewest: 0)
     return entries.count
   }
 
@@ -12836,11 +13026,6 @@ final class ChatEngine {
     }
   }
 
-  private let packetMeshMaxVoiceUploadBytes = 2 * 1024 * 1024
-  private let packetMeshMaxImageUploadBytes = 384 * 1024
-  private let packetMeshImageMaxDimensions: [CGFloat] = [1440, 1280, 960, 768]
-  private let packetMeshImageQualities: [CGFloat] = [0.82, 0.72, 0.62, 0.52, 0.45]
-
   private func isLocalMediaURI(_ raw: String) -> Bool {
     raw.hasPrefix("file://") || raw.hasPrefix("/") || raw.hasPrefix("content://")
   }
@@ -12852,103 +13037,13 @@ final class ChatEngine {
     fileNameHint: String?
   ) -> Result<PreparedLocalMediaUpload, LocalMediaPreparationFailure> {
     let resolvedFileName = fileNameHint ?? normalizedURL.lastPathComponent
-    let transportMode = syncOnQueue { transportModeLocked() }
-
-    if transportMode != "packet_mesh" {
-      return .success(
-        PreparedLocalMediaUpload(
-          fileData: fileData,
-          fileName: resolvedFileName,
-          mimeType: mediaMimeType(fileName: resolvedFileName, fallbackType: messageType)
-        )
-      )
-    }
-
-    switch messageType {
-    case "voice":
-      guard fileData.count <= packetMeshMaxVoiceUploadBytes else {
-        return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_voice_too_large"))
-      }
-      return .success(
-        PreparedLocalMediaUpload(
-          fileData: fileData,
-          fileName: resolvedFileName,
-          mimeType: mediaMimeType(fileName: resolvedFileName, fallbackType: messageType)
-        )
-      )
-    case "image":
-      return preparePacketMeshImageUploadLocked(
+    return .success(
+      PreparedLocalMediaUpload(
         fileData: fileData,
-        normalizedURL: normalizedURL,
-        fileNameHint: fileNameHint
+        fileName: resolvedFileName,
+        mimeType: mediaMimeType(fileName: resolvedFileName, fallbackType: messageType)
       )
-    default:
-      return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_type_blocked"))
-    }
-  }
-
-  private func preparePacketMeshImageUploadLocked(
-    fileData: Data,
-    normalizedURL: URL,
-    fileNameHint: String?
-  ) -> Result<PreparedLocalMediaUpload, LocalMediaPreparationFailure> {
-    guard let image = UIImage(data: fileData) else {
-      return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_image_decode_failed"))
-    }
-
-    let rawBaseName = (
-      fileNameHint?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-      ? fileNameHint!
-      : normalizedURL.deletingPathExtension().lastPathComponent
-    ).trimmingCharacters(in: .whitespacesAndNewlines)
-    let strippedBaseName = (rawBaseName as NSString).deletingPathExtension
-    let baseName = strippedBaseName.isEmpty ? "packet-image" : strippedBaseName
-
-    for maxDimension in packetMeshImageMaxDimensions {
-      guard let renderedImage = packetMeshRenderedImage(image, maxDimension: maxDimension) else {
-        continue
-      }
-      for quality in packetMeshImageQualities {
-        guard let jpegData = renderedImage.jpegData(compressionQuality: quality) else {
-          continue
-        }
-        if jpegData.count <= packetMeshMaxImageUploadBytes {
-          return .success(
-            PreparedLocalMediaUpload(
-              fileData: jpegData,
-              fileName: "\(baseName).jpg",
-              mimeType: "image/jpeg"
-            )
-          )
-        }
-      }
-    }
-
-    return .failure(LocalMediaPreparationFailure(reason: "packet_mesh_image_too_large"))
-  }
-
-  private func packetMeshRenderedImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage? {
-    let sourceSize = image.size
-    guard sourceSize.width > 0, sourceSize.height > 0 else {
-      return nil
-    }
-
-    let longestSide = max(sourceSize.width, sourceSize.height)
-    let scale = min(1.0, maxDimension / longestSide)
-    let targetSize = CGSize(
-      width: max(1.0, floor(sourceSize.width * scale)),
-      height: max(1.0, floor(sourceSize.height * scale))
     )
-
-    let format = UIGraphicsImageRendererFormat.default()
-    format.scale = 1
-    format.opaque = true
-
-    return UIGraphicsImageRenderer(size: targetSize, format: format).image { context in
-      UIColor.white.setFill()
-      context.fill(CGRect(origin: .zero, size: targetSize))
-      image.draw(in: CGRect(origin: .zero, size: targetSize))
-    }
   }
 
   private func uploadCategory(for messageType: String) -> String {
@@ -13441,6 +13536,33 @@ final class ChatEngine {
     return "\(chatHistoryCacheKeyPrefix).\(cacheKeyComponent(userId)).\(cacheKeyComponent(chatId))"
   }
 
+  /// Rows any off-open prepare measures. An open lands on the tail; everything older is
+  /// measured at `settle`, when the chat is closed and the main thread is idle.
+  private static let persistPrepareTailRows = 400
+
+  /// Re-measures prepared heights for the next likely chats, off-main from the sealed store.
+  /// Memory-only store, so a launch starts with no coverage; reads a tail, not a transcript.
+  func prepareTimelinesAfterLaunch(chatIds: [String]) {
+    let bounded = Array(
+      chatIds
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .prefix(3))
+    guard !bounded.isEmpty else { return }
+    queue.async { [weak self] in
+      guard let self, let userId = self.chatHistoryCacheUserIdLocked() else { return }
+      for chatId in bounded {
+        guard !VibeTimelinePreparedStore.shared.hasCoverage(chatId: chatId) else { continue }
+        let rows: [[String: Any]] = self.messageStore.recentMessagePayloads(
+          userId: userId, chatId: chatId, limit: Self.persistPrepareTailRows
+        ).compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+        guard !rows.isEmpty else { continue }
+        VibeTimelinePreparedStore.shared.prepareAsync(
+          chatId: chatId, rawRows: rows, reason: "launch", scope: .page)
+      }
+    }
+  }
+
   /// Live stream placeholder rows (`stream-…` / `lan-…` ids) are transient render
   /// state: their run either settles into a real message or dies with the socket.
   /// Persisting them poisons the cache — on the next open they resurrect as
@@ -13595,6 +13717,14 @@ final class ChatEngine {
       if let userId = chatHistoryCacheUserIdLocked() {
         messageStore.deleteMessages(
           userId: userId, chatId: chatId, messageIds: dedup.droppedIds)
+        // The twin was dropped from `messages`; drop it from the sealed table too, or the
+        // dedup heals once per table and the core keeps re-deriving the duplicate pair.
+        // The tombstone is what stops the retired id generation coming back on the next
+        // history page — the dedup is otherwise re-run, and re-won, on every launch.
+        VibeCoreStoreBridge.tombstoneMessages(
+          userId: userId, chatId: chatId, messageIds: dedup.droppedIds)
+        VibeCoreStoreBridge.repairChat(
+          userId: userId, chatId: chatId, reason: "restore-dedup")
       }
       flagTranscriptHealedForRasterInvalidation(chatId: chatId)
       NSLog(
@@ -13746,11 +13876,17 @@ final class ChatEngine {
     // `.page`, because this is the rows *this write* touched — a history page, a backfill,
     // one incoming message — not the chat. Declaring it full is what made every drained
     // page evict the transcript's measurements and the next pass re-measure them.
+    // Tail only. A launch restore persists whole transcripts, so an unbounded persist
+    // measured 1000 rows (818ms) for a chat nobody opened, during someone's open.
     VibeTimelinePreparedStore.shared.prepareAsync(
-      chatId: chatId, rawRows: durableRows, reason: "persist", scope: .page)
+      chatId: chatId,
+      rawRows: Array(durableRows.suffix(Self.persistPrepareTailRows)),
+      reason: "persist", scope: .page)
     historyRestoreMissChats.remove(chatId)
-    if let deletedIds = deletedMessageIdsByChat[chatId], !deletedIds.isEmpty {
-      messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: Array(deletedIds))
+    let locallyDeletedIds = deletedMessageIdsByChat[chatId] ?? []
+    if !locallyDeletedIds.isEmpty {
+      messageStore.deleteMessages(
+        userId: userId, chatId: chatId, messageIds: Array(locallyDeletedIds))
     }
     if !skipPrune {
       messageStore.pruneChat(userId: userId, chatId: chatId)
@@ -13765,8 +13901,33 @@ final class ChatEngine {
     // can never see a row that arrives after it. Same serial queue, so the
     // historical walk always lands before the increments that follow it.
     VibeCoreStoreBridge.backfillChat(userId: userId, chatId: chatId)
+    // Never seal a row this same call just deleted from `messages`.
+    //
+    // The delete above and the mirror here read the same batch: a message the user
+    // deleted locally that the server keeps re-sending is upserted, mirrored, and then
+    // removed from the legacy table — leaving the sealed copy behind on EVERY persist.
+    // Filtering here is prevention rather than repair, which matters because this choke
+    // runs on every incoming message and every history page; a rebuild-on-delete at this
+    // frequency would re-seal whole transcripts for a row that should never have been
+    // written. The rarer, genuinely destructive deletes (user delete, twin dedup,
+    // canonical ghost purge) call `VibeCoreStoreBridge.repairChat` at their own sites.
+    let mirroredEntries =
+      locallyDeletedIds.isEmpty
+      ? entries
+      : entries.filter { !locallyDeletedIds.contains($0.messageId) }
+    // The ids this batch actually tried to write and the delete above then removed —
+    // i.e. the server re-delivering something already deleted here. Tombstone exactly
+    // those, so the store itself refuses them from now on and this stops depending on a
+    // filter every future write path has to remember. Computed as an intersection rather
+    // than tombstoning the whole deleted set, because this choke runs on every incoming
+    // message and re-marking a hundred ids per message is work for nothing.
+    if !locallyDeletedIds.isEmpty, mirroredEntries.count != entries.count {
+      let resurrected = entries.map(\.messageId).filter { locallyDeletedIds.contains($0) }
+      VibeCoreStoreBridge.tombstoneMessages(
+        userId: userId, chatId: chatId, messageIds: resurrected)
+    }
     VibeCoreStoreBridge.mirrorRows(
-      userId: userId, chatId: chatId, entries: entries,
+      userId: userId, chatId: chatId, entries: mirroredEntries,
       keepNewest: skipPrune ? 0 : UInt32(ChatMessageStore.prunedChatRowLimit))
     VibeCoreStoreBridge.verifyAgainstLegacy(userId: userId, chatId: chatId)
     return entries.count
@@ -13797,6 +13958,11 @@ final class ChatEngine {
     }.map(\.messageId)
     guard !ghostIds.isEmpty else { return }
     messageStore.deleteMessages(userId: userId, chatId: chatId, messageIds: ghostIds)
+    // Ghosts the canonical transcript does not list are ghosts in both tables.
+    VibeCoreStoreBridge.tombstoneMessages(
+      userId: userId, chatId: chatId, messageIds: ghostIds)
+    VibeCoreStoreBridge.repairChat(
+      userId: userId, chatId: chatId, reason: "canonical-reconcile")
     flagTranscriptHealedForRasterInvalidation(chatId: chatId)
     NSLog(
       "[HistoryStore] reconcile chat=%@ purged=%d of %d stored (ids absent from the canonical transcript)",
@@ -15602,12 +15768,22 @@ final class ChatEngine {
     for (chatId, prompts) in pendingAsk where prompts.count > 1 {
       pendingAsk[chatId] = prompts.sorted { $0.requestId < $1.requestId }
     }
+    // Every chat with an outstanding approval request, presented or not — the predicate
+    // `bridgeRunIsActive` scans for. Unlike `pendingAsk` above this is NOT filtered by
+    // `presentedAskRequestIds`: a prompt the user is currently answering is a live run.
+    var askChatIds: Set<String> = []
+    for payload in agentBridgeAskByRequestId.values {
+      guard let chatId = normalizedString(payload["chatId"]), !chatId.isEmpty else { continue }
+      askChatIds.insert(chatId)
+    }
     uiMirror.publish(
       typingByChatId: peerTypingUserIdsByChatId,
       agentProgressByChatId: progress,
       onlineUserIds: onlineUsers,
       lastSeenByUserId: lastSeenByUserId,
-      pendingAskByChatId: pendingAsk
+      pendingAskByChatId: pendingAsk,
+      agentTurnRunningAtMsByChatId: agentTurnRunningAtMsByChatId,
+      agentAskChatIds: askChatIds
     )
     // Sampled, so the export can answer "is the UI still queueing?" without a
     // profiler. `fallback` climbing after launch means the mirror stopped being
@@ -16076,14 +16252,14 @@ final class ChatEngine {
         }
         return
       }
-      if transportMode == "packet_mesh" && !["text", "voice", "image"].contains(type) {
-        DispatchQueue.main.async {
-          completion(["success": false, "reason": "type_disabled_in_packet_mesh", "type": type])
-        }
-        return
-      }
-
-      let uploadableTypes: Set<String> = ["image", "voice", "video", "file", "sticker", "music"]
+      // "gif" belongs here for a security reason, not a completeness one. It was already
+      // in `shouldEncryptUploadedMediaType` but missing from this set, so a gif message
+      // was never uploaded at all — it would have shipped whatever URL it arrived with,
+      // i.e. the third-party provider's, in the clear. With it here a GIF takes the same
+      // encrypt-and-upload leg as a photo and the wire carries only our own media URL.
+      let uploadableTypes: Set<String> = [
+        "image", "gif", "voice", "video", "file", "sticker", "music",
+      ]
       if let currentMediaUrl = mediaUrl, uploadableTypes.contains(type),
         self.isLocalMediaURI(currentMediaUrl)
       {
@@ -16122,7 +16298,11 @@ final class ChatEngine {
         // errors; the recipient just gets a black square. The bytes are right here — they
         // were just uploaded — so read the header (no decode) and fill the gap. Covers
         // every send path at once, including the ones that never passed dimensions.
-        if width == nil || height == nil, ["image", "gif"].contains(type) {
+        // `file` included for the same reason as the DM send path above: the receiver
+        // renders an image-looking file as `.media`, so denying it dimensions guarantees
+        // the square fallback and the resize-on-decode that follows.
+        // `chatMediaImageHeaderSize` answers nil for non-images, so this cannot misfire.
+        if width == nil || height == nil, ["image", "gif", "file"].contains(type) {
           let localPath: String? = {
             if let url = URL(string: currentMediaUrl), url.isFileURL { return url.path }
             return currentMediaUrl.hasPrefix("/") ? currentMediaUrl : nil

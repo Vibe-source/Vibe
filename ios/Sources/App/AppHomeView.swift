@@ -1327,6 +1327,7 @@ final class AppShellCoordinator: ObservableObject {
     // The conversation is full-screen above the tab bar controller, so it
     // covers the tab bar by z-order; no hidesBottomBarWhenPushed needed.
     nav.pushViewController(controller, animated: true)
+    controller.probePrestageParkingAfterPush(container: nav.view)
   }
 
   /// Open the AI agent conversation surface, reusing the existing
@@ -1355,6 +1356,11 @@ final class AppShellCoordinator: ObservableObject {
       "[AgentOpen] host-stage pre-push prestage %dms",
       Int((ProcessInfo.processInfo.systemUptime - prePushStartedAt) * 1000))
     nav.pushViewController(controller, animated: true)
+  }
+
+  func openStory() {
+    guard let nav = rootNavigationController, nav.presentedViewController == nil else { return }
+    nav.present(AppNativeStoryViewController(), animated: true)
   }
 
   /// Pop back to the tab shell. Native back/swipe handle the common case; this
@@ -1530,8 +1536,7 @@ final class VibeRoomLinkRouter {
     let isBridgeAgent = user.bridgeProvider != nil || user.isAgent
     let result = try await ChatDirectMessageService.startChat(
       config: config,
-      friendID: user.userID,
-      allowPacketFallback: !isBridgeAgent
+      friendID: user.userID
     )
 
     if let publicKey = user.publicKey, !publicKey.isEmpty {
@@ -1699,7 +1704,7 @@ private enum VibeShareLinkResolver {
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw ChatDirectMessageServiceError.invalidResponse
     }
@@ -1758,18 +1763,8 @@ private enum ChannelRoomLinkService {
       throw ChatDirectMessageServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-      payload = try await perform(request, session: PacketRuntime.shared.makeURLSession(snapshot: snapshot))
     case .direct:
-      do {
-        payload = try await perform(request, session: .shared)
-      } catch {
-        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else { throw error }
-        let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        payload = try await perform(
-          request, session: PacketRuntime.shared.makeURLSession(snapshot: snapshot))
-      }
+      payload = try await perform(request, session: PacketRuntime.shared.session())
     }
 
     let status = normalizedString(payload["status"])?.lowercased()
@@ -1929,11 +1924,13 @@ private final class ChatsViewModel: ObservableObject {
           // restart. The user topic replays nothing on rejoin, so without this Home can
           // sit on pre-drop state indefinitely even though a push already announced the
           // message.
-          let connected = Self.isEngineConnected()
-          if connected, !self.wasEngineConnected {
-            self.refreshAfterConnectivityGap(trigger: "reconnect")
+          Self.resolveEngineConnected { [weak self] connected in
+            guard let self else { return }
+            if connected, !self.wasEngineConnected {
+              self.refreshAfterConnectivityGap(trigger: "reconnect")
+            }
+            self.wasEngineConnected = connected
           }
-          self.wasEngineConnected = connected
         }
         switch reason {
         case "chatCleared":
@@ -2090,7 +2087,21 @@ private final class ChatsViewModel: ObservableObject {
 
   /// True only when the socket is known-up (not mid-bootstrap).
   static func isEngineConnected() -> Bool {
-    let status = ChatEngine.shared.getStatus()
+    statusIsConnected(ChatEngine.shared.getStatus())
+  }
+
+  /// ``isEngineConnected()`` without blocking the main thread. See `ChatEngine.status(_:)`.
+  ///
+  /// Answers late rather than never, which matters: the caller uses the result to spot a
+  /// `false → true` edge and reconcile what the socket missed while it was down.
+  /// Defaulting to `false` on an unavailable read would be non-blocking too, but it
+  /// could swallow the edge entirely if no further status change followed, and a Home
+  /// screen stuck on pre-drop state is a worse bug than the stall.
+  static func resolveEngineConnected(_ completion: @escaping (Bool) -> Void) {
+    ChatEngine.shared.status { completion(statusIsConnected($0)) }
+  }
+
+  private static func statusIsConnected(_ status: [String: Any]) -> Bool {
     if (status["connected"] as? Bool) == true { return true }
     let stateValue =
       (status["state"] as? String)?
@@ -2278,6 +2289,16 @@ private final class ChatsViewModel: ObservableObject {
     }
   }
 
+  /// Reads the engine WITHOUT blocking, then projects.
+  ///
+  /// This used to call `ChatEngine.shared.getChatRows` inline. That enters the engine's
+  /// serial queue, and on a miss it is a `queue.sync` from the main thread — so every
+  /// `chatMessageChanged`/`chatDelta` notification could park the UI behind a decrypt or
+  /// a SQLite write. A main-thread stack sample caught it exactly here:
+  ///   ChatEngine.syncOnQueue ← ChatEngine.getChatRows ← ChatsViewModel.applyEngineProjection
+  ///   ← @MainActor closure in ChatsViewModel.init  … main thread blocked 0.67s
+  /// The projection is a list preview and is re-run on the next notification anyway, so
+  /// being one engine turn late is free; blocking the thread that draws the list is not.
   private func applyEngineProjection(
     chatID: String,
     reason: String,
@@ -2289,6 +2310,31 @@ private final class ChatsViewModel: ObservableObject {
     guard !normalizedChatID.isEmpty, !locallyRemovedChatIDs.contains(normalizedChatID) else {
       return
     }
+    ChatEngine.shared.chatRows(chatId: normalizedChatID) { [weak self] rawEngineRows in
+      // `chatRows` guarantees main-thread delivery; assume the isolation rather than
+      // hop again, so the common (already-published) case still projects in this turn.
+      MainActor.assumeIsolated {
+        self?.applyEngineProjection(
+          engineRowsRaw: rawEngineRows,
+          normalizedChatID: normalizedChatID,
+          reason: reason,
+          changedMessageID: changedMessageID,
+          changedMessageWasInserted: changedMessageWasInserted,
+          chatIsOnScreen: chatIsOnScreen)
+      }
+    }
+  }
+
+  private func applyEngineProjection(
+    engineRowsRaw: [[String: Any]],
+    normalizedChatID: String,
+    reason: String,
+    changedMessageID: String?,
+    changedMessageWasInserted: Bool?,
+    chatIsOnScreen: Bool
+  ) {
+    // Re-checked after the hop: the chat may have been removed while we were away.
+    guard !locallyRemovedChatIDs.contains(normalizedChatID) else { return }
     let projectionHomeRow =
       rows.first(where: { $0.chatId == normalizedChatID })
       ?? archivedRows.first(where: { $0.chatId == normalizedChatID })
@@ -2301,7 +2347,7 @@ private final class ChatsViewModel: ObservableObject {
     }
 
     let deletedMessageIDs = locallyDeletedMessageIDsByChat[normalizedChatID] ?? []
-    let engineRows = ChatEngine.shared.getChatRows(["chatId": normalizedChatID])
+    let engineRows = engineRowsRaw
       .filter { row in
         let payload = Self.messagePayload(from: row)
         guard let messageID = Self.messageID(from: payload) ?? Self.messageID(from: row) else {
@@ -2865,7 +2911,32 @@ private final class ChatsViewModel: ObservableObject {
     }
   }
 
+  /// Identity of the last warmed row set, so an unchanged list is not re-warmed.
+  private var lastWarmedRowsFingerprint: String?
+
   private func warmCachedRows(_ rows: [ChatHomeListRow], shouldFetchHistory: Bool) {
+    // Foreground fires two `/api/chats` fetches close together — one from becoming
+    // active, one from the socket reopening and triggering reconnects — and the second
+    // usually returns the byte-identical list. Device log 2026-08-08: `rows=15 in 1001ms`
+    // at 11:01:21.9 then `rows=15 in 306ms` at 11:01:23.8, each followed by the same
+    // `PREWARM-PLAN` and `history prefetch kicked=14 of 14`. The fetch itself is cheap to
+    // repeat; re-running the warm is not — it re-seeds every chat onto the engine's
+    // serial queue, re-decodes up to eight full-screen rasters, and fans out fourteen
+    // history loads, all to arrive at the state already in memory.
+    //
+    // Keyed on what the warm actually consumes (chat identity, order, and the preview
+    // tail it seeds), so a genuinely changed list still warms — including a reorder,
+    // because the raster budget and the prefetch prefix are both order-dependent.
+    let fingerprint =
+      rows
+      .map { "\($0.chatId)|\($0.initialMessages.count)|\($0.previewRows.count)" }
+      .joined(separator: ",")
+    if fingerprint == lastWarmedRowsFingerprint {
+      AppUITrace.notice("ChatsViewModel warmCachedRows SKIP — row set unchanged")
+      return
+    }
+    lastWarmedRowsFingerprint = fingerprint
+
     let visibleRows = Array(rows.prefix(8))
     // Seed EVERY row, not the top 8, and with the whole preview the payload carries
     // rather than 3 of it. These messages are already in memory — the only cost is one
@@ -2902,12 +2973,16 @@ private final class ChatsViewModel: ObservableObject {
     // raster is a full-screen bitmap and the overlay cache holds 8, so warming all ten
     // chats newest-first made the oldest ones evict the newest, i.e. the chats actually
     // being opened. Bounded, newest-first, and remembered for the foreground re-warm.
-    ChatListView.prewarmReopenSnapshotRasters(
-      chatIds: rows
-        .filter { !$0.isBuiltInAgentSurface }
-        .map { $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
-    )
+    let prewarmChatIds =
+      rows
+      .filter { !$0.isBuiltInAgentSurface }
+      .map { $0.chatId.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    ChatListView.prewarmReopenSnapshotRasters(chatIds: prewarmChatIds)
+    // Same set, the other half of a fast open: the prepared-height store is memory-only,
+    // so without this the first open of every session measures its whole seed.
+    ChatEngine.shared.prepareTimelinesAfterLaunch(chatIds: prewarmChatIds)
+    ChatListCell.prewarmRealization()
 
     guard shouldFetchHistory else { return }
     // Was `prefix(2)`: only the top TWO chats ever had their history fetched, and a chat
@@ -3236,12 +3311,42 @@ private struct CallsRootView: View {
   }
 }
 
+private struct HomeProxyBadge: Equatable {
+  enum State: Equatable {
+    case off
+    case starting
+    case active
+    case error
+  }
+
+  var state: State = .off
+
+  var shieldActive: Bool { state != .off }
+
+  var accessibilityLabel: String {
+    switch state {
+    case .off: return "Proxy off"
+    case .starting: return "Proxy starting"
+    case .active: return "Proxy active"
+    case .error: return "Proxy error"
+    }
+  }
+
+  func tint(palette: AppThemePalette) -> Color {
+    switch state {
+    case .off: return palette.secondaryText.opacity(0.7)
+    case .starting: return Color.orange
+    case .active: return palette.accent
+    case .error: return Color.red
+    }
+  }
+}
+
 private struct ChatHomeScreen: View {
   @EnvironmentObject private var coordinator: AppShellCoordinator
   @Environment(\.colorScheme) private var colorScheme
   @StateObject private var model = ChatsViewModel()
   @State private var isShowingSearch = false
-  @State private var isShowingStoryCamera = false
   @State private var isEditingHome = false
   @State private var isShowingArchivedChats = false
   @State private var selectedChatIDs = Set<String>()
@@ -3251,6 +3356,9 @@ private struct ChatHomeScreen: View {
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
   @State private var pendingCreatedRoomRoute: ChatRoute?
+  @State private var pendingSavedContact: ContactSearchUser?
+  @State private var isShowingProxy = false
+  @State private var proxyBadge = HomeProxyBadge()
   @State private var homeSearchQuery = ""
   @State private var isHomeSearchFocused = false
   /// The overlay's animated pose. Visibility (isHomeSearchFocused) and pose are
@@ -3662,20 +3770,20 @@ private struct ChatHomeScreen: View {
                 // own inline animated search capsule (tap it directly); a second
                 // magnifying-glass in the header was pure duplication.
                 Button {
-                  openAgentChat()
+                  isShowingProxy = true
                 } label: {
-                  Image("BrandLogo")
-                    .renderingMode(.template)
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(colorScheme == .dark ? .white : .black)
-                    .frame(width: 22, height: 22)
+                  AppProxyShieldIcon(
+                    isActive: proxyBadge.shieldActive,
+                    tint: proxyBadge.tint(palette: palette)
+                  )
+                  .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+                .accessibilityLabel(proxyBadge.accessibilityLabel)
 
                 Button {
-                  isShowingStoryCamera = true
+                  coordinator.openStory()
                 } label: {
                   AppVectorIcon(glyph: .story, tint: colorScheme == .dark ? .white : .black)
                     .frame(width: 22, height: 22)
@@ -3739,6 +3847,13 @@ private struct ChatHomeScreen: View {
       AppUITrace.notice("ChatHomeScreen task loadIfNeeded")
       await model.loadIfNeeded()
       await model.loadArchivedIfNeeded()
+      refreshProxyBadge()
+    }
+    .onReceive(NotificationCenter.default.publisher(for: PacketProxyStore.didChangeNotification)) { _ in
+      refreshProxyBadge()
+    }
+    .onReceive(NotificationCenter.default.publisher(for: ChatEngine.didChangeNotification)) { _ in
+      refreshProxyBadge()
     }
     .task {
       // A desktop-started Codex task now reaches Home as a `bridge-status` push on
@@ -3785,6 +3900,23 @@ private struct ChatHomeScreen: View {
         }
       }
     }
+    .sheet(item: $pendingSavedContact) { user in
+      ContactActionSheet(user: user) {
+        pendingSavedContact = nil
+        Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 180_000_000)
+          _ = await openChat(for: user)
+        }
+      }
+    }
+    .sheet(isPresented: $isShowingProxy) {
+      NavigationStack {
+        ProxySheetView(onDismiss: {
+          isShowingProxy = false
+          refreshProxyBadge()
+        })
+      }
+    }
     .sheet(isPresented: $isShowingGroupCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChatGroupCreationSheet(config: config, homeRows: visibleHomeRows) { route in
@@ -3805,13 +3937,32 @@ private struct ChatHomeScreen: View {
         }
       }
     }
-    .fullScreenCover(isPresented: $isShowingStoryCamera) {
-      AppNativeStoryCameraPage {
-        AppUITrace.notice("ChatHomeScreen story close")
-        isShowingStoryCamera = false
-      }
-      .ignoresSafeArea()
+  }
+
+  private func refreshProxyBadge() {
+    let enabled = PacketProxyStore.shared.useProxy
+    let config = ChatEngineStore.shared.getConfig()
+    let status = (config["packetStatus"] as? String)?.lowercased() ?? "idle"
+    let port: Int
+    if let value = config["packetProxyPort"] as? NSNumber {
+      port = value.intValue
+    } else if let value = config["packetProxyPort"] as? String {
+      port = Int(value) ?? 0
+    } else {
+      port = 0
     }
+
+    let state: HomeProxyBadge.State
+    if !enabled {
+      state = .off
+    } else if status == "failed" || status.contains("error") {
+      state = .error
+    } else if port > 0 || ["running", "connected", "ready", "bootstrap_ready"].contains(status) {
+      state = .active
+    } else {
+      state = .starting
+    }
+    proxyBadge = HomeProxyBadge(state: state)
   }
 
   private func openPendingCreatedRoom() {
@@ -4187,6 +4338,14 @@ private struct ChatHomeScreen: View {
       return
     }
 
+    if action == "createdRoom", let route = payload["route"] as? ChatRoute {
+      isShowingSearch = false
+      model.projectCreatedRoom(route)
+      pendingCreatedRoomRoute = route
+      Task { await model.refresh() }
+      return
+    }
+
     if action == "newContact" {
       isShowingSearch = true
       return
@@ -4214,8 +4373,10 @@ private struct ChatHomeScreen: View {
     }
 
     if action == "saveContact" {
-      Task {
-        await saveContact(for: user)
+      Task { @MainActor in
+        guard await saveContact(for: user) else { return }
+        isShowingSearch = false
+        pendingSavedContact = user
       }
       return
     }
@@ -4232,18 +4393,20 @@ private struct ChatHomeScreen: View {
 
 
   @MainActor
-  private func saveContact(for user: ContactSearchUser) async {
+  private func saveContact(for user: ContactSearchUser) async -> Bool {
     guard let config = AppSessionConfig.current else {
       errorMessage = "The current session is unavailable."
-      return
+      return false
     }
 
     do {
       _ = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
       await model.refresh()
       AppToastController.shared.show("Contact saved.")
+      return true
     } catch {
       errorMessage = error.localizedDescription
+      return false
     }
   }
 
@@ -4273,8 +4436,7 @@ private struct ChatHomeScreen: View {
     do {
       let result = try await ChatDirectMessageService.startChat(
         config: config,
-        friendID: user.userID,
-        allowPacketFallback: !isBridgeAgent
+        friendID: user.userID
       )
       if let publicKey = user.publicKey, !publicKey.isEmpty {
         _ = ChatEngine.shared.cachePeerPublicKey([
@@ -4743,7 +4905,7 @@ private enum ChatHomeEditService {
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
     }
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
       throw EditError.requestFailed(responseMessage(from: data))
     }
@@ -9506,10 +9668,20 @@ private final class ChatHomeMiniPreviewController: UIViewController {
 
     if row.supportsRemoteHomeActions {
       openedChatChannel = true
-      _ = ChatEngine.shared.openChatChannel([
-        "chatId": row.chatId,
-        "peerUserId": row.peerUserId ?? "",
-      ])
+      // Off the main thread, for the same reason `ChatConversationController` already
+      // does this on a background queue: `openChatChannel` ends in `syncOnQueue`, so
+      // calling it here made a long-press wait on the engine's serial queue while it was
+      // busy. Device export 2026-08-08T08:10:54 caught it at 0.81s, blocking the very
+      // gesture that is meant to feel instant — the preview is a read-only surface and
+      // nothing in this initializer depends on the channel being open yet.
+      let chatId = row.chatId
+      let peerUserId = row.peerUserId ?? ""
+      DispatchQueue.global(qos: .userInitiated).async {
+        _ = ChatEngine.shared.openChatChannel([
+          "chatId": chatId,
+          "peerUserId": peerUserId,
+        ])
+      }
     }
   }
 
@@ -9735,6 +9907,7 @@ private struct ContactsPageView: View {
   @State private var roomCreationName = ""
   @State private var isShowingGroupCreation = false
   @State private var pendingCreatedRoomRoute: ChatRoute?
+  @State private var pendingSavedContact: ContactSearchUser?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -9846,6 +10019,15 @@ private struct ContactsPageView: View {
         }
       }
     }
+    .sheet(item: $pendingSavedContact) { user in
+      ContactActionSheet(user: user) {
+        pendingSavedContact = nil
+        Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 180_000_000)
+          _ = await openChat(for: user)
+        }
+      }
+    }
     .sheet(isPresented: $isShowingGroupCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
         ChatGroupCreationSheet(config: config, homeRows: model.rows) { route in
@@ -9883,6 +10065,13 @@ private struct ContactsPageView: View {
       return
     }
 
+    if action == "createdRoom", let route = payload["route"] as? ChatRoute {
+      isShowingSearch = false
+      pendingCreatedRoomRoute = route
+      Task { await model.refresh() }
+      return
+    }
+
     if action == "newContact" {
       isShowingSearch = true
       return
@@ -9910,8 +10099,10 @@ private struct ContactsPageView: View {
     }
 
     if action == "saveContact" {
-      Task {
-        await saveContact(for: user)
+      Task { @MainActor in
+        guard await saveContact(for: user) else { return }
+        isShowingSearch = false
+        pendingSavedContact = user
       }
       return
     }
@@ -9927,18 +10118,20 @@ private struct ContactsPageView: View {
 
 
   @MainActor
-  private func saveContact(for user: ContactSearchUser) async {
+  private func saveContact(for user: ContactSearchUser) async -> Bool {
     guard let config = AppSessionConfig.current else {
       errorMessage = "The current session is unavailable."
-      return
+      return false
     }
 
     do {
       _ = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
       await model.refresh()
       AppToastController.shared.show("Contact saved.")
+      return true
     } catch {
       errorMessage = error.localizedDescription
+      return false
     }
   }
 
@@ -9957,8 +10150,7 @@ private struct ContactsPageView: View {
     do {
       let result = try await ChatDirectMessageService.startChat(
         config: config,
-        friendID: user.userID,
-        allowPacketFallback: !isBridgeAgent
+        friendID: user.userID
       )
       if let publicKey = user.publicKey, !publicKey.isEmpty {
         _ = ChatEngine.shared.cachePeerPublicKey([
@@ -10522,6 +10714,12 @@ final class ChatConversationController: UIViewController {
   /// transcript by estimate.
   private var prestagedInitialBounds: CGRect?
 
+  /// The navigation container the prestaged view is parked in until UIKit takes it.
+  /// See `prepareForNavigationPush` — the reveal is keyed on leaving THIS superview.
+  private weak var prestageParkingSuperview: UIView?
+  /// Bumped per push so a late watchdog cannot unhide a view a newer open owns.
+  private var prestageRevealToken = 0
+
   /// The isolated full-screen agent runtime surface (Claude/Codex), hosted as a child VC
   /// over `mainView` when this DM's Default view is Agent or the user taps "See progress".
   /// It owns its full bounds + its own header (no nesting under the chat header → no clip /
@@ -10595,7 +10793,7 @@ final class ChatConversationController: UIViewController {
 
     mainView.finishNavigationPushPrestaging()
     let tFinish = ProcessInfo.processInfo.systemUptime
-    view.isHidden = false
+    armPrestageRevealOnReparent(parkedIn: navigationController.view)
     NSLog(
       "[AgentOpen] prestage-phases loadView=%dms firstLayout=%dms finishPrestage=%dms total=%dms",
       Int((tLoad - t0) * 1000), Int((tLayout - tLoad) * 1000),
@@ -10611,12 +10809,97 @@ final class ChatConversationController: UIViewController {
     // chat. Visibility is not geometry; the frames are already correct.
   }
 
+  /// Keeps the parked destination hidden until UIKit moves it into the transition
+  /// container, then reveals it in that same commit.
+  ///
+  /// ## The frame this removes
+  ///
+  /// Reported from a slow-motion capture: on tap, the whole chat flashes full-screen,
+  /// disappears, and only then does the push slide begin. That flash is this view —
+  /// `prepareForNavigationPush` parks it in the navigation container at full destination
+  /// bounds so the transcript lays out at final width, and the old code unhid it on the
+  /// line before `pushViewController`. If any commit lands while it is still parked (a
+  /// re-parent UIKit defers past that commit, or a `drawHierarchy(afterScreenUpdates:)`
+  /// anywhere in the synchronous will-appear path forcing a render), the user gets a full
+  /// screen of the destination on top of the page they are still looking at.
+  ///
+  /// Moving the `isHidden = false` line below `pushViewController` does **not** fix that:
+  /// Core Animation commits at the end of the run-loop turn, and both orderings are the
+  /// same turn. The only event that reliably separates "parked" from "pushed" is the
+  /// re-parent itself, so that is what the reveal is keyed on.
+  private func armPrestageRevealOnReparent(parkedIn container: UIView) {
+    prestageRevealToken &+= 1
+    let token = prestageRevealToken
+    prestageParkingSuperview = container
+    guard let root = view as? ChatPrestageRootView else {
+      // No hook available (a root view we did not create): fall back to the old behaviour
+      // rather than pushing a permanently invisible page.
+      view.isHidden = false
+      return
+    }
+    root.onSuperviewChanged = { [weak self] superview in
+      guard let self, self.prestageRevealToken == token else { return }
+      // Still parked (or detached mid-teardown) — keep it invisible.
+      guard let superview, superview !== self.prestageParkingSuperview else { return }
+      self.revealPrestagedView(reason: "reparent")
+    }
+    // The push may never start (a route replaced before it runs, a push cancelled by an
+    // interactive pop). Never leave a page hidden forever because of an optimisation.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+      guard let self, self.prestageRevealToken == token, self.view.isHidden else { return }
+      NSLog(
+        "[ChatOpen] prestage-reveal WATCHDOG chat=%@ — re-parent never happened",
+        String(self.route.chatId.prefix(12)))
+      self.revealPrestagedView(reason: "watchdog")
+    }
+  }
+
+  private func revealPrestagedView(reason: String) {
+    guard view.isHidden else { return }
+    // Unhiding a view that is STILL parked would recreate the full-screen flash this
+    // whole mechanism exists to remove — now on a timer, which is worse than the bug.
+    // The watchdog exists so a page is never permanently invisible, not so a parked one
+    // gets shown: if the push never took the view, take it out of the container instead.
+    // UIKit re-adds it wherever it belongs the moment a transition does start.
+    if let parking = prestageParkingSuperview, view.superview === parking {
+      view.removeFromSuperview()
+    }
+    (view as? ChatPrestageRootView)?.onSuperviewChanged = nil
+    prestageParkingSuperview = nil
+    view.isHidden = false
+    NSLog(
+      "[ChatOpen] prestage-reveal chat=%@ by=%@ sinceTapMs=%d",
+      String(route.chatId.prefix(12)), reason, VibeChatOpenTap.msSinceTap())
+  }
+
+  /// Was the destination still parked in the navigation container one turn after the push
+  /// was asked for? Answers, from any device export, whether UIKit defers the re-parent
+  /// past the first commit — the difference between "the reveal hook is enough" and "the
+  /// parking itself has to move".
+  func probePrestageParkingAfterPush(container: UIView) {
+    let token = prestageRevealToken
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.prestageRevealToken == token else { return }
+      let stillParked = self.view.superview === container
+      NSLog(
+        "[ChatOpen] prestage-parking chat=%@ stillParked=%@ hidden=%@ sinceTapMs=%d",
+        String(self.route.chatId.prefix(12)),
+        stillParked ? "Y" : "N", self.view.isHidden ? "Y" : "N",
+        VibeChatOpenTap.msSinceTap())
+    }
+  }
+
   override var preferredStatusBarStyle: UIStatusBarStyle {
     return isDark ? .lightContent : .darkContent
   }
 
   override func loadView() {
-    super.loadView()
+    // A root view that can say when UIKit re-parents it. `prepareForNavigationPush`
+    // parks this view inside the navigation container to lay the transcript out at final
+    // width, and it must stay hidden until the push actually takes it — see that method.
+    // `didMoveToSuperview` is the only signal that fires in the same commit as the
+    // reparent, which is what makes the reveal frame-exact rather than turn-exact.
+    view = ChatPrestageRootView()
     // Before viewDidLoad, so the seed it triggers measures at the destination width.
     if let prestagedInitialBounds {
       view.frame = prestagedInitialBounds
@@ -10744,7 +11027,85 @@ final class ChatConversationController: UIViewController {
     // `prestage` to `complete` — 600ms on a large chat, most of it main-thread-blocked,
     // with no way to tell how much was spent getting to the transition and how much was
     // the transition itself.
-    VibeOpenTrace.shared.mark("will-appear")
+    // What UIKit says the push will take, from UIKit — because `will-appear → did-appear`
+    // measures 529–589ms with the main thread completely free (`hang=0.00s`) and is
+    // identical on a 12-row chat and a 1,379-row one, so it is the transition itself and
+    // not our work. There is no custom animator anywhere in this app, so either UIKit's
+    // own push really is ~550ms on this OS (a spring that settles well after the motion
+    // reads as finished), or something is delaying the completion callback. Those two
+    // have completely different fixes, and guessing between them is how you end up
+    // writing a custom transition that fixes nothing.
+    let pushMs = Int((transitionCoordinator?.transitionDuration ?? 0) * 1000)
+    VibeOpenTrace.shared.mark("will-appear", "pushDur=\(pushMs)ms")
+    // Answer the question the comment above poses, instead of reasoning about it.
+    //
+    // A display link is downstream of every callback that could eat this window, so the
+    // two candidates separate cleanly on one number:
+    //   * frames ship steadily for the whole ~550ms → UIKit's spring really does take
+    //     that long to settle and there is no main-thread work to remove. The fix, if
+    //     any, is the curve — not our code.
+    //   * frames are dropped → something of ours is running inside the transition, and
+    //     `dropped`/`worstGap` size it. The main-thread watchdog cannot see this: it only
+    //     reports blocks over 350ms, and 200ms spread across a dozen frames never trips it.
+    pushWindowPacer.begin()
+    pushWindowStartedAt = ProcessInfo.processInfo.systemUptime
+    pushWindowDurationMs = pushMs
+  }
+
+  /// Frame delivery during will-appear → did-appear. See `viewWillAppear`.
+  private let pushWindowPacer = VibeListFramePacer()
+  private var pushWindowStartedAt: TimeInterval = 0
+  private var pushWindowDurationMs = 0
+
+  /// The verdict on the push window, in the log that leaves the device.
+  ///
+  /// `will-appear → did-appear` measures ~550ms on EVERY open — 3 rows, 24 rows, 1103
+  /// rows — against a `pushDur` UIKit reports as 350ms. That the number does not move
+  /// with content is why it was never chased as our work; that it exceeds the animation
+  /// by ~200ms is why it cannot simply be dismissed as the animation either.
+  ///
+  /// `verdict` is the whole point: `animation-only` means stop looking at our code.
+  private func reportPushWindowFrames() {
+    pushWindowPacer.end()
+    guard pushWindowStartedAt > 0 else { return }
+    let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - pushWindowStartedAt) * 1000)
+    pushWindowStartedAt = 0
+    let dropped = pushWindowPacer.dropped
+    let frames = pushWindowPacer.frames
+    // A handful of dropped frames is normal for any transition; a fifth of the window is
+    // not. Both thresholds are deliberately loose — this is a triage signal, not a gate.
+    let verdict: String
+    if frames == 0 {
+      verdict = "no-frames"
+    } else if dropped == 0 {
+      verdict = "animation-only"
+    } else if dropped * 5 >= frames {
+      verdict = "OUR-WORK"
+    } else {
+      verdict = "mixed"
+    }
+    // NSLog as well as VibeLog, because this line is the whole point of the pacer and it
+    // was invisible in exactly the artifact that gets sent for triage: a device console
+    // capture is NSLog-only, so every export so far has carried `viewDidAppear
+    // sinceTapMs=620` with no way to tell whether those 620ms were UIKit's spring or our
+    // work inside it. Printing it next to that line is what makes the question answerable
+    // from a log instead of re-derived by reasoning.
+    NSLog(
+      "[ChatOpen] push-window chat=%@ verdict=%@ elapsedMs=%d pushDurMs=%d frames=%d "
+        + "dropped=%d stutters=%d worstGapMs=%.1f",
+      String(route.chatId.prefix(12)), verdict, elapsedMs, pushWindowDurationMs,
+      frames, dropped, pushWindowPacer.stutters, pushWindowPacer.worstGapMs)
+    VibeLog.info(
+      "push window frames", category: "chatopen",
+      metadata: [
+        "verdict": verdict,
+        "elapsedMs": String(elapsedMs),
+        "pushDurMs": String(pushWindowDurationMs),
+        "frames": String(frames),
+        "dropped": String(dropped),
+        "stutters": String(pushWindowPacer.stutters),
+        "worstGapMs": String(format: "%.1f", pushWindowPacer.worstGapMs),
+      ])
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -10754,6 +11115,7 @@ final class ChatConversationController: UIViewController {
     NSLog(
       "[ChatOpen] host-stage viewDidAppear sinceTapMs=%d", VibeChatOpenTap.msSinceTap())
     VibeOpenTrace.shared.mark("did-appear")
+    reportPushWindowFrames()
     logLifecycle("viewDidAppear")
     logVisualState("viewDidAppear", force: true)
     applyPendingAppearanceAfterAttachment(reason: "viewDidAppear")
@@ -10801,6 +11163,9 @@ final class ChatConversationController: UIViewController {
 
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
+    // Leaves with the chat, like the keyboard — so re-entering never opens onto a panel
+    // the user left behind.
+    mainView.dismissGifPanel()
     // A pushed Agent Settings page owns the system navigation header. Freeze
     // engine-driven presence/pin/header work in the covered chat so a Phoenix
     // reconnect cannot rebuild iOS 26 glass effects inside the outgoing view.
@@ -11913,7 +12278,7 @@ final class ChatConversationController: UIViewController {
       chatNativeAgentPushConfig(
         agentId: peerAgentId,
         apiContext: apiContext,
-        appearance: .fallback,
+        appearance: .current,
         from: navigationController,
         onToast: { AppToastController.shared.show($0) }
       )
@@ -13073,10 +13438,10 @@ final class ChatConversationController: UIViewController {
     return nil
   }
 
+  /// The colour under the transcript during the push. Pure black/white here is what showed
+  /// through as a solid before the wallpaper painted; take the theme's own base instead.
   private static func backgroundColor(isDark: Bool) -> UIColor {
-    isDark
-      ? UIColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
-      : UIColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+    ChatListAppearance.from(raw: resolvedAppearance(isDark: isDark)).wallpaperBase
   }
 
   private static func resolvedAppearance(isDark: Bool) -> [String: Any] {
@@ -13703,13 +14068,10 @@ private struct ContactSearchView: View {
   let homeRows: [ChatHomeListRow]
   let onResult: ([String: Any]) -> Void
   @State private var query = ""
-  @State private var results: [ContactSearchUser] = []
   @State private var savedUserIDs = Set<String>()
-  @State private var isLoading = false
-  @State private var hasSearched = false
-  @State private var statusText = ""
-  @State private var searchTask: Task<Void, Never>?
   @State private var isSearchPresented = false
+  @State private var isShowingNewContact = false
+  @State private var isShowingChannelCreation = false
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -13732,9 +14094,8 @@ private struct ContactSearchView: View {
         prompt: "Username, phone, or ID"
       )
       .onChange(of: query) { _, _ in
-        scheduleSearch(immediate: false)
+        // Main-sheet search is intentionally local; server lookup lives in New Contact.
       }
-      .onDisappear { searchTask?.cancel() }
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
           Button {
@@ -13743,6 +14104,24 @@ private struct ContactSearchView: View {
           } label: {
             Image(systemName: "xmark")
           }
+        }
+      }
+      .sheet(isPresented: $isShowingNewContact) {
+        NavigationStack {
+          NewContactSearchView(config: config) { payload in
+            if (payload["action"] as? String) != "saveContact" {
+              isShowingNewContact = false
+            }
+            onResult(payload)
+          }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+      }
+      .sheet(isPresented: $isShowingChannelCreation) {
+        ChannelCreationSheet(config: config, homeRows: homeRows) { route in
+          isShowingChannelCreation = false
+          onResult(["action": "createdRoom", "route": route])
         }
       }
   }
@@ -13770,7 +14149,7 @@ private struct ContactSearchView: View {
         systemImage: "person.badge.plus",
         palette: palette
       ) {
-        isSearchPresented = true
+        isShowingNewContact = true
       }
 
       ContactSearchActionRow(
@@ -13778,26 +14157,37 @@ private struct ContactSearchView: View {
         systemImage: "megaphone",
         palette: palette
       ) {
-        onResult(["action": "newChannel"])
-        dismiss()
+        isShowingChannelCreation = true
       }
     }
-    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+    .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
     .listRowBackground(Color.clear)
-    .listRowSeparatorTint(palette.border)
+    .listRowSeparator(.hidden)
+    .listSectionSeparator(.hidden, edges: .top)
+    .listSectionSeparator(.visible, edges: .bottom)
+    .listSectionSeparatorTint(palette.border)
   }
 
 
 
   @ViewBuilder
   private var contentSection: some View {
-    if !results.isEmpty {
-      groupedUsersSection(users: results)
-    } else if query.isEmpty {
-      groupedUsersSection(users: homeRows.map(contactUser(for:)))
+    let users = filteredUsers
+    if !users.isEmpty {
+      groupedUsersSection(users: users)
     } else {
       statusSection
     }
+  }
+
+  private var filteredUsers: [ContactSearchUser] {
+    let rows = homeRows.filter { row in
+      guard !trimmedQuery.isEmpty else { return true }
+      return row.title.localizedCaseInsensitiveContains(trimmedQuery)
+        || row.preview.localizedCaseInsensitiveContains(trimmedQuery)
+        || (row.peerUserId?.localizedCaseInsensitiveContains(trimmedQuery) == true)
+    }
+    return rows.compactMap(contactUser(for:))
   }
 
   private func groupedUsersSection(users: [ContactSearchUser]) -> some View {
@@ -13815,13 +14205,20 @@ private struct ContactSearchView: View {
     let sortedKeys = grouped.keys.sorted()
 
     return ForEach(sortedKeys, id: \.self) { letter in
-      Section(letter) {
+      Section {
         ForEach(grouped[letter]!) { user in
           ContactSearchResultRow(
             user: user,
             isSaved: savedUserIDs.contains(user.userID),
-            palette: palette
+            palette: palette,
+            avatarSize: 46,
+            rowHorizontalPadding: 12,
+            rowVerticalPadding: 7,
+            rowMinHeight: 64,
+            showsSeparator: true
           )
+          .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+          .listRowSeparator(.hidden)
           .contentShape(Rectangle())
           .onTapGesture { open(user, action: "chat") }
           .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -13830,7 +14227,7 @@ private struct ContactSearchView: View {
             } label: {
               Label("Call", systemImage: "phone.fill")
             }
-            .tint(.green)
+            .tint(palette.accent)
 
             if !savedUserIDs.contains(user.userID) {
               Button {
@@ -13843,6 +14240,11 @@ private struct ContactSearchView: View {
             }
           }
         }
+      } header: {
+        Text(letter)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(palette.secondaryText)
+          .textCase(nil)
       }
     }
   }
@@ -13850,9 +14252,9 @@ private struct ContactSearchView: View {
   private var statusSection: some View {
     Section {
       ContactSearchStatusView(
-        isLoading: isLoading,
-        hasSearched: hasSearched,
-        message: statusText,
+        isLoading: false,
+        hasSearched: !trimmedQuery.isEmpty,
+        message: trimmedQuery.isEmpty ? "" : "No people found in your chats.",
         palette: palette
       )
       .frame(maxWidth: .infinity)
@@ -13865,7 +14267,7 @@ private struct ContactSearchView: View {
 
   private func contactUser(for row: ChatHomeListRow) -> ContactSearchUser {
     ContactSearchUser(payload: [
-      "userId": row.chatId,
+      "userId": row.peerUserId ?? row.chatId,
       "username": row.title,
       "displayName": row.title,
       "profileImage": row.avatarUri ?? "",
@@ -13879,47 +14281,6 @@ private struct ContactSearchView: View {
   private func open(_ user: ContactSearchUser, action: String) {
     onResult(["action": action, "user": user.payload])
     dismiss()
-  }
-
-  /// Debounced live search. Typing reschedules a 350ms-delayed query; submitting
-  /// runs immediately. A single in-flight task is kept so results never race.
-  private func scheduleSearch(immediate: Bool) {
-    searchTask?.cancel()
-    let queryValue = trimmedQuery
-    guard !queryValue.isEmpty else {
-      results = []
-      hasSearched = false
-      statusText = ""
-      isLoading = false
-      return
-    }
-
-    searchTask = Task { @MainActor in
-      if !immediate {
-        try? await Task.sleep(nanoseconds: 350_000_000)
-        if Task.isCancelled { return }
-      }
-      await performSearch(for: queryValue)
-    }
-  }
-
-  @MainActor
-  private func performSearch(for queryValue: String) async {
-    isLoading = true
-    defer { isLoading = false }
-
-    do {
-      let found = try await ContactSearchService.search(config: config, query: queryValue)
-      if Task.isCancelled { return }
-      results = found
-      hasSearched = true
-      statusText = found.isEmpty ? "No people found for “\(queryValue)”." : ""
-    } catch {
-      if Task.isCancelled { return }
-      results = []
-      hasSearched = true
-      statusText = error.localizedDescription
-    }
   }
 }
 
@@ -14117,6 +14478,11 @@ struct ContactSearchResultRow: View {
   let user: ContactSearchUser
   let isSaved: Bool
   let palette: AppThemePalette
+  var avatarSize: CGFloat = 56
+  var rowHorizontalPadding: CGFloat = 16
+  var rowVerticalPadding: CGFloat = 12
+  var rowMinHeight: CGFloat = 76
+  var showsSeparator: Bool = false
   @Environment(\.colorScheme) private var colorScheme
 
   var body: some View {
@@ -14128,13 +14494,14 @@ struct ContactSearchResultRow: View {
         avatarURI: resolvedProfileImage,
         fallback: String(user.username.prefix(2)),
         isDark: colorScheme == .dark,
-        palette: palette
+        palette: palette,
+        size: avatarSize
       )
 
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 6) {
           Text(user.username)
-            .font(.system(size: 16, weight: .semibold))
+            .font(.system(size: 16, weight: .medium))
             .foregroundStyle(palette.text)
           if user.isGoldTier {
             Image(systemName: "checkmark.seal.fill")
@@ -14157,9 +14524,17 @@ struct ContactSearchResultRow: View {
           .foregroundStyle(palette.accent)
       }
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 12)
-    .frame(minHeight: 76)
+    .padding(.horizontal, rowHorizontalPadding)
+    .padding(.vertical, rowVerticalPadding)
+    .frame(minHeight: rowMinHeight)
+    .overlay(alignment: .bottom) {
+      if showsSeparator {
+        Rectangle()
+          .fill(palette.border.opacity(0.75))
+          .frame(height: 0.5)
+          .padding(.leading, rowHorizontalPadding + avatarSize + 12)
+      }
+    }
     .contentShape(Rectangle())
   }
 
@@ -14193,6 +14568,142 @@ struct ContactSearchResultRow: View {
   }
 }
 
+private struct ContactActionSheet: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+
+  let user: ContactSearchUser
+  let onChat: () -> Void
+
+  private var palette: AppThemePalette {
+    AppThemePalette.resolve(for: colorScheme)
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack {
+        Spacer()
+        Button { dismiss() } label: {
+          Image(systemName: "xmark")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(palette.secondaryText)
+            .frame(width: 32, height: 32)
+            .background(palette.card, in: Circle())
+        }
+        .accessibilityLabel("Close")
+      }
+
+      HomeListStyleAvatar(
+        title: user.username,
+        peerUserId: user.userID,
+        chatId: nil,
+        avatarURI: ChatAvatarURLResolver.resolve(
+          rawAvatar: user.profileImage,
+          peerUserId: user.userID,
+          chatId: nil,
+          preferPushAvatar: false,
+          isAgent: user.isAgent || user.bridgeProvider != nil,
+          agentId: user.agentId ?? user.bridgeAgentRouteId,
+          displayName: user.handle ?? user.username
+        ),
+        fallback: String(user.username.prefix(2)),
+        isDark: colorScheme == .dark,
+        palette: palette,
+        size: 88
+      )
+      .padding(.top, 2)
+
+      Text(user.username)
+        .font(.system(size: 21, weight: .semibold))
+        .foregroundStyle(palette.text)
+        .lineLimit(1)
+        .padding(.top, 12)
+
+      Text(user.subtitle)
+        .font(.system(size: 14, weight: .regular))
+        .foregroundStyle(palette.secondaryText)
+        .lineLimit(1)
+        .padding(.top, 4)
+
+      HStack(spacing: 12) {
+        ContactActionButton(
+          title: "Chat",
+          subtitle: "Open chat",
+          systemImage: "message.fill",
+          palette: palette,
+          isEnabled: true,
+          action: onChat
+        )
+
+        ContactActionButton(
+          title: "Call",
+          subtitle: "Unavailable",
+          systemImage: "phone.fill",
+          palette: palette,
+          isEnabled: false,
+          action: {}
+        )
+      }
+      .padding(.top, 24)
+
+      Label("Calls are unavailable until secure call-key exchange is enabled.", systemImage: "info.circle")
+        .font(.system(size: 12, weight: .regular))
+        .foregroundStyle(palette.secondaryText)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 28)
+        .padding(.top, 18)
+    }
+    .padding(.horizontal, 20)
+    .padding(.top, 10)
+    .padding(.bottom, 28)
+    .frame(maxWidth: .infinity)
+    .background(palette.background.ignoresSafeArea())
+    .presentationDetents([.medium])
+    .presentationDragIndicator(.visible)
+  }
+}
+
+private struct ContactActionButton: View {
+  let title: String
+  let subtitle: String
+  let systemImage: String
+  let palette: AppThemePalette
+  let isEnabled: Bool
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      VStack(spacing: 8) {
+        Image(systemName: systemImage)
+          .font(.system(size: 19, weight: .semibold))
+          .foregroundStyle(isEnabled ? palette.accent : palette.secondaryText.opacity(0.55))
+          .frame(width: 46, height: 46)
+          .background(
+            (isEnabled ? palette.accent : palette.secondaryText).opacity(0.12),
+            in: Circle()
+          )
+
+        Text(title)
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(isEnabled ? palette.text : palette.secondaryText.opacity(0.7))
+
+        Text(subtitle)
+          .font(.system(size: 11, weight: .regular))
+          .foregroundStyle(palette.secondaryText)
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, 12)
+      .background(palette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .stroke(palette.border.opacity(0.6), lineWidth: 1)
+      )
+    }
+    .buttonStyle(.plain)
+    .disabled(!isEnabled)
+  }
+}
+
 private struct ContactSearchActionRow: View {
   let title: String
   let systemImage: String
@@ -14201,25 +14712,237 @@ private struct ContactSearchActionRow: View {
 
   var body: some View {
     Button(action: action) {
-      HStack(spacing: 16) {
+      HStack(spacing: 12) {
         Image(systemName: systemImage)
-          .font(.system(size: 20, weight: .regular))
+          .font(.system(size: 18, weight: .regular))
           .symbolRenderingMode(.hierarchical)
           .foregroundStyle(palette.accent)
-          .frame(width: 32, height: 32)
+          .frame(width: 28, height: 28)
 
         Text(title)
-          .font(.system(size: 17, weight: .regular))
+          .font(.system(size: 16, weight: .regular))
           .foregroundStyle(palette.accent)
           .lineLimit(1)
           .minimumScaleFactor(0.82)
 
         Spacer(minLength: 8)
       }
-      .padding(.vertical, 4)
+      .padding(.vertical, 3)
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+  }
+}
+
+/// Server-backed lookup kept separate from the local New Message list.
+private struct NewContactSearchView: View {
+  @Environment(\.dismiss) private var dismiss
+  @Environment(\.colorScheme) private var colorScheme
+  @FocusState private var focusedField: Field?
+
+  private enum Field {
+    case name
+    case query
+  }
+
+  let config: AppSessionConfig
+  let onResult: ([String: Any]) -> Void
+
+  @State private var contactName = ""
+  @State private var query = ""
+  @State private var results: [ContactSearchUser] = []
+  @State private var selectedUser: ContactSearchUser?
+  @State private var isLoading = false
+  @State private var hasSearched = false
+  @State private var statusText = ""
+  @State private var searchTask: Task<Void, Never>?
+
+  private var palette: AppThemePalette {
+    AppThemePalette.resolve(for: colorScheme)
+  }
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 16) {
+        contactFields
+
+        if results.isEmpty {
+          ContactSearchStatusView(
+            isLoading: isLoading,
+            hasSearched: hasSearched,
+            message: statusText,
+            palette: palette
+          )
+          .frame(maxWidth: .infinity)
+          .padding(.top, 16)
+        } else {
+          Text("People")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(palette.secondaryText)
+            .textCase(.uppercase)
+            .padding(.horizontal, 4)
+
+          LazyVStack(spacing: 0) {
+            ForEach(results) { user in
+              let isSelected = selectedUser?.userID == user.userID
+              ContactSearchResultRow(
+                user: user,
+                isSaved: isSelected,
+                palette: palette,
+                avatarSize: 46,
+                rowHorizontalPadding: 12,
+                rowVerticalPadding: 7,
+                rowMinHeight: 62,
+                showsSeparator: true
+              )
+              .background(
+                isSelected
+                  ? palette.accent.opacity(0.1)
+                  : Color.clear
+              )
+              .contentShape(Rectangle())
+              .onTapGesture {
+                selectedUser = user
+                focusedField = nil
+              }
+            }
+          }
+          .background(palette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+          .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+              .stroke(palette.border.opacity(0.65), lineWidth: 1)
+          )
+        }
+      }
+      .padding(.horizontal, 16)
+      .padding(.top, 12)
+      .padding(.bottom, 28)
+    }
+    .scrollIndicators(.hidden)
+    .background(palette.background.ignoresSafeArea())
+    .navigationTitle("New Contact")
+    .navigationBarTitleDisplayMode(.inline)
+    .onChange(of: query) { _, newValue in
+      scheduleSearch(query: newValue)
+    }
+    .onDisappear { searchTask?.cancel() }
+    .task {
+      focusedField = .query
+      statusText = "Search by username or phone number."
+    }
+    .toolbar {
+      ToolbarItem(placement: .topBarLeading) {
+        Button { dismiss() } label: {
+          Image(systemName: "xmark")
+        }
+        .accessibilityLabel("Close")
+      }
+
+      ToolbarItem(placement: .topBarTrailing) {
+        Button {
+          if let selectedUser {
+            save(selectedUser)
+          }
+        } label: {
+          Image(systemName: "checkmark")
+        }
+        .tint(palette.accent)
+        .disabled(selectedUser == nil)
+        .accessibilityLabel("Save contact")
+      }
+    }
+  }
+
+  private var contactFields: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 12) {
+        Image(systemName: "person")
+          .font(.system(size: 17, weight: .medium))
+          .foregroundStyle(palette.secondaryText)
+          .frame(width: 22)
+
+        TextField("Name (optional)", text: $contactName)
+          .focused($focusedField, equals: .name)
+          .textInputAutocapitalization(.words)
+          .autocorrectionDisabled()
+          .font(.system(size: 16, weight: .regular))
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 14)
+
+      Divider()
+        .overlay(palette.border.opacity(0.75))
+        .padding(.leading, 50)
+
+      HStack(spacing: 12) {
+        Image(systemName: "magnifyingglass")
+          .font(.system(size: 17, weight: .medium))
+          .foregroundStyle(palette.accent)
+          .frame(width: 22)
+
+        TextField("Username or phone number", text: $query)
+          .focused($focusedField, equals: .query)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+          .keyboardType(.default)
+          .font(.system(size: 16, weight: .regular))
+
+        if isLoading {
+          ProgressView()
+            .controlSize(.small)
+            .tint(palette.accent)
+        }
+      }
+      .padding(.horizontal, 16)
+      .padding(.vertical, 14)
+    }
+    .background(palette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(palette.border.opacity(0.65), lineWidth: 1)
+    )
+  }
+
+  private func scheduleSearch(query rawQuery: String) {
+    searchTask?.cancel()
+    let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else {
+      results = []
+      selectedUser = nil
+      isLoading = false
+      hasSearched = false
+      statusText = "Search by username or phone number."
+      return
+    }
+
+    isLoading = true
+    searchTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 300_000_000)
+      guard !Task.isCancelled else { return }
+      do {
+        let found = try await ContactSearchService.search(config: config, query: query)
+        guard !Task.isCancelled else { return }
+        results = found
+        isLoading = false
+        hasSearched = true
+        statusText = found.isEmpty ? "No user found for “\(query)”." : ""
+      } catch {
+        guard !Task.isCancelled else { return }
+        results = []
+        isLoading = false
+        hasSearched = true
+        statusText = error.localizedDescription
+      }
+    }
+  }
+
+  private func save(_ user: ContactSearchUser) {
+    var payload = user.payload
+    let trimmedName = contactName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmedName.isEmpty {
+      payload["contactName"] = trimmedName
+    }
+    onResult(["action": "saveContact", "user": payload])
   }
 }
 
@@ -14470,7 +15193,7 @@ enum ContactSearchService {
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
       throw ContactSearchServiceError.invalidResponse
     }
@@ -14708,26 +15431,13 @@ enum ChatRoomCreateService {
       throw ChatDirectMessageServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-      let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-      return try await perform(request, fallbackName: name, session: session)
     case .direct:
-      do {
-        let result = try await perform(request, fallbackName: name, session: .shared)
-        PacketRuntime.shared.stop(resetToDirect: true)
-        Task.detached {
-          await PacketBootstrapService.prefetchIfNeeded(config: config)
-        }
-        return result
-      } catch {
-        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else {
-          throw error
-        }
-        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-        return try await perform(request, fallbackName: name, session: session)
+      let result = try await perform(
+        request, fallbackName: name, session: PacketRuntime.shared.session())
+      Task.detached {
+        await PacketBootstrapService.prefetchIfNeeded(config: config)
       }
+      return result
     }
   }
 
@@ -14897,7 +15607,7 @@ enum ChatRoomCreateService {
     body.append(imageData)
     body.append("\r\n--\(boundary)--\r\n".data(using: .utf8) ?? Data())
 
-    let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+    let (data, response) = try await VibeHTTP.shared.upload(for: request, from: body)
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
       throw ChatDirectMessageServiceError.invalidResponse
     }
@@ -14945,21 +15655,8 @@ enum GroupMembersUpdateService {
       throw ChatDirectMessageServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-      let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-      return try await perform(request, session: session)
     case .direct:
-      do {
-        return try await perform(request, session: .shared)
-      } catch {
-        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else {
-          throw error
-        }
-        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-        return try await perform(request, session: session)
-      }
+      return try await perform(request, session: PacketRuntime.shared.session())
     }
   }
 
@@ -15100,19 +15797,8 @@ enum GroupUpdateService {
       throw ChatDirectMessageServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-      let session = PacketRuntime.shared.makeURLSession(snapshot: snapshot)
-      return try await perform(request, session: session)
     case .direct:
-      do {
-        return try await perform(request, session: .shared)
-      } catch {
-        guard ChatDirectMessageService.shouldAttemptPacketFallback(for: error) else { throw error }
-        let snapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        let session = PacketRuntime.shared.makeURLSession(snapshot: snapshot)
-        return try await perform(request, session: session)
-      }
+      return try await perform(request, session: PacketRuntime.shared.session())
     }
   }
 
@@ -15557,26 +16243,24 @@ private enum ChatDirectMessageService {
   static func startChat(
     config: AppSessionConfig,
     friendID: String,
-    allowPacketFallback: Bool = true
   ) async throws -> ChatCreateResult {
     let activeConfig = AppSessionConfig.current ?? config
     do {
       return try await startChatOnce(
-        config: activeConfig, friendID: friendID, allowPacketFallback: allowPacketFallback)
+        config: activeConfig, friendID: friendID)
     } catch let error as ChatDirectMessageServiceError {
       guard error.isSessionExpired else {
         throw error
       }
       let refreshedConfig = try await AppSessionRefreshService.refresh(config: activeConfig)
       return try await startChatOnce(
-        config: refreshedConfig, friendID: friendID, allowPacketFallback: allowPacketFallback)
+        config: refreshedConfig, friendID: friendID)
     }
   }
 
   private static func startChatOnce(
     config: AppSessionConfig,
     friendID: String,
-    allowPacketFallback: Bool
   ) async throws -> ChatCreateResult {
     let request = try buildRequest(config: config, friendID: friendID)
 
@@ -15585,30 +16269,12 @@ private enum ChatDirectMessageService {
       throw ChatDirectMessageServiceError.transportUnavailable("offline")
     case .bridgeText:
       throw ChatDirectMessageServiceError.transportUnavailable("bridge_text")
-    case .packetMesh:
-      guard allowPacketFallback else {
-        // Agent DMs must not hang on mesh bootstrap when direct is preferred.
-        throw ChatDirectMessageServiceError.transportUnavailable("packet_mesh_disabled")
-      }
-      let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-      let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-      return try await perform(request, session: session)
     case .direct:
-      do {
-        let result = try await perform(request, session: .shared)
-        PacketRuntime.shared.stop(resetToDirect: true)
-        Task.detached {
-          await PacketBootstrapService.prefetchIfNeeded(config: config)
-        }
-        return result
-      } catch {
-        guard allowPacketFallback, shouldAttemptPacketFallback(for: error) else {
-          throw error
-        }
-        let packetSnapshot = try await PacketRuntime.shared.ensureStarted(config: config)
-        let session = PacketRuntime.shared.makeURLSession(snapshot: packetSnapshot)
-        return try await perform(request, session: session)
+      let result = try await perform(request, session: PacketRuntime.shared.session())
+      Task.detached {
+        await PacketBootstrapService.prefetchIfNeeded(config: config)
       }
+      return result
     }
   }
 
@@ -15661,20 +16327,6 @@ private enum ChatDirectMessageService {
 
     let messages = (payload["messages"] as? [[String: Any]]) ?? []
     return ChatCreateResult(chatID: chatID, messages: messages)
-  }
-
-  fileprivate static func shouldAttemptPacketFallback(for error: Error) -> Bool {
-    if let serviceError = error as? ChatDirectMessageServiceError {
-      switch serviceError {
-      case let .http(statusCode, _):
-        return statusCode >= 500
-      case .transportUnavailable:
-        return false
-      default:
-        return true
-      }
-    }
-    return true
   }
 
   fileprivate static func normalizedString(_ value: Any?) -> String? {
@@ -15836,6 +16488,30 @@ private struct AppAnimatedSVGView: UIViewRepresentable {
 private final class AppToastOverlayWindow: UIWindow {
   override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
     nil
+  }
+}
+
+/// Root view of a pushed chat, which reports when UIKit re-parents it.
+///
+/// `ChatConversationController.prepareForNavigationPush` parks this view inside the
+/// navigation container — hidden — so the transcript can lay out at the destination's
+/// real width before the push starts. The parking is the whole reason the seed measures
+/// against cached heights instead of estimating, and it must stay invisible: a full-screen
+/// chat parked in the container is a full-screen chat on top of the page the user is still
+/// looking at.
+///
+/// Unhiding cannot be done by code position. Core Animation commits state at the end of a
+/// run-loop turn, so "unhide before `pushViewController`" and "unhide after it returns"
+/// commit the identical frame; the only thing that separates parked from pushed is the
+/// re-parent itself. `didMoveToSuperview` fires inside that same commit, which is what
+/// makes the reveal frame-exact — no parked frame, and no blank first frame of the slide.
+final class ChatPrestageRootView: UIView {
+  /// Called on every superview change while a push reveal is armed.
+  var onSuperviewChanged: ((UIView?) -> Void)?
+
+  override func didMoveToSuperview() {
+    super.didMoveToSuperview()
+    onSuperviewChanged?(superview)
   }
 }
 
@@ -16028,7 +16704,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     )
     let controller = ChatAgentsMainViewController(
       apiContext: apiContext,
-      appearance: .fallback,
+      appearance: .current,
       showsCloseButton: false
     )
     controller.onToast = { message in
@@ -16093,7 +16769,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     Task { @MainActor [weak self] in
       do {
         let result = try await ChatDirectMessageService.startChat(
-          config: config, friendID: agentUserId, allowPacketFallback: false
+          config: config, friendID: agentUserId
         )
         self?.coordinator.openChat(
           ChatRoute(
@@ -16135,7 +16811,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     request.setValue("application/json", forHTTPHeaderField: "Accept")
 
     let cardTitle = card.displayName
-    URLSession.shared.dataTask(with: request) { data, response, error in
+    VibeHTTP.shared.dataTask(with: request) { data, response, error in
       DispatchQueue.main.async {
         if let error {
           NSLog("[AgentsTab] delete agent failed %@", error.localizedDescription)
@@ -16530,12 +17206,17 @@ final class ChatAgentConversationController: UIViewController {
     isDark ? .lightContent : .darkContent
   }
 
+  /// Reports its own re-parent so the pre-push parking can stay hidden until UIKit takes
+  /// it — see `armPrestageRevealOnReparent`.
+  override func loadView() {
+    view = ChatPrestageRootView()
+  }
+
   override func viewDidLoad() {
     super.viewDidLoad()
     let viewDidLoadStartedAt = ProcessInfo.processInfo.systemUptime
-    view.backgroundColor = isDark ? .black : .white
-
     let appearance: [String: Any] = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
+    view.backgroundColor = ChatListAppearance.from(raw: appearance).wallpaperBase
 
     // Same live-repaint contract as ChatConversationController: without this the agent
     // chat keeps whatever wallpaper it was built with until it is rebuilt.
@@ -16643,11 +17324,50 @@ final class ChatAgentConversationController: UIViewController {
     }
     stageInitialRowsIfPossible(reason: "pre-push")
     mainView.finishNavigationPushPrestaging()
-    view.isHidden = false
     UIView.performWithoutAnimation {
       view.layoutIfNeeded()
       mainView.layoutIfNeeded()
     }
+    // Same parked-frame defect as the chat surface, same reveal contract — see
+    // `ChatConversationController.armPrestageRevealOnReparent`. The view stays hidden
+    // until UIKit re-parents it out of the navigation container, so a commit that lands
+    // while it is still parked cannot paint a full-screen agent page over Home.
+    armPrestageRevealOnReparent(parkedIn: navigationController.view)
+  }
+
+  private weak var prestageParkingSuperview: UIView?
+  private var prestageRevealToken = 0
+
+  private func armPrestageRevealOnReparent(parkedIn container: UIView) {
+    prestageRevealToken &+= 1
+    let token = prestageRevealToken
+    prestageParkingSuperview = container
+    guard let root = view as? ChatPrestageRootView else {
+      view.isHidden = false
+      return
+    }
+    root.onSuperviewChanged = { [weak self] superview in
+      guard let self, self.prestageRevealToken == token else { return }
+      guard let superview, superview !== self.prestageParkingSuperview else { return }
+      self.revealPrestagedView(reason: "reparent")
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+      guard let self, self.prestageRevealToken == token, self.view.isHidden else { return }
+      NSLog("[AgentOpen] prestage-reveal WATCHDOG — re-parent never happened")
+      self.revealPrestagedView(reason: "watchdog")
+    }
+  }
+
+  private func revealPrestagedView(reason: String) {
+    guard view.isHidden else { return }
+    // Never unhide a view that is still parked — see the chat surface's copy of this.
+    if let parking = prestageParkingSuperview, view.superview === parking {
+      view.removeFromSuperview()
+    }
+    (view as? ChatPrestageRootView)?.onSuperviewChanged = nil
+    prestageParkingSuperview = nil
+    view.isHidden = false
+    NSLog("[AgentOpen] prestage-reveal by=%@", reason)
   }
 
   private func stageInitialRowsIfPossible(reason: String) {

@@ -84,7 +84,7 @@ final class ChatAppearanceLiveHostView: UIView {
   private let patternMaskLayer = CALayer()
   private let stack = UIStackView()
   private var cells: [ChatListCell] = []
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   private var mode: Mode = .full
 
   enum Mode {
@@ -157,9 +157,18 @@ final class ChatAppearanceLiveHostView: UIView {
       && appearance.wallpaperPatternOpacity > 0.001
       && (appearance.wallpaperMaskKey?.isEmpty == false)
 
+    // Cache-only: see `ChatWallpaperView.apply`. A miss decodes off-main and re-enters.
+    if canShowPattern, let maskKey = appearance.wallpaperMaskKey,
+      ChatWallpaperMaskStore.cachedImage(forKey: maskKey) == nil
+    {
+      ChatWallpaperMaskStore.prewarm(key: maskKey) { [weak self] ok in
+        guard ok else { return }
+        DispatchQueue.main.async { self?.applyWallpaper() }
+      }
+    }
     if canShowPattern,
       let maskKey = appearance.wallpaperMaskKey,
-      let maskImage = ChatWallpaperMaskStore.image(forKey: maskKey)
+      let maskImage = ChatWallpaperMaskStore.cachedImage(forKey: maskKey)
     {
       patternLayer.colors = appearance.wallpaperPatternGradient.map(\.cgColor)
       patternLayer.locations = appearance.wallpaperPatternLocations
@@ -375,21 +384,58 @@ struct AppearanceThemeThumbView: View {
 struct WallpaperPatternPreview: View {
   let appearance: ChatListAppearance
 
-  var body: some View {
-    if appearance.backgroundMode != "transparent",
+  /// Decoded mask, or nil until the off-main decode lands.
+  ///
+  /// This used to call `ChatWallpaperMaskStore.image(forKey:)` inline in `body`, which
+  /// rasterises a full-screen vector on a cache miss. SwiftUI evaluates `body` on the
+  /// main thread, so the wallpaper picker — which builds one of these per option —
+  /// froze the app for the length of the decode: two `[mainhang]` samples in one
+  /// session, 0.51s and 0.75s, both with `WallpaperPatternPreview.body.getter` directly
+  /// under `renderAlphaOnly`. Cache hits still resolve on the first `body`, so a
+  /// warm picker looks exactly as it did.
+  @State private var maskImage: CGImage?
+
+  private var maskKey: String? {
+    guard appearance.backgroundMode != "transparent",
       appearance.wallpaperPatternGradient.count >= 2,
       appearance.wallpaperPatternOpacity > 0.001,
-      let maskKey = appearance.wallpaperMaskKey, !maskKey.isEmpty,
-      let cgImage = ChatWallpaperMaskStore.image(forKey: maskKey)
-    {
-      patternGradient
-        .mask(
-          Image(decorative: cgImage, scale: 1, orientation: .up)
-            .resizable()
-            .scaledToFill()
-        )
-        .opacity(Double(max(0.04, appearance.wallpaperPatternOpacity)))
-        .allowsHitTesting(false)
+      let key = appearance.wallpaperMaskKey, !key.isEmpty
+    else { return nil }
+    return key
+  }
+
+  var body: some View {
+    Group {
+      if let cgImage = maskImage ?? maskKey.flatMap({ ChatWallpaperMaskStore.cachedImage(forKey: $0) }) {
+        patternGradient
+          .mask(
+            Image(decorative: cgImage, scale: 1, orientation: .up)
+              .resizable()
+              .scaledToFill()
+          )
+          .opacity(Double(max(0.04, appearance.wallpaperPatternOpacity)))
+          .allowsHitTesting(false)
+      }
+    }
+    .onAppear(perform: loadMaskIfNeeded)
+    .onChange(of: appearance.visualKey) { _, _ in
+      maskImage = nil
+      loadMaskIfNeeded()
+    }
+  }
+
+  private func loadMaskIfNeeded() {
+    guard maskImage == nil, let key = maskKey else { return }
+    if let cached = ChatWallpaperMaskStore.cachedImage(forKey: key) {
+      maskImage = cached
+      return
+    }
+    ChatWallpaperMaskStore.prewarm(key: key) { ok in
+      guard ok else { return }
+      DispatchQueue.main.async {
+        guard maskKey == key else { return }
+        maskImage = ChatWallpaperMaskStore.cachedImage(forKey: key)
+      }
     }
   }
 
@@ -448,68 +494,33 @@ struct ChatWallpaperPickerView: View {
     GridItem(.flexible(), spacing: 10),
   ]
 
+  /// A gallery, nothing else. The live preview banner used to sit above this grid, but
+  /// it competed with the very artwork it was previewing and the user read its updates
+  /// as the picker having already changed their wallpaper. Selection now happens in one
+  /// place only: the full-screen preview's Set button.
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 16) {
-        // Live production preview
-        ChatAppearanceLiveHost(draft: draft, mode: .compact)
-          .frame(height: 160)
-          .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-              .stroke(palette.border, lineWidth: 1)
-          )
-
-        Text("SELECT A WALLPAPER")
-          .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(palette.secondaryText.opacity(0.7))
-
-        LazyVGrid(columns: columns, spacing: 10) {
-          ForEach(AppearanceWallpaperCatalog.all) { option in
-            let selected = selectedId == option.id
-            Button {
-              previewOption = option
-            } label: {
-              wallpaperThumb(option: option, selected: selected)
-            }
-            .buttonStyle(.plain)
+      LazyVGrid(columns: columns, spacing: 12) {
+        ForEach(AppearanceWallpaperCatalog.all) { option in
+          Button {
+            previewOption = option
+          } label: {
+            wallpaperThumb(option: option, selected: selectedId == option.id)
           }
-        }
-
-        Text("PATTERN OPACITY")
-          .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(palette.secondaryText.opacity(0.7))
-          .padding(.top, 4)
-
-        HStack {
-          Slider(
-            value: Binding(
-              get: { draft.wallpaperPatternOpacity },
-              set: {
-                draft.wallpaperPatternOpacity = $0
-                ChatAppearanceDraftStore.save(draft)
-              }
-            ),
-            in: 0...0.4
-          )
-          .tint(Color(uiColor: ChatListAppearance.brandAccentFallback))
-          Text("\(Int(draft.wallpaperPatternOpacity * 100))%")
-            .font(.system(size: 13, weight: .medium, design: .monospaced))
-            .foregroundStyle(palette.secondaryText)
-            .frame(width: 44, alignment: .trailing)
+          .buttonStyle(.plain)
         }
       }
-      .padding(16)
+      .padding(.horizontal, 12)
+      .padding(.vertical, 14)
     }
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Chat Wallpaper")
     .navigationBarTitleDisplayMode(.inline)
-    .sheet(item: $previewOption) { option in
-      WallpaperPreviewSheet(option: option, baseDraft: draft) {
-        apply(option)
+    .fullScreenCover(item: $previewOption) { option in
+      WallpaperPreviewSheet(option: option, baseDraft: draft) { committed in
+        draft = committed
+        ChatAppearanceDraftStore.save(committed)
       }
-      .presentationDetents([.fraction(0.92), .large])
-      .presentationDragIndicator(.visible)
     }
   }
 
@@ -520,26 +531,17 @@ struct ChatWallpaperPickerView: View {
     return "none"
   }
 
-  /// Commits a wallpaper selection into the real draft and persists it.
-  /// Only ever called from the preview sheet's "Set" button — tapping a
-  /// grid tile just opens the preview, it never mutates `draft` itself.
-  private func apply(_ option: AppearanceWallpaperOption) {
-    draft.wallpaperPatternMaskKey = option.maskKey
-    if option.maskKey == nil {
-      draft.wallpaperPatternOpacity = 0
-    } else if draft.wallpaperPatternOpacity < 0.05 {
-      draft.wallpaperPatternOpacity = 0.17
-    }
-    draft.wallpaperKind = option.maskKey == nil ? "solid" : "gradient"
-    ChatAppearanceDraftStore.save(draft)
-  }
-
   private func wallpaperThumb(option: AppearanceWallpaperOption, selected: Bool) -> some View {
     var thumbDraft = draft
     thumbDraft.wallpaperPatternMaskKey = option.maskKey
-    thumbDraft.wallpaperPatternOpacity = option.maskKey == nil ? 0 : max(0.12, draft.wallpaperPatternOpacity)
+    // Thumbs read at a fixed legible intensity. Using the live opacity made every tile
+    // fade together whenever the user had turned the pattern down, so the grid stopped
+    // showing what it was meant to be choosing between.
+    thumbDraft.wallpaperPatternOpacity = option.maskKey == nil ? 0 : 0.34
+    let accent = Color(uiColor: ChatListAppearance.brandAccentFallback)
     return ZStack(alignment: .bottomLeading) {
-      AppearanceThemeThumbView(draft: thumbDraft, emoji: option.emoji, selected: selected)
+      AppearanceThemeThumbView(draft: thumbDraft, emoji: option.emoji, selected: false)
+
       Text(option.title)
         .font(.system(size: 11, weight: .semibold))
         .foregroundColor(.white)
@@ -547,81 +549,208 @@ struct ChatWallpaperPickerView: View {
         .padding(.vertical, 4)
         .background(Capsule().fill(Color.black.opacity(0.45)))
         .padding(8)
+
+      if selected {
+        Image(systemName: "checkmark")
+          .font(.system(size: 11, weight: .bold))
+          .foregroundColor(.black.opacity(0.85))
+          .frame(width: 22, height: 22)
+          .background(Circle().fill(accent))
+          .padding(8)
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+      }
     }
     // Portrait 3:4 tile — matches how a wallpaper actually reads behind a
     // full chat column, rather than the old near-square crop.
     .aspectRatio(3.0 / 4.0, contentMode: .fit)
+    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 16, style: .continuous)
+        .stroke(selected ? accent : Color.white.opacity(0.10), lineWidth: selected ? 2 : 1)
+    )
   }
 }
 
 // MARK: - Wallpaper full-screen preview sheet
 
-/// Large preview of a single wallpaper option, rendered with the same
-/// gradient + mask recipe as `WallpaperPatternPreview`/`ChatAppearanceCanvas`
-/// (a couple of sample bubbles included) so what you see here is exactly
-/// what the chat will look like. `baseDraft` is a snapshot, not the live
-/// binding — dismissing without tapping "Set" never touches the real draft.
+/// Full-screen preview of one wallpaper.
+///
+/// Rendered through `ChatAppearanceLiveHost` — the production UIKit pipeline with real
+/// `ChatListCell`s — rather than the SwiftUI mock canvas. The mock resolved its colours
+/// independently of `ChatWallpaperView`, which is why the preview did not match the
+/// wallpaper the chat list actually painted.
+///
+/// Everything adjustable lives in one floating console at the bottom: colours, pattern
+/// intensity, and the commit. `baseDraft` is a snapshot and every edit stays local, so
+/// closing without pressing Set Wallpaper cannot change anything.
 private struct WallpaperPreviewSheet: View {
   let option: AppearanceWallpaperOption
   let baseDraft: ChatAppearanceDraft
-  var onSet: () -> Void
+  /// Hands back the fully-resolved draft — wallpaper, colours and intensity together —
+  /// so one Set commits everything the console changed.
+  var onSet: (ChatAppearanceDraft) -> Void
 
   @Environment(\.dismiss) private var dismiss
+  @State private var themeId: String?
+  @State private var opacity: Double
+
+  init(
+    option: AppearanceWallpaperOption,
+    baseDraft: ChatAppearanceDraft,
+    onSet: @escaping (ChatAppearanceDraft) -> Void
+  ) {
+    self.option = option
+    self.baseDraft = baseDraft
+    self.onSet = onSet
+    _themeId = State(initialValue: baseDraft.themeId)
+    _opacity = State(
+      initialValue: baseDraft.wallpaperPatternOpacity < 0.05
+        ? 0.17 : baseDraft.wallpaperPatternOpacity)
+  }
 
   private var previewDraft: ChatAppearanceDraft {
     var next = baseDraft
+    if let themeId, themeId != baseDraft.themeId {
+      next = next.applying(themeId: themeId)
+    }
     next.wallpaperPatternMaskKey = option.maskKey
-    next.wallpaperPatternOpacity =
-      option.maskKey == nil ? 0 : max(0.12, baseDraft.wallpaperPatternOpacity)
+    next.wallpaperPatternOpacity = option.maskKey == nil ? 0 : opacity
     next.wallpaperKind = option.maskKey == nil ? "solid" : "gradient"
     return next
   }
 
+  private var accent: Color { Color(uiColor: ChatListAppearance.brandAccentFallback) }
+
   var body: some View {
-    ZStack {
-      ChatAppearanceCanvas(draft: previewDraft)
+    ZStack(alignment: .bottom) {
+      ChatAppearanceLiveHost(draft: previewDraft, mode: .full)
         .ignoresSafeArea()
 
-      VStack {
-        HStack {
-          Button {
-            dismiss()
-          } label: {
-            Image(systemName: "xmark")
-              .font(.system(size: 14, weight: .bold))
-              .foregroundColor(.white)
-              .frame(width: 34, height: 34)
-              .background(Circle().fill(Color.black.opacity(0.4)))
-          }
-          Spacer()
-          Text(option.title)
-            .font(.system(size: 17, weight: .semibold))
-            .foregroundColor(.white)
-            .shadow(color: .black.opacity(0.4), radius: 4)
-          Spacer()
-          Color.clear.frame(width: 34, height: 34)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 16)
+      topBar
+        .frame(maxHeight: .infinity, alignment: .top)
 
-        Spacer()
-
-        Button {
-          onSet()
-          dismiss()
-        } label: {
-          Text("Set")
-            .font(.system(size: 17, weight: .semibold))
-            .foregroundColor(.black.opacity(0.85))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(Capsule().fill(Color.white.opacity(0.92)))
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 20)
-        .padding(.bottom, 24)
-      }
+      console
     }
     .preferredColorScheme(.dark)
+  }
+
+  private var topBar: some View {
+    HStack {
+      Button {
+        dismiss()
+      } label: {
+        Image(systemName: "xmark")
+          .font(.system(size: 14, weight: .bold))
+          .foregroundColor(.white)
+          .frame(width: 34, height: 34)
+          .background(Circle().fill(.ultraThinMaterial))
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Close")
+
+      Spacer()
+
+      Text(option.title)
+        .font(.system(size: 17, weight: .semibold))
+        .foregroundColor(.white)
+        .shadow(color: .black.opacity(0.45), radius: 5)
+
+      Spacer()
+      Color.clear.frame(width: 34, height: 34)
+    }
+    .padding(.horizontal, 16)
+    .padding(.top, 12)
+  }
+
+  /// One console instead of controls scattered over the artwork: colours, intensity and
+  /// the commit stack in a single glass panel, so the wallpaper keeps the whole screen.
+  private var console: some View {
+    VStack(spacing: 16) {
+      VStack(alignment: .leading, spacing: 10) {
+        Text("Colors")
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundColor(.white.opacity(0.65))
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 10) {
+            ForEach(AppearanceThemeCatalog.plates) { card in
+              colorPlate(card: card)
+            }
+          }
+          .padding(.horizontal, 2)
+        }
+      }
+
+      if option.maskKey != nil {
+        VStack(alignment: .leading, spacing: 6) {
+          HStack {
+            Text("Pattern intensity")
+              .font(.system(size: 12, weight: .semibold))
+              .foregroundColor(.white.opacity(0.65))
+            Spacer()
+            Text("\(Int(opacity * 100))%")
+              .font(.system(size: 12, weight: .medium, design: .monospaced))
+              .foregroundColor(.white.opacity(0.65))
+          }
+          Slider(value: $opacity, in: 0...0.4)
+            .tint(accent)
+        }
+      }
+
+      Button {
+        onSet(previewDraft)
+        dismiss()
+      } label: {
+        Text("Set Wallpaper")
+          .font(.system(size: 17, weight: .semibold))
+          .foregroundColor(.black.opacity(0.88))
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 14)
+          .background(Capsule().fill(Color.white.opacity(0.95)))
+      }
+      .buttonStyle(.plain)
+    }
+    .padding(16)
+    .background(
+      RoundedRectangle(cornerRadius: 26, style: .continuous)
+        .fill(.ultraThinMaterial)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 26, style: .continuous)
+        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+    )
+    .padding(.horizontal, 14)
+    .padding(.bottom, 14)
+  }
+
+  private func colorPlate(card: AppearanceThemeCard) -> some View {
+    let resolved = ChatListAppearance.from(draft: baseDraft.applying(themeId: card.id))
+    let colors = resolved.wallpaperGradient.map { Color(uiColor: $0) }
+    let selected = (themeId ?? baseDraft.themeId) == card.id
+    return Button {
+      themeId = card.id
+    } label: {
+      Circle()
+        .fill(
+          LinearGradient(
+            colors: colors.count >= 2 ? colors : [colors.first ?? .gray, colors.first ?? .gray],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+        .frame(width: 38, height: 38)
+        .overlay(
+          Circle().stroke(selected ? accent : Color.white.opacity(0.18), lineWidth: selected ? 2.5 : 1)
+        )
+        .overlay(
+          Image(systemName: "checkmark")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundColor(.white)
+            .shadow(color: .black.opacity(0.5), radius: 2)
+            .opacity(selected ? 1 : 0)
+        )
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(card.title)
   }
 }

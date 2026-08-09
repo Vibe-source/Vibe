@@ -748,7 +748,7 @@ enum NativeAuthService {
     }
     request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
       throw NativeAuthError.message("The server did not return a valid response.")
     }

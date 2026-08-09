@@ -77,23 +77,11 @@ defmodule VibeWeb.BridgeController do
   end
 
   def packet_bootstrap(conn, _params) do
-    case PacketBootstrap.issue_for_user(conn.assigns.current_user) do
-      {:ok, payload} ->
-        conn
-        |> put_resp_header("cache-control", "no-store")
-        |> json(payload)
+    {:ok, payload} = PacketBootstrap.issue_for_user(conn.assigns.current_user)
 
-      {:error, :packet_server_url_missing} ->
-        conn |> put_status(:service_unavailable) |> json(%{error: "packet_server_url_missing"})
-
-      {:error, :packet_signing_secret_missing} ->
-        conn
-        |> put_status(:service_unavailable)
-        |> json(%{error: "packet_signing_secret_missing"})
-
-      {:error, reason} ->
-        conn |> put_status(:unprocessable_entity) |> json(%{error: to_string(reason)})
-    end
+    conn
+    |> put_resp_header("cache-control", "no-store")
+    |> json(payload)
   end
 
   def register_relay(conn, params) do

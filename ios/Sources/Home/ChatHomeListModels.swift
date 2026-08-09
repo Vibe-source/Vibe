@@ -390,7 +390,7 @@ enum ChatAvatarImageStore {
           request.timeoutInterval = 12.0
           request.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
           request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-          let (data, response) = try await URLSession.shared.data(for: request)
+          let (data, response) = try await VibeHTTP.shared.data(for: request)
           if let status = (response as? HTTPURLResponse)?.statusCode,
             !(200...299).contains(status)
           {

@@ -100,9 +100,67 @@ final class VibeRowMeasurementCache {
   /// `VibeRowMetrics` measurement.
   var agentStateProvider: ((ChatListRow) -> AgentTurnBubbleState)?
 
+  /// A height this row already has, from something that measured it for real.
+  ///
+  /// The seam that stops this cache re-deriving numbers the app is already holding.
+  /// `measure` below is a full text layout — `VibeRowMetrics.mainThreadHeight` is the
+  /// exact sizing path, not an estimate — and `mount` runs it once per row in the
+  /// window, on the main thread, inside the push. On a 999-row chat that measured at
+  /// **0.57s** (device export 2026-08-07, `hangDuring=176cdf92eec5/will-appear`), while
+  /// the list sized the same 999 rows in **13ms** from its persisted-height file
+  /// (`seed-where sizeCalls=999/13ms trust=999 measure=0/0ms`). Same rows, same width,
+  /// same answer, 40× apart — the expensive copy ran during the transition.
+  ///
+  /// So ask first. A hit is a dictionary lookup and counts as a real measurement,
+  /// because it *is* one: the persisted entry was measured by this app at this width
+  /// and is re-validated off-main after the push by `auditSeedTrustedHeights`.
+  ///
+  /// Absent (the Diagnostics preview, which has no list behind it) everything below
+  /// behaves exactly as before.
+  var knownHeightProvider: ((ChatListRow, CGFloat) -> CGFloat?)?
+
+  /// How many rows a single mount may measure from scratch on the main thread.
+  ///
+  /// Only rows that neither this cache nor ``knownHeightProvider`` can answer are
+  /// counted, so on a warm chat the budget is never reached. It exists for the cold
+  /// case — a chat opened for the first time, no persisted heights — where the
+  /// un-budgeted loop is unbounded main-thread work in the middle of a push.
+  ///
+  /// Rows past the budget are sized by ``placeholderMeasure(_:revision:)`` and recorded
+  /// in ``placeholderIds`` exactly like any other estimate, which is what makes this
+  /// safe rather than merely fast: `coreFrozenHeight` already refuses placeholder rows,
+  /// so a deferred row's height cannot reach the screen.
+  ///
+  /// # Why nothing upgrades the deferred rows
+  ///
+  /// Because on the only surface that can reach the budget, nothing reads the result.
+  /// `coreFrozenHeight` is consulted by `estimateMessageHeight` alone, and `rowHeight`
+  /// routes there only while `rows.count <= 12` — see the note on
+  /// `ChatListView.apply(snapshot:reason:)`. A chat small enough for the geometry to be
+  /// load-bearing cannot exhaust a budget set far above 12, and a chat large enough to
+  /// exhaust it is one whose heights are already ignored. So the budget engages
+  /// **only** where the measurement was dead work, which is why it needs no
+  /// compensating machinery — and why ``deferredIds`` is a record rather than a queue.
+  ///
+  /// That reasoning is load-bearing: if the geometry flip ever widens the reader past
+  /// 12 rows, this needs a real upgrade pass before it ships, and `deferred` in the
+  /// `mount cost` diagnostic is how you will see that it is owed.
+  ///
+  /// `.max` is "measure everything", which is the preview's behaviour and was
+  /// everyone's before this existed.
+  var exactMeasurementBudget: Int = .max
+
+  /// Rows this mount deferred for budget, awaiting a real measurement.
+  private(set) var deferredIds: Set<String> = []
+  private var exactMeasurementsThisMount = 0
+
   private(set) var measurements = 0
   private(set) var reuses = 0
   private(set) var invalidations = 0
+  /// Rows answered from ``knownHeightProvider`` instead of a fresh text layout.
+  private(set) var knownHeightHits = 0
+  /// Rows this mount pushed past ``exactMeasurementBudget``.
+  private(set) var budgetDeferrals = 0
   /// Rows the provider could not supply, so they were sized by the placeholder. In a
   /// real chat this must be zero — a non-zero count means the core is laying out rows
   /// it cannot actually size, and the heights on screen are fiction.
@@ -126,17 +184,36 @@ final class VibeRowMeasurementCache {
     self.contentSizeCategory = contentSizeCategory
     self.themeEpoch = themeEpoch
     rows.removeAll(keepingCapacity: true)
+    // Every deferral described the old environment. Keeping them would upgrade rows
+    // to heights measured against a width that no longer exists, which is the one
+    // failure worse than not upgrading them at all.
+    deferredIds.removeAll(keepingCapacity: true)
+    placeholderIds.removeAll(keepingCapacity: true)
     invalidations += 1
     return true
   }
+
+  /// Opens a fresh main-thread measurement budget for one mount.
+  ///
+  /// Per mount, not per session: the budget bounds how long a *single* runloop turn can
+  /// block, and a chat open is several mounts (arm, then engine reconcile). Carrying a
+  /// spent budget across them would starve every mount after the first.
+  func beginMountBudget() { exactMeasurementsThisMount = 0 }
 
   var layoutWidth: CGFloat { width }
 
   func cached(_ messageId: String) -> VibeMeasuredRow? { rows[messageId] }
 
-  func forget(_ messageId: String) { rows.removeValue(forKey: messageId) }
+  func forget(_ messageId: String) {
+    rows.removeValue(forKey: messageId)
+    deferredIds.remove(messageId)
+  }
 
-  func forgetAll() { rows.removeAll(keepingCapacity: true) }
+  func forgetAll() {
+    rows.removeAll(keepingCapacity: true)
+    deferredIds.removeAll(keepingCapacity: true)
+    placeholderIds.removeAll(keepingCapacity: true)
+  }
 
   /// Frozen geometry for a settled row: measured on first sight, reused forever.
   ///
@@ -190,13 +267,35 @@ final class VibeRowMeasurementCache {
   // MARK: Measurement
 
   private func measure(_ message: VibeFfiMessage, revision: UInt64) -> VibeMeasuredRow {
-    if let row = rowProvider?(message.messageId),
-      let height = VibeRowMetrics.mainThreadHeight(
-        row: row, rowWidth: width,
-        state: agentStateProvider?(row) ?? AgentTurnBubbleState())
-    {
-      placeholderIds.remove(message.messageId)
-      return measuredFromRealRow(height: height, revision: revision)
+    if let row = rowProvider?(message.messageId) {
+      // Free: a height this app already measured, at this width, and persisted.
+      // Nothing below can produce a better answer than the one that is already correct.
+      if let known = knownHeightProvider?(row, width), known > 0 {
+        knownHeightHits += 1
+        placeholderIds.remove(message.messageId)
+        deferredIds.remove(message.messageId)
+        return measuredFromRealRow(height: known, revision: revision)
+      }
+      // Not free: a full text layout, and on an agent turn a template view plus
+      // `systemLayoutSizeFitting`. Budgeted because this runs inside the push — see
+      // ``exactMeasurementBudget``.
+      if exactMeasurementsThisMount < exactMeasurementBudget {
+        if let height = VibeRowMetrics.mainThreadHeight(
+          row: row, rowWidth: width,
+          state: agentStateProvider?(row) ?? AgentTurnBubbleState())
+        {
+          exactMeasurementsThisMount += 1
+          placeholderIds.remove(message.messageId)
+          deferredIds.remove(message.messageId)
+          return measuredFromRealRow(height: height, revision: revision)
+        }
+      } else {
+        // Measurable, just not on this runloop turn. Recorded so the deferred pass
+        // can finish it; it falls through to the estimate below, which is marked as
+        // a placeholder and therefore refused by every consumer that freezes heights.
+        budgetDeferrals += 1
+        deferredIds.insert(message.messageId)
+      }
     }
     // Remember that this row's height is a guess.
     //
@@ -612,6 +711,18 @@ final class VibeTimelineHost {
     cache.agentStateProvider = provider
   }
 
+  /// Installs the "you already know this height" seam. See
+  /// ``VibeRowMeasurementCache/knownHeightProvider``.
+  func setKnownHeightProvider(_ provider: @escaping (ChatListRow, CGFloat) -> CGFloat?) {
+    cache.knownHeightProvider = provider
+  }
+
+  /// Caps the main-thread text layouts one mount may run. See
+  /// ``VibeRowMeasurementCache/exactMeasurementBudget``.
+  func setExactMeasurementBudget(_ budget: Int) {
+    cache.exactMeasurementBudget = budget
+  }
+
   var measurementStats: (measured: Int, reused: Int, invalidations: Int, placeholders: Int) {
     (cache.measurements, cache.reuses, cache.invalidations, cache.placeholderMeasurements)
   }
@@ -666,14 +777,63 @@ final class VibeTimelineHost {
     // at all, in which case *every* row fails and the core is ordering messages it
     // cannot read.
     let failedFlag: UInt32 = 1 << 8  // VibeMessageFlags::DECRYPTION_FAILED
-    let failed = window.messages.filter { $0.flags & failedFlag != 0 }.count
-    let empty = window.messages.filter { $0.text.isEmpty && !$0.hasMedia }.count
+    var failed = 0
+    var empty = 0
+    for message in window.messages {
+      if message.flags & failedFlag != 0 { failed += 1 }
+      if message.text.isEmpty && !message.hasMedia { empty += 1 }
+    }
     NSLog(
       "[VibeCore] window chat=%@ rows=%d decryptFailed=%d emptyNoMedia=%d",
       String(chatId.prefix(12)), window.messages.count, failed, empty)
 
+    // Everything from here to `applied = items` is main-thread work inside a navigation
+    // push, so it is measured and reported rather than assumed. The device export that
+    // motivated this reported the whole transition as one stall — `hangSeconds=0.57`
+    // with `hangDuring=<chat>/will-appear` — and nothing in the log said which part of
+    // the mount spent it. Now `mount cost` does.
+    cache.beginMountBudget()
+    let knownBefore = cache.knownHeightHits
+    let measuredBefore = cache.measurements
+    let reusedBefore = cache.reuses
+    let deferredBefore = cache.budgetDeferrals
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+
     let items = window.messages.map { factory.settledItem($0) }
-    for message in window.messages { recordBody(message) }
+    // Bodies are read by exactly one consumer (`VibeMessageListBodySink`, which is the
+    // Diagnostics preview) and by nothing on the chat surface. Recording them for a
+    // host that cannot ask was a string interpolation and two dictionary inserts per
+    // message, per mount, on the push — ~1,000 of each on a large chat, for a value
+    // no one would ever read.
+    if listHost is VibeMessageListBodySink {
+      for message in window.messages { recordBody(message) }
+    }
+    let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000_000)
+    let deferredThisMount = cache.budgetDeferrals - deferredBefore
+    onDiagnostic?(
+      "mount cost",
+      [
+        "chat": chatId,
+        "rows": String(window.messages.count),
+        "ms": String(elapsedMs),
+        // The four ways a row got its height, which is the whole question when a mount
+        // is slow: `known` and `reused` are lookups, `measured` is a real text layout.
+        //
+        // `measured` is derived rather than read off `cache.measurements`, which counts
+        // every row that went through `settledGeometry` — including the free ones. That
+        // made the first device run read `known=1361 measured=1361`, which parses as
+        // "1,361 text layouts" when the true number was zero. A counter nobody can read
+        // correctly is worse than no counter.
+        "known": String(cache.knownHeightHits - knownBefore),
+        "reused": String(cache.reuses - reusedBefore),
+        "measured": String(
+          max(
+            0,
+            (cache.measurements - measuredBefore)
+              - (cache.knownHeightHits - knownBefore) - deferredThisMount)),
+        "deferred": String(deferredThisMount),
+        "reason": reason.rawValue,
+      ])
     generation = window.generation
     applied = items
 

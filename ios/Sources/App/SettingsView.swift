@@ -22,7 +22,7 @@ private enum SettingsRoute: String, Identifiable {
 }
 
 private enum SettingsModal: String, Identifiable {
-  case connectionManager
+  case proxy
   case switchAccount
 
   var id: String { rawValue }
@@ -152,13 +152,13 @@ struct SettingsView: View {
             destructive: false
           ),
           SettingsNativeRow(
-            id: "connection-manager",
-            icon: "server.rack",
-            label: "Connection Manager",
-            detailText: connectionModeTitle,
+            id: "proxy",
+            icon: PacketProxyStore.shared.useProxy ? "ProxyShieldActive" : "ProxyShieldInactive",
+            label: "Proxy",
+            detailText: proxySummary,
             toggleValue: false,
             kind: .link,
-            iconColor: UIColor(red: 255 / 255, green: 149 / 255, blue: 0 / 255, alpha: 1),
+            iconColor: UIColor(red: 52 / 255, green: 199 / 255, blue: 89 / 255, alpha: 1),
             divider: true,
             destructive: false
           ),
@@ -351,9 +351,9 @@ struct SettingsView: View {
     }
     .sheet(item: $activeModal) { modal in
       switch modal {
-      case .connectionManager:
+      case .proxy:
         NavigationStack {
-          ConnectionManagerSheetView(onDismiss: {
+          ProxySheetView(onDismiss: {
             activeModal = nil
           })
         }
@@ -418,17 +418,9 @@ struct SettingsView: View {
     return "\(modeTitle) • Custom"
   }
 
-  private var connectionModeTitle: String {
-    switch AppSessionConfig.current?.transportMode ?? .direct {
-    case .packetMesh:
-      return "Automatic"
-    case .direct:
-      return "Direct"
-    case .offline:
-      return "Offline"
-    case .bridgeText:
-      return "Bridge Text"
-    }
+  private var proxySummary: String {
+    guard PacketProxyStore.shared.useProxy else { return "Off" }
+    return PacketProxyStore.shared.activeProfile?.displayName ?? "On"
   }
 
   private func handleRowPress(_ rowID: String) {
@@ -443,8 +435,8 @@ struct SettingsView: View {
       openSavedMessages()
     case "your-qr":
       activeRoute = .qr
-    case "connection-manager":
-      activeModal = .connectionManager
+    case "proxy":
+      activeModal = .proxy
     case "connected-apps":
       activeRoute = .connectedApps
     case "privacy":
@@ -2603,141 +2595,6 @@ private struct MediaCacheSettingsDetailView: View {
   }
 }
 
-private struct ConnectionManagerSheetView: View {
-  @Environment(\.dismiss) private var dismiss
-  @Environment(\.colorScheme) private var colorScheme
-  let onDismiss: () -> Void
-
-  @State private var selectedMode = AppSessionConfig.current?.transportMode ?? .direct
-
-  private var palette: AppThemePalette {
-    AppThemePalette.resolve(for: colorScheme)
-  }
-
-  private let modes: [PacketTransportMode] = [.packetMesh, .direct, .offline]
-
-  var body: some View {
-    List {
-      Section {
-        ForEach(modes, id: \.rawValue) { mode in
-          Button {
-            apply(mode)
-          } label: {
-            HStack {
-              VStack(alignment: .leading, spacing: 3) {
-                Text(title(for: mode))
-                  .foregroundStyle(.primary)
-                Text(description(for: mode))
-                  .font(.footnote)
-                  .foregroundStyle(.secondary)
-              }
-              Spacer()
-              if mode == selectedMode {
-                Image(systemName: "checkmark")
-                  .font(.system(size: 14, weight: .bold))
-                  .foregroundStyle(palette.accent)
-              }
-            }
-          }
-        }
-      }
-      .listRowBackground(palette.card)
-
-      Section {
-        Text("Connection mode changes take effect the next time chats refresh or reconnect.")
-          .font(.footnote)
-          .foregroundStyle(.secondary)
-      }
-      .listRowBackground(palette.card)
-    }
-    .listStyle(.insetGrouped)
-    .scrollContentBackground(.hidden)
-    .background(palette.background.ignoresSafeArea())
-    .navigationTitle("Connection Manager")
-    .navigationBarTitleDisplayMode(.inline)
-    .toolbar {
-      ToolbarItem(placement: .topBarLeading) {
-        Button {
-          dismiss()
-          onDismiss()
-        } label: {
-          Image(systemName: "xmark")
-            .font(.system(size: 14, weight: .bold))
-        }
-      }
-    }
-  }
-
-  private func apply(_ mode: PacketTransportMode) {
-    guard let current = AppSessionConfig.current else { return }
-
-    let updated = AppSessionConfig(
-      apiBaseURLString: current.apiBaseURLString,
-      socketURLString: current.socketURLString,
-      userID: current.userID,
-      authToken: current.authToken,
-      transportMode: mode,
-      username: current.username,
-      name: current.name,
-      secureID: current.secureID,
-      publicKeyPem: current.publicKeyPem,
-      privateKeyPem: current.privateKeyPem,
-      encryptedPrivateKey: current.encryptedPrivateKey,
-      tokenExpiresAt: current.tokenExpiresAt,
-      identityKey: current.identityKey,
-      phoneNumber: current.phoneNumber,
-      bio: current.bio,
-      profileImage: current.profileImage,
-      dateOfBirth: current.dateOfBirth,
-      showLastSeen: current.showLastSeen,
-      showOnlineStatus: current.showOnlineStatus,
-      autoDeleteTimer: current.autoDeleteTimer,
-      privacyLastSeen: current.privacyLastSeen,
-      privacyForward: current.privacyForward,
-      privacyCalls: current.privacyCalls,
-      privacyPhoneNumber: current.privacyPhoneNumber,
-      privacyProfilePhotos: current.privacyProfilePhotos,
-      privacyBio: current.privacyBio,
-      privacyGifts: current.privacyGifts,
-      privacyBirthday: current.privacyBirthday,
-      privacySavedMusic: current.privacySavedMusic
-    )
-
-    AppSessionConfig.store(updated)
-    PacketRuntime.shared.stop(resetToDirect: mode == .direct)
-    AppToastController.shared.show("Connection mode set to \(title(for: mode)).")
-    selectedMode = mode
-    dismiss()
-    onDismiss()
-  }
-
-  private func title(for mode: PacketTransportMode) -> String {
-    switch mode {
-    case .packetMesh:
-      return "Automatic"
-    case .direct:
-      return "Direct"
-    case .offline:
-      return "Offline"
-    case .bridgeText:
-      return "Bridge Text"
-    }
-  }
-
-  private func description(for mode: PacketTransportMode) -> String {
-    switch mode {
-    case .packetMesh:
-      return "Use packet mesh when available and fall back automatically."
-    case .direct:
-      return "Connect to the API directly without packet mesh."
-    case .offline:
-      return "Pause remote chat traffic until you switch back."
-    case .bridgeText:
-      return "Text bridge transport."
-    }
-  }
-}
-
 private struct BlockedUsersDetailView: View {
   @Environment(\.colorScheme) private var colorScheme
   let users: [AppBlockedUser]
@@ -3002,7 +2859,7 @@ private enum AppBlockedUsersService {
     request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
     request.setValue("Bearer \(config.authToken)", forHTTPHeaderField: "Authorization")
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode)
     else {
       return []

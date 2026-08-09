@@ -90,7 +90,7 @@ final class VibeTimelinePreparedStoreTests: XCTestCase {
     // Nothing has published a width yet — the cold-launch case. Measuring against a
     // guess and correcting on mount is the shift, so there is no answer to give.
     let row = textRow("hello")
-    store.prepareAsync(chatId: "c1", rows: [row], reason: "test")
+    store.prepareAsync(chatId: "c1", rows: [row], reason: "test", scope: .fullTranscript)
     XCTAssertNil(store.prepared(chatId: "c1", width: width))
   }
 

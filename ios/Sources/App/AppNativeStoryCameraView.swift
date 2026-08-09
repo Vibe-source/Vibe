@@ -30,7 +30,10 @@ struct AppNativeStoryCameraPage: View {
           handleComposerEvent(payload)
         }
         .ignoresSafeArea()
-        .transition(.opacity)
+        .transition(.asymmetric(
+          insertion: .move(edge: .trailing).combined(with: .opacity),
+          removal: .opacity
+        ))
       } else {
         AppNativeStoryCameraRepresentable { payload in
           handleCameraEvent(payload)
@@ -46,7 +49,7 @@ struct AppNativeStoryCameraPage: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.black.opacity(0.55), in: Capsule(style: .continuous))
+            .glassEffect(.regular, in: .capsule)
             .padding(.bottom, 44)
         }
         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -142,6 +145,175 @@ struct AppNativeStoryCameraPage: View {
   }
 }
 
+/// Self-contained host for `AppNativeStoryCameraPage`; dismisses itself through the page's `onClose`.
+final class AppNativeStoryViewController: UIViewController {
+  private let storyTransitioningDelegate = AppNativeStoryTransitioningDelegate()
+  private var hostingController: UIHostingController<AppNativeStoryCameraPage>?
+
+  init() {
+    super.init(nibName: nil, bundle: nil)
+    modalPresentationStyle = .custom
+    transitioningDelegate = storyTransitioningDelegate
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .black
+
+    let page = AppNativeStoryCameraPage { [weak self] in
+      self?.dismiss(animated: true)
+    }
+    let hosting = UIHostingController(rootView: page)
+    hosting.view.backgroundColor = .clear
+    addChild(hosting)
+    hosting.view.frame = view.bounds
+    hosting.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    view.addSubview(hosting.view)
+    hosting.didMove(toParent: self)
+    hostingController = hosting
+  }
+
+  override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+}
+
+private final class AppNativeStoryTransitioningDelegate: NSObject, UIViewControllerTransitioningDelegate {
+  func animationController(
+    forPresented presented: UIViewController,
+    presenting: UIViewController,
+    source: UIViewController
+  ) -> UIViewControllerAnimatedTransitioning? {
+    AppNativeStoryPresentAnimator()
+  }
+
+  func animationController(forDismissed dismissed: UIViewController) -> UIViewControllerAnimatedTransitioning? {
+    AppNativeStoryDismissAnimator()
+  }
+
+  func presentationController(
+    forPresented presented: UIViewController,
+    presenting: UIViewController?,
+    source: UIViewController
+  ) -> UIPresentationController? {
+    AppNativeStoryPresentationController(presentedViewController: presented, presenting: presenting)
+  }
+}
+
+private final class AppNativeStoryPresentationController: UIPresentationController {
+  override var shouldRemovePresentersView: Bool { false }
+
+  override var frameOfPresentedViewInContainerView: CGRect {
+    containerView?.bounds ?? .zero
+  }
+}
+
+/// Reveals Story behind Home on the same clock as a navigation transition.
+private final class AppNativeStoryPresentAnimator: NSObject, UIViewControllerAnimatedTransitioning {
+  func transitionDuration(using transitionContext: UIViewControllerContextTransitioning?) -> TimeInterval {
+    TimeInterval(UINavigationController.hideShowBarDuration)
+  }
+
+  func animateTransition(using transitionContext: UIViewControllerContextTransitioning) {
+    guard
+      let toVC = transitionContext.viewController(forKey: .to),
+      let fromView = transitionContext.view(forKey: .from),
+      let toView = transitionContext.view(forKey: .to)
+    else {
+      transitionContext.completeTransition(false)
+      return
+    }
+
+    let container = transitionContext.containerView
+    let finalFrame = transitionContext.finalFrame(for: toVC)
+    let parallax = finalFrame.width * 0.28
+
+    toView.frame = finalFrame
+    toView.transform = CGAffineTransform(translationX: -parallax, y: 0)
+    if fromView.superview === container {
+      container.insertSubview(toView, belowSubview: fromView)
+    } else {
+      container.addSubview(toView)
+      container.bringSubviewToFront(fromView)
+    }
+
+    let animator = UIViewPropertyAnimator(
+      duration: transitionDuration(using: transitionContext),
+      curve: .easeInOut
+    ) {
+      fromView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
+      toView.transform = .identity
+    }
+    animator.addCompletion { _ in
+      let cancelled = transitionContext.transitionWasCancelled
+      if cancelled {
+        fromView.transform = .identity
+        toView.transform = .identity
+        toView.removeFromSuperview()
+      } else {
+        container.bringSubviewToFront(toView)
+        fromView.transform = .identity
+      }
+      transitionContext.completeTransition(!cancelled)
+    }
+    animator.startAnimation()
+  }
+}
+
+/// Covers Story with the real Home hierarchy, reversing the presentation motion.
+private final class AppNativeStoryDismissAnimator: NSObject, UIViewControllerAnimatedTransitioning {
+  func transitionDuration(using transitionContext: UIViewControllerContextTransitioning?) -> TimeInterval {
+    TimeInterval(UINavigationController.hideShowBarDuration)
+  }
+
+  func animateTransition(using transitionContext: UIViewControllerContextTransitioning) {
+    guard
+      let toVC = transitionContext.viewController(forKey: .to),
+      let fromView = transitionContext.view(forKey: .from),
+      let toView = transitionContext.view(forKey: .to)
+    else {
+      transitionContext.completeTransition(false)
+      return
+    }
+
+    let container = transitionContext.containerView
+    let finalFrame = transitionContext.finalFrame(for: toVC)
+    let parallax = finalFrame.width * 0.28
+
+    toView.frame = finalFrame
+    if toView.superview !== container {
+      if fromView.superview === container {
+        container.insertSubview(toView, belowSubview: fromView)
+      } else {
+        container.addSubview(toView)
+      }
+    }
+    container.bringSubviewToFront(toView)
+    toView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
+    fromView.transform = .identity
+
+    let animator = UIViewPropertyAnimator(
+      duration: transitionDuration(using: transitionContext),
+      curve: .easeInOut
+    ) {
+      toView.transform = .identity
+      fromView.transform = CGAffineTransform(translationX: -parallax, y: 0)
+    }
+    animator.addCompletion { _ in
+      let cancelled = transitionContext.transitionWasCancelled
+      if cancelled {
+        container.bringSubviewToFront(fromView)
+      }
+      fromView.transform = .identity
+      toView.transform = .identity
+      transitionContext.completeTransition(!cancelled)
+    }
+    animator.startAnimation()
+  }
+}
+
 private struct AppNativeStoryCameraRepresentable: UIViewRepresentable {
   let onEvent: ([String: Any]) -> Void
 
@@ -171,6 +343,40 @@ private final class AppNativeStoryCameraPreviewView: UIView {
   }
 }
 
+/// A round icon control hosted on real Liquid Glass instead of a painted translucent fill.
+private final class AppNativeStoryGlassIconButton: UIButton {
+  private let glass = UIVisualEffectView(effect: nil)
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    tintColor = .white
+    glass.isUserInteractionEnabled = false
+    glass.clipsToBounds = true
+    insertSubview(glass, at: 0)
+    if #available(iOS 26.0, *) {
+      glass.cornerConfiguration = .capsule()
+      let effect = UIGlassEffect()
+      effect.isInteractive = true
+      glass.effect = effect
+    } else {
+      glass.layer.cornerCurve = .continuous
+      glass.effect = UIBlurEffect(style: .systemUltraThinMaterialDark)
+    }
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    glass.frame = bounds
+    if #unavailable(iOS 26.0) {
+      glass.layer.cornerRadius = bounds.height * 0.5
+    }
+  }
+}
+
 private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDelegate,
   AVCaptureFileOutputRecordingDelegate, PHPickerViewControllerDelegate
 {
@@ -184,12 +390,10 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
   private let photoOutput = AVCapturePhotoOutput()
   private let movieOutput = AVCaptureMovieFileOutput()
   private let previewView = AppNativeStoryCameraPreviewView()
-  private let cardContainer = UIView()
-  private let topBar = UIView()
-  private let closeButton = UIButton(type: .system)
-  private let galleryButton = UIButton(type: .system)
-  private let flipButton = UIButton(type: .system)
-  private let modeContainer = UIView()
+  private let closeButton = AppNativeStoryGlassIconButton(type: .system)
+  private let galleryButton = AppNativeStoryGlassIconButton(type: .system)
+  private let flipButton = AppNativeStoryGlassIconButton(type: .system)
+  private let modeContainer = UIVisualEffectView(effect: nil)
   private let pictureModeButton = UIButton(type: .system)
   private let videoModeButton = UIButton(type: .system)
   private let shutterButton = UIButton(type: .custom)
@@ -213,11 +417,6 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     super.init(frame: frame)
     backgroundColor = .black
     clipsToBounds = true
-
-    cardContainer.backgroundColor = .black
-    cardContainer.layer.cornerRadius = 32.0
-    cardContainer.layer.cornerCurve = .continuous
-    cardContainer.clipsToBounds = true
 
     previewView.previewLayer.session = session
     previewView.previewLayer.videoGravity = .resizeAspectFill
@@ -273,30 +472,17 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
   override func layoutSubviews() {
     super.layoutSubviews()
 
+    previewView.frame = bounds
+
     let safeTop = max(safeAreaInsets.top, 12.0)
     let safeBottom = max(safeAreaInsets.bottom, 20.0)
-    let horizontalMargin: CGFloat = 10.0
-    let bottomReservedHeight: CGFloat = 140.0
-    let cardTop = safeTop + 4.0
-    let cardWidth = max(0.0, bounds.width - (horizontalMargin * 2.0))
-    let maxCardHeight = max(280.0, bounds.height - cardTop - bottomReservedHeight)
-    let preferredCardHeight = max(340.0, bounds.height * 0.85)
-    let cardHeight = min(preferredCardHeight, maxCardHeight)
+    let horizontalMargin: CGFloat = 16.0
+    let controlSize: CGFloat = 44.0
+    let shutterSize: CGFloat = 74.0
 
-    cardContainer.frame = CGRect(
-      x: horizontalMargin,
-      y: cardTop,
-      width: cardWidth,
-      height: cardHeight
-    )
-    previewView.frame = cardContainer.bounds
+    closeButton.frame = CGRect(x: horizontalMargin, y: safeTop + 6.0, width: controlSize, height: controlSize)
 
-    topBar.frame = CGRect(x: 14.0, y: 14.0, width: max(0.0, cardWidth - 28.0), height: 44.0)
-    closeButton.frame = CGRect(x: cardWidth - 44.0, y: 0.0, width: 44.0, height: 44.0)
-
-    let shutterSize: CGFloat = 84
-    let remainingSpace = bounds.height - cardContainer.frame.maxY - safeBottom
-    let shutterY = cardContainer.frame.maxY + (remainingSpace - shutterSize) * 0.5 + 10.0
+    let shutterY = bounds.height - safeBottom - 22.0 - shutterSize
     shutterButton.frame = CGRect(
       x: (bounds.width - shutterSize) * 0.5,
       y: shutterY,
@@ -306,25 +492,37 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     shutterRingView.frame = shutterButton.bounds
     shutterRingView.layer.cornerRadius = shutterSize * 0.5
 
-    let innerSize: CGFloat = isRecording ? 34 : 62
+    let innerSize: CGFloat = isRecording ? 30 : shutterSize - 12.0
     shutterInnerView.frame = CGRect(
       x: (shutterButton.bounds.width - innerSize) * 0.5,
       y: (shutterButton.bounds.height - innerSize) * 0.5,
       width: innerSize,
       height: innerSize
     )
-    shutterInnerView.layer.cornerRadius = isRecording ? 12 : innerSize * 0.5
+    shutterInnerView.layer.cornerRadius = isRecording ? 10 : innerSize * 0.5
 
-    galleryButton.frame = CGRect(x: 18, y: bounds.height - safeBottom - 70, width: 50, height: 50)
-    flipButton.frame = CGRect(x: bounds.width - 68, y: bounds.height - safeBottom - 70, width: 50, height: 50)
-    modeContainer.frame = CGRect(
-      x: (bounds.width - 156) * 0.5,
-      y: bounds.height - safeBottom - 63,
-      width: 156,
-      height: 36
+    let sideControlY = shutterY + (shutterSize - controlSize) * 0.5
+    galleryButton.frame = CGRect(x: horizontalMargin, y: sideControlY, width: controlSize, height: controlSize)
+    flipButton.frame = CGRect(
+      x: bounds.width - horizontalMargin - controlSize,
+      y: sideControlY,
+      width: controlSize,
+      height: controlSize
     )
-    pictureModeButton.frame = CGRect(x: 0, y: 0, width: 78, height: 36)
-    videoModeButton.frame = CGRect(x: 78, y: 0, width: 78, height: 36)
+
+    let modeWidth: CGFloat = 168.0
+    let modeHeight: CGFloat = 36.0
+    modeContainer.frame = CGRect(
+      x: (bounds.width - modeWidth) * 0.5,
+      y: shutterY - 14.0 - modeHeight,
+      width: modeWidth,
+      height: modeHeight
+    )
+    if #unavailable(iOS 26.0) {
+      modeContainer.layer.cornerRadius = modeHeight * 0.5
+    }
+    pictureModeButton.frame = CGRect(x: 0, y: 0, width: modeWidth * 0.5, height: modeHeight)
+    videoModeButton.frame = CGRect(x: modeWidth * 0.5, y: 0, width: modeWidth * 0.5, height: modeHeight)
 
     let permissionWidth = min(bounds.width - 44, 330)
     permissionContainer.frame = CGRect(
@@ -335,20 +533,16 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     )
     permissionTitleLabel.frame = CGRect(x: 22, y: 28, width: permissionWidth - 44, height: 44)
     permissionButton.frame = CGRect(x: 22, y: 88, width: permissionWidth - 44, height: 44)
-    loadingSpinner.center = CGPoint(x: cardContainer.frame.midX, y: cardContainer.frame.midY)
+    loadingSpinner.center = CGPoint(x: bounds.midX, y: bounds.midY)
     updatePreviewOrientation()
   }
 
   private func configureView() {
-    addSubview(cardContainer)
-    cardContainer.addSubview(previewView)
-
-    topBar.backgroundColor = .clear
-    cardContainer.addSubview(topBar)
+    addSubview(previewView)
 
     configureCircleButton(closeButton, symbol: "xmark")
     closeButton.addTarget(self, action: #selector(handleClosePress), for: .touchUpInside)
-    topBar.addSubview(closeButton)
+    addSubview(closeButton)
 
     configureCircleButton(galleryButton, symbol: "photo.on.rectangle.angled")
     galleryButton.addTarget(self, action: #selector(handleGalleryPress), for: .touchUpInside)
@@ -358,19 +552,25 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     flipButton.addTarget(self, action: #selector(handleFlipPress), for: .touchUpInside)
     addSubview(flipButton)
 
-    modeContainer.backgroundColor = UIColor.black.withAlphaComponent(0.34)
-    modeContainer.layer.cornerRadius = 18
-    modeContainer.layer.cornerCurve = .continuous
     modeContainer.clipsToBounds = true
+    if #available(iOS 26.0, *) {
+      modeContainer.cornerConfiguration = .capsule()
+      let effect = UIGlassEffect(style: .regular)
+      effect.isInteractive = true
+      modeContainer.effect = effect
+    } else {
+      modeContainer.layer.cornerCurve = .continuous
+      modeContainer.effect = UIBlurEffect(style: .systemUltraThinMaterialDark)
+    }
     addSubview(modeContainer)
 
     configureModeButton(pictureModeButton, title: "Photo")
     pictureModeButton.addTarget(self, action: #selector(handlePictureModePress), for: .touchUpInside)
-    modeContainer.addSubview(pictureModeButton)
+    modeContainer.contentView.addSubview(pictureModeButton)
 
     configureModeButton(videoModeButton, title: "Video")
     videoModeButton.addTarget(self, action: #selector(handleVideoModePress), for: .touchUpInside)
-    modeContainer.addSubview(videoModeButton)
+    modeContainer.contentView.addSubview(videoModeButton)
 
     shutterRingView.isUserInteractionEnabled = false
     shutterRingView.layer.borderColor = UIColor.white.cgColor
@@ -383,8 +583,15 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     shutterButton.addTarget(self, action: #selector(handleShutterPress), for: .touchUpInside)
     addSubview(shutterButton)
 
-    permissionContainer.layer.cornerRadius = 22
-    permissionContainer.layer.cornerCurve = .continuous
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassEffect(style: .regular)
+      effect.isInteractive = true
+      permissionContainer.effect = effect
+      permissionContainer.cornerConfiguration = .uniformCorners(radius: .fixed(22))
+    } else {
+      permissionContainer.layer.cornerRadius = 22
+      permissionContainer.layer.cornerCurve = .continuous
+    }
     permissionContainer.clipsToBounds = true
     permissionContainer.isHidden = true
     addSubview(permissionContainer)
@@ -410,12 +617,8 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     updateModeAppearance()
   }
 
-  private func configureCircleButton(_ button: UIButton, symbol: String) {
+  private func configureCircleButton(_ button: AppNativeStoryGlassIconButton, symbol: String) {
     button.setImage(UIImage(systemName: symbol), for: .normal)
-    button.tintColor = .white
-    button.backgroundColor = UIColor.black.withAlphaComponent(0.38)
-    button.layer.cornerRadius = 25
-    button.layer.cornerCurve = .continuous
   }
 
   private func configureModeButton(_ button: UIButton, title: String) {
@@ -1036,7 +1239,7 @@ private enum AppNativeStoryService {
     body.append(fileData)
     body.append("\r\n--\(boundary)--\r\n".data(using: .utf8) ?? Data())
 
-    let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+    let (data, response) = try await VibeHTTP.shared.upload(for: request, from: body)
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
       throw StoryServiceError.uploadFailed(responseMessage(from: data))
     }
@@ -1079,7 +1282,7 @@ private enum AppNativeStoryService {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
       throw StoryServiceError.publishFailed(responseMessage(from: data))
     }

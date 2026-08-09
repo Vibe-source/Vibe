@@ -2184,8 +2184,8 @@ final class ChatNativeAgentHighlightControl: UIControl {
 /// broken; a travelling shimmer reads as "loading" and feels premium.
 final class ChatNativeAgentShimmerView: UIView {
   private let gradientLayer = CAGradientLayer()
-  private let baseColor: UIColor
-  private let highlightColor: UIColor
+  private var baseColor: UIColor
+  private var highlightColor: UIColor
 
   init(baseColor: UIColor, highlightColor: UIColor, cornerRadius: CGFloat) {
     self.baseColor = baseColor
@@ -2210,6 +2210,13 @@ final class ChatNativeAgentShimmerView: UIView {
 
   required init?(coder: NSCoder) {
     return nil
+  }
+
+  func applyColors(base: UIColor, highlight: UIColor) {
+    baseColor = base
+    highlightColor = highlight
+    backgroundColor = base
+    gradientLayer.colors = [base.cgColor, highlight.cgColor, base.cgColor]
   }
 
   private var animatedWidth: CGFloat = 0
@@ -2262,6 +2269,7 @@ final class ChatNativeAgentShimmerView: UIView {
 
 final class ChatNativeAgentSkeletonView: UIView {
   private var shimmers: [ChatNativeAgentShimmerView] = []
+  private var rows: [UIView] = []
 
   init(theme: ChatNativeAgentConfigTheme) {
     super.init(frame: .zero)
@@ -2318,11 +2326,23 @@ final class ChatNativeAgentSkeletonView: UIView {
       ])
 
       stackView.addArrangedSubview(row)
+      rows.append(row)
     }
   }
 
   required init?(coder: NSCoder) {
     return nil
+  }
+
+  /// Repaint on a theme switch — colours are baked into subviews at init.
+  func applyTheme(_ theme: ChatNativeAgentConfigTheme) {
+    for row in rows {
+      row.backgroundColor = theme.cardColor
+      row.layer.borderColor = theme.cardStrokeColor.cgColor
+    }
+    for shimmer in shimmers {
+      shimmer.applyColors(base: theme.cardColor, highlight: theme.inputColor)
+    }
   }
 
   override func didMoveToWindow() {
@@ -2335,6 +2355,10 @@ final class ChatNativeAgentSkeletonView: UIView {
 
 
 final class ChatNativeAgentEmptyStateView: UIView {
+  private let iconView = UIImageView()
+  private let titleLabel = UILabel()
+  private let subtitleLabel = UILabel()
+
   init(theme: ChatNativeAgentConfigTheme) {
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
@@ -2346,31 +2370,27 @@ final class ChatNativeAgentEmptyStateView: UIView {
     container.spacing = 16.0
     addSubview(container)
 
-    let iconView = UIImageView()
     iconView.translatesAutoresizingMaskIntoConstraints = false
     iconView.image = UIImage(
       systemName: "person.crop.circle.badge.questionmark",
       withConfiguration: UIImage.SymbolConfiguration(pointSize: 48.0, weight: .light)
     )
-    iconView.tintColor = theme.secondaryTextColor.withAlphaComponent(0.5)
     container.addArrangedSubview(iconView)
 
-    let titleLabel = UILabel()
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
     titleLabel.text = "No Agents Yet"
     titleLabel.font = .systemFont(ofSize: 20.0, weight: .bold)
-    titleLabel.textColor = theme.textColor
     titleLabel.textAlignment = .center
     container.addArrangedSubview(titleLabel)
 
-    let subtitleLabel = UILabel()
     subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
     subtitleLabel.text = "Create a new agent from the builder to get started."
     subtitleLabel.font = .systemFont(ofSize: 15.0, weight: .regular)
-    subtitleLabel.textColor = theme.secondaryTextColor
     subtitleLabel.numberOfLines = 0
     subtitleLabel.textAlignment = .center
     container.addArrangedSubview(subtitleLabel)
+
+    applyTheme(theme)
 
     NSLayoutConstraint.activate([
       container.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -2378,6 +2398,13 @@ final class ChatNativeAgentEmptyStateView: UIView {
       container.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 32.0),
       container.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -32.0)
     ])
+  }
+
+  /// Repaint on a theme switch — colours are baked into subviews at init.
+  func applyTheme(_ theme: ChatNativeAgentConfigTheme) {
+    iconView.tintColor = theme.secondaryTextColor.withAlphaComponent(0.5)
+    titleLabel.textColor = theme.textColor
+    subtitleLabel.textColor = theme.secondaryTextColor
   }
 
   required init?(coder: NSCoder) {

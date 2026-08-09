@@ -309,7 +309,7 @@ public final class VibeNativeCallManager: NSObject {
       apns == nil ? "false" : "true",
       voip == nil ? "false" : "true"
     )
-    URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+    VibeHTTP.shared.dataTask(with: request) { [weak self] _, response, error in
       guard let self else { return }
       let status = (response as? HTTPURLResponse)?.statusCode ?? 0
       self.pushSyncQueue.async {

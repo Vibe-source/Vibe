@@ -1,99 +1,95 @@
 # Vibe — agent guide
 
+Keep entries here SHORT. Details live in `docs/` and go stale in two places if copied
+here. A long instruction that has drifted is worse than a pointer.
+
+## Finish the whole task
+
+When given a list, write the task list first, then complete **every** item. Do not stop
+partway to report progress, and do not hand back "I did 3 of 5, the rest is next" — that
+is not a checkpoint, it is an unfinished job.
+
+Build and install once at the end, not per item. Report only when everything is done, or
+when something is genuinely blocked — and then say which item and why, in one line.
+
+## Comments: short
+
+**Hard cap: 2 lines per comment. Never a multi-paragraph doc block.** A blank `///` line
+inside a comment means it is already too long — cut it. Say what the code does, or why a
+non-obvious choice was made. Nothing else.
+
+Never write: bug history, what the old version did wrong, measured numbers, "which is
+why…", "on purpose because…", or a chain of reasoning. A long comment rots — the code
+changes, the story stays, and the next reader trusts a wrong explanation. It also costs
+context on every future read of the file.
+
+Too long — a real example, four paragraphs on one function:
+
+```swift
+/// Rebuilds prepared heights for the chats most likely to be opened next, after a launch.
+///
+/// `VibeTimelinePreparedStore` is memory-only on purpose — its entries hold decrypted
+/// rows, and the sealed store exists so plaintext does not rest on disk. Coverage
+/// survives a launch by being re-measured off-main from the sealed store instead, which
+/// is why the first open of a session read `prepared=0hit/Nmiss`.
+///
+/// Bounded deliberately: the SQLite read and JSON parse run on the engine queue, so this
+/// takes a tail, not a transcript. …
+```
+
+Right:
+
+```swift
+/// Re-measures prepared heights for the next likely chats, off-main from the sealed store.
+/// Memory-only store, so a launch starts with no coverage; reads a tail, not a transcript.
+```
+
+The full story goes in `docs/` with a one-line pointer. Before reporting a task done,
+re-read the comments you added and delete anything past the cap.
+
+Same rule for commit messages and PR bodies.
+
 ## "Run it on my mobile" / "launch it on my device"
 
-The user means: **build + install + launch the iOS app on their attached iPhone.**
+Build + install + launch the iOS app on the attached iPhone.
+Project `ios/Vibe.xcodeproj` · scheme `Vibe` · bundle `com.vibegram.app`.
 
-- Target device: **"iPhone" — iPhone 16 Pro Max**, UDID `00008140-000935000288801C`
-- Bundle id: `com.vibegram.app` · Project `ios/Vibe.xcodeproj` · Scheme `Vibe`
-- **Building is free** — just build it (no need to ask).
-- **Installing the build onto the phone is free** (`xcrun devicectl device install app`
-  — just copies the binary over, no observable effect until it's run).
-- **Launching it asks first** (`xcrun devicectl device process launch`) — confirm
-  before the app actually runs on the real device.
+- Building and installing are free — just do them.
+- **Launching asks first.**
 
-Exact commands + device table: [docs/run-on-device.md](docs/run-on-device.md).
+Device table + exact commands: [docs/run-on-device.md](docs/run-on-device.md).
 
-## Tool approval config
+## Command approval
 
-Interactive approvals for Claude Code in this repo are governed by
-`~/.vibe/agent-config.toml` → `approval_mode`:
+Read-only / search / inspect commands auto-run. Commands that mutate the filesystem or
+run arbitrary code stop for approval, so prefer the auto-allowed form: don't copy a file
+just to read it, and edit with Edit/Write rather than `sed -i` or shell redirects.
 
-- `local` (default) — approve/answer everything on this device; nothing goes to the phone.
-- `mobile` — route non-auto-allowed tools to the phone (falls back local if unanswered).
-- `auto` — safe/allow-listed commands run without asking; only blockers go to the phone.
-- `full` — allow everything except the always-blocked destructive commands.
+Full list: [docs/agent-command-guide.md](docs/agent-command-guide.md).
+Approval modes live in `~/.vibe/agent-config.toml`. Destructive commands (`rm -rf`,
+`sudo`, `git push`, `git reset --hard`, `curl|sh`, …) are blocked in every remote mode.
 
-Destructive commands (rm -rf, sudo, git push, git reset --hard, dd, mkfs, curl|sh,
-npm publish, ...) are blocked in every remote mode, even `full`.
+## Ask Fable (advisor)
 
-## Ask Fable (advisor) — only when you're actually stuck
+Paid credits — a last resort, not a first step. Solve it yourself first. Reach for it only
+when genuinely stuck: a bug that survived your fix, or an architecture call you can't
+resolve from the code. Not because a task looks big.
 
-Fable runs on **paid credits** (and falls back to GPT when Fable itself is down),
-so it's a **last resort, not a first step**. Solve it yourself first — diagnose,
-read the code, attempt the fix. Reach for Fable only when you have genuinely tried
-and **cannot** crack it: a hard bug that survives your first fix, a risky/unfamiliar
-call you can't resolve from the code, or an architecture decision you're truly
-unsure of. Do NOT call it just because a task looks complex or multi-step — if you
-can fix it, fix it, then move on.
+Prefer the built-in `advisor` tool; otherwise `mcp__vibeask__ask_fable`. It returns advice
+only — you still implement and verify. Keep calls lean: sharp question, short context,
+small snippets, no whole files.
 
-**If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): do NOT call the
-advisor or `ask_fable` — you'd be asking yourself. Just proceed with the task.
+**If you ARE Fable** (`claude-fable-5`): don't call the advisor — you'd be asking yourself.
 
-### How to call
+## Dispatching worker CLIs
 
-1. Prefer the built-in **`advisor`** tool when available.
-2. Otherwise use the Fable MCP tool:
-   - **`mcp__vibeask__ask_fable`** (Claude Code / bridge MCP name), or
-   - **`vibeask__ask_fable`** (qualified `server__tool` form).
+For multi-slice work you have ALREADY finished diagnosing. Write a board with frozen
+contract names and one owner per file, then brief each worker. Review diffs, never handoff
+prose — workers over-report. One verify pass at the end; workers never commit or launch.
 
-Pass at least:
-- `question` — concrete decision/review (required)
-- `context` — goal, findings, errors, assumptions
-- optional `diff`, `constraints[]`, `files[{path,content,note}]`
+Operating guide, worker invocations, routing: `agent-bridge/instructions/team-lead.md`.
 
-Fable returns **plain-text advice only** (Assessment / Risks / Next steps /
-Verification) via the MCP tool result — you still implement and verify. If
-unavailable (rate limit / error), note it and continue.
+## Shared agent memory
 
-**Usage:** keep calls lean — sharp `question`, short `context`, tiny snippets.
-Default package budget is ~24k chars (`VIBE_FABLE_MCP_CONTEXT_CHARS`). Do not
-paste whole files or re-ask with the same dump.
-
-Full how-to (response path + optimise tips): see [Agents.md](Agents.md)
-→ **Ask Fable (advisor)**.
-
-## Complex task? Diagnose yourself, then dispatch worker CLIs
-
-When a task is multi-slice and you have FINISHED diagnosing (you know exactly what
-must change where), don't patch everything yourself — dispatch worker CLIs as
-background subprocesses for speed and cost. The full operating guide (loop, board
-protocol, routing, review rules) is `agent-bridge/instructions/team-lead.md` — follow
-it. The essentials:
-
-- Write a board (`.vibe/team/<run>-board.md`) with FROZEN contract names + ownership
-  (one owner per file, disjoint), then one self-contained brief per worker.
-- Exact worker invocations (verified 2026-07-18):
-  - codex: `codex exec --json -c sandbox_mode="workspace-write" -c approval_policy="never" -c model_reasoning_effort="<low|medium|high>" --cd <repo> --skip-git-repo-check "<prompt>"`
-  - grok: `~/.grok/bin/grok --prompt-file <brief> --always-approve --max-turns 80 --output-format plain --cwd <repo>` (acceptEdits is silently DROPPED headless; default max-turns cuts workers off)
-  - agy: `~/.local/bin/agy -p "Read and execute the brief at <path>" --mode accept-edits --dangerously-skip-permissions --print-timeout 30m` (UI/low-risk only — never auth/security/payments/migrations)
-- Review DIFFS vs baseline, never handoff prose. One verify pass (compile/tests/build)
-  at the end — workers never commit, build, or launch.
-- **Shared agent memory**: `.vibe/memory.md` is the append-only journal all agents
-  share — read it before diagnosing (what previous runs shipped/learned), append one
-  short entry (Shipped / Learned / Open) after finishing real work.
-- **Clean up when the run settles**: fold durable learnings into docs/memory, then
-  delete that run's `.vibe/team/<run>*` board and brief files.
-- Live status: the lead prints `VIBE_TEAM_STATUS {"worker":"codex","state":"spawn|running|done|failed","label":"..."}`
-  on its own stdout at every worker spawn/start/finish so the phone shows a live
-  per-worker board — avatar + elapsed clock ticking from the `spawn` beat.
-
-## Prefer commands that run without approval
-
-Read-only / search / inspect commands (and pipelines of them) auto-run; commands
-that mutate the filesystem or run arbitrary code stop for approval. Prefer the
-auto-allowed forms and don't reach for a mutating command unless the task needs the
-side effect — e.g. **don't `cp` a file just to read or diff it** (use Read / `cat` /
-`diff`), and edit files with the **Edit/Write** tools (auto-allowed) instead of
-`sed -i` / redirects. Full list of what runs free vs. asks:
-[docs/agent-command-guide.md](docs/agent-command-guide.md).
+`.vibe/memory.md` is the append-only journal every agent shares. Read it before
+diagnosing; append one short entry (Shipped / Learned / Open) after real work.

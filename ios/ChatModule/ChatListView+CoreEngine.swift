@@ -172,6 +172,15 @@ extension ChatListView: VibeMessageListHost {
         agentStateProvider: { [weak self] row in
           guard let self else { return AgentTurnBubbleState() }
           return self.agentTurnBubbleState(for: row)
+        },
+        // The measurement this list has already done. Only chats the core is armed for
+        // reach here — DMs, never groups (see ``makeCoreDriverIfEligible``) — so the
+        // width the core measures against and the width these heights were persisted at
+        // are the same expression, and the equality test below is exact rather than
+        // hopeful. See ``ChatListView/coreKnownHeight(for:width:)``.
+        knownHeightProvider: { [weak self] row, width in
+          guard let self else { return nil }
+          return self.coreKnownHeight(for: row, width: width)
         }
       )
       coreState.driver?.onCoreRows = { [weak self] rows in

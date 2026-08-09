@@ -8,6 +8,52 @@ filename** — use this file (or `.grok/rules/*.md`) for Grok-native rules.
 Also loaded when present: `CLAUDE.md` (Claude Code compat). Deeper paths win on
 conflicts. Inspect with: `grok inspect`.
 
+## Finish the whole task
+
+When given a list, write the task list first, then complete **every** item. Do not stop
+partway to report progress, and do not hand back "I did 3 of 5, the rest is next" — that
+is not a checkpoint, it is an unfinished job.
+
+Build and install once at the end, not per item. Report only when everything is done, or
+when something is genuinely blocked — and then say which item and why, in one line.
+
+## Comments: short
+
+**Hard cap: 2 lines per comment. Never a multi-paragraph doc block.** A blank `///` line
+inside a comment means it is already too long — cut it. Say what the code does, or why a
+non-obvious choice was made. Nothing else.
+
+Never write: bug history, what the old version did wrong, measured numbers, "which is
+why…", "on purpose because…", or a chain of reasoning. A long comment rots — the code
+changes, the story stays, and the next reader trusts a wrong explanation. It also costs
+context on every future read of the file.
+
+Too long — a real example, four paragraphs on one function:
+
+```swift
+/// Rebuilds prepared heights for the chats most likely to be opened next, after a launch.
+///
+/// `VibeTimelinePreparedStore` is memory-only on purpose — its entries hold decrypted
+/// rows, and the sealed store exists so plaintext does not rest on disk. Coverage
+/// survives a launch by being re-measured off-main from the sealed store instead, which
+/// is why the first open of a session read `prepared=0hit/Nmiss`.
+///
+/// Bounded deliberately: the SQLite read and JSON parse run on the engine queue, so this
+/// takes a tail, not a transcript. …
+```
+
+Right:
+
+```swift
+/// Re-measures prepared heights for the next likely chats, off-main from the sealed store.
+/// Memory-only store, so a launch starts with no coverage; reads a tail, not a transcript.
+```
+
+The full story goes in `docs/` with a one-line pointer. Before reporting a task done,
+re-read the comments you added and delete anything past the cap.
+
+Same rule for commit messages and PR bodies.
+
 ## "Run it on my mobile" / "launch it on my device"
 
 The user means: **build + install + launch the iOS app on their attached iPhone.**

@@ -62,6 +62,7 @@ struct ChatGroupCreationSheet: View {
             } label: {
               Image(systemName: "xmark")
             }
+            .accessibilityLabel("Close")
           }
           ToolbarItem(placement: .topBarTrailing) {
             Button("Next") {

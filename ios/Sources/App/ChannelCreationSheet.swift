@@ -90,7 +90,10 @@ struct ChannelCreationSheet: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
           ToolbarItem(placement: .topBarLeading) {
-            Button("Cancel") { dismiss() }
+            Button { dismiss() } label: {
+              Image(systemName: "xmark")
+            }
+            .accessibilityLabel("Close")
           }
           ToolbarItem(placement: .topBarTrailing) {
             Button("Next") {
@@ -152,91 +155,126 @@ struct ChannelCreationSheet: View {
           }
         }
     }
+    .tint(palette.accent)
+    .presentationDetents([.large])
+    .presentationDragIndicator(.visible)
+    .presentationBackground(palette.background)
   }
 
   // MARK: - Step 1: Identity
 
   private var identityStepView: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 20) {
-        Text("Set a name and photo for your channel. You can always change these later.")
-          .font(.subheadline)
-          .foregroundStyle(palette.secondaryText)
-          .padding(.horizontal)
-          .padding(.top)
-
-        VStack(spacing: 0) {
-          HStack(spacing: 16) {
-            PhotosPicker(selection: $avatarItem, matching: .images) {
+      VStack(spacing: 0) {
+        VStack(spacing: 10) {
+          PhotosPicker(selection: $avatarItem, matching: .images) {
+            ZStack {
               if let avatarImage {
                 avatarImage
                   .resizable()
                   .scaledToFill()
-                  .frame(width: 56, height: 56)
-                  .clipShape(Circle())
               } else {
+                Circle()
+                  .fill(palette.accent.opacity(0.13))
                 Image(systemName: "camera.fill")
-                  .font(.title2)
+                  .font(.system(size: 26, weight: .medium))
                   .foregroundStyle(palette.accent)
-                  .frame(width: 56, height: 56)
-                  .background(palette.accent.opacity(0.12))
-                  .clipShape(Circle())
               }
+              Circle()
+                .stroke(palette.border.opacity(0.7), lineWidth: 1)
             }
-            .buttonStyle(.plain)
+            .frame(width: 92, height: 92)
+            .clipShape(Circle())
+          }
+          .buttonStyle(.plain)
 
+          Text("New Channel")
+            .font(.system(size: 24, weight: .bold))
+            .foregroundStyle(palette.text)
+          Text("Broadcast messages to your audience")
+            .font(.subheadline)
+            .foregroundStyle(palette.secondaryText)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 28)
+        .padding(.bottom, 24)
+
+        VStack(spacing: 0) {
+          HStack(spacing: 12) {
+            Image(systemName: "character.cursor.ibeam")
+              .foregroundStyle(palette.secondaryText)
+              .frame(width: 24)
             TextField("Channel name", text: $channelName)
               .font(.body)
+              .foregroundStyle(palette.text)
               .submitLabel(.next)
           }
-          .padding()
+          .padding(.horizontal, 16)
+          .padding(.vertical, 14)
 
-          Divider().padding(.leading, 16)
+          Divider().padding(.leading, 52)
 
-          TextField("Description (optional)", text: $channelDescription, axis: .vertical)
-            .font(.body)
-            .lineLimit(3...6)
-            .padding()
+          HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "text.alignleft")
+              .foregroundStyle(palette.secondaryText)
+              .frame(width: 24)
+              .padding(.top, 2)
+            TextField("Description (optional)", text: $channelDescription, axis: .vertical)
+              .font(.body)
+              .foregroundStyle(palette.text)
+              .lineLimit(2...5)
+          }
+          .padding(.horizontal, 16)
+          .padding(.vertical, 14)
         }
         .background(palette.card)
-        .cornerRadius(12)
-        .padding(.horizontal)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 16)
+
+        Text("You can change the channel photo, name, and description later.")
+          .font(.footnote)
+          .foregroundStyle(palette.secondaryText)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 20)
+          .padding(.top, 12)
 
         if let errorMessage {
           Text(errorMessage)
             .font(.footnote)
             .foregroundStyle(.red)
-            .padding(.horizontal)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
         }
 
-        Spacer(minLength: 24)
+        Spacer(minLength: 32)
       }
     }
+    .scrollIndicators(.hidden)
   }
 
   // MARK: - Step 2: Type & policy
 
   private var typePolicyStepView: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 20) {
-        Text("Choose who can find and join this channel.")
-          .font(.subheadline)
-          .foregroundStyle(palette.secondaryText)
-          .padding(.horizontal)
-          .padding(.top)
+      VStack(alignment: .leading, spacing: 16) {
+        channelStepHeader(
+          title: "Channel type",
+          subtitle: "Choose who can find and join this channel."
+        )
 
         VStack(spacing: 0) {
           channelTypeRow(
-            title: "Private Channel",
-            subtitle: "Only invited people can join via a revocable invite link.",
+            title: "Private",
+            subtitle: "Only people you invite can join.",
             selected: !isPublic
           ) {
             isPublic = false
           }
-          Divider().padding(.leading, 56)
+          Divider().padding(.leading, 60)
           channelTypeRow(
-            title: "Public Channel",
-            subtitle: "Anyone can find this channel with a public link.",
+            title: "Public",
+            subtitle: "Anyone can find this channel by its link.",
             selected: isPublic
           ) {
             isPublic = true
@@ -246,7 +284,7 @@ struct ChannelCreationSheet: View {
           }
         }
         .background(palette.card)
-        .cornerRadius(12)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(.horizontal)
 
         if isPublic {
@@ -254,7 +292,7 @@ struct ChannelCreationSheet: View {
             Text("Public link")
               .font(.subheadline.weight(.semibold))
               .foregroundStyle(palette.text)
-              .padding(.horizontal)
+              .padding(.horizontal, 20)
 
             HStack(spacing: 0) {
               // Never hardcode the host: it follows the server's share base.
@@ -275,19 +313,19 @@ struct ChannelCreationSheet: View {
             }
             .padding()
             .background(palette.card)
-            .cornerRadius(12)
-            .padding(.horizontal)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(.horizontal, 16)
 
             Text(slugGuidanceText)
               .font(.caption)
               .foregroundStyle(slugIsValid ? palette.secondaryText : Color.red.opacity(0.9))
-              .padding(.horizontal)
+              .padding(.horizontal, 20)
           }
         } else {
           Text("A revocable invite link is generated when the channel is created. You can rotate or revoke it later from channel settings.")
             .font(.footnote)
             .foregroundStyle(palette.secondaryText)
-            .padding(.horizontal)
+            .padding(.horizontal, 20)
         }
 
         VStack(spacing: 0) {
@@ -318,19 +356,33 @@ struct ChannelCreationSheet: View {
           .tint(palette.accent)
         }
         .background(palette.card)
-        .cornerRadius(12)
-        .padding(.horizontal)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 16)
 
         if let errorMessage {
           Text(errorMessage)
             .font(.footnote)
             .foregroundStyle(.red)
-            .padding(.horizontal)
+            .padding(.horizontal, 20)
         }
 
         Spacer(minLength: 24)
       }
     }
+    .scrollIndicators(.hidden)
+  }
+
+  private func channelStepHeader(title: String, subtitle: String) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      Text(title)
+        .font(.system(size: 26, weight: .bold))
+        .foregroundStyle(palette.text)
+      Text(subtitle)
+        .font(.subheadline)
+        .foregroundStyle(palette.secondaryText)
+    }
+    .padding(.horizontal, 20)
+    .padding(.top, 24)
   }
 
   private var slugGuidanceText: String {
@@ -352,9 +404,9 @@ struct ChannelCreationSheet: View {
     Button(action: action) {
       HStack(alignment: .top, spacing: 14) {
         Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-          .font(.system(size: 22))
+          .font(.system(size: 21, weight: .medium))
           .foregroundStyle(selected ? palette.accent : palette.secondaryText)
-          .frame(width: 28)
+          .frame(width: 30)
           .padding(.top, 2)
 
         VStack(alignment: .leading, spacing: 4) {
@@ -368,7 +420,8 @@ struct ChannelCreationSheet: View {
         }
         Spacer(minLength: 0)
       }
-      .padding()
+      .padding(.horizontal, 16)
+      .padding(.vertical, 14)
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
@@ -378,6 +431,25 @@ struct ChannelCreationSheet: View {
 
   private var peopleStepView: some View {
     VStack(spacing: 0) {
+      channelStepHeader(
+        title: "Add subscribers",
+        subtitle: "Invite people now or add them later from the channel profile."
+      )
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      if !selectedSubscribers.isEmpty || !selectedAgentAdmins.isEmpty {
+        HStack(spacing: 8) {
+          Image(systemName: "person.2.fill")
+            .foregroundStyle(palette.accent)
+          Text("\(selectedSubscribers.count + selectedAgentAdmins.count) selected")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(palette.text)
+          Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+      }
+
       if let errorMessage {
         Text(errorMessage)
           .font(.footnote)
@@ -409,6 +481,8 @@ struct ChannelCreationSheet: View {
           }
           .buttonStyle(.plain)
           .listRowBackground(Color.clear)
+          .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
+          .listRowSeparator(.hidden)
         }
 
         let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -424,6 +498,7 @@ struct ChannelCreationSheet: View {
             Text("No users found.")
               .foregroundStyle(palette.secondaryText)
               .listRowBackground(Color.clear)
+              .listRowSeparator(.hidden)
           } else {
             groupedUsersSection(users: searchResults)
           }
@@ -443,6 +518,8 @@ struct ChannelCreationSheet: View {
         }
       }
       .listStyle(.plain)
+      .scrollContentBackground(.hidden)
+      .background(palette.background)
       .searchable(
         text: $searchQuery,
         isPresented: $isSearchPresented,
@@ -481,10 +558,17 @@ struct ChannelCreationSheet: View {
     let sortedKeys = grouped.keys.sorted()
 
     return ForEach(sortedKeys, id: \.self) { letter in
-      Section(letter) {
+      Section {
         ForEach(grouped[letter] ?? [], id: \.userID) { user in
           personOrAgentRow(user: user)
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+            .listRowSeparatorTint(palette.border.opacity(0.7))
         }
+      } header: {
+        Text(letter)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(palette.secondaryText)
+          .textCase(nil)
       }
     }
   }
@@ -512,9 +596,15 @@ struct ChannelCreationSheet: View {
         }
       }
     } label: {
-      HStack(spacing: 12) {
-        ContactSearchResultRow(user: user, isSaved: isSelected, palette: palette)
-      }
+      ContactSearchResultRow(
+        user: user,
+        isSaved: isSelected,
+        palette: palette,
+        avatarSize: 48,
+        rowHorizontalPadding: 12,
+        rowVerticalPadding: 7,
+        rowMinHeight: 64
+      )
       .overlay(alignment: .topTrailing) {
         if isAgentAdminCandidate {
           Text("Agent admin")
@@ -524,8 +614,8 @@ struct ChannelCreationSheet: View {
             .padding(.vertical, 4)
             .background(palette.accent.opacity(0.12))
             .clipShape(Capsule())
-            .padding(.trailing, 48)
-            .padding(.top, 14)
+            .padding(.trailing, 42)
+            .padding(.top, 10)
         }
       }
       .contentShape(Rectangle())

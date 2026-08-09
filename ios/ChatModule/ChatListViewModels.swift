@@ -612,8 +612,16 @@ struct ChatListRow {
   // E2E-encrypted bridge image attachments (phone-held key); rendered locally in the
   // agent surface and relayed to the desktop bridge as opaque ciphertext.
   let agentBridgeAttachmentsEnc: [String]
-  /// Server-persisted JPEG thumbs for multi-image agent sends (blobs are stripped on persist).
+  /// Server-persisted JPEG thumbs for multi-image sends (blobs are stripped on persist).
   let attachmentThumbnailsB64: [String]
+  /// Durable URL per picture for a multi-image send in a plain chat, first entry
+  /// being the message's own `mediaUrl`. Agent sends carry their pictures inline
+  /// as sealed blobs instead, so this stays empty for them.
+  let attachmentUrls: [String]
+  /// Per-picture media key, index-aligned with `attachmentUrls`. Media is
+  /// encrypted per file, so one key cannot open the whole set; an empty string
+  /// marks a picture that was uploaded unencrypted.
+  let attachmentMediaKeys: [String]
   let agentActionSourceText: String?
   let agentRegeneratePrompt: String?
   let agentCard: AgentCard?
@@ -735,7 +743,7 @@ struct ChatListRow {
   }
 
   var shouldShowUploadOverlay: Bool {
-    guard isMe else {
+    guard isMe, messageType != "gif" else {
       return false
     }
     let normalized = status?.lowercased() ?? ""
@@ -861,6 +869,8 @@ struct ChatListRow {
       agentBridgeResumeSessionId = nil
       agentBridgeAttachmentsEnc = []
       attachmentThumbnailsB64 = []
+      attachmentUrls = []
+      attachmentMediaKeys = []
       agentActionSourceText = nil
       agentRegeneratePrompt = nil
       agentCard = nil
@@ -1187,6 +1197,23 @@ struct ChatListRow {
         + parseStringArray(message["attachmentThumbnailsB64"])
         + parseStringArray(message["attachment_thumbnails_b64"])
     )
+    // NOT de-duplicated, and not concatenated across sources: these two are
+    // index-aligned with each other and with the thumbs, so dropping a repeat or
+    // appending a second source would silently pair a picture with another
+    // picture's key.
+    let parsedAttachmentUrls =
+      parseStringArray(metadata?["attachmentUrls"]).isEmpty
+      ? parseStringArray(message["attachmentUrls"])
+      : parseStringArray(metadata?["attachmentUrls"])
+    let parsedAttachmentKeys =
+      parseStringArray(metadata?["attachmentMediaKeys"]).isEmpty
+      ? parseStringArray(message["attachmentMediaKeys"])
+      : parseStringArray(metadata?["attachmentMediaKeys"])
+    attachmentUrls = parsedAttachmentUrls
+    attachmentMediaKeys =
+      parsedAttachmentKeys.count == parsedAttachmentUrls.count
+      ? parsedAttachmentKeys
+      : Array(repeating: "", count: parsedAttachmentUrls.count)
     agentActionSourceText = firstNonEmptyString(
       in: [metadata, message],
       keys: ["sourceText", "actionSourceText"]

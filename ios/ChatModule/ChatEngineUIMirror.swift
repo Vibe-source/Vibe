@@ -137,6 +137,19 @@ final class ChatEngineUIMirror: @unchecked Sendable {
   /// keyed by request id and scans, which is the wrong shape for a hot read.
   private var pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:]
 
+  /// When each chat last had an agent turn reported running, so
+  /// `ChatEngine.bridgeRunIsActive` can answer off the mirror instead of hopping the
+  /// engine's serial queue. See that method — this is the field that removes a
+  /// 21-second main-thread block.
+  private var agentTurnRunningAtMsByChatId: [String: Int64] = [:]
+
+  /// Chats with ANY outstanding bridge approval request, including ones whose sheet is
+  /// already on screen. Deliberately not `pendingAskByChatId`, which excludes presented
+  /// prompts: a prompt the user is looking at is a run that is very much still alive, and
+  /// reusing the filtered map here would make the composer drop STOP the moment the sheet
+  /// appears. Same predicate as the engine's own `agentBridgeAskByRequestId` scan.
+  private var agentAskChatIds: Set<String> = []
+
   /// Until the first publish the mirror cannot distinguish "nothing is
   /// happening" from "nobody has told me yet", so readers fall back to the
   /// queue. One publish lands on the first engine notification.
@@ -159,7 +172,9 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     agentProgressByChatId: [String: ChatEngineAgentProgressSnapshot],
     onlineUserIds: Set<String>,
     lastSeenByUserId: [String: Int64],
-    pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:]
+    pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:],
+    agentTurnRunningAtMsByChatId: [String: Int64] = [:],
+    agentAskChatIds: Set<String> = []
   ) {
     lock.lock()
     defer { lock.unlock() }
@@ -168,6 +183,8 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     self.onlineUserIds = onlineUserIds
     self.lastSeenByUserId = lastSeenByUserId
     self.pendingAskByChatId = pendingAskByChatId
+    self.agentTurnRunningAtMsByChatId = agentTurnRunningAtMsByChatId
+    self.agentAskChatIds = agentAskChatIds
     hasPublished = true
     publishes += 1
   }
@@ -208,6 +225,24 @@ final class ChatEngineUIMirror: @unchecked Sendable {
 
   func isUserOnline(userId: String) -> Bool? {
     read { onlineUserIds.contains(userId) }
+  }
+
+  /// Whether this chat has a live agent run, answered without touching the engine queue.
+  ///
+  /// Mirrors all three inputs `ChatEngine.bridgeRunIsActive` reads — a progress entry, a
+  /// recent running stamp within `graceMs`, and an unanswered approval prompt — so the
+  /// mirrored answer is the same predicate rather than an approximation of it. The grace
+  /// window is evaluated against `nowMs` at read time, not at publish time, because the
+  /// answer decays with the clock: a stamp published 3s ago must expire on its own
+  /// without waiting for another publish to notice.
+  func bridgeRunIsActive(chatId: String, nowMs: Int64, graceMs: Int64) -> Bool? {
+    read {
+      if agentProgressByChatId[chatId] != nil { return true }
+      if let runningAt = agentTurnRunningAtMsByChatId[chatId], nowMs - runningAt < graceMs {
+        return true
+      }
+      return agentAskChatIds.contains(chatId)
+    }
   }
 
   /// The oldest unanswered approval prompt for a chat, optionally narrowed to one

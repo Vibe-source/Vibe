@@ -340,8 +340,28 @@ fn build_snapshot(
         .and_then(|m| pick_str(m, &["caption"]))
         .or_else(|| pick_str(raw, &["caption"]));
 
-    // "Decrypted to an empty string" counts as a failure in the shipped client.
-    if decryption_failed || (p.envelope.is_some() && payload.is_some() && text.is_empty()) {
+    // "Decrypted to an empty string" counts as a failure in the shipped client — but
+    // the shipped client means the ENVELOPE opened to nothing, not that the payload's
+    // `text` field is empty. `ChatEngine.swift:11399`:
+    //
+    //     let decryptionFailed = … hadEncryptedContent && (hybrid || mls)
+    //                            && decryptedText.isEmpty
+    //
+    // where `decryptedText` is the whole decrypted envelope string, empty only when the
+    // open produced nothing. The previous condition here transcribed that as
+    // `payload.is_some() && text.is_empty()` — the `text` field *inside* a payload that
+    // opened perfectly well.
+    //
+    // Those diverge on every legitimately text-less message: a photo without a caption,
+    // a voice note, a sticker, a document. Each one decrypts to a real payload whose
+    // `text` is `""`, and each one was being flagged as a decryption failure. Device
+    // 2026-08-08, chat 71312111f04b: `decryptFailed=12` of 72 rows, in the one chat with
+    // media — a number that is unactionable precisely because it mixes these two.
+    //
+    // The faithful translation is "an envelope with no usable payload behind it", which
+    // also covers the case the old clause was reaching for: bytes that opened but did not
+    // parse as JSON, where `decryption_failed` is false and `payload` is `None`.
+    if decryption_failed || (p.envelope.is_some() && payload.is_none()) {
         flags.insert(VibeMessageFlags::DECRYPTION_FAILED);
     }
 
@@ -1311,5 +1331,103 @@ mod tests {
         assert_eq!(m.body.text, "secret hello");
         assert_eq!(m.body.caption.as_deref(), Some("cap"));
         assert!(!m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
+    }
+
+    /// A photo sent without a caption decrypts to a payload whose `text` is `""`. That
+    /// is a successful decrypt of a message that simply has no words in it, and it must
+    /// not carry the failure flag.
+    ///
+    /// This is the case the flag condition used to get wrong, by transcribing the shipped
+    /// client's `decryptedText.isEmpty` (the whole envelope opened to nothing) as "the
+    /// payload's `text` field is empty". It inflated every `decryptFailed=` count in a
+    /// chat containing media, and would have rendered those photos as failure states the
+    /// day the list reads from the core.
+    #[cfg(feature = "aead-aes-gcm")]
+    #[test]
+    fn a_captionless_photo_is_not_a_decryption_failure() {
+        use crate::crypto::VibeAesGcm256Aead;
+        use crate::secret::VibeSecretKey;
+
+        struct FixedKeyUnwrapper;
+        impl VibeKeyUnwrapper for FixedKeyUnwrapper {
+            fn unwrap_aes_keys(
+                &self,
+                requests: &[VibeWrappedKeyRequest],
+            ) -> Vec<Option<VibeSecretKey>> {
+                requests
+                    .iter()
+                    .map(|_| Some(VibeSecretKey::from_bytes([42u8; 32])))
+                    .collect()
+            }
+        }
+
+        let aead = VibeAesGcm256Aead;
+        let sealed = envelope::seal_hybrid(
+            &aead,
+            &VibeSecretKey::from_bytes([42u8; 32]),
+            br#"{"text":"","mediaUrl":"https://example.test/p.jpg","mediaKey":"k","type":"image"}"#,
+            vec![3u8; 256],
+            None,
+        )
+        .unwrap();
+
+        let wire = sealed.to_json().replace('"', "\\\"");
+        let frame = format!(
+            r#"{{"id":"e2","chat_id":"c","sender_id":"peer","timestamp":5,"encrypted_content":"{wire}"}}"#
+        );
+
+        let out =
+            canonicalize_frame(frame.as_bytes(), &ctx(&aead, &FixedKeyUnwrapper, false)).unwrap();
+        let m = &out.messages[0];
+        assert!(m.body.text.is_empty());
+        assert!(
+            !m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED),
+            "a captionless photo opened fine; only an envelope with no usable payload fails"
+        );
+    }
+
+    /// The other half of the same contract: bytes that open but are not JSON have no
+    /// usable payload, so the row IS a failure even though `decryption_failed` is false.
+    /// This is the case the old `text.is_empty()` clause was reaching for, and the only
+    /// one it was right about.
+    #[cfg(feature = "aead-aes-gcm")]
+    #[test]
+    fn an_envelope_that_opens_to_non_json_is_a_decryption_failure() {
+        use crate::crypto::VibeAesGcm256Aead;
+        use crate::secret::VibeSecretKey;
+
+        struct FixedKeyUnwrapper;
+        impl VibeKeyUnwrapper for FixedKeyUnwrapper {
+            fn unwrap_aes_keys(
+                &self,
+                requests: &[VibeWrappedKeyRequest],
+            ) -> Vec<Option<VibeSecretKey>> {
+                requests
+                    .iter()
+                    .map(|_| Some(VibeSecretKey::from_bytes([42u8; 32])))
+                    .collect()
+            }
+        }
+
+        let aead = VibeAesGcm256Aead;
+        let sealed = envelope::seal_hybrid(
+            &aead,
+            &VibeSecretKey::from_bytes([42u8; 32]),
+            b"not json at all",
+            vec![3u8; 256],
+            None,
+        )
+        .unwrap();
+
+        let wire = sealed.to_json().replace('"', "\\\"");
+        let frame = format!(
+            r#"{{"id":"e3","chat_id":"c","sender_id":"peer","timestamp":5,"encrypted_content":"{wire}"}}"#
+        );
+
+        let out =
+            canonicalize_frame(frame.as_bytes(), &ctx(&aead, &FixedKeyUnwrapper, false)).unwrap();
+        assert!(out.messages[0]
+            .flags
+            .contains(VibeMessageFlags::DECRYPTION_FAILED));
     }
 }

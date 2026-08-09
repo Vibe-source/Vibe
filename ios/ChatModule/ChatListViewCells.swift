@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import ImageIO
 import LinkPresentation
 import MediaPlayer
@@ -249,6 +250,11 @@ private func chatCellDebugLog(_ enabled: Bool, _ format: String, _ args: CVarArg
   }
 }
 
+/// Animated-aware decode for callers outside this file (GIF recents).
+func chatMediaDecodedImagePublic(from data: Data, shouldAnimate: Bool) -> UIImage? {
+  chatMediaDecodedImage(from: data, shouldAnimate: shouldAnimate)
+}
+
 private func chatMediaDecodedImage(
   from data: Data, shouldAnimate: Bool
 ) -> UIImage? {
@@ -319,8 +325,106 @@ func chatMicroThumbnailJPEGBase64(
   return jpeg.base64EncodedString()
 }
 
+/// Encode the same micro-thumb straight from a file, without ever decoding the
+/// full-resolution image.
+///
+/// `UIImage(contentsOfFile:)` followed by `draw(in:)` materializes the entire bitmap:
+/// a 12MP photo costs tens of megabytes and ~100ms of main-thread decode to produce a
+/// 64px thumbnail that is then thrown away. ImageIO decodes at the reduced size
+/// directly, so a multi-image send stops paying a full decode per picture — that pass
+/// was measured at 0.56s of blocked main thread on a single send.
+///
+/// `kCGImageSourceCreateThumbnailWithTransform` is not optional. Without it ImageIO
+/// returns the raw pixels and ignores the EXIF orientation, so every photo taken in
+/// portrait would ship a sideways thumbnail — orientation is the one thing
+/// `UIImage(contentsOfFile:)` was handling for free, and it has to be asked for here.
+///
+/// Falls back to the decoded-image path for anything ImageIO cannot open, so a format
+/// it does not understand still produces a thumbnail rather than none.
+func chatMicroThumbnailJPEGBase64(
+  contentsOf fileURL: URL,
+  maxDimension: CGFloat = chatMicroThumbMaxDimension
+) -> String? {
+  func decodedFallback() -> String? {
+    UIImage(contentsOfFile: fileURL.path).flatMap {
+      chatMicroThumbnailJPEGBase64(from: $0, maxDimension: maxDimension)
+    }
+  }
+  let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+  guard
+    let source = CGImageSourceCreateWithURL(fileURL as CFURL, sourceOptions as CFDictionary)
+  else { return decodedFallback() }
+  let thumbnailOptions: [CFString: Any] = [
+    kCGImageSourceCreateThumbnailFromImageAlways: true,
+    kCGImageSourceCreateThumbnailWithTransform: true,
+    kCGImageSourceShouldCacheImmediately: true,
+    kCGImageSourceThumbnailMaxPixelSize: Int(max(1.0, maxDimension)),
+  ]
+  guard
+    let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+      source, 0, thumbnailOptions as CFDictionary),
+    let jpeg = UIImage(cgImage: thumbnail)
+      .jpegData(compressionQuality: chatMicroThumbJPEGQuality)
+  else { return decodedFallback() }
+  return jpeg.base64EncodedString()
+}
+
+/// Shared context for the placeholder blur. Building a `CIContext` is the expensive part
+/// of Core Image — tens of milliseconds — while the filter itself, on an image this
+/// small, is not. One global, created on first use.
+private let chatMicroThumbBlurContext = CIContext(options: [.useSoftwareRenderer: false])
+
+/// Turn a micro-thumb into the soft placeholder, rather than a small image stretched big.
+///
+/// A 64px thumb spread across a ~300pt bubble is a 12x upscale, and at that factor the
+/// JPEG's 8x8 blocks become visible squares with hard edges between them. That is what
+/// reads as *broken resolution* instead of an intentional preview — the eye recognises
+/// block edges and interpolation seams as damage, not as blur. A Gaussian destroys
+/// exactly those artifacts while keeping the broad colour layout that makes a placeholder
+/// worth showing at all, which is the difference between our plate and Telegram's.
+///
+/// Baked into the cached bitmap on purpose, NOT applied as a live `UIVisualEffectView`
+/// over each cell. A visual-effect view is a per-frame GPU cost on every visible media
+/// cell, and it is a frosted *material* — it desaturates and lifts everything toward the
+/// material colour — where this needs a plain blur of the image's own colours.
+private func chatBlurredMicroThumbnail(_ image: UIImage) -> UIImage? {
+  let size = image.size
+  let longest = max(size.width, size.height)
+  guard longest > 0.5 else { return nil }
+  // Upscale BEFORE blurring. Blurring at 64px and letting the image view stretch the
+  // result would leave the seams of that stretch behind; blurring after a smooth upscale
+  // removes those too. 180px carries no detail worth resolving and stays cheap.
+  let scale = max(1.0, 180.0 / longest)
+  let target = CGSize(
+    width: max(1.0, (size.width * scale).rounded()),
+    height: max(1.0, (size.height * scale).rounded())
+  )
+  let format = UIGraphicsImageRendererFormat.default()
+  format.scale = 1.0
+  format.opaque = true
+  let upscaled = UIGraphicsImageRenderer(size: target, format: format).image { context in
+    context.cgContext.interpolationQuality = .high
+    image.draw(in: CGRect(origin: .zero, size: target))
+  }
+  guard let upscaledCG = upscaled.cgImage else { return nil }
+  let input = CIImage(cgImage: upscaledCG)
+  guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
+  // Clamped to extent first: a Gaussian samples beyond the edges, and against a finite
+  // input those samples come back transparent — which fades the border and gives the
+  // placeholder a washed-out frame instead of a full-bleed one.
+  filter.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+  filter.setValue(max(1.0, max(target.width, target.height) * 0.06), forKey: kCIInputRadiusKey)
+  guard let output = filter.outputImage,
+    let rendered = chatMicroThumbBlurContext.createCGImage(output, from: input.extent)
+  else { return nil }
+  return UIImage(cgImage: rendered)
+}
+
 /// Sync decode of micro-thumb for first paint. Clamps oversized legacy thumbs so
 /// main-thread configure never stalls on a full-res base64 blob.
+///
+/// Returns the SHARP thumb — the blur is a Core Image pass and belongs off main; ask for
+/// it with ``chatRequestMicroThumbBlur``.
 func chatDecodedMicroThumbnail(fromBase64 value: String?, cacheKey: String?) -> UIImage? {
   if let cacheKey,
     let hit = chatMicroThumbDecodedCache.object(forKey: cacheKey as NSString)
@@ -330,7 +434,7 @@ func chatDecodedMicroThumbnail(fromBase64 value: String?, cacheKey: String?) -> 
   guard let image = chatMediaImageFromBase64Public(value) else { return nil }
   let size = image.size
   let clampDim: CGFloat = 128.0
-  let out: UIImage
+  let clamped: UIImage
   if max(size.width, size.height) > clampDim + 0.5 {
     let scale = clampDim / max(size.width, size.height)
     let target = CGSize(
@@ -340,16 +444,48 @@ func chatDecodedMicroThumbnail(fromBase64 value: String?, cacheKey: String?) -> 
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = 1.0
     format.opaque = true
-    out = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+    clamped = UIGraphicsImageRenderer(size: target, format: format).image { _ in
       image.draw(in: CGRect(origin: .zero, size: target))
     }
   } else {
-    out = image
+    clamped = image
   }
   if let cacheKey {
-    chatMicroThumbDecodedCache.setObject(out, forKey: cacheKey as NSString)
+    chatMicroThumbDecodedCache.setObject(clamped, forKey: cacheKey as NSString)
   }
-  return out
+  return clamped
+}
+
+private let chatMicroThumbBlurQueue = DispatchQueue(
+  label: "vibe.microthumb.blur", qos: .userInitiated)
+private let chatMicroThumbBlurLock = NSLock()
+private var chatMicroThumbBlurInFlight = Set<String>()
+
+/// Blurs a sharp micro-thumb off main, once per key, and calls back on main.
+///
+/// Ran inline in `cellForItemAt` before: a device trace charged it a 0.56s main-thread
+/// hang during a chat open. The result replaces the sharp thumb in both thumb caches, so
+/// every later configure reads the blurred one straight from memory.
+func chatRequestMicroThumbBlur(
+  sharp: UIImage,
+  cacheKey: String,
+  completion: @escaping (UIImage) -> Void
+) {
+  chatMicroThumbBlurLock.lock()
+  let alreadyRunning = !chatMicroThumbBlurInFlight.insert(cacheKey).inserted
+  chatMicroThumbBlurLock.unlock()
+  guard !alreadyRunning else { return }
+  chatMicroThumbBlurQueue.async {
+    let blurred = chatBlurredMicroThumbnail(sharp)
+    chatMicroThumbBlurLock.lock()
+    chatMicroThumbBlurInFlight.remove(cacheKey)
+    chatMicroThumbBlurLock.unlock()
+    // No Core Image result — the sharp thumb stays. A blocky placeholder still beats the
+    // empty plate this path exists to avoid.
+    guard let blurred else { return }
+    chatMicroThumbDecodedCache.setObject(blurred, forKey: cacheKey as NSString)
+    DispatchQueue.main.async { completion(blurred) }
+  }
 }
 
 
@@ -656,7 +792,7 @@ func chatLoadMusicCover(urlString: String?, completion: @escaping (UIImage) -> V
     return nil
   }
   guard let url = URL(string: trimmed) else { return nil }
-  let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+  let task = VibeHTTP.shared.dataTask(with: url) { data, _, _ in
     guard let data, !data.isEmpty, let image = UIImage(data: data) else { return }
     chatMediaImageCache.setObject(image, forKey: key as NSString)
     chatMediaDiskCacheSave(data, forKey: key)
@@ -692,7 +828,7 @@ func chatMediaPrefetch(urlString: String, animated: Bool) {
     chatMediaImageCache.setObject(diskImage, forKey: cacheKey as NSString)
     return
   }
-  URLSession.shared.dataTask(with: url) { data, _, error in
+  VibeHTTP.shared.dataTask(with: url) { data, _, error in
     guard error == nil, let data, !data.isEmpty,
       let image = chatMediaDecodedImage(from: data, shouldAnimate: animated)
     else { return }
@@ -758,7 +894,7 @@ final class BubbleBackgroundView: UIView {
   private let gradientLayer = CAGradientLayer()
   private let fillLayer = CAShapeLayer()
   private let bubbleMaskLayer = CAShapeLayer()
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   internal var wallpaperSnapshot: CGImage?
   internal var wallpaperContainerSize: CGSize = .zero
   internal var wallpaperSampleRect: CGRect = .zero
@@ -2973,8 +3109,10 @@ func chatMediaGridImageCount(_ row: ChatListRow) -> Int {
   guard row.kind == .message, row.visualKind == .media, row.messageType != "file" else {
     return 0
   }
-  let count = max(row.agentBridgeAttachmentsEnc.count, row.attachmentThumbnailsB64.count)
-  // Multi-image grid only; a single sealed blob uses the hero mediaImageView path.
+  let count = max(
+    row.agentBridgeAttachmentsEnc.count,
+    max(row.attachmentThumbnailsB64.count, row.attachmentUrls.count))
+  // Multi-image only; a single picture uses the hero mediaImageView path.
   return count > 1 ? count : 0
 }
 
@@ -2991,6 +3129,26 @@ func chatRowHasBridgeImageBlobsOnly(_ row: ChatListRow) -> Bool {
 
 private func chatMediaGridColumns(_ tiles: Int) -> Int {
   tiles <= 4 ? 2 : 3
+}
+
+/// A caption wants the bubble's width for text, so the images page in place;
+/// without one the bubble *is* the picture and the deck can spend a few points of
+/// height letting the stack read as a stack.
+func chatMediaStackMode(_ row: ChatListRow) -> ChatMediaStackMode {
+  hasMediaCaptionLayout(row) ? .carousel : .deck
+}
+
+/// The single height answer for a multi-image bubble, used by both the sizing
+/// pass and the layout pass. Two of these that disagree is a visible row shift.
+func chatMediaStackHeight(for row: ChatListRow, width: CGFloat) -> CGFloat {
+  let count = chatMediaGridImageCount(row)
+  guard count > 1 else { return 0 }
+  return ChatMediaStackGeometry.height(
+    count: count,
+    width: width,
+    mode: chatMediaStackMode(row),
+    aspect: ChatMediaStackGeometry.cardAspect(natural: resolvedMediaNaturalSize(for: row))
+  )
 }
 
 /// Row-major tile frames (origin 0,0). Tiles in a full row are square; a short final
@@ -3918,7 +4076,7 @@ private final class BubbleMusicPreviewStore {
       forHTTPHeaderField: "User-Agent"
     )
     request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
-    URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+    VibeHTTP.shared.dataTask(with: request) { [weak self] data, response, _ in
       let resolvedURL = (response?.url) ?? url
       // og tags live in <head>; cap the parse window so huge pages stay cheap.
       let html = data.flatMap { String(data: $0.prefix(400_000), encoding: .utf8) } ?? ""
@@ -4158,7 +4316,7 @@ private final class BubbleLinkPreviewView: UIView {
   private var isMusicCard = false
   private var currentArtworkURLString: String?
   private var currentURL: URL?
-  private var currentAppearance = ChatListAppearance.fallback
+  private var currentAppearance = ChatListAppearance.current
   private var currentIsMe = false
 
   override init(frame: CGRect) {
@@ -4528,17 +4686,12 @@ func agentTurnSettledTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) 
   return min(maxContentWidth, max(196.0, measuredWidth + 10.0))
 }
 
-/// Width a PLAIN conversational agent answer should hug — live OR settled — so its bubble
-/// tracks the text instead of snapping to the full agent workspace width (the "big empty
-/// shell around a one-line reply"). Qualifies only when there is NO tool/progress feed, NO
-/// runtime card, and NO action bar — i.e. the row renders "plain text only" (Vibe AI's
-/// conversational turns, a no-tool bridge answer). Uses ROW-NATIVE fields, not the
-/// VibeAgentKit mapping, because the built-in agent's rows don't set isStreaming /
-/// hasFinalResponseText consistently (that's why the earlier streaming-only hug never
-/// fired). Handles live + settled identically so the width doesn't jump at settle. The hug
-/// tracks the WIDEST wrapped line, so it grows monotonically as text streams (a later short
-/// line never shrinks it) and caps at maxContentWidth. Height is always measured at this
-/// same width, so an imperfect estimate costs at most a hair of extra wrap — never a clip.
+/// Width a short, single-line conversational agent answer should hug so its bubble tracks
+/// the text instead of drawing a full-width empty shell around "Done" / "No track found".
+/// Multiline prose deliberately falls through to the normal full reading width: measuring
+/// each source line unwrapped makes lists and short Markdown paragraphs look artificially
+/// narrow, then forces their real rendered text to wrap a second time inside that width.
+/// Qualifies only when there is NO tool/progress feed, runtime card, or action bar.
 func agentTurnPlainTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -> CGFloat? {
   guard row.isAgentMessage,
     row.agentRuntime == nil,
@@ -4546,16 +4699,22 @@ func agentTurnPlainTextHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) ->
     (row.agentActionsEnc?.isEmpty ?? true)
   else { return nil }
   let text = trimmedBubbleText(row)
-  // Code blocks / tables need the full reading width to stay legible.
-  guard !text.isEmpty, !text.contains("```") else { return nil }
+  // Structured / multiline answers need the full reading width. Apart from fixing list
+  // wrapping, this keeps measure == render while a streamed answer grows into paragraphs.
+  guard !text.isEmpty,
+    text.count <= 84,
+    !text.contains(where: { $0.isNewline }),
+    !text.contains("```"),
+    !text.contains("`"),
+    !text.contains("**"),
+    !text.contains("__"),
+    !text.contains("[")
+  else { return nil }
   let font = UIFont.systemFont(ofSize: 16.0, weight: .regular)
-  let widestLine = text.split(whereSeparator: { $0.isNewline }).reduce(CGFloat(0)) {
-    acc, line in
-    max(acc, ceil((String(line) as NSString).size(withAttributes: [.font: font]).width))
-  }
-  guard widestLine > 0 else { return nil }
+  let measuredWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+  guard measuredWidth > 0, measuredWidth < maxContentWidth * 0.72 else { return nil }
   // +16 slack so a slightly-wider glyph (bold, emoji) never forces an extra wrap.
-  return min(maxContentWidth, max(bubbleMinWidth, widestLine + 16.0))
+  return min(maxContentWidth, max(bubbleMinWidth, measuredWidth + 16.0))
 }
 
 /// Width a NATIVE ("Vibe AI") turn should hug while it is showing ONLY a single running
@@ -4908,7 +5067,7 @@ func measureMessageBubbleLayout(
       let gridCount = chatMediaGridImageCount(row)
       if gridCount > 1 {
         targetWidth = maxContentWidth
-        mediaHeight = chatMediaGridLayout(count: gridCount, width: targetWidth).height
+        mediaHeight = chatMediaStackHeight(for: row, width: targetWidth)
       } else if let naturalSize = resolvedMediaNaturalSize(for: row),
         naturalSize.width > 1.0,
         naturalSize.height > 1.0
@@ -4930,16 +5089,32 @@ func measureMessageBubbleLayout(
         mediaHeight = stickerDefaultDisplaySide
         mediaAspectWasUnknown = row.mediaUrl?.isEmpty == false
       } else {
-        // THE square fallback. A wide photo really measures ~84pt here and gets ~336 —
-        // the reported `slot-repair … slack=+252`. Flag it so the height it produces is
-        // treated as provisional rather than cached and persisted as if it were real.
+        // The unknown-aspect fallback. NOT a square any more.
         //
-        // Only when there is media that could still resolve, though: a bundled/animated
-        // sticker with no url is never going to report a natural size, so its default box
-        // is the FINAL answer, not a guess — marking it provisional would keep re-measuring
-        // it forever and drop it out of the persisted-height coverage the seed depends on.
+        // A square was the worst available guess. Full width on a 430pt screen is a ~336pt
+        // box, while real photos land between 84pt (wide panorama) and 380pt (the portrait
+        // cap) — so the guess was wrong by up to 252pt (`slot-repair … slack=+252`) and the
+        // correction that followed was the largest single layout shift in the app. Every
+        // `[shift]` line from the 2026-08-07 device run is one of these: ±200pt, `where=ABOVE`,
+        // moving content the reader was looking at, and worst of all during a send.
+        //
+        // 4:3 landscape is the modal photo shape, so it is both a better guess and a far
+        // cheaper mistake: the worst case drops from 252pt to roughly 60pt, and the common
+        // case is near zero.
+        //
+        // This path is now rare by construction. It is reached only when the message carries
+        // NEITHER dimensions NOR a thumbnail — and those two are produced together by the
+        // same block in `ChatEngine.sendMessage`, which used to skip anything whose declared
+        // type was not image/gif. A photo shared as a FILE therefore arrived with both
+        // missing. That gate now keys off the file header instead of the type, so new sends
+        // always carry a shape and never reach this line.
+        //
+        // Still provisional: unlike a bundled sticker (whose default box is the final
+        // answer), this media can resolve, and a stale guess that is never corrected is a
+        // permanently mis-shaped photo. The goal here is to make the correction small
+        // enough not to be seen, not to abandon it.
         targetWidth = max(120.0, maxContentWidth)
-        mediaHeight = targetWidth
+        mediaHeight = max(84.0, min(380.0, targetWidth * 0.75))
         mediaAspectWasUnknown = row.mediaUrl?.isEmpty == false
       }
     case .text:
@@ -5554,10 +5729,10 @@ final class VoicePlayProgressView: UIView {
   private let uploadSpinAnimationKey = "voice.upload.spin"
   private let badgeSpinAnimationKey = "voice.badge.spin"
   private let badgeProgressAnimationKey = "voice.badge.progress"
-  private var iconTintColor = ChatListAppearance.fallback.accent
-  private var ringTintColor = ChatListAppearance.fallback.accent
+  private var iconTintColor = ChatListAppearance.current.accent
+  private var ringTintColor = ChatListAppearance.current.accent
   /// Fill color of the corner download badge — the appearance accent (falls back to ringTint).
-  private var badgeTintColor = ChatListAppearance.fallback.accent
+  private var badgeTintColor = ChatListAppearance.current.accent
   /// Dominant color pulled from the artwork; tints the fluid halo so it reads as the cover.
   private var artworkAccentColor: UIColor?
   /// When true the glyph is punched OUT of the filled circle instead of drawn on top,
@@ -5713,6 +5888,21 @@ final class VoicePlayProgressView: UIView {
     refreshIconKnockout()
   }
 
+  /// Every input of the last `applyStyle` that actually landed.
+  ///
+  /// `cellForItemAt` re-applies appearance on every dequeue, and the five values are
+  /// identical the overwhelming majority of the time — the appearance only genuinely
+  /// changes when the user picks a new theme. Comparing them is far cheaper than a
+  /// `tintColor` re-render, three `CAShapeLayer` fill writes and a knockout rebuild.
+  private struct VoicePlateStyle: Equatable {
+    let fill: UIColor
+    let iconTint: UIColor
+    let ringTint: UIColor
+    let badgeTint: UIColor
+    let knockout: Bool
+  }
+  private var lastAppliedPlateStyle: VoicePlateStyle?
+
   func applyStyle(
     fillColor: UIColor,
     iconTint: UIColor,
@@ -5720,6 +5910,21 @@ final class VoicePlayProgressView: UIView {
     badgeTint: UIColor? = nil,
     knockoutIcon: Bool = false
   ) {
+    let style = VoicePlateStyle(
+      fill: fillColor,
+      iconTint: iconTint,
+      ringTint: ringTint,
+      badgeTint: badgeTint ?? ringTint,
+      knockout: knockoutIcon
+    )
+    if style == lastAppliedPlateStyle {
+      // The glyph and the plate size can change with no color changing at all, and the
+      // knockout is keyed on exactly those — so it still gets its chance to notice.
+      // It is a cache hit when nothing moved.
+      refreshIconKnockout()
+      return
+    }
+    lastAppliedPlateStyle = style
     fillView.backgroundColor = fillColor
     iconTintColor = iconTint
     ringTintColor = ringTint
@@ -5762,6 +5967,15 @@ final class VoicePlayProgressView: UIView {
     knockoutIcon && artworkImageView.image == nil
   }
 
+  /// Knockout masks, shared by every cell in the app.
+  ///
+  /// The mask is a pure alpha punch-out — the plate circle with the glyph erased from it
+  /// — so it depends on nothing but the symbol and the two sizes, never on color and
+  /// never on which cell is asking. Rendering it per cell meant a `UIGraphicsImageRenderer`
+  /// pass inside `cellForItemAt` every time a reused cell crossed from a their-bubble to
+  /// a mine-bubble; there are only a handful of distinct keys in the whole app.
+  private static let knockoutMaskCache = NSCache<NSString, UIImage>()
+
   /// Rebuild the punched-out plate. The mask is the filled circle with the glyph
   /// erased out of it, so whatever is behind the button (the bubble) reads as the icon.
   private func refreshIconKnockout() {
@@ -5776,21 +5990,31 @@ final class VoicePlayProgressView: UIView {
 
     iconView.isHidden = true
     let size = fillView.bounds.size
-    let key = "\(currentIconName ?? "-")|\(Int(size.width))x\(Int(size.height))"
+    let glyphSize = glyph.size
+    // The glyph's own size is part of the key, not decoration: the same symbol name is
+    // set at different point sizes and weights, and two of those render different masks.
+    let key =
+      "\(currentIconName ?? "-")|\(Int(glyphSize.width))x\(Int(glyphSize.height))"
+      + "|\(Int(size.width))x\(Int(size.height))"
     guard key != lastKnockoutMaskKey else { return }
     lastKnockoutMaskKey = key
 
-    let glyphSize = glyph.size
-    let glyphRect = CGRect(
-      x: (size.width - glyphSize.width) * 0.5,
-      y: (size.height - glyphSize.height) * 0.5,
-      width: glyphSize.width,
-      height: glyphSize.height
-    )
-    let maskImage = UIGraphicsImageRenderer(size: size).image { _ in
-      UIColor.black.setFill()
-      UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).fill()
-      glyph.draw(in: glyphRect, blendMode: .destinationOut, alpha: 1.0)
+    let maskImage: UIImage
+    if let cached = Self.knockoutMaskCache.object(forKey: key as NSString) {
+      maskImage = cached
+    } else {
+      let glyphRect = CGRect(
+        x: (size.width - glyphSize.width) * 0.5,
+        y: (size.height - glyphSize.height) * 0.5,
+        width: glyphSize.width,
+        height: glyphSize.height
+      )
+      maskImage = UIGraphicsImageRenderer(size: size).image { _ in
+        UIColor.black.setFill()
+        UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).fill()
+        glyph.draw(in: glyphRect, blendMode: .destinationOut, alpha: 1.0)
+      }
+      Self.knockoutMaskCache.setObject(maskImage, forKey: key as NSString)
     }
 
     let maskLayer = CALayer()
@@ -5999,6 +6223,9 @@ final class VoicePlayProgressView: UIView {
     needsDownload = false
     isDownloading = false
     downloadProgress = nil
+    // Reuse is exactly when the style memo must not be trusted — the next row may want
+    // the same colors but this cell's chrome has just been torn down underneath them.
+    lastAppliedPlateStyle = nil
     updateDownloadBadge()
     applyPlaybackChrome(isPlaying: false, progress: 0.0, level: 0.0)
   }
@@ -6098,6 +6325,8 @@ final class VoiceWaveformView: UIView {
   /// Per-frame write avoidance in `applyBarFrames` — bar geometry and per-bar fill.
   private var lastBarGeometryKey: String?
   private var lastBarFillFractions: [CGFloat] = []
+  /// Samples arrived but have not been bucketed yet. See ``setWaveform(_:)``.
+  private var needsEnvelopeRebuild = false
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -6126,6 +6355,12 @@ final class VoiceWaveformView: UIView {
         self.layer.addSublayer(layer)
       }
       rebuildEnvelope()
+      needsEnvelopeRebuild = false
+      invalidateBarCaches()
+    } else if needsEnvelopeRebuild {
+      // Same bar count, new audio: the samples ``setWaveform(_:)`` deferred to here.
+      rebuildEnvelope()
+      needsEnvelopeRebuild = false
       invalidateBarCaches()
     }
     applyBarFrames()
@@ -6141,9 +6376,21 @@ final class VoiceWaveformView: UIView {
 
   func setWaveform(_ samples: [CGFloat]?) {
     rawSamples = samples
-    rebuildEnvelope()
-    invalidateBarCaches()
-    applyBarFrames()
+    // Resample at LAYOUT, not here — this is the wave that changes shape a beat after a
+    // chat opens.
+    //
+    // The envelope is `rawSamples` bucketed into `barCount` buckets, and `barCount` is a
+    // function of `bounds.width` that only ``layoutSubviews()`` knows. Cells are
+    // configured *before* they are laid out, so on a recycled cell this ran while
+    // `bounds` still described the PREVIOUS row: the new audio was bucketed into the old
+    // bar count and painted (`barLayers` is already populated from that row, so
+    // `applyBarFrames` does not early-return), and layout then re-bucketed it into the
+    // right count a frame later. Two different shapes for one voice note.
+    //
+    // Deferring costs nothing: `setNeedsLayout` runs before this frame is displayed, so
+    // the first shape drawn is the only shape drawn.
+    needsEnvelopeRebuild = true
+    setNeedsLayout()
   }
 
   private func rebuildEnvelope() {
@@ -7905,7 +8152,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
       messageId,
       remoteURL.host ?? remoteURL.absoluteString
     )
-    let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
+    let task = VibeHTTP.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
       guard let self else { return }
       DispatchQueue.main.async {
         guard self.prefetchMessageId == messageId else { return }
@@ -8257,7 +8504,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
         request.setValue(value, forHTTPHeaderField: field)
       }
     }
-    let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
+    let task = VibeHTTP.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
     // Note: progress observation is set up below after task is assigned to activeDownloadTask.
       guard let self, let tempURL = tempURL, error == nil else {
         NSLog(
@@ -9240,7 +9487,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
 
 private final class MessageSelectionCircleView: UIControl {
   private var checked = false
-  private var accentColor = ChatListAppearance.fallback.accent
+  private var accentColor = ChatListAppearance.current.accent
   private let ringLayer = CAShapeLayer()
   private let fillLayer = CAShapeLayer()
   private let checkLayer = CAShapeLayer()
@@ -9506,6 +9753,18 @@ private final class ForwardedFromHeaderView: UIView {
 
 final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   static let reuseIdentifier = "ChatListCell"
+
+  private static var hasPrewarmedRealization = false
+
+  /// Builds and discards a few cells at launch so the first open pays neither class
+  /// realization nor first-time subview setup: cold dequeue measured 12.6ms, warm 2.7ms.
+  static func prewarmRealization() {
+    guard Thread.isMainThread, !hasPrewarmedRealization else { return }
+    hasPrewarmedRealization = true
+    let frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 80)
+    for _ in 0..<3 { _ = ChatListCell(frame: frame) }
+  }
+
   private static let reactionBadgeBaseSize = CGSize(width: 34.0, height: 24.0)
   private static let reactionBadgeInsetLeft: CGFloat = 8.0
   private static let reactionBadgeInsetBottom: CGFloat = 6.0
@@ -9606,6 +9865,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let replyPreviewView = BubbleReplyPreviewView()
   /// Built the first time a row carries a link preview — see ``linkPreviewView``.
   private var _linkPreviewView: BubbleLinkPreviewView?
+  private var lastTouchPointInCell: CGPoint?
+  private var lastTouchAt: TimeInterval = 0
   /// The link-preview card. 156us to construct, needed by the rare message that has a URL.
   ///
   /// Same contract as ``agentTurnContentView`` and ``agentActionBarView``: hiding,
@@ -9712,7 +9973,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let mediaProgressOverlayView = UIView()
   private let mediaProgressRingView = BubbleUploadProgressView()
   // Multi-image bridge sends: tile views for the inline grid (created lazily, max 6).
-  private var mediaGridTileViews: [UIImageView] = []
+  /// Multi-image body — a swipeable deck (or inline carousel when the message has
+  /// a caption). Replaces the tile grid; created lazily, see `ensureMediaStackView`.
+  private var mediaStackView: ChatMediaStackView?
   private var mediaGridRowKey: String?
   private static let bridgeGridImageCache = NSCache<NSString, UIImage>()
   private static let bridgeGridDecodeQueue = DispatchQueue(
@@ -9785,7 +10048,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private let reactionPillView = UIView()
   private let reactionLabel = UILabel()
   private let selectionCircleView = MessageSelectionCircleView()
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   var row: ChatListRow?
   private var selectionMode = false
   private var isSelectionChecked = false
@@ -10387,19 +10650,27 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaImageView
   }
 
-  /// Image for a multi-image grid tile (or hero image when index is 0 / no grid).
+  /// Image for one of a multi-image message's pictures (or the hero image when
+  /// the message carries only one).
   func mediaImage(atGridIndex index: Int) -> UIImage? {
-    if index >= 0, index < mediaGridTileViews.count, !mediaGridTileViews[index].isHidden {
-      return mediaGridTileViews[index].image ?? mediaImageView.image
+    if let stack = mediaStackView, !stack.isHidden, let image = stack.image(at: index) {
+      return image
     }
     return mediaImageView.image
   }
 
   func mediaImageView(atGridIndex index: Int) -> UIImageView? {
-    if index >= 0, index < mediaGridTileViews.count, !mediaGridTileViews[index].isHidden {
-      return mediaGridTileViews[index]
+    if let stack = mediaStackView, !stack.isHidden, let view = stack.imageView(at: index) {
+      return view
     }
     return mediaImageView
+  }
+
+  /// Which picture the stack is currently showing — the one a tap opens and the
+  /// one the zoom transition has to fly out of and back into.
+  var currentMediaStackIndex: Int {
+    guard let stack = mediaStackView, !stack.isHidden else { return 0 }
+    return stack.currentIndex
   }
 
   var isInlineVideoPlaybackActive: Bool { mediaVideoPlaybackActive }
@@ -10560,7 +10831,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.layer.cornerCurve = .circular
     dayLabel.clipsToBounds = true
     let isCurrentRowMe = row?.isMe == true
-    applyVoiceChromeColors(isMe: isCurrentRowMe)
+    // Only a voice/music row ever shows the plate and waveform, but both are non-lazy
+    // stored properties, so restyling them here charged every text bubble in the
+    // transcript for voice chrome — a knockout-mask render included — on each
+    // `cellForItemAt`. A voice row still gets its colors from `configure`, which calls
+    // this same helper, so gating here loses nothing.
+    if row?.visualKind == .voice {
+      applyVoiceChromeColors(isMe: isCurrentRowMe)
+    }
     // Only re-style a scrim that exists. A cell with no media has nothing to restyle, and
     // the lazy initializer already reads the current appearance when it does build one.
     _mediaPlaceholderBlurView?.effect = UIBlurEffect(
@@ -11234,6 +11512,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   override func prepareForReuse() {
     super.prepareForReuse()
+    lastTouchPointInCell = nil
     resetTallBubbleInnerContentAnimation()
     clipsToBounds = false
     contentView.clipsToBounds = false
@@ -11887,10 +12166,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         )
         // Frame height = visible plate slice; full content is measured taller and soft-
         // masked when collapsed so expand only grows Y.
-        let agentBodyHeight =
-          metrics.tallToggleVisible
-          ? min(metrics.textHeight, agentBodyMaxHeight)
-          : metrics.textHeight
+        // A live stream can receive its next body measurement one run-loop before the
+        // collection layout installs the matching taller slot. Never give the wrapper a
+        // frame outside the plate during that interval: the next invalidated layout reveals
+        // the remaining text at its newly measured height, while this pass stays contained.
+        let agentBodyHeight = min(metrics.textHeight, agentBodyMaxHeight)
         agentTurnContentView.frame = pixelAlignedRect(
           CGRect(
             x: contentX,
@@ -12848,51 +13128,35 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let count = chatMediaGridImageCount(row)
     guard count > 1 else {
       mediaGridRowKey = nil
-      for tile in mediaGridTileViews {
-        tile.isHidden = true
-        tile.image = nil
-        tile.gestureRecognizers?.forEach { tile.removeGestureRecognizer($0) }
-        tile.isUserInteractionEnabled = false
-      }
+      mediaStackView?.isHidden = true
+      mediaStackView?.configure(count: 0, mode: .deck, aspect: 1.0, resetIndex: true)
       return
     }
 
     let tiles = min(count, chatMediaGridMaxTiles)
-    while mediaGridTileViews.count < tiles {
-      let tile = UIImageView()
-      tile.contentMode = .scaleAspectFill
-      tile.clipsToBounds = true
-      tile.layer.cornerRadius = 4.0
-      tile.layer.cornerCurve = .continuous
-      tile.backgroundColor = UIColor(white: 0.0, alpha: 0.22)
-      mediaContainerView.insertSubview(tile, aboveSubview: mediaImageView)
-      mediaGridTileViews.append(tile)
-    }
+    let stack = ensureMediaStackView()
+    stack.isHidden = false
 
     mediaImageView.isHidden = true
     mediaPrimaryIconView.isHidden = true
-    // Grid tiles need hit-testing; keep the container interactive while the grid is live.
+    // The stack needs hit-testing; keep the container interactive while it is live.
     mediaContainerView.isUserInteractionEnabled = true
     let rowKey = row.messageId ?? row.key
+    // A recycled cell must not open on the picture the *previous* message was
+    // left on, so the index resets whenever the row identity changes.
+    let isNewRow = mediaGridRowKey != rowKey
     mediaGridRowKey = rowKey
-    for (index, tile) in mediaGridTileViews.enumerated() {
-      tile.isHidden = index >= tiles
-      if index < tiles { tile.image = nil }
-      tile.gestureRecognizers?.forEach { tile.removeGestureRecognizer($0) }
-      if index < tiles {
-        tile.isUserInteractionEnabled = true
-        tile.tag = index
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleMediaGridTileTap(_:)))
-        tile.addGestureRecognizer(tap)
-      } else {
-        tile.isUserInteractionEnabled = false
-      }
-    }
+    stack.configure(
+      count: tiles,
+      mode: chatMediaStackMode(row),
+      aspect: ChatMediaStackGeometry.cardAspect(natural: resolvedMediaNaturalSize(for: row)),
+      resetIndex: isNewRow
+    )
 
     for index in 0..<tiles {
       let cacheKey = "\(rowKey)#grid-\(index)" as NSString
       if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
-        mediaGridTileViews[index].image = cached
+        stack.setImage(cached, at: index)
         continue
       }
       // Prefer live sealed blobs; fall back to durable server-persisted thumbs after reopen.
@@ -12900,10 +13164,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         ? row.agentBridgeAttachmentsEnc[index] : nil
       let thumbB64 = index < row.attachmentThumbnailsB64.count
         ? row.attachmentThumbnailsB64[index] : nil
+      // Plain-chat multi-image: each picture has its own uploaded URL and its own
+      // media key. The thumb only shapes the card; this is what fills it.
+      let remoteURL = index < row.attachmentUrls.count ? row.attachmentUrls[index] : nil
+      let remoteKey = index < row.attachmentMediaKeys.count
+        ? row.attachmentMediaKeys[index] : nil
       ChatListCell.bridgeGridDecodeQueue.async { [weak self] in
         var image: UIImage?
         if let blob {
           image = ChatListCell.decodeBridgeGridImage(blob: blob)
+        }
+        if image == nil, let remoteURL, !remoteURL.isEmpty {
+          image = ChatListCell.loadMultiImageCard(
+            remoteURL: remoteURL, mediaKey: (remoteKey?.isEmpty == false) ? remoteKey : nil)
         }
         if image == nil, let thumbB64,
           let data = Data(base64Encoded: thumbB64, options: [.ignoreUnknownCharacters])
@@ -12913,26 +13186,68 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         guard let image else { return }
         ChatListCell.bridgeGridImageCache.setObject(image, forKey: cacheKey)
         DispatchQueue.main.async {
-          guard let self,
-            self.mediaGridRowKey == rowKey,
-            index < self.mediaGridTileViews.count
-          else { return }
-          self.mediaGridTileViews[index].image = image
+          guard let self, self.mediaGridRowKey == rowKey else { return }
+          self.mediaStackView?.setImage(image, at: index)
         }
       }
     }
   }
 
-  @objc private func handleMediaGridTileTap(_ gr: UITapGestureRecognizer) {
-    guard let row, let tile = gr.view as? UIImageView else { return }
-    // Don't open while upload/download overlay is active — cancel path owns the center.
-    if row.shouldShowUploadOverlay || mediaIsDownloading { return }
-    onMediaGridTileTap?(row, tile.tag, tile)
+  /// Built on first use: most cells never carry more than one image, and a stack
+  /// view per cell would be paid for on every row in the chat.
+  private func ensureMediaStackView() -> ChatMediaStackView {
+    if let mediaStackView { return mediaStackView }
+    let stack = ChatMediaStackView()
+    stack.onTap = { [weak self] index, view in
+      guard let self, let row = self.row else { return }
+      // Don't open while upload/download overlay is active — cancel path owns the center.
+      if row.shouldShowUploadOverlay || self.mediaIsDownloading { return }
+      self.onMediaGridTileTap?(row, index, view)
+    }
+    mediaContainerView.insertSubview(stack, aboveSubview: mediaImageView)
+    mediaStackView = stack
+    return stack
   }
 
   /// Public entry for gallery/filmstrip seeding from sealed bridge blobs.
   static func decodeBridgeGridImagePublic(blob: String) -> UIImage? {
     decodeBridgeGridImage(blob: blob)
+  }
+
+  /// One picture of a multi-image message, by its own URL and its own key.
+  /// Synchronous by design: it is already called on `bridgeGridDecodeQueue`,
+  /// alongside the blob decode it stands in for.
+  static func loadMultiImageCard(remoteURL: String, mediaKey: String?) -> UIImage? {
+    let trimmed = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if trimmed.hasPrefix("/"), let image = UIImage(contentsOfFile: trimmed) { return image }
+    if let fileURL = URL(string: trimmed), fileURL.isFileURL,
+      let image = UIImage(contentsOfFile: fileURL.path)
+    {
+      return image
+    }
+    // Same cache slot the hero image uses, keyed on URL *and* key — a signed URL
+    // alone is not a stable identity for the bytes behind it.
+    let cacheKey = chatMediaCacheKey(trimmed, mediaKey: mediaKey)
+    if let cached = chatMediaDiskCacheLoad(cacheKey),
+      let image = UIImage(data: cached)
+    {
+      return image
+    }
+    guard let url = URL(string: trimmed), let data = try? Data(contentsOf: url) else {
+      return nil
+    }
+    // Try decrypted first, then the raw bytes: a stale or absent key must not
+    // leave a permanently blank card.
+    if let decrypted = chatMediaDecryptedDataIfNeeded(data, mediaKey: mediaKey),
+      let image = UIImage(data: decrypted)
+    {
+      chatMediaDiskCacheSave(decrypted, forKey: cacheKey)
+      return image
+    }
+    guard let image = UIImage(data: data) else { return nil }
+    chatMediaDiskCacheSave(data, forKey: cacheKey)
+    return image
   }
 
   /// Open one sealed arte1 image blob into a tile-sized UIImage. Returns nil when the
@@ -12978,6 +13293,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   private func updateMediaTransferChrome(for row: ChatListRow) {
+    let hidesLocalGifTransfer = row.isMe && row.messageType == "gif"
+    if hidesLocalGifTransfer {
+      mediaProgressOverlayView.isHidden = true
+      mediaProgressRingView.isHidden = true
+      mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
+      mediaProgressRingView.setDownloadState(
+        needsDownload: false, isDownloading: false, progress: nil)
+      mediaProgressSpinner.stopAnimating()
+      mediaProgressSizeLabel.isHidden = true
+      mediaProgressSizeLabel.text = nil
+      mediaPrimaryIconView.isHidden = true
+      return
+    }
+
     let hasActiveTransfer = row.shouldShowUploadOverlay || mediaIsDownloading
     mediaProgressOverlayView.backgroundColor = .clear
     mediaProgressOverlayView.isHidden = !hasActiveTransfer
@@ -13504,6 +13833,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           mediaURL: row.mediaUrl ?? row.key,
           quality: .microThumb
         )
+        chatRequestMicroThumbBlur(
+          sharp: thumbImage, cacheKey: "thumb-\(row.key)"
+        ) { [weak self] blurred in
+          guard let self, (self.row?.messageId ?? self.row?.key) == rowKey else { return }
+          self.applyResolvedMediaPreviewImage(
+            blurred,
+            for: row,
+            mediaURL: row.mediaUrl ?? row.key,
+            quality: .microThumb
+          )
+        }
       }
       if let cached = ChatListCell.bridgeGridImageCache.object(forKey: cacheKey) {
         applyResolvedMediaPreviewImage(
@@ -13605,6 +13945,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               mediaURL: row.mediaUrl ?? row.key,
               quality: .microThumb
             )
+            let blurRowKey = row.messageId ?? row.key
+            chatRequestMicroThumbBlur(
+              sharp: thumbnailImage, cacheKey: thumbCacheKey
+            ) { [weak self] blurred in
+              chatMediaImageCache.setObject(blurred, forKey: thumbCacheKey as NSString)
+              guard let self, (self.row?.messageId ?? self.row?.key) == blurRowKey else { return }
+              self.applyResolvedMediaPreviewImage(
+                blurred,
+                for: row,
+                mediaURL: row.mediaUrl ?? row.key,
+                quality: .microThumb
+              )
+            }
             mediaPrimaryIconView.isHidden = true
             chatCellDebugLog(
               chatCellMediaDebugLogs,
@@ -13744,7 +14097,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             chatCellDebugLog(
               chatCellMediaDebugLogs,
               "[ChatMediaLoad] network fetch START msgId=%@ url=%@", row.messageId ?? "-", shortUrl)
-            mediaImageTask = URLSession.shared.dataTask(with: url) {
+            mediaImageTask = VibeHTTP.shared.dataTask(with: url) {
               [weak self] data, response, error in
               if let error {
                 let nsErr = error as NSError
@@ -14294,14 +14647,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     let gridCount = chatMediaGridImageCount(row)
     if gridCount > 1 {
-      let grid = chatMediaGridLayout(count: gridCount, width: width)
-      for (index, tile) in mediaGridTileViews.enumerated() {
-        tile.frame = index < grid.frames.count ? grid.frames[index] : .zero
-      }
+      // Full media canvas: the stack owns its own internal card geometry, and its
+      // height came from `chatMediaStackHeight` in the sizing pass.
+      mediaStackView?.frame = CGRect(x: 0, y: 0, width: width, height: height)
     } else {
-      for tile in mediaGridTileViews {
-        tile.frame = .zero
-      }
+      mediaStackView?.frame = .zero
     }
 
     // Documents place their own transfer affordance: the ring sits on the preview well —
@@ -14673,6 +15023,28 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     let local = contentView.convert(pointInCell, from: self)
     return inlineAttachmentView.frame.contains(local)
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+    lastTouchPointInCell = touches.first?.location(in: self)
+    lastTouchAt = ProcessInfo.processInfo.systemUptime
+    super.touchesBegan(touches, with: event)
+  }
+
+  /// Whether the last touch landed on the media itself rather than anywhere in the row.
+  /// No recent point means open — an interactive subview can swallow the touch, and a
+  /// dead media tap is worse than an over-broad one.
+  func lastTouchWasOnMediaContent() -> Bool {
+    guard let point = lastTouchPointInCell,
+      ProcessInfo.processInfo.systemUptime - lastTouchAt < 2.0
+    else { return true }
+    var regions: [UIView] = [mediaContainerView, inlineAttachmentView]
+    if let stack = mediaStackView { regions.append(stack) }
+    if let preview = _linkPreviewView { regions.append(preview) }
+    for region in regions where !region.isHidden && region.superview != nil {
+      if region.convert(region.bounds, to: self).contains(point) { return true }
+    }
+    return false
   }
 
   func applyVoicePlaybackState(isPlaying: Bool, progress: CGFloat, level: CGFloat) {
@@ -15934,7 +16306,7 @@ final class BubbleTailView: UIView {
   private let tailMaskLayer = CAShapeLayer()
   private let clipMaskLayer = CAShapeLayer()
   private var currentIsMe: Bool = true
-  private var appearance = ChatListAppearance.fallback
+  private var appearance = ChatListAppearance.current
   private var wallpaperSnapshot: CGImage?
   private var wallpaperContainerSize: CGSize = .zero
   private var wallpaperSampleRect: CGRect = .zero

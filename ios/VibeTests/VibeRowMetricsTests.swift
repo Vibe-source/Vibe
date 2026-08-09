@@ -88,6 +88,25 @@ final class VibeRowMetricsTests: XCTestCase {
     ])!
   }
 
+  private func plainAgentTurnRow(
+    _ text: String, isStreaming: Bool, key: String = UUID().uuidString
+  ) -> ChatListRow {
+    ChatListRow(raw: [
+      "kind": "message",
+      "key": key,
+      "message": [
+        "id": key,
+        "text": text,
+        "timestamp": "22:20",
+        "isMe": false,
+        "type": "agent_progress_tree",
+        "isAgentMessage": true,
+        "isStreaming": isStreaming,
+        "agentName": "Vibe AI",
+      ],
+    ])!
+  }
+
   private let rowWidth: CGFloat = 393  // iPhone 16 Pro Max portrait content width
 
   // MARK: The gate
@@ -105,6 +124,39 @@ final class VibeRowMetricsTests: XCTestCase {
     XCTAssertTrue(bubbleUsesAgentTurnContent(row), "fixture no longer models an agent turn")
     XCTAssertTrue(VibeRowMetrics.requiresMainThread(row))
     XCTAssertNil(VibeRowMetrics.height(row: row, rowWidth: rowWidth))
+  }
+
+  func testMultilineAgentProseUsesTheFullReadingWidthWhileStreamingAndSettled() {
+    let text = """
+      1. Understand the customer
+      Ask:
+      • What are you looking for?
+      • Who is it for?
+      """
+    let maxContentWidth: CGFloat = 320
+
+    for isStreaming in [true, false] {
+      let row = plainAgentTurnRow(text, isStreaming: isStreaming)
+      XCTAssertTrue(bubbleUsesAgentTurnContent(row), "fixture no longer models an agent turn")
+      XCTAssertEqual(
+        agentTurnContentWidth(row, maxContentWidth: maxContentWidth),
+        maxContentWidth
+      )
+    }
+  }
+
+  func testShortSingleLineAgentProseCanStillHugItsText() {
+    let maxContentWidth: CGFloat = 320
+    let row = plainAgentTurnRow("No track found", isStreaming: false)
+
+    XCTAssertLessThan(
+      agentTurnContentWidth(row, maxContentWidth: maxContentWidth),
+      maxContentWidth
+    )
+  }
+
+  func testAgentTurnWrapperContainsTransientStreamingOverflow() {
+    XCTAssertTrue(VibeAgentTurnContentView().clipsToBounds)
   }
 
   func testABatchReportsDeferredRowsRatherThanDroppingThem() {

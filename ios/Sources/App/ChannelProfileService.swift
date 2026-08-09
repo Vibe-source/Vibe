@@ -380,7 +380,7 @@ enum ChannelProfileService {
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
     }
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw ChannelProfileServiceError.invalidResponse
     }

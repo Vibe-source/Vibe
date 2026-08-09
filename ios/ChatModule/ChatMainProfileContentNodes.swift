@@ -417,7 +417,7 @@ final class ChatMainProfileMediaCellNode: UIControl {
       return
     }
 
-    let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+    let task = VibeHTTP.shared.dataTask(with: url) { [weak self] data, _, _ in
       guard let self, let data, let image = UIImage(data: data) else { return }
       Self.imageCache.setObject(image, forKey: urlString as NSString)
       DispatchQueue.main.async {

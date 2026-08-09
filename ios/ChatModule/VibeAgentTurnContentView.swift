@@ -40,6 +40,10 @@ final class VibeAgentTurnContentView: UIView {
   override init(frame: CGRect) {
     super.init(frame: frame)
     backgroundColor = .clear
+    // The body owns required-height text/code rows while the chat list owns this wrapper's
+    // manual frame. During a streaming growth tick those two heights can differ for one
+    // layout pass; contain the body until the collection installs the newly measured slot.
+    clipsToBounds = true
     bodyView.translatesAutoresizingMaskIntoConstraints = false
     addSubview(bodyView)
     // The chat-bubble cell positions this wrapper with MANUAL FRAMES (it never turns off

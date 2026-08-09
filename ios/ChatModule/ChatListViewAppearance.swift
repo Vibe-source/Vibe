@@ -30,11 +30,86 @@ enum ChatWallpaperMaskStore {
   /// that upscale, not the source art, was the visible blur.
   private static let maxPixelSize = 1024
 
+  /// Already-rasterised mask, from memory or from disk. Never runs the vector
+  /// renderer, so a caller on the main thread can ask without risking the 0.4–0.9s
+  /// stall a cold render costs (measured on device: `renderAlphaOnly` at the top of
+  /// three separate `[mainhang]` stacks — 0.43s, 0.51s, 0.75s).
+  ///
+  /// The disk tier is what makes a COLD LAUNCH paint the pattern on frame one. Both
+  /// caches used to be `NSCache`, so every launch — and every memory warning, see
+  /// `purge()` — threw away a completely static image and re-derived it from the SVG.
+  /// The first `apply()` therefore missed, painted the bare gradient, and faded the
+  /// pattern in when the off-main decode landed: the reported "solid background first,
+  /// then the wallpaper appears". Reading pre-rendered bytes back is ~2–4ms, which is
+  /// inside one frame, so the miss no longer exists to be seen.
+  static func cachedImage(forKey key: String) -> CGImage? {
+    let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else { return nil }
+    if let hit = cache.object(forKey: normalized as NSString)?.image { return hit }
+    guard let fromDisk = loadFromDisk(key: normalized) else { return nil }
+    store(fromDisk, key: normalized)
+    return fromDisk
+  }
+
+  /// Decode a mask off the main thread and leave it in the cache for the synchronous
+  /// readers. Callers that must paint right now still call `image(forKey:)`; this is
+  /// what turns that call into a cache hit instead of a full-screen vector rasterisation.
+  static func prewarm(
+    key: String, bundles: [Bundle] = [.main], completion: ((Bool) -> Void)? = nil
+  ) {
+    let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else {
+      completion?(false)
+      return
+    }
+    if cache.object(forKey: normalized as NSString) != nil {
+      completion?(true)
+      return
+    }
+    // The render size depends on the screen, which is main-only. Resolve it here — this
+    // call is cheap and usually already on main — so the worker never touches UIScreen.
+    primeScreenPixelSize()
+    prewarmLock.lock()
+    let alreadyRunning = !prewarmingKeys.insert(normalized).inserted
+    prewarmLock.unlock()
+    guard !alreadyRunning else {
+      completion?(false)
+      return
+    }
+    prewarmQueue.async {
+      let startedAt = ProcessInfo.processInfo.systemUptime
+      let image = image(forKey: normalized, bundles: bundles)
+      prewarmLock.lock()
+      prewarmingKeys.remove(normalized)
+      prewarmLock.unlock()
+      NSLog(
+        "[Wallpaper] mask prewarm key=%@ ok=%@ ms=%d (off-main)", normalized,
+        image != nil ? "Y" : "N",
+        Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))
+      completion?(image != nil)
+    }
+  }
+
+  private static let prewarmQueue = DispatchQueue(
+    label: "com.vibe.wallpaper-mask-prewarm", qos: .utility)
+  private static let prewarmLock = NSLock()
+  private static var prewarmingKeys: Set<String> = []
+
   static func image(forKey key: String, bundles: [Bundle] = [.main]) -> CGImage? {
     let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard !normalized.isEmpty else { return nil }
     if let cached = cache.object(forKey: normalized as NSString) {
       return cached.image
+    }
+    if let fromDisk = loadFromDisk(key: normalized) {
+      store(fromDisk, key: normalized)
+      return fromDisk
+    }
+    // Everything past this point rasterises. On the main thread that is the single
+    // longest stall in the app, so say so — a `[mainhang]` stack now has a matching
+    // line naming the key that paid for it.
+    if Thread.isMainThread {
+      NSLog("[Wallpaper] MASK RENDER ON MAIN key=%@ (cache miss)", normalized)
     }
 
     // Prefer a vector asset when one exists for this key.
@@ -42,6 +117,7 @@ enum ChatWallpaperMaskStore {
       let image = loadVector(named: vectorName, bundles: bundles)
     {
       store(image, key: normalized)
+      persistToDisk(image, key: normalized)
       return image
     }
 
@@ -66,8 +142,145 @@ enum ChatWallpaperMaskStore {
     return nil
   }
 
+  /// Drops the in-memory copies only. The disk tier survives on purpose: this runs on
+  /// a memory warning, and before the disk tier existed that meant the next chat open
+  /// paid a fresh half-second vector render on the main thread to redraw an image that
+  /// had not changed.
   static func purge() {
     cache.removeAllObjects()
+  }
+
+  // MARK: - Disk tier
+
+  /// `VMSK` + version + width + height, then `width * height` tightly-packed alpha
+  /// bytes. Raw rather than PNG because the point is to beat a decode, not to be
+  /// small: the read is a memcpy into a bitmap context of exactly the shape
+  /// `renderAlphaOnly` produces, so the reconstructed image is byte-identical to a
+  /// freshly rendered one.
+  private static let diskMagic: UInt32 = 0x564D_534B
+  private static let diskVersion: UInt32 = 1
+  private static let diskHeaderBytes = 16
+  /// Screen-resolution alpha masks are ~3.6 MB each and there are only a handful of
+  /// keys, but a user who tours the picker should not accumulate them forever.
+  private static let diskFileLimit = 4
+  private static let diskQueue = DispatchQueue(
+    label: "com.vibe.wallpaper-mask-disk", qos: .utility)
+
+  private static let diskDirectory: URL? = {
+    guard
+      let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    else { return nil }
+    let directory = caches.appendingPathComponent("WallpaperMasks", isDirectory: true)
+    try? FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true)
+    return directory
+  }()
+
+  private static func diskURL(key: String) -> URL? {
+    // Keys are internal identifiers ("doodles", "music2"), but a path component built
+    // from an untrusted string is a traversal waiting to happen.
+    let safe = key.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    guard !safe.isEmpty else { return nil }
+    return diskDirectory?.appendingPathComponent("\(safe).vibemask8", isDirectory: false)
+  }
+
+  private static func loadFromDisk(key: String) -> CGImage? {
+    guard let url = diskURL(key: key),
+      let data = try? Data(contentsOf: url),
+      data.count > diskHeaderBytes
+    else { return nil }
+
+    let header: (UInt32, UInt32, Int, Int) = data.withUnsafeBytes { raw in
+      (
+        UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self)),
+        UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 4, as: UInt32.self)),
+        Int(UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 8, as: UInt32.self))),
+        Int(UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 12, as: UInt32.self)))
+      )
+    }
+    let (magic, version, width, height) = header
+    guard magic == diskMagic, version == diskVersion,
+      width > 0, height > 0,
+      data.count == diskHeaderBytes + width * height,
+      let context = alphaContext(width: width, height: height),
+      let destination = context.data
+    else { return nil }
+
+    data.withUnsafeBytes { raw in
+      guard let base = raw.baseAddress else { return }
+      // `alphaContext` asks for `bytesPerRow == width`, so the stored bytes are already
+      // in the context's layout and this is one flat copy rather than a row loop.
+      memcpy(destination, base.advanced(by: diskHeaderBytes), width * height)
+    }
+    return context.makeImage()
+  }
+
+  private static func persistToDisk(_ image: CGImage, key: String) {
+    guard let url = diskURL(key: key),
+      image.bitsPerPixel == 8,
+      let pixels = image.dataProvider?.data as Data?
+    else { return }
+    let width = image.width
+    let height = image.height
+    let bytesPerRow = image.bytesPerRow
+    guard width > 0, height > 0, bytesPerRow >= width,
+      pixels.count >= bytesPerRow * height
+    else { return }
+
+    diskQueue.async {
+      var out = Data(capacity: diskHeaderBytes + width * height)
+      for value in [diskMagic, diskVersion, UInt32(width), UInt32(height)] {
+        withUnsafeBytes(of: value.littleEndian) { out.append(contentsOf: $0) }
+      }
+      if bytesPerRow == width {
+        out.append(pixels.prefix(width * height))
+      } else {
+        // Rows can be padded for alignment; the file format is tightly packed so that
+        // the read side is a single memcpy.
+        for row in 0..<height {
+          let start = row * bytesPerRow
+          out.append(pixels[start..<(start + width)])
+        }
+      }
+      do {
+        try out.write(to: url, options: .atomic)
+        NSLog("[Wallpaper] mask persisted key=%@ %dx%d", key, width, height)
+      } catch {
+        NSLog("[Wallpaper] mask persist failed key=%@ err=%@", key, "\(error)")
+      }
+      pruneDisk()
+    }
+  }
+
+  private static func pruneDisk() {
+    guard let directory = diskDirectory,
+      let entries = try? FileManager.default.contentsOfDirectory(
+        at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+    else { return }
+    guard entries.count > diskFileLimit else { return }
+    let byAge = entries.sorted {
+      let lhs =
+        (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
+        .contentModificationDate ?? .distantPast
+      let rhs =
+        (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?
+        .contentModificationDate ?? .distantPast
+      return lhs > rhs
+    }
+    for stale in byAge.dropFirst(diskFileLimit) {
+      try? FileManager.default.removeItem(at: stale)
+    }
+  }
+
+  private static func alphaContext(width: Int, height: Int) -> CGContext? {
+    CGContext(
+      data: nil,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: width,
+      space: CGColorSpaceCreateDeviceGray(),
+      bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
   }
 
   private static func store(_ image: CGImage, key: String) {
@@ -121,10 +334,52 @@ enum ChatWallpaperMaskStore {
     return nil
   }
 
+  /// Screen pixel size, cached so `vectorRenderSize` can run on a worker.
+  ///
+  /// `UIScreen.main` is main-actor-only, and it is the ONLY main-thread dependency in
+  /// the whole decode path — everything else is `UIImage(named:)`, `CGContext` and
+  /// `CGImage`, all of which are safe off-main. Caching it once is what lets the
+  /// rasterisation leave the main thread at all.
+  private static let screenPixelSizeLock = NSLock()
+  private static var cachedScreenPixelSize: CGSize?
+
+  static func primeScreenPixelSize() {
+    screenPixelSizeLock.lock()
+    let known = cachedScreenPixelSize != nil
+    screenPixelSizeLock.unlock()
+    guard !known else { return }
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async { primeScreenPixelSize() }
+      return
+    }
+    let size = UIScreen.main.nativeBounds.size
+    screenPixelSizeLock.lock()
+    cachedScreenPixelSize = size
+    screenPixelSizeLock.unlock()
+  }
+
+  private static func screenPixelSize() -> CGSize {
+    screenPixelSizeLock.lock()
+    let cached = cachedScreenPixelSize
+    screenPixelSizeLock.unlock()
+    if let cached { return cached }
+    guard Thread.isMainThread else {
+      // Off-main with nothing primed: fall back to the source size rather than touch
+      // UIScreen. `primeScreenPixelSize` runs before every prewarm, so this is only
+      // reachable if a worker races the very first main-thread turn.
+      return .zero
+    }
+    let size = UIScreen.main.nativeBounds.size
+    screenPixelSizeLock.lock()
+    cachedScreenPixelSize = size
+    screenPixelSizeLock.unlock()
+    return size
+  }
+
   /// Smallest size that still covers the screen, since the mask is drawn
   /// `resizeAspectFill`. Rasterising the vector here means zero upscale.
   private static func vectorRenderSize(for source: CGSize) -> CGSize {
-    let screen = UIScreen.main.nativeBounds.size
+    let screen = screenPixelSize()
     guard source.width > 0, source.height > 0, screen.width > 0, screen.height > 0 else {
       return source
     }
@@ -137,18 +392,14 @@ enum ChatWallpaperMaskStore {
 
   /// 8-bit alpha-only raster: a mask only ever uses its alpha, so storing RGBA
   /// would waste 4x the memory for identical output.
+  ///
+  /// The context shape is shared with `alphaContext` so that a mask rebuilt from the
+  /// disk tier is indistinguishable from one rendered here.
   private static func renderAlphaOnly(_ image: UIImage, size: CGSize) -> CGImage? {
     let width = Int(size.width)
     let height = Int(size.height)
     guard width > 0, height > 0,
-      let context = CGContext(
-        data: nil,
-        width: width,
-        height: height,
-        bitsPerComponent: 8,
-        bytesPerRow: width,
-        space: CGColorSpaceCreateDeviceGray(),
-        bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
+      let context = alphaContext(width: width, height: height)
     else { return nil }
 
     context.translateBy(x: 0, y: size.height)
@@ -215,21 +466,23 @@ enum ChatWallpaperMaskStore {
 /// persist and cross the wire. Integrator maps via `ChatListAppearance.from(draft:)`.
 struct ChatAppearanceDraft: Equatable, Codable {
   var version: Int = 2
-  var mode: String = "dark"  // "dark" | "light" | "system"
+  var mode: String = "system"  // "dark" | "light" | "system"
   var themeId: String? = nil
 
   var wallpaperKind: String = "gradient"  // "builtin" | "solid" | "gradient" | "custom"
-  var wallpaperGradient: [String] = ["#05050B", "#05050B"]
+  /// Empty means "the plate decides". These carried the dark Aurora hexes, so an
+  /// unedited draft overrode the light plate with a dark wallpaper and dark bubbles.
+  var wallpaperGradient: [String] = []
   var wallpaperGradientLocations: [Double] = [0.0, 1.0]
   /// Optional second pair blended in while scrolling (Telegram-style “4 color”).
   var wallpaperScrollGradient: [String] = []
-  var wallpaperPatternMaskKey: String? = "doodles"
-  var wallpaperPatternOpacity: Double = 0.17
+  var wallpaperPatternMaskKey: String? = nil
+  var wallpaperPatternOpacity: Double = -1.0  // < 0 = take the plate's
 
-  var bubbleMeGradient: [String] = ["#8B7CFF", "#08C6B4"]
-  var bubbleThemGradient: [String] = ["#252936", "#1A202C"]
+  var bubbleMeGradient: [String] = []
+  var bubbleThemGradient: [String] = []
 
-  var accent: String = "#2F9E93"
+  var accent: String = ""
   /// Normalized 0…1. Points via `messageCornerRadiusPoints(normalized:)`.
   /// Telegram-matched default: (16pt - 4pt) / 22pt = 6/11.
   var messageCornerRadius: Double = 6.0 / 11.0
@@ -239,7 +492,7 @@ struct ChatAppearanceDraft: Equatable, Codable {
   var textScale: Double = 1.0
   var animationsEnabled: Bool = true
 
-  /// Vibe Aurora defaults (matches `ChatListAppearance.fallback` hex palette).
+  /// Empty colour fields — the theme plate decides.
   static let `default` = ChatAppearanceDraft()
 
   // MARK: Canonical corner mapping (single source of truth)
@@ -261,12 +514,25 @@ struct ChatAppearanceDraft: Equatable, Codable {
   /// Move only that exact legacy default to the screenshot-matched 16pt value; preserve
   /// every deliberately customized slider position.
   static func migratingLegacyDefaults(_ draft: ChatAppearanceDraft) -> ChatAppearanceDraft {
-    guard draft.version < 2 else { return draft }
     var migrated = draft
-    migrated.version = 2
-    if abs(draft.messageCornerRadius - 0.62) < 0.000_001 {
-      migrated.messageCornerRadius = 6.0 / 11.0
+    if migrated.version < 2 {
+      migrated.version = 2
+      if abs(draft.messageCornerRadius - 0.62) < 0.000_001 {
+        migrated.messageCornerRadius = 6.0 / 11.0
+      }
     }
+    guard migrated.version < 3 else { return migrated }
+    migrated.version = 3
+    // Drafts written before colours resolved live carry a baked palette, which pinned the
+    // chat to whatever appearance was active when the draft was first seeded. Where it
+    // still matches a plate it was seeded rather than chosen — clear it so the theme wins.
+    guard chatAppearanceDraftPaletteIsSeeded(migrated) else { return migrated }
+    migrated.wallpaperGradient = []
+    migrated.bubbleMeGradient = []
+    migrated.bubbleThemGradient = []
+    migrated.wallpaperPatternMaskKey = nil
+    migrated.wallpaperPatternOpacity = -1.0
+    migrated.accent = ""
     return migrated
   }
 
@@ -413,47 +679,24 @@ enum ChatAppearanceDraftStore {
     ) {
       UserDefaults.standard.set(data, forKey: storageKey)
     }
+    ChatListAppearance.invalidateBootstrap()
     NotificationCenter.default.post(name: didChangeNotification, object: nil)
   }
 
-  /// Seed from current light/dark preference + theme plate when nothing saved yet.
+  /// Seed from the current light/dark preference + theme plate when nothing is saved.
+  ///
+  /// Carries the *choice* — mode and plate — and no colours. It used to bake the resolved
+  /// palette into the draft, which froze the chat at whichever appearance was active the
+  /// first time it ran: switching to light afterwards left the dark hexes in place and the
+  /// chat kept painting dark. Colours resolve live in `ChatListAppearance.from(draft:)`.
   static func seededDefault() -> ChatAppearanceDraft {
     var draft = ChatAppearanceDraft.default
-    let mode =
+    draft.mode =
       UserDefaults.standard.string(forKey: "vibe.app.appearance")
       ?? AppAppearanceOption.system.rawValue
-    draft.mode = mode
-    let plateRaw =
+    draft.themeId =
       UserDefaults.standard.string(forKey: "vibe.app.themePlate")
       ?? AppThemePlateOption.glacier.rawValue
-    draft.themeId = plateRaw
-
-    let isDark: Bool = {
-      switch mode {
-      case "light": return false
-      case "dark": return true
-      default:
-        return UITraitCollection.current.userInterfaceStyle != .light
-      }
-    }()
-
-    let seeded = ChatListAppearance.from(raw: [
-      "theme": isDark ? "dark" : "light",
-      "backgroundMode": "gradient",
-      "wallpaperOpacity": 1.0,
-      "nativeThemeId": plateRaw,
-      "nativeThemeIsDark": isDark,
-    ])
-    draft.wallpaperGradient = seeded.wallpaperGradient.map(chatAppearanceColorHex)
-    draft.bubbleMeGradient = seeded.bubbleMeGradient.map(chatAppearanceColorHex)
-    draft.bubbleThemGradient = seeded.bubbleThemGradient.map(chatAppearanceColorHex)
-    draft.accent = chatAppearanceColorHex(seeded.accent)
-    draft.wallpaperPatternMaskKey = seeded.wallpaperMaskKey
-    draft.wallpaperPatternOpacity = Double(seeded.wallpaperPatternOpacity)
-    if seeded.messageCornerRadius > 1.0 {
-      let clamped = max(4.0, min(26.0, Double(seeded.messageCornerRadius)))
-      draft.messageCornerRadius = (clamped - 4.0) / 22.0
-    }
     return draft
   }
 
@@ -625,12 +868,31 @@ struct ChatListAppearance {
     self.bubbleThemGradient = bubbleThemGradient
     self.bubbleThemColor = bubbleThemColor
     self.textColorMe = textColorMe
-    self.textColorThem = textColorThem
+    // A theme may not ship unreadable incoming text.
+    //
+    // `from(draft:)` derives this itself and always picks white-on-dark, but
+    // `from(raw:)` takes `textColorThem` straight from the theme payload — so a theme
+    // whose ink was authored against a lighter plate than the one it actually renders
+    // produces dark text on a near-black bubble. That is the reported "some themes I
+    // cannot read anything": incoming bubbles, their timestamps, and the day pills all
+    // disappeared while outgoing bubbles stayed fine.
+    //
+    // Enforced here rather than at either call site because this is the one funnel every
+    // construction path goes through, including any theme added later.
+    let incomingPlate = incomingPlateReference(
+      gradient: bubbleThemGradient, base: bubbleThemColor)
+    let readableThem = readableForeground(textColorThem, on: incomingPlate)
+    self.textColorThem = readableThem
     self.timeColorMe = timeColorMe
-    self.timeColorThem = timeColorThem
-    self.dayTextColor = dayTextColor
+    // The derived colours were built from the ORIGINAL ink by `colorWithAlpha`, so
+    // correcting only `textColorThem` would leave the timestamps and day pills exactly as
+    // unreadable as they were. Re-tint them onto the corrected hue, keeping the alpha each
+    // one was designed with.
+    let themInkChanged = !colorsEqual(readableThem, textColorThem)
+    self.timeColorThem = themInkChanged ? retinted(timeColorThem, to: readableThem) : timeColorThem
+    self.dayTextColor = themInkChanged ? retinted(dayTextColor, to: readableThem) : dayTextColor
     self.dayBackgroundColor = dayBackgroundColor
-    self.dayBorderColor = dayBorderColor
+    self.dayBorderColor = themInkChanged ? retinted(dayBorderColor, to: readableThem) : dayBorderColor
     self.insertionAnimationMode = insertionAnimationMode
     self.accent = accent
     self.messageCornerRadius = messageCornerRadius
@@ -638,39 +900,27 @@ struct ChatListAppearance {
     self.wallpaperScrollGradient = wallpaperScrollGradient
   }
 
-  // Vibe Aurora fallback: near-black base, low-contrast doodle ink, and a
-  // teal-leaning outgoing bubble so missing native payloads do not look Telegram-like.
-  static let fallback = ChatListAppearance(
+  /// Structural defaults handed to the preset resolver — background mode, animation mode,
+  /// accent and corner geometry. Its colours are placeholders: every one is replaced by the
+  /// theme variant. There is no fallback palette in this type; the preset table owns colour.
+  private static let structuralSeed = ChatListAppearance(
     backgroundMode: "gradient",
-    wallpaperGradient: [
-      UIColor(red: 0.0196, green: 0.0196, blue: 0.0431, alpha: 1.0),  // #05050B
-      UIColor(red: 0.0196, green: 0.0196, blue: 0.0431, alpha: 1.0),  // #05050B
-    ],
+    wallpaperGradient: [],
     wallpaperOpacity: 1.0,
-    wallpaperPatternGradient: [
-      UIColor(red: 0.4980, green: 0.3529, blue: 0.9412, alpha: 1.0),  // #7F5AF0
-      UIColor(red: 0.1137, green: 0.7216, blue: 0.6510, alpha: 1.0),  // #1DB8A6
-      UIColor(red: 0.8196, green: 0.4353, blue: 0.3451, alpha: 1.0),  // #D16F58
-    ],
-    wallpaperPatternLocations: [0.0, 0.50, 1.0],
-    wallpaperPatternOpacity: 0.17,
-    wallpaperMaskKey: "doodles",
-    bubbleMeGradient: [
-      UIColor(red: 0.5451, green: 0.4863, blue: 1.0, alpha: 1.0),  // #8B7CFF
-      UIColor(red: 0.0314, green: 0.7765, blue: 0.7059, alpha: 1.0),  // #08C6B4
-    ],
-    bubbleThemGradient: [
-      UIColor(red: 0.1451, green: 0.1608, blue: 0.2118, alpha: 1.0),  // #252936
-      UIColor(red: 0.1020, green: 0.1255, blue: 0.1725, alpha: 1.0),  // #1A202C
-    ],
-    bubbleThemColor: UIColor(red: 0.1451, green: 0.1608, blue: 0.2118, alpha: 1.0),
-    textColorMe: .white,
-    textColorThem: UIColor(white: 0.94, alpha: 1.0),
-    timeColorMe: UIColor(white: 1.0, alpha: 0.68),
-    timeColorThem: UIColor(white: 1.0, alpha: 0.52),
-    dayTextColor: UIColor(white: 0.95, alpha: 0.88),
-    dayBackgroundColor: UIColor(red: 0.0706, green: 0.0824, blue: 0.1255, alpha: 0.74),
-    dayBorderColor: UIColor(white: 1.0, alpha: 0.14),
+    wallpaperPatternGradient: [],
+    wallpaperPatternLocations: [],
+    wallpaperPatternOpacity: 0.0,
+    wallpaperMaskKey: nil,
+    bubbleMeGradient: [],
+    bubbleThemGradient: [],
+    bubbleThemColor: .clear,
+    textColorMe: .clear,
+    textColorThem: .clear,
+    timeColorMe: .clear,
+    timeColorThem: .clear,
+    dayTextColor: .clear,
+    dayBackgroundColor: .clear,
+    dayBorderColor: .clear,
     insertionAnimationMode: 2,
     accent: brandAccentFallback,
     messageCornerRadius: ChatAppearanceDraft.defaultMessageCornerRadiusPoints,
@@ -678,10 +928,91 @@ struct ChatListAppearance {
     wallpaperScrollGradient: []
   )
 
-  static func from(raw: [String: Any]?) -> ChatListAppearance {
-    guard let raw else {
-      return .fallback
+  /// The palette for a theme plate in light or dark, straight from the preset table.
+  ///
+  /// The one colour source in the app. Unknown or missing plate resolves to the default
+  /// plate rather than to a literal, so light mode can never render a dark constant.
+  static func plate(themeId: String?, isDark: Bool) -> ChatListAppearance {
+    let trimmed = themeId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let ids = [trimmed, AppThemePlateOption.glacier.rawValue]
+    for id in ids where !id.isEmpty {
+      let raw: [String: Any] = [
+        "nativeThemeId": id,
+        "nativeThemeIsDark": isDark,
+        "backgroundMode": "gradient",
+        "wallpaperOpacity": 1.0,
+      ]
+      if let resolved = nativePresetAppearance(from: raw, fallback: structuralSeed) {
+        return resolved
+      }
     }
+    return structuralSeed
+  }
+
+  /// The surface colour under the transcript. Always a theme colour, never a literal.
+  var wallpaperBase: UIColor {
+    wallpaperGradient.first ?? bubbleThemColor
+  }
+
+  /// The live appearance: the saved theme resolved against the app's effective light/dark.
+  /// There is no fallback palette — every surface starts from the real theme.
+  static var current: ChatListAppearance {
+    bootstrap(systemStyle: resolvedSystemStyle())
+  }
+
+  private static var bootstrapCache: (style: UIUserInterfaceStyle, value: ChatListAppearance)?
+  private static var lastKnownSystemStyle: UIUserInterfaceStyle = .unspecified
+  private static let bootstrapLock = NSLock()
+
+  /// The app's effective light/dark. The key window carries the explicit Light/Dark
+  /// preference as `overrideUserInterfaceStyle`; `UITraitCollection.current` does not, so
+  /// reading it made the first paint disagree with the appearance that landed after it.
+  /// Main thread reads live and records it; other threads reuse that record.
+  static func resolvedSystemStyle() -> UIUserInterfaceStyle {
+    guard Thread.isMainThread else {
+      bootstrapLock.lock()
+      defer { bootstrapLock.unlock() }
+      return lastKnownSystemStyle
+    }
+    let windows = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap(\.windows)
+    let window = windows.first(where: \.isKeyWindow) ?? windows.first
+    var live = window?.traitCollection.userInterfaceStyle ?? .unspecified
+    if live == .unspecified {
+      live = UIScreen.main.traitCollection.userInterfaceStyle
+    }
+    if live == .unspecified {
+      live = UITraitCollection.current.userInterfaceStyle
+    }
+    bootstrapLock.lock()
+    lastKnownSystemStyle = live
+    bootstrapLock.unlock()
+    return live
+  }
+
+  static func bootstrap(systemStyle: UIUserInterfaceStyle) -> ChatListAppearance {
+    bootstrapLock.lock()
+    if let cached = bootstrapCache, cached.style == systemStyle {
+      bootstrapLock.unlock()
+      return cached.value
+    }
+    bootstrapLock.unlock()
+    let resolved = from(draft: ChatAppearanceDraftStore.current, systemStyle: systemStyle)
+    bootstrapLock.lock()
+    bootstrapCache = (systemStyle, resolved)
+    bootstrapLock.unlock()
+    return resolved
+  }
+
+  static func invalidateBootstrap() {
+    bootstrapLock.lock()
+    bootstrapCache = nil
+    bootstrapLock.unlock()
+  }
+
+  static func from(raw: [String: Any]?) -> ChatListAppearance {
+    guard let raw else { return .current }
 
     // Versioned editor drafts take precedence over nativeThemeId presets.
     let version =
@@ -696,18 +1027,18 @@ struct ChatListAppearance {
         } else if let theme = (raw["theme"] as? String)?.lowercased() {
           isDark = theme != "light"
         } else {
-          isDark = true
+          isDark = resolvedSystemStyle() != .light
         }
         draft.mode = isDark ? "dark" : "light"
       }
       return from(draft: draft)
     }
 
-    if let nativeResolved = nativePresetAppearance(from: raw, fallback: .fallback) {
+    if let nativeResolved = nativePresetAppearance(from: raw, fallback: .current) {
       return nativeResolved
     }
 
-    let fallback = ChatListAppearance.fallback
+    let fallback = ChatListAppearance.current
     let mode = (raw["backgroundMode"] as? String) ?? fallback.backgroundMode
     let gradientStrings = raw["wallpaperGradient"] as? [String]
     let patternGradientStrings = raw["wallpaperPatternGradient"] as? [String]
@@ -789,17 +1120,23 @@ struct ChatListAppearance {
   /// Map a hex-string `ChatAppearanceDraft` into the runtime `UIColor` model.
   /// Applies the canonical corner mapping and carries accent + scroll gradient.
   static func from(draft: ChatAppearanceDraft) -> ChatListAppearance {
-    let fallback = ChatListAppearance.fallback
+    from(draft: draft, systemStyle: resolvedSystemStyle())
+  }
+
+  /// `systemStyle` resolves `mode == "system"`. It used to resolve to dark unconditionally,
+  /// which is why a light-mode user saw a dark chat: "system" is the default mode.
+  static func from(
+    draft: ChatAppearanceDraft, systemStyle: UIUserInterfaceStyle
+  ) -> ChatListAppearance {
     let modeLower = draft.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let isDark: Bool = {
       switch modeLower {
       case "light": return false
       case "dark": return true
-      default:
-        // "system" / unknown — prefer dark Aurora until traits are applied upstream.
-        return true
+      default: return systemStyle != .light
       }
     }()
+    let fallback = plate(themeId: draft.themeId, isDark: isDark)
 
     // Seed from a native preset when themeId is set; draft fields then override.
     var base = fallback
@@ -857,14 +1194,14 @@ struct ChatListAppearance {
       }
     }()
 
-    let maskKey =
-      draft.wallpaperPatternMaskKey
-      ?? (draft.wallpaperKind == "builtin" ? base.wallpaperMaskKey : draft.wallpaperPatternMaskKey)
-
-    let patternOpacity = CGFloat(draft.wallpaperPatternOpacity)
-    let textColorMe: UIColor = isDark ? .white : UIColor(white: 0.08, alpha: 1.0)
-    let textColorThem: UIColor =
-      isDark ? UIColor(white: 0.94, alpha: 1.0) : UIColor(white: 0.08, alpha: 1.0)
+    let maskKey = draft.wallpaperPatternMaskKey ?? base.wallpaperMaskKey
+    // Negative means the draft never set one — take the plate's, so the pattern follows
+    // the theme instead of being pinned to whatever it was when the draft was seeded.
+    let patternOpacity =
+      draft.wallpaperPatternOpacity < 0
+      ? base.wallpaperPatternOpacity : CGFloat(draft.wallpaperPatternOpacity)
+    let textColorMe = base.textColorMe
+    let textColorThem = base.textColorThem
     let dayPlateBase = resolvedDayPlateBase(
       bubbleThemColor: bubbleThemColor,
       wallpaperGradient: wallpaperGradient,
@@ -955,7 +1292,7 @@ struct ChatListAppearance {
   }
 
   var wallpaperAnchorColor: UIColor {
-    let wallFirst = wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
+    let wallFirst = wallpaperBase
     let wallLast = wallpaperGradient.last ?? wallFirst
     return blendColor(wallFirst, with: wallLast, amount: 0.42)
   }
@@ -1292,6 +1629,26 @@ private func nativePresetAppearance(
   )
 }
 
+/// True when the draft's colours are exactly some plate variant's — i.e. they were seeded
+/// by the old `seededDefault`, not picked by the user. Used once, by the v3 migration.
+private func chatAppearanceDraftPaletteIsSeeded(_ draft: ChatAppearanceDraft) -> Bool {
+  func same(_ lhs: [String], _ rhs: [String]) -> Bool {
+    lhs.map { $0.uppercased() } == rhs.map { $0.uppercased() }
+  }
+  for option in AppThemePlateOption.allCases {
+    guard let preset = nativePreset(for: option.rawValue) else { continue }
+    for variant in [preset.light, preset.dark] {
+      if same(draft.wallpaperGradient, variant.backgroundGradient),
+        same(draft.bubbleMeGradient, variant.bubbleMeGradient),
+        same(draft.bubbleThemGradient, variant.bubbleThemGradient)
+      {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 private func nativePreset(for id: String) -> NativeThemePreset? {
   switch id {
   case "glacier":
@@ -1553,7 +1910,7 @@ private func resolvedDayPlateBase(
   wallpaperGradient: [UIColor],
   isDark: Bool
 ) -> UIColor {
-  let wallFirst = wallpaperGradient.first ?? (isDark ? UIColor.black : UIColor.white)
+  let wallFirst = wallpaperGradient.first ?? bubbleThemColor
   let wallLast = wallpaperGradient.last ?? wallFirst
   let wallpaperAnchor = blendColor(wallFirst, with: wallLast, amount: 0.38)
   return blendColor(bubbleThemColor, with: wallpaperAnchor, amount: isDark ? 0.14 : 0.08)
@@ -1600,6 +1957,60 @@ private func isDarkColor(_ color: UIColor) -> Bool {
   guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return true }
   let luminance = 0.299 * r + 0.587 * g + 0.114 * b
   return luminance < 0.5
+}
+
+/// The plate incoming text is actually drawn on.
+///
+/// Mirrors `ChatListAppearance.incomingBasePlateColor`, which cannot be used from `init`
+/// because it is a computed property on the very value being built. `wallpaperPlateColor`
+/// darkens this further for the them side, so judging contrast against this reference is
+/// conservative in the right direction: the real plate is never lighter.
+private func incomingPlateReference(gradient: [UIColor], base: UIColor) -> UIColor {
+  blendColor(gradient.first ?? base, with: gradient.last ?? base, amount: 0.5)
+}
+
+/// WCAG AA for body text. Below this, ink on a plate stops being text and becomes texture.
+private let minimumIncomingTextContrast: CGFloat = 4.5
+
+/// Returns `ink` when it is legible on `plate`, otherwise the nearest legible replacement.
+///
+/// Only two candidates, deliberately: white and near-black. A theme's ink is a design
+/// choice and is left alone whenever it clears the bar; when it does not, the answer that
+/// preserves the theme's intent least badly is the one that maximises contrast, not a
+/// nudged version of a colour that was already wrong.
+private func readableForeground(_ ink: UIColor, on plate: UIColor) -> UIColor {
+  guard contrastRatio(ink, plate) < minimumIncomingTextContrast else { return ink }
+  let white = UIColor.white
+  let nearBlack = UIColor(white: 0.08, alpha: 1.0)
+  return contrastRatio(white, plate) >= contrastRatio(nearBlack, plate) ? white : nearBlack
+}
+
+/// `color`'s alpha carried onto `hue`'s RGB — for the timestamp and day-pill inks, which
+/// are the primary ink at a designed opacity and must follow it when it is corrected.
+private func retinted(_ color: UIColor, to hue: UIColor) -> UIColor {
+  var sourceRed: CGFloat = 0
+  var sourceGreen: CGFloat = 0
+  var sourceBlue: CGFloat = 0
+  var alpha: CGFloat = 1.0
+  guard
+    color.getRed(&sourceRed, green: &sourceGreen, blue: &sourceBlue, alpha: &alpha)
+  else { return hue }
+  var r: CGFloat = 0
+  var g: CGFloat = 0
+  var b: CGFloat = 0
+  var hueAlpha: CGFloat = 0
+  guard hue.getRed(&r, green: &g, blue: &b, alpha: &hueAlpha) else { return hue }
+  return UIColor(red: r, green: g, blue: b, alpha: alpha)
+}
+
+private func colorsEqual(_ lhs: UIColor, _ rhs: UIColor) -> Bool {
+  var lr: CGFloat = 0, lg: CGFloat = 0, lb: CGFloat = 0, la: CGFloat = 0
+  var rr: CGFloat = 0, rg: CGFloat = 0, rb: CGFloat = 0, ra: CGFloat = 0
+  guard lhs.getRed(&lr, green: &lg, blue: &lb, alpha: &la),
+    rhs.getRed(&rr, green: &rg, blue: &rb, alpha: &ra)
+  else { return false }
+  return abs(lr - rr) < 0.001 && abs(lg - rg) < 0.001 && abs(lb - rb) < 0.001
+    && abs(la - ra) < 0.001
 }
 
 private func contrastRatio(_ c1: UIColor, _ c2: UIColor) -> CGFloat {
@@ -2333,9 +2744,22 @@ final class ChatAppearanceLivePreview: UIView {
         && self.tokens.wallpaperPatternOpacity > 0.001
         && (self.tokens.wallpaperMaskKey?.isEmpty == false)
 
+      // Cache-only on main — a miss here would rasterise a full-screen vector inside a
+      // CATransaction. Decode off-main and re-render when it lands.
+      if canShowPattern, let maskKey = self.tokens.wallpaperMaskKey,
+        ChatWallpaperMaskStore.cachedImage(forKey: maskKey) == nil
+      {
+        ChatWallpaperMaskStore.prewarm(key: maskKey) { [weak self] ok in
+          guard ok else { return }
+          DispatchQueue.main.async {
+            guard let self, self.tokens.wallpaperMaskKey == maskKey else { return }
+            self.render(animated: false)
+          }
+        }
+      }
       if canShowPattern,
         let maskKey = self.tokens.wallpaperMaskKey,
-        let mask = ChatWallpaperMaskStore.image(forKey: maskKey)
+        let mask = ChatWallpaperMaskStore.cachedImage(forKey: maskKey)
       {
         self.patternLayer.colors = self.tokens.wallpaperPatternGradient.map(\.cgColor)
         self.patternLayer.locations = self.tokens.wallpaperPatternLocations

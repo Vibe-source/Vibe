@@ -43,6 +43,8 @@ struct ChatGifSelection {
     let previewUrl: String
     let width: Int
     let height: Int
+    /// Already-decoded/cached GIF bytes when available (cell image, cache, or local file).
+    let localData: Data?
 }
 
 protocol ChatGifPanelViewDelegate: AnyObject {
@@ -76,34 +78,41 @@ private enum ChatGifPanelTab: Int, CaseIterable {
 
 private struct ChatGifQuickFilter {
     let id: String
-    let title: String
+    /// SF Symbol name (outline); rendered as a muted template image.
+    let symbolName: String
     let query: String
 }
 
+/// Standard Unicode emoji groups. Replaced an emotion taxonomy that could only ever hold a
+/// hand-picked sample.
 private enum ChatEmojiCategory: String, CaseIterable {
     case recent
     case smileys
-    case love
-    case gestures
-    case party
-    case sad
-    case angry
-    case neutral
+    case people
+    case nature
+    case food
+    case activity
+    case travel
+    case objects
+    case symbols
+    case flags
 
     static let browseCases: [ChatEmojiCategory] = [
-        .smileys, .love, .gestures, .party, .sad, .angry, .neutral,
+        .smileys, .people, .nature, .food, .activity, .travel, .objects, .symbols, .flags,
     ]
 
     var title: String {
         switch self {
         case .recent: return "Recently Used"
-        case .smileys: return "Kawaii Emoji"
-        case .love: return "Love"
-        case .gestures: return "Hands"
-        case .party: return "Party"
-        case .sad: return "Sad"
-        case .angry: return "Angry"
-        case .neutral: return "Neutral"
+        case .smileys: return "Smileys & Emotion"
+        case .people: return "People & Body"
+        case .nature: return "Animals & Nature"
+        case .food: return "Food & Drink"
+        case .activity: return "Activity"
+        case .travel: return "Travel & Places"
+        case .objects: return "Objects"
+        case .symbols: return "Symbols"
+        case .flags: return "Flags"
         }
     }
 
@@ -111,13 +120,113 @@ private enum ChatEmojiCategory: String, CaseIterable {
         switch self {
         case .recent: return "🕘"
         case .smileys: return "🙂"
-        case .love: return "♡"
-        case .gestures: return "👍"
-        case .party: return "🎉"
-        case .sad: return "🥹"
-        case .angry: return "😠"
-        case .neutral: return "😐"
+        case .people: return "👍"
+        case .nature: return "🐻"
+        case .food: return "🍔"
+        case .activity: return "⚽️"
+        case .travel: return "✈️"
+        case .objects: return "💡"
+        case .symbols: return "❤️"
+        case .flags: return "🏳️"
         }
+    }
+
+    /// Scalar ranges per group, approximated by Unicode block.
+    var scalarRanges: [ClosedRange<UInt32>] {
+        switch self {
+        case .recent, .flags: return []
+        case .smileys: return [0x1F600...0x1F64F, 0x1F910...0x1F93A, 0x1F970...0x1F97A,
+                               0x1FAE0...0x1FAE8, 0x2639...0x263A]
+        case .people: return [0x1F440...0x1F450, 0x1F464...0x1F487, 0x1F574...0x1F575,
+                              0x1F645...0x1F64F, 0x1F9B0...0x1F9DF, 0x1FAF0...0x1FAF8,
+                              0x261D...0x261D, 0x270A...0x270D]
+        case .nature: return [0x1F400...0x1F43F, 0x1F980...0x1F9AE, 0x1F330...0x1F344,
+                              0x1F998...0x1F9AE, 0x1F41A...0x1F43F, 0x2600...0x2604]
+        case .food: return [0x1F345...0x1F37F, 0x1F950...0x1F96F, 0x1F32D...0x1F32F]
+        case .activity: return [0x1F380...0x1F3AF, 0x1F930...0x1F93E, 0x26BD...0x26BE,
+                                0x1F3C0...0x1F3CF]
+        case .travel: return [0x1F680...0x1F6C5, 0x1F3E0...0x1F3F0, 0x1F5FA...0x1F5FF,
+                              0x2708...0x2708]
+        case .objects: return [0x1F4A0...0x1F4FF, 0x1F510...0x1F5D4, 0x1F9F0...0x1F9FF,
+                               0x231A...0x231B]
+        case .symbols: return [0x2190...0x21FF, 0x2700...0x27BF, 0x1F300...0x1F32C,
+                               0x1F500...0x1F50F, 0x2764...0x2764, 0x1F493...0x1F49F,
+                               0x0023...0x0023, 0x2049...0x2049]
+        }
+    }
+}
+
+/// Every emoji this device can draw, from Unicode. Search text comes from
+/// `properties.name`; unrenderable scalars are dropped rather than shown as tofu.
+private enum ChatEmojiCatalogBuilder {
+    static func build() -> [ChatEmojiEntry] {
+        var seen = Set<String>()
+        var entries: [ChatEmojiEntry] = []
+
+        for category in ChatEmojiCategory.browseCases where category != .flags {
+            for range in category.scalarRanges {
+                for raw in range {
+                    guard let scalar = Unicode.Scalar(raw) else { continue }
+                    let properties = scalar.properties
+                    guard properties.isEmoji else { continue }
+                    // Without the selector these draw as monochrome text glyphs.
+                    let value =
+                        properties.isEmojiPresentation
+                        ? String(scalar) : String(scalar) + "\u{FE0F}"
+                    guard !seen.contains(value), isRenderable(value) else { continue }
+                    seen.insert(value)
+                    entries.append(
+                        ChatEmojiEntry(
+                            value: value,
+                            searchText: (properties.name ?? "").lowercased(),
+                            category: category
+                        ))
+                }
+            }
+        }
+
+        entries.append(contentsOf: flagEntries(excluding: &seen))
+        return entries
+    }
+
+    /// Flags are regional-indicator pairs, so they come from region codes, not a range.
+    private static func flagEntries(excluding seen: inout Set<String>) -> [ChatEmojiEntry] {
+        let base: UInt32 = 0x1F1E6
+        let scalarA = Unicode.Scalar("A").value
+        var entries: [ChatEmojiEntry] = []
+        for region in Locale.Region.isoRegions {
+            let code = region.identifier
+            guard code.count == 2 else { continue }
+            var value = ""
+            var valid = true
+            for character in code.uppercased().unicodeScalars {
+                guard character.value >= scalarA, character.value <= scalarA + 25,
+                    let indicator = Unicode.Scalar(base + (character.value - scalarA))
+                else {
+                    valid = false
+                    break
+                }
+                value.unicodeScalars.append(indicator)
+            }
+            guard valid, !seen.contains(value), isRenderable(value) else { continue }
+            seen.insert(value)
+            let name = Locale.current.localizedString(forRegionCode: code) ?? code
+            entries.append(
+                ChatEmojiEntry(
+                    value: value,
+                    searchText: "\(name.lowercased()) flag \(code.lowercased())",
+                    category: .flags
+                ))
+        }
+        return entries
+    }
+
+    /// Tofu filter: does the emoji font have a glyph for every scalar?
+    private static func isRenderable(_ value: String) -> Bool {
+        let font = CTFontCreateWithName("AppleColorEmoji" as CFString, 16, nil)
+        var characters = Array(value.utf16)
+        var glyphs = [CGGlyph](repeating: 0, count: characters.count)
+        return CTFontGetGlyphsForCharacters(font, &characters, &glyphs, characters.count)
     }
 }
 
@@ -130,6 +239,39 @@ private struct ChatEmojiEntry: Hashable {
 private struct ChatEmojiSection {
     let title: String
     let items: [ChatEmojiEntry]
+}
+
+/// `safeAreaInsets` is zeroed on both bars below for the same reason: a bottom bar inherits
+/// the window's home-indicator inset and reserves room for it *inside itself*, which is the
+/// extra edge that pushed this chrome out of view. The panel positions these itself.
+private final class FloatingTabBar: UITabBar {
+    override var safeAreaInsets: UIEdgeInsets { .zero }
+}
+
+private final class ChatGifRecentCell: UICollectionViewCell {
+    static let reuseIdentifier = "ChatGifRecentCell"
+    let imageView = UIImageView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        imageView.layer.cornerRadius = 10
+        imageView.layer.cornerCurve = .continuous
+        contentView.addSubview(imageView)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        imageView.frame = contentView.bounds
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        imageView.image = nil
+    }
 }
 
 private final class ChatGifPanelEmojiCell: UICollectionViewCell {
@@ -197,27 +339,28 @@ private final class ChatGifPanelEmojiHeaderView: UICollectionReusableView {
     }
 }
 
-private final class FloatingTabBar: UITabBar {
-    override var safeAreaInsets: UIEdgeInsets { .zero }
-}
-
 final class ChatGifPanelView: UIView {
     weak var delegate: ChatGifPanelViewDelegate?
     var onPreferredHeightChange: (() -> Void)?
 
-    private(set) var preferredHeightExpansion: CGFloat = 0
-    private(set) var preferredHeightScaleBoost: CGFloat = 0
+    /// True while the panel's own search field holds focus. Host lifts the bar above the
+    /// search keyboard; panel height stays fixed so the composer is not pushed offscreen.
+    private(set) var isSearchExpanded = false
 
     /// Space above floating tab bar for scroll content (tighter — closer to content).
     private let bottomFloatingInset: CGFloat = 40
-    private let bottomFloatingControlHeight: CGFloat = 32
-    private let bottomFloatingEdgeInset: CGFloat = 4
+    /// Was 32, which the 49pt bar overflowed because the container did not clip.
+    private let bottomFloatingControlHeight: CGFloat = 36
+    /// Was 4. Not from the safe area — that reserves the home-indicator strip inside the
+    /// chrome and pushes it out of view.
+    private let bottomFloatingEdgeInset: CGFloat = 14
     private let topControlsSpacing: CGFloat = 4
     private let stripHeight: CGFloat = 30
     private let searchHeight: CGFloat = 34
     // Total header zone: strip + gap + search + bottom gap
+    /// One row plus breathing room above and below. Was two stacked rows.
     private var headerZoneHeight: CGFloat {
-        6 + stripHeight + topControlsSpacing + searchHeight + 2
+        6 + searchHeight + 8
     }
 
     private var panelVisible = false
@@ -252,6 +395,7 @@ final class ChatGifPanelView: UIView {
     private let glassBackground = UIVisualEffectView(effect: nil)
     // Category strip + search — translateY + fade on content scroll
     private let headerView = UIView()
+    private let headerChromeView = UIVisualEffectView(effect: nil)
     private let topStripScrollView = UIScrollView()
     private let topStripStack = UIStackView()
     private let searchChromeView = UIVisualEffectView(effect: nil)
@@ -262,6 +406,28 @@ final class ChatGifPanelView: UIView {
     private let contentContainerView = UIView()
     private let pagesScrollView = UIScrollView()
     private let mediaContainerView = UIView()
+    /// GIFs the user has sent, above the browse grid. Local files, no network.
+    private lazy var recentsCollectionView: UICollectionView = {
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .horizontal
+        layout.minimumLineSpacing = 6
+        layout.itemSize = CGSize(width: 96, height: 96)
+        layout.sectionInset = UIEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        let view = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        view.backgroundColor = .clear
+        view.showsHorizontalScrollIndicator = false
+        view.register(
+            ChatGifRecentCell.self, forCellWithReuseIdentifier: ChatGifRecentCell.reuseIdentifier)
+        view.register(
+            UICollectionReusableView.self,
+            forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader,
+            withReuseIdentifier: "ChatGifPanelEmptyHeaderView"
+        )
+        view.dataSource = self
+        view.delegate = self
+        return view
+    }()
+    private var recentGifEntries: [ChatGifRecentsStore.Entry] = []
     private let stateLabel = UILabel()
     private let loadingView = UIView()
     private let loadingSpinner = UIActivityIndicatorView(style: .medium)
@@ -271,6 +437,8 @@ final class ChatGifPanelView: UIView {
     private let bottomMaskView = UIView()
     private let bottomMaskGradient = CAGradientLayer()
     // Bottom floating controls
+    /// Clips the bar to a capsule. The original bug was only that this did NOT clip, so
+    /// the 49pt bar painted its background past a 32pt container.
     private let bottomTabBarContainer = UIView()
     private let bottomTabBar = FloatingTabBar()
     private let closeChromeView = UIVisualEffectView(effect: nil)
@@ -310,9 +478,14 @@ final class ChatGifPanelView: UIView {
         glassBackground.layer.cornerRadius = panelCornerRadius
         glassBackground.layer.cornerCurve = .continuous
         glassBackground.layer.maskedCorners = topCorners
+        bottomTabBarContainer.layer.cornerRadius = bottomFloatingControlHeight * 0.5
         closeChromeView.layer.cornerRadius = bottomFloatingControlHeight * 0.5
         closeChromeView.layer.cornerCurve = .continuous
         applyFrameLayout()
+        // The Giphy grid builds its scroll view lazily, so the inset pass at install time
+        // finds nothing. Re-applying on layout catches it; it is idempotent and leaves a
+        // scrolling user alone.
+        updateContentInsets()
     }
 
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
@@ -343,6 +516,7 @@ final class ChatGifPanelView: UIView {
         panelVisible = visible
 
         if visible {
+            reloadRecentGifs()
             applyActiveTabState(animated: false)
             if activeTab == .gifs {
                 installEmbeddedPickerIfNeeded()
@@ -438,10 +612,15 @@ final class ChatGifPanelView: UIView {
         headerView.isUserInteractionEnabled = true
         addSubview(headerView)
 
+        headerChromeView.clipsToBounds = true
+        headerChromeView.layer.cornerRadius = 18
+        headerChromeView.layer.cornerCurve = .continuous
+        headerView.addSubview(headerChromeView)
+
         topStripScrollView.showsHorizontalScrollIndicator = false
         topStripScrollView.alwaysBounceHorizontal = true
         topStripScrollView.backgroundColor = .clear
-        headerView.addSubview(topStripScrollView)
+        headerChromeView.contentView.addSubview(topStripScrollView)
 
         topStripStack.axis = .horizontal
         topStripStack.alignment = .center
@@ -467,7 +646,7 @@ final class ChatGifPanelView: UIView {
         searchChromeView.clipsToBounds = true
         searchChromeView.layer.cornerRadius = 18
         searchChromeView.layer.cornerCurve = .continuous
-        headerView.addSubview(searchChromeView)
+        headerChromeView.contentView.addSubview(searchChromeView)
 
         searchIconView.contentMode = .scaleAspectFit
         searchChromeView.contentView.addSubview(searchIconView)
@@ -522,9 +701,10 @@ final class ChatGifPanelView: UIView {
         ])
         _ = searchIcon  // suppress unused warning
 
-        // ── Bottom floating tab bar + close ──
-        bottomTabBarContainer.backgroundColor = .clear
-        bottomTabBarContainer.clipsToBounds = false
+        // ── Bottom floating tab capsule + close ──
+        bottomTabBarContainer.clipsToBounds = true
+        bottomTabBarContainer.layer.cornerRadius = bottomFloatingControlHeight * 0.5
+        bottomTabBarContainer.layer.cornerCurve = .continuous
         bottomTabBarContainer.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bottomTabBarContainer)
 
@@ -534,6 +714,8 @@ final class ChatGifPanelView: UIView {
         bottomTabBarContainer.addSubview(bottomTabBar)
 
         closeChromeView.clipsToBounds = true
+        closeChromeView.layer.cornerRadius = bottomFloatingControlHeight * 0.5
+        closeChromeView.layer.cornerCurve = .continuous
         closeChromeView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(closeChromeView)
 
@@ -546,9 +728,12 @@ final class ChatGifPanelView: UIView {
             bottomTabBarContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
             bottomTabBarContainer.bottomAnchor.constraint(
                 equalTo: bottomAnchor, constant: -bottomFloatingEdgeInset),
-            bottomTabBarContainer.widthAnchor.constraint(equalToConstant: 200),
-            bottomTabBarContainer.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
+            bottomTabBarContainer.heightAnchor.constraint(
+                equalToConstant: bottomFloatingControlHeight),
+            bottomTabBarContainer.widthAnchor.constraint(equalToConstant: 210),
 
+            // Pinned on all four edges AND height-constrained, so the bar cannot fall back
+            // to its intrinsic height and spill out of the capsule.
             bottomTabBar.leadingAnchor.constraint(
                 equalTo: bottomTabBarContainer.leadingAnchor, constant: -12),
             bottomTabBar.trailingAnchor.constraint(
@@ -556,8 +741,10 @@ final class ChatGifPanelView: UIView {
             bottomTabBar.centerYAnchor.constraint(equalTo: bottomTabBarContainer.centerYAnchor),
 
             closeChromeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            closeChromeView.bottomAnchor.constraint(
-                equalTo: bottomAnchor, constant: -bottomFloatingEdgeInset),
+            // Centred on the capsule rather than pinned to the panel bottom, so the two
+            // read as one row however tall the capsule ends up.
+            closeChromeView.centerYAnchor.constraint(
+                equalTo: bottomTabBarContainer.centerYAnchor),
             closeChromeView.widthAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
             closeChromeView.heightAnchor.constraint(equalToConstant: bottomFloatingControlHeight),
 
@@ -576,9 +763,11 @@ final class ChatGifPanelView: UIView {
         bottomTabBar.items = items
         bottomTabBar.selectedItem = items.first
 
-        let closeConfig = UIImage.SymbolConfiguration(pointSize: 20, weight: .bold)
+        // Plain glyph, not `xmark.circle.fill` — that symbol carries its own filled disc,
+        // which read as a second plate on top of the toolbar's material.
+        let closeConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
         closeButton.setImage(
-            UIImage(systemName: "xmark.circle.fill", withConfiguration: closeConfig),
+            UIImage(systemName: "xmark", withConfiguration: closeConfig),
             for: .normal
         )
         closeButton.tintColor = secondaryTextColor
@@ -594,16 +783,26 @@ final class ChatGifPanelView: UIView {
 
     private func updateContentInsets() {
         let insets = UIEdgeInsets(top: headerZoneHeight, left: 0, bottom: bottomFloatingInset, right: 0)
-        emojiCollectionView.contentInset = insets
-        emojiCollectionView.scrollIndicatorInsets = insets
-        stickerPackPanel.contentScrollView.contentInset = insets
-        stickerPackPanel.contentScrollView.scrollIndicatorInsets = insets
+        applyContentInsets(insets, to: emojiCollectionView)
+        applyContentInsets(insets, to: stickerPackPanel.contentScrollView)
         #if canImport(GiphyUISDK)
         if let pickerView = pickerViewController?.view, let sv = findScrollView(in: pickerView) {
-            sv.contentInset = insets
-            sv.scrollIndicatorInsets = insets
+            applyContentInsets(insets, to: sv)
         }
         #endif
+    }
+
+    /// Setting `contentInset.top` does not move content that is already at rest — the
+    /// offset has to be pinned to `-top` too, or the first rows sit under the header.
+    private func applyContentInsets(_ insets: UIEdgeInsets, to scrollView: UIScrollView) {
+        // Ours is the only top inset; without this the safe area is added on top of it.
+        scrollView.contentInsetAdjustmentBehavior = .never
+        let wasAtTop = scrollView.contentOffset.y <= -scrollView.contentInset.top + 0.5
+        scrollView.contentInset = insets
+        scrollView.verticalScrollIndicatorInsets = insets
+        if wasAtTop, !scrollView.isDragging, !scrollView.isDecelerating {
+            scrollView.contentOffset.y = -insets.top
+        }
     }
 
     /// Frame-based layout — called from layoutSubviews.
@@ -626,11 +825,23 @@ final class ChatGifPanelView: UIView {
             headerView.frame = CGRect(x: 0, y: 0, width: w, height: headerZoneHeight)
             headerView.transform = t
         }
-        let stripFrame = CGRect(x: hInset, y: stripTop, width: w - hInset * 2, height: stripHeight)
-        topStripScrollView.frame = stripFrame
-        let searchY = stripFrame.maxY + topControlsSpacing
+        // One row: search on the left, category chips scrolling beside it. Two stacked
+        // rows made the header a block that pushed content under the composer.
+        let rowHeight = searchHeight
+        headerChromeView.frame = CGRect(
+            x: hInset, y: stripTop, width: max(0, w - hInset * 2), height: rowHeight)
+        let chromeWidth = headerChromeView.bounds.width
+        let searchWidth = isSearchExpanded ? chromeWidth : min(150, chromeWidth * 0.42)
         searchChromeView.frame = CGRect(
-            x: hInset, y: searchY, width: w - hInset * 2, height: searchHeight)
+            x: 0, y: 0, width: searchWidth, height: rowHeight)
+        let stripX = searchChromeView.frame.maxX + topControlsSpacing
+        topStripScrollView.frame = CGRect(
+            x: stripX,
+            y: 0,
+            width: max(0, chromeWidth - stripX),
+            height: rowHeight
+        )
+        topStripScrollView.alpha = isSearchExpanded ? 0 : 1
 
         // Content: full-bleed horizontal pages
         contentContainerView.frame = bounds
@@ -652,6 +863,18 @@ final class ChatGifPanelView: UIView {
             pagesScrollView.contentOffset = CGPoint(x: pageX, y: 0)
             isProgrammaticPageScroll = false
         }
+
+        // Recents ride just under the header on the GIF page; the browse grid keeps the
+        // rest. Hidden entirely when the user has sent nothing.
+        if recentsCollectionView.superview !== mediaContainerView {
+            mediaContainerView.addSubview(recentsCollectionView)
+        }
+        let recentsHeight: CGFloat = 96
+        let showRecents = !recentGifEntries.isEmpty && currentSearchText().isEmpty
+        recentsCollectionView.isHidden = !showRecents
+        recentsCollectionView.frame = CGRect(
+            x: 0, y: headerZoneHeight, width: w, height: showRecents ? recentsHeight : 0)
+        mediaContainerView.bringSubviewToFront(recentsCollectionView)
 
         stateLabel.frame = mediaContainerView.bounds
         loadingView.frame = mediaContainerView.bounds
@@ -680,23 +903,26 @@ final class ChatGifPanelView: UIView {
     private func refreshChrome() {
         let blurStyle: UIBlurEffect.Style =
             isDarkMode ? .systemChromeMaterialDark : .systemChromeMaterialLight
-
         if #available(iOS 26.0, *) {
             let backgroundGlass = UIGlassEffect()
             backgroundGlass.isInteractive = true
             glassBackground.effect = backgroundGlass
+            let headerGlass = UIGlassEffect()
+            headerGlass.isInteractive = true
+            headerChromeView.effect = headerGlass
             searchChromeView.effect = nil
             let closeGlass = UIGlassEffect()
             closeGlass.isInteractive = true
             closeChromeView.effect = closeGlass
         } else {
             glassBackground.effect = UIBlurEffect(style: .systemMaterial)
+            headerChromeView.effect = UIBlurEffect(style: blurStyle)
             searchChromeView.effect = nil
             closeChromeView.effect = UIBlurEffect(style: blurStyle)
         }
 
-        // Very soft transparent search bar
-        searchChromeView.backgroundColor = UIColor.label.withAlphaComponent(0.06)
+        headerChromeView.backgroundColor = UIColor.label.withAlphaComponent(0.06)
+        searchChromeView.backgroundColor = .clear
 
         // Update gradient mask colours to match current background
         let bgColor =
@@ -729,9 +955,8 @@ final class ChatGifPanelView: UIView {
         tabAppearance.compactInlineLayoutAppearance = itemAppearance
 
         bottomTabBar.standardAppearance = tabAppearance
-        if #available(iOS 15.0, *) {
-            bottomTabBar.scrollEdgeAppearance = tabAppearance
-        }
+        bottomTabBar.scrollEdgeAppearance = tabAppearance
+        closeButton.tintColor = secondaryTextColor
     }
 
     private func rebuildSearchChrome() {
@@ -766,7 +991,7 @@ final class ChatGifPanelView: UIView {
         case .gifs:
             for (index, filter) in gifQuickFilters.enumerated() {
                 let button = makeStripButton(
-                    title: filter.title,
+                    symbolName: filter.symbolName,
                     selected: selectedGifFilterID == filter.id,
                     showsAddBadge: false
                 )
@@ -778,17 +1003,23 @@ final class ChatGifPanelView: UIView {
             }
         case .stickers:
             ensureStickerPackSelection()
-            let recentButton = makeStripButton(
-                title: "🕘",
-                selected: stickerShowingRecent,
-                showsAddBadge: false
-            )
-            recentButton.accessibilityLabel = "Recently Used"
-            recentButton.addTarget(
-                self, action: #selector(stickerRecentTapped), for: .touchUpInside)
-            topStripStack.addArrangedSubview(recentButton)
-
             let installedStickerPacks = ChatStickerPackStore.shared.installedPacks
+            // Header shows only what exists. With no packs installed there is nothing to
+            // filter, and a strip of buttons over an empty grid reads as a mock panel.
+            guard !installedStickerPacks.isEmpty else { break }
+
+            if !ChatStickerPackStore.shared.recentStickers.isEmpty {
+                let recentButton = makeStripButton(
+                    title: "🕘",
+                    selected: stickerShowingRecent,
+                    showsAddBadge: false
+                )
+                recentButton.accessibilityLabel = "Recently Used"
+                recentButton.addTarget(
+                    self, action: #selector(stickerRecentTapped), for: .touchUpInside)
+                topStripStack.addArrangedSubview(recentButton)
+            }
+
             for (index, pack) in installedStickerPacks.enumerated() {
                 let button = makeStripButton(
                     title: pack.icon,
@@ -819,20 +1050,36 @@ final class ChatGifPanelView: UIView {
         }
     }
 
-    private func makeStripButton(title: String, selected: Bool, showsAddBadge: Bool) -> UIButton {
+    private func makeStripButton(
+        title: String? = nil,
+        symbolName: String? = nil,
+        selected: Bool,
+        showsAddBadge: Bool
+    ) -> UIButton {
         let button = UIButton(type: .system)
         button.translatesAutoresizingMaskIntoConstraints = false
-        let isEmoji = title.count <= 2
         var config = UIButton.Configuration.plain()
-        config.contentInsets = NSDirectionalEdgeInsets(
-            top: 0, leading: isEmoji ? 6 : 10, bottom: 0, trailing: isEmoji ? 6 : 10)
-        button.configuration = config
-        button.setTitle(title, for: .normal)
-        button.setTitleColor(primaryTextColor, for: .normal)
-        button.titleLabel?.font = .systemFont(
-            ofSize: isEmoji ? 24 : 15,
-            weight: isEmoji ? .regular : .semibold
-        )
+
+        if let symbolName {
+            // Muted outline SF Symbol; selected uses primary tint + chip background.
+            let symbolConfig = UIImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+            config.image = UIImage(systemName: symbolName, withConfiguration: symbolConfig)
+            config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)
+            button.configuration = config
+            button.tintColor = selected ? primaryTextColor : secondaryTextColor
+        } else if let title {
+            let isEmoji = title.count <= 2
+            config.contentInsets = NSDirectionalEdgeInsets(
+                top: 0, leading: isEmoji ? 6 : 10, bottom: 0, trailing: isEmoji ? 6 : 10)
+            button.configuration = config
+            button.setTitle(title, for: .normal)
+            button.setTitleColor(primaryTextColor, for: .normal)
+            button.titleLabel?.font = .systemFont(
+                ofSize: isEmoji ? 24 : 15,
+                weight: isEmoji ? .regular : .semibold
+            )
+        }
+
         button.backgroundColor = selected ? selectedChipColor : .clear
         if activeTab == .emoji {
             button.alpha = 1.0
@@ -930,12 +1177,22 @@ final class ChatGifPanelView: UIView {
     }
 
     /// Category strip + search: translateY up and fade as the active page scrolls.
-    private func updateHeaderForContentOffsetY(_ offsetY: CGFloat) {
-        let progress = min(1, max(0, offsetY / 56))
-        let ty = -progress * 36
-        headerView.transform = CGAffineTransform(translationX: 0, y: ty)
+    ///
+    /// Measured from the inset origin, not raw `contentOffset.y`. A page at rest sits at
+    /// `-contentInset.top`, so the raw offset was already negative before a finger moved —
+    /// the header hid at the wrong time, or never.
+    private func updateHeaderForScroll(_ scrollView: UIScrollView) {
+        let travel = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
+        let progress = min(1, max(0, travel / 56))
+        headerView.transform = CGAffineTransform(translationX: 0, y: -progress * 36)
         headerView.alpha = 1 - progress * 0.92
         headerView.isUserInteractionEnabled = progress < 0.85
+    }
+
+    private func reloadRecentGifs() {
+        recentGifEntries = ChatGifRecentsStore.shared.entries
+        recentsCollectionView.reloadData()
+        setNeedsLayout()
     }
 
     private func applyStickerPanelState() {
@@ -1083,29 +1340,13 @@ final class ChatGifPanelView: UIView {
             selectedStickerPackID, forKey: Self.selectedStickerPackDefaultsKey)
     }
 
-    private func searchFocusedHeightScaleBoost(for tab: ChatGifPanelTab) -> CGFloat {
-        // Rule: search focus expands the panel height (same mechanism for all tabs).
-        switch tab {
-        case .gifs:
-            return 1.05  // ~2× compact base via preferredGifPanelHeight boost path
-        case .stickers:
-            return 0.55
-        case .emoji:
-            return 0.65
-        }
-    }
-
     private func setSearchExpanded(_ expanded: Bool) {
-        let nextExpansion: CGFloat = expanded ? 24 : 0
-        let nextScaleBoost = expanded ? searchFocusedHeightScaleBoost(for: activeTab) : 0
-        guard
-            abs(preferredHeightExpansion - nextExpansion) > 0.5
-                || abs(preferredHeightScaleBoost - nextScaleBoost) > 0.001
-        else {
-            return
+        guard expanded != isSearchExpanded else { return }
+        isSearchExpanded = expanded
+        // Chips yield to the field while typing; height stays fixed (host lifts the bar).
+        UIView.animate(withDuration: 0.22, delay: 0, options: [.beginFromCurrentState]) {
+            self.applyFrameLayout()
         }
-        preferredHeightExpansion = nextExpansion
-        preferredHeightScaleBoost = nextScaleBoost
         onPreferredHeightChange?()
     }
 
@@ -1152,6 +1393,12 @@ final class ChatGifPanelView: UIView {
         }
 
         emojiCollectionView.reloadData()
+        if activeTab == .stickers, ChatStickerPackStore.shared.installedPacks.isEmpty {
+            stateLabel.text = "No sticker packs yet."
+            stateLabel.textColor = secondaryTextColor
+            stateLabel.isHidden = false
+            return
+        }
         let shouldShowEmpty = activeTab == .emoji && emojiSections.allSatisfy(\.items.isEmpty)
         if shouldShowEmpty {
             stateLabel.text =
@@ -1224,14 +1471,18 @@ final class ChatGifPanelView: UIView {
                 )
             }
 
-            switch activeTab {
-            case .emoji:
-                return .emoji
-            case .gifs:
-                return .trendingGifs
-            case .stickers:
-                return .trendingGifs
+            // A quick-filter chip is a search, not a browse.
+            if let filterID = selectedGifFilterID,
+                let filter = gifQuickFilters.first(where: { $0.id == filterID })
+            {
+                return .search(
+                    withQuery: filter.query,
+                    mediaType: .gif,
+                    language: .english,
+                    includeDynamicResults: true
+                )
             }
+            return .trendingGifs
         }
     #endif
 
@@ -1268,6 +1519,8 @@ final class ChatGifPanelView: UIView {
             picker.theme = currentGiphyTheme()
             picker.direction = .vertical
             picker.fixedSizeCells = false
+            // Same rendition as send path so cell image / GPHCache hits are reusable.
+            picker.renditionType = Self.gridGifRendition
             picker.additionalSafeAreaInsets = .zero
             picker.content = resolvedGiphyContent()
 
@@ -1353,14 +1606,46 @@ final class ChatGifPanelView: UIView {
     }
 
     #if canImport(GiphyUISDK)
+        /// Grid + send share this so visible cell / GPHCache bytes match the URL we emit.
+        private static let gridGifRendition: GPHRenditionType = .downsized
+
         private func resolvedPrimaryImage(from images: GPHImages?) -> GPHImage? {
             guard let images else { return nil }
-            if let original = images.original { return original }
+            if let preferred = images.rendition(Self.gridGifRendition) { return preferred }
+            if let downsized = images.downsized { return downsized }
             if let fixedWidth = images.fixedWidth { return fixedWidth }
             if let fixedHeight = images.fixedHeight { return fixedHeight }
-            if let downsized = images.downsized { return downsized }
+            if let original = images.original { return original }
             if let preview = images.preview { return preview }
             if let fixedWidthSmall = images.fixedWidthSmall { return fixedWidthSmall }
+            return nil
+        }
+
+        private func findGPHMediaView(in view: UIView) -> GPHMediaView? {
+            if let mediaView = view as? GPHMediaView { return mediaView }
+            for subview in view.subviews {
+                if let found = findGPHMediaView(in: subview) { return found }
+            }
+            return nil
+        }
+
+        /// Prefer the cell's already-decoded GIF, then exact-URL cache; nil falls back to fetch.
+        private func localGifData(from cell: UICollectionViewCell?, renditionURL: String?) -> Data? {
+            if let cell,
+                let mediaView = findGPHMediaView(in: cell),
+                let yyImage = mediaView.image as? GiphyYYImage,
+                let data = yyImage.animatedImageData,
+                !data.isEmpty
+            {
+                return data
+            }
+            if let renditionURL,
+                let url = URL(string: renditionURL),
+                let cached = GPHCache.shared.cache.cachedResponse(for: URLRequest(url: url)),
+                !cached.data.isEmpty
+            {
+                return cached.data
+            }
             return nil
         }
 
@@ -1421,108 +1706,18 @@ final class ChatGifPanelView: UIView {
     private static let selectedStickerPackDefaultsKey = "chat.gif.panel.selected.sticker.pack"
 
     private let gifQuickFilters: [ChatGifQuickFilter] = [
-        .init(id: "love", title: "♡", query: "love"),
-        .init(id: "like", title: "👍", query: "like"),
-        .init(id: "dislike", title: "👎", query: "dislike"),
-        .init(id: "party", title: "🎉", query: "party"),
-        .init(id: "happy", title: "🙂", query: "happy"),
-        .init(id: "sad", title: "🥲", query: "sad"),
-        .init(id: "angry", title: "😠", query: "angry"),
-        .init(id: "neutral", title: "😐", query: "neutral"),
+        .init(id: "love", symbolName: "heart", query: "love"),
+        .init(id: "like", symbolName: "hand.thumbsup", query: "like"),
+        .init(id: "dislike", symbolName: "hand.thumbsdown", query: "dislike"),
+        .init(id: "party", symbolName: "party.popper", query: "party"),
+        .init(id: "happy", symbolName: "face.smiling", query: "happy"),
+        .init(id: "sad", symbolName: "cloud.rain", query: "sad"),
+        .init(id: "angry", symbolName: "flame", query: "angry"),
+        .init(id: "neutral", symbolName: "minus.circle", query: "neutral"),
     ]
 
-    private let emojiCatalog: [ChatEmojiEntry] = [
-        .init(value: "😀", searchText: "grinning smile happy face", category: .smileys),
-        .init(value: "😁", searchText: "beaming smile grin face", category: .smileys),
-        .init(value: "😂", searchText: "laugh tears joy funny", category: .smileys),
-        .init(value: "😊", searchText: "smile blush happy cute", category: .smileys),
-        .init(value: "😉", searchText: "wink playful face", category: .smileys),
-        .init(value: "😍", searchText: "heart eyes love crush", category: .smileys),
-        .init(value: "🤩", searchText: "star struck wow excited", category: .smileys),
-        .init(value: "😎", searchText: "cool sunglasses face", category: .smileys),
-        .init(value: "🥳", searchText: "party celebrate happy", category: .smileys),
-        .init(value: "🤗", searchText: "hug warm happy", category: .smileys),
-        .init(value: "😋", searchText: "yum tasty playful", category: .smileys),
-        .init(value: "😜", searchText: "tongue wink goofy", category: .smileys),
-
-        .init(value: "❤️", searchText: "red heart love", category: .love),
-        .init(value: "🩷", searchText: "pink heart love", category: .love),
-        .init(value: "🧡", searchText: "orange heart love", category: .love),
-        .init(value: "💛", searchText: "yellow heart love", category: .love),
-        .init(value: "💚", searchText: "green heart love", category: .love),
-        .init(value: "💙", searchText: "blue heart love", category: .love),
-        .init(value: "💜", searchText: "purple heart love", category: .love),
-        .init(value: "🤍", searchText: "white heart love", category: .love),
-        .init(value: "🖤", searchText: "black heart love", category: .love),
-        .init(value: "💘", searchText: "heart arrow crush", category: .love),
-        .init(value: "💞", searchText: "revolving hearts", category: .love),
-        .init(value: "💝", searchText: "gift heart valentine", category: .love),
-
-        .init(value: "👍", searchText: "thumbs up like approve", category: .gestures),
-        .init(value: "👎", searchText: "thumbs down dislike", category: .gestures),
-        .init(value: "👌", searchText: "ok hand approve", category: .gestures),
-        .init(value: "✌️", searchText: "peace victory hand", category: .gestures),
-        .init(value: "🤞", searchText: "cross fingers luck", category: .gestures),
-        .init(value: "🙌", searchText: "raised hands cheer", category: .gestures),
-        .init(value: "👏", searchText: "clap applause", category: .gestures),
-        .init(value: "👋", searchText: "wave hello hi", category: .gestures),
-        .init(value: "🤝", searchText: "handshake deal", category: .gestures),
-        .init(value: "🫶", searchText: "heart hands love", category: .gestures),
-        .init(value: "🙏", searchText: "pray thanks please", category: .gestures),
-        .init(value: "✍️", searchText: "writing pen note", category: .gestures),
-
-        .init(value: "🎉", searchText: "party confetti celebration", category: .party),
-        .init(value: "🎊", searchText: "confetti ball celebrate", category: .party),
-        .init(value: "✨", searchText: "sparkles magic shiny", category: .party),
-        .init(value: "💫", searchText: "dizzy stars sparkle", category: .party),
-        .init(value: "⭐️", searchText: "star favorite", category: .party),
-        .init(value: "🔥", searchText: "fire hot lit", category: .party),
-        .init(value: "🎈", searchText: "balloon celebrate", category: .party),
-        .init(value: "🎁", searchText: "gift present", category: .party),
-        .init(value: "🥂", searchText: "cheers toast party", category: .party),
-        .init(value: "🎵", searchText: "music note song", category: .party),
-        .init(value: "🎶", searchText: "music notes song", category: .party),
-        .init(value: "🌟", searchText: "glowing star", category: .party),
-
-        .init(value: "🥹", searchText: "teary eyes soft sweet", category: .sad),
-        .init(value: "😢", searchText: "cry sad tear", category: .sad),
-        .init(value: "🥲", searchText: "smile tear sad", category: .sad),
-        .init(value: "😭", searchText: "sob cry loudly", category: .sad),
-        .init(value: "😞", searchText: "disappointed sad", category: .sad),
-        .init(value: "😔", searchText: "pensive down", category: .sad),
-        .init(value: "😩", searchText: "weary tired upset", category: .sad),
-        .init(value: "😫", searchText: "tired exhausted sad", category: .sad),
-        .init(value: "😕", searchText: "confused sad unsure", category: .sad),
-        .init(value: "🫠", searchText: "melting awkward", category: .sad),
-        .init(value: "😥", searchText: "sad relief sweat", category: .sad),
-        .init(value: "😪", searchText: "sleepy tired", category: .sad),
-
-        .init(value: "😠", searchText: "angry mad face", category: .angry),
-        .init(value: "😡", searchText: "rage angry", category: .angry),
-        .init(value: "🤬", searchText: "swearing angry rage", category: .angry),
-        .init(value: "😤", searchText: "steam nose frustrated", category: .angry),
-        .init(value: "🙄", searchText: "eye roll annoyed", category: .angry),
-        .init(value: "😒", searchText: "unamused annoyed", category: .angry),
-        .init(value: "😑", searchText: "expressionless blank", category: .angry),
-        .init(value: "🤨", searchText: "raised eyebrow skeptical", category: .angry),
-        .init(value: "🥴", searchText: "woozy irritated", category: .angry),
-        .init(value: "🤯", searchText: "mind blown anger shock", category: .angry),
-        .init(value: "💢", searchText: "anger symbol mad comic", category: .angry),
-        .init(value: "👺", searchText: "goblin angry demon", category: .angry),
-
-        .init(value: "🙂", searchText: "slight smile calm", category: .neutral),
-        .init(value: "😐", searchText: "neutral blank face", category: .neutral),
-        .init(value: "😶", searchText: "no mouth quiet", category: .neutral),
-        .init(value: "🫥", searchText: "dotted line face invisible", category: .neutral),
-        .init(value: "🤔", searchText: "thinking curious", category: .neutral),
-        .init(value: "😬", searchText: "grimace awkward", category: .neutral),
-        .init(value: "🫤", searchText: "diagonal mouth unsure", category: .neutral),
-        .init(value: "🙃", searchText: "upside down silly", category: .neutral),
-        .init(value: "😮", searchText: "open mouth surprised", category: .neutral),
-        .init(value: "😯", searchText: "hushed surprise", category: .neutral),
-        .init(value: "😳", searchText: "flushed shy", category: .neutral),
-        .init(value: "🤷", searchText: "shrug whatever", category: .neutral),
-    ]
+    /// Was a hand-typed list of ~90; now the full set.
+    private lazy var emojiCatalog: [ChatEmojiEntry] = ChatEmojiCatalogBuilder.build()
 }
 
 extension ChatGifPanelView: UITextFieldDelegate {
@@ -1554,25 +1749,47 @@ extension ChatGifPanelView: UITabBarDelegate {
             searchField.text = currentSearchText()
         }
         selectionFeedback.selectionChanged()
+        updateTabButtonSelection()
         applyActiveTabState(animated: true)
+    }
+
+    fileprivate func updateTabButtonSelection() {
+        guard let items = bottomTabBar.items,
+            let match = items.first(where: { $0.tag == activeTab.rawValue })
+        else { return }
+        bottomTabBar.selectedItem = match
     }
 }
 
 extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     func numberOfSections(in collectionView: UICollectionView) -> Int {
-        emojiSections.count
+        collectionView === recentsCollectionView ? 1 : emojiSections.count
     }
 
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int)
         -> Int
     {
-        emojiSections[section].items.count
+        if collectionView === recentsCollectionView { return recentGifEntries.count }
+        return emojiSections[section].items.count
     }
 
     func collectionView(
         _ collectionView: UICollectionView,
         cellForItemAt indexPath: IndexPath
     ) -> UICollectionViewCell {
+        if collectionView === recentsCollectionView {
+            guard
+                let cell = collectionView.dequeueReusableCell(
+                    withReuseIdentifier: ChatGifRecentCell.reuseIdentifier, for: indexPath
+                ) as? ChatGifRecentCell
+            else { return UICollectionViewCell() }
+            let entry = recentGifEntries[indexPath.item]
+            let url = ChatGifRecentsStore.shared.fileURL(for: entry)
+            if let data = try? Data(contentsOf: url) {
+                cell.imageView.image = chatMediaDecodedImagePublic(from: data, shouldAnimate: true)
+            }
+            return cell
+        }
         guard
             let cell = collectionView.dequeueReusableCell(
                 withReuseIdentifier: ChatGifPanelEmojiCell.reuseIdentifier,
@@ -1588,6 +1805,23 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        if collectionView === recentsCollectionView {
+            let entry = recentGifEntries[indexPath.item]
+            let url = ChatGifRecentsStore.shared.fileURL(for: entry)
+            let localData = try? Data(contentsOf: url)
+            selectionFeedback.selectionChanged()
+            delegate?.chatGifPanel(
+                self,
+                didSelectGif: ChatGifSelection(
+                    id: entry.id,
+                    url: url.absoluteString,
+                    previewUrl: url.absoluteString,
+                    width: entry.width,
+                    height: entry.height,
+                    localData: localData
+                ))
+            return
+        }
         let item = emojiSections[indexPath.section].items[indexPath.item]
         registerRecentEmoji(item.value)
         delegate?.chatGifPanel(self, didSelectEmoji: item.value)
@@ -1601,8 +1835,17 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
         viewForSupplementaryElementOfKind kind: String,
         at indexPath: IndexPath
     ) -> UICollectionReusableView {
+        if collectionView === recentsCollectionView {
+            return collectionView.dequeueReusableSupplementaryView(
+                ofKind: kind,
+                withReuseIdentifier: "ChatGifPanelEmptyHeaderView",
+                for: indexPath
+            )
+        }
+
         guard
             kind == UICollectionView.elementKindSectionHeader,
+            emojiSections.indices.contains(indexPath.section),
             let header = collectionView.dequeueReusableSupplementaryView(
                 ofKind: kind,
                 withReuseIdentifier: ChatGifPanelEmojiHeaderView.reuseIdentifier,
@@ -1621,6 +1864,11 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
         layout collectionViewLayout: UICollectionViewLayout,
         sizeForItemAt indexPath: IndexPath
     ) -> CGSize {
+        if collectionView === recentsCollectionView {
+            return (collectionViewLayout as? UICollectionViewFlowLayout)?.itemSize
+                ?? CGSize(width: 96, height: 96)
+        }
+
         let columns: CGFloat = bounds.width < 360 ? 7 : 8
         let horizontalPadding: CGFloat = 24
         let spacing: CGFloat = 8 * (columns - 1)
@@ -1633,6 +1881,10 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
         layout collectionViewLayout: UICollectionViewLayout,
         referenceSizeForHeaderInSection section: Int
     ) -> CGSize {
+        guard collectionView === emojiCollectionView,
+              emojiSections.indices.contains(section) else {
+            return .zero
+        }
         let title = emojiSections[section].title.trimmingCharacters(in: .whitespacesAndNewlines)
         return title.isEmpty ? .zero : CGSize(width: collectionView.bounds.width, height: 36)
     }
@@ -1643,7 +1895,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
             let page = Int(round(pagesScrollView.contentOffset.x / pagesScrollView.bounds.width))
             guard let tab = ChatGifPanelTab(rawValue: page), tab != activeTab else { return }
             activeTab = tab
-            bottomTabBar.selectedItem = bottomTabBar.items?[page]
+            updateTabButtonSelection()
             if tab == .stickers { ensureStickerPackSelection() }
             // Refresh strip/search for the page without re-animating pager.
             rebuildSearchChrome()
@@ -1667,7 +1919,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
             || scrollView === stickerPackPanel.contentScrollView
             || scrollView === findScrollView(in: mediaContainerView)
         {
-            updateHeaderForContentOffsetY(scrollView.contentOffset.y)
+            updateHeaderForScroll(scrollView)
         }
     }
 
@@ -1690,13 +1942,15 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
             target = emojiCollectionView
         }
         guard let target else {
-            updateHeaderForContentOffsetY(0)
+            headerView.transform = .identity
+            headerView.alpha = 1
+            headerView.isUserInteractionEnabled = true
             return
         }
-        updateHeaderForContentOffsetY(target.contentOffset.y)
+        updateHeaderForScroll(target)
         contentOffsetObservation = target.observe(\.contentOffset, options: [.new]) {
             [weak self] sv, _ in
-            self?.updateHeaderForContentOffsetY(sv.contentOffset.y)
+            self?.updateHeaderForScroll(sv)
         }
     }
 }
@@ -1715,7 +1969,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
         }
 
         func didSelectMedia(media: GPHMedia, cell: UICollectionViewCell) {
-            emitSelection(media: media)
+            emitSelection(media: media, cell: cell)
         }
 
         func didSelectMoreByYou(query: String) {}
@@ -1734,7 +1988,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
             showStateLabel("Unable to load \(activeTab.title.lowercased()) right now.")
         }
 
-        private func emitSelection(media: GPHMedia) {
+        private func emitSelection(media: GPHMedia, cell: UICollectionViewCell) {
             let images = media.images
             let primaryImage = resolvedPrimaryImage(from: images)
             let normalizedMediaID = media.id.isEmpty ? UUID().uuidString.lowercased() : media.id
@@ -1744,8 +1998,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
                 let url = primaryURL
             else {
                 guard let fallbackUrl = normalizedNonEmptyString(media.url) else { return }
-                // Kick off prefetch immediately so the image is cached before cell appears
-                chatMediaPrefetch(urlString: fallbackUrl, animated: true)
+                let localData = localGifData(from: cell, renditionURL: fallbackUrl)
                 delegate?.chatGifPanel(
                     self,
                     didSelectGif: ChatGifSelection(
@@ -1753,7 +2006,8 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
                         url: fallbackUrl,
                         previewUrl: fallbackUrl,
                         width: 0,
-                        height: 0
+                        height: 0,
+                        localData: localData
                     )
                 )
                 return
@@ -1764,9 +2018,7 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
                 primaryImage: primaryImage,
                 fallbackURL: url
             )
-
-            // Kick off prefetch immediately so the image is cached before cell appears
-            chatMediaPrefetch(urlString: url, animated: true)
+            let localData = localGifData(from: cell, renditionURL: url)
 
             delegate?.chatGifPanel(
                 self,
@@ -1775,7 +2027,8 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
                     url: url,
                     previewUrl: previewUrl,
                     width: primaryImage?.width ?? 0,
-                    height: primaryImage?.height ?? 0
+                    height: primaryImage?.height ?? 0,
+                    localData: localData
                 )
             )
         }

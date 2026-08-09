@@ -886,7 +886,7 @@ final class ChatMusicStreamResolver {
     for (key, value) in headers {
       request.setValue(value, forHTTPHeaderField: key)
     }
-    let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+    let task = VibeHTTP.shared.dataTask(with: request) { [weak self] data, response, _ in
       guard let self else { return }
       var resolved: URL?
       if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),

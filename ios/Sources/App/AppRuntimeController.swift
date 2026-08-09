@@ -54,6 +54,14 @@ enum AppAppearanceController {
 
   static func setOption(_ option: AppAppearanceOption) {
     UserDefaults.standard.set(option.rawValue, forKey: storageKey)
+    // The chat draft carries its own light/dark mode. Without this it kept whatever was
+    // current the first time it was seeded, so switching to Light left the chat dark.
+    var draft = ChatAppearanceDraftStore.current
+    if draft.mode != option.rawValue {
+      draft.mode = option.rawValue
+      ChatAppearanceDraftStore.save(draft)
+    }
+    ChatListAppearance.invalidateBootstrap()
     applyStoredPreference()
   }
 
@@ -135,6 +143,13 @@ enum AppThemePlateController {
 
   static func setOption(_ option: AppThemePlateOption) {
     UserDefaults.standard.set(option.rawValue, forKey: storageKey)
+    // Same reason as AppAppearanceController.setOption — the chat draft names its own plate.
+    var draft = ChatAppearanceDraftStore.current
+    if draft.themeId != option.rawValue {
+      draft.themeId = option.rawValue
+      ChatAppearanceDraftStore.save(draft)
+    }
+    ChatListAppearance.invalidateBootstrap()
   }
 }
 
@@ -772,7 +787,7 @@ private enum AppProfileService {
     request.timeoutInterval = 15
     applyHeaders(&request, token: config.authToken)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
       throw AppProfileServiceError.invalidResponse
     }
@@ -823,7 +838,7 @@ private enum AppProfileService {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await VibeHTTP.shared.data(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
       throw AppProfileServiceError.invalidResponse
     }

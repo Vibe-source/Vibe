@@ -319,6 +319,107 @@ fn tombstone_round_trip() {
     assert!(!store.is_tombstoned(USER, CHAT, "lan-y").unwrap());
 }
 
+/// A tombstone the reads never consult is a tombstone that does nothing, which is
+/// exactly what this table was until now: written, tested for round-trip, and joined
+/// by no query in the store.
+#[test]
+fn a_tombstoned_row_is_invisible_to_every_read() {
+    let (_tmp, store) = open_fresh();
+    store
+        .upsert(
+            USER,
+            CHAT,
+            &[
+                sealed("m1", 10, 0, b"a", b"n1"),
+                sealed("m2", 20, 0, b"b", b"n2"),
+                sealed("m3", 30, 0, b"c", b"n3"),
+            ],
+        )
+        .unwrap();
+    assert_eq!(ids(&store.page_before(USER, CHAT, None, 10).unwrap()), ["m1", "m2", "m3"]);
+
+    store.tombstone(USER, CHAT, &["m2"], 1_000, true).unwrap();
+
+    // Newest page (page_before with no cursor) — the path `newest_message_ids` uses,
+    // and therefore the one `verifyAgainstLegacy` compares against the legacy table.
+    assert_eq!(ids(&store.page_before(USER, CHAT, None, 10).unwrap()), ["m1", "m3"]);
+    // Oldest page, the other direction.
+    assert_eq!(ids(&store.page_after(USER, CHAT, None, 10).unwrap()), ["m1", "m3"]);
+}
+
+/// The property that makes a tombstone worth more than a delete: the server re-sending
+/// a message the user deleted must not bring it back. A hard delete loses this on every
+/// round trip; the store has to refuse the write itself.
+#[test]
+fn a_tombstoned_id_cannot_be_re_admitted_by_a_later_upsert() {
+    let (_tmp, store) = open_fresh();
+    store
+        .upsert(USER, CHAT, &[sealed("m1", 10, 0, b"a", b"n1")])
+        .unwrap();
+    store.tombstone(USER, CHAT, &["m1"], 1_000, true).unwrap();
+    assert!(store.page_before(USER, CHAT, None, 10).unwrap().is_empty());
+
+    // The server re-delivers it, exactly as a history page would.
+    store
+        .upsert(USER, CHAT, &[sealed("m1", 10, 0, b"a-again", b"n1")])
+        .unwrap();
+    assert!(
+        store.page_before(USER, CHAT, None, 10).unwrap().is_empty(),
+        "a re-delivered message must stay deleted"
+    );
+}
+
+/// A tombstone must survive `prune`, including `prune(0)`.
+///
+/// This is the flow the app actually runs at every delete site: tombstone the id, then
+/// `repairChat` — which is `prune(keep_newest: 0)` + re-backfill from the legacy table.
+/// A prune that clears tombstones destroys the guard two calls after it was set, and the
+/// next time the server re-delivers the deleted message there is nothing left to refuse
+/// it. The row comes back and the delete has to be re-applied forever, which is the exact
+/// thing the tombstone exists to end.
+///
+/// The invariant is the opposite of the intuitive one: **a tombstone whose row is absent
+/// is the load-bearing case.** Its whole job is refusing re-admission of a row that is not
+/// there. A tombstone sitting next to a present row is the transitional state.
+#[test]
+fn a_tombstone_survives_prune_and_still_refuses_re_delivery() {
+    let (_tmp, store) = open_fresh();
+    store
+        .upsert(USER, CHAT, &[sealed("m1", 10, 0, b"a", b"n1")])
+        .unwrap();
+    store.tombstone(USER, CHAT, &["m1"], 1_000, true).unwrap();
+
+    // `repairChat`: wipe the sealed table, then rebuild from legacy.
+    store.prune(USER, CHAT, 0).unwrap();
+    assert!(
+        store.is_tombstoned(USER, CHAT, "m1").unwrap(),
+        "prune(0) is a storage operation; it must not forget what was deleted"
+    );
+
+    // The server re-delivers, as a history page would.
+    store
+        .upsert(USER, CHAT, &[sealed("m1", 10, 0, b"a-again", b"n1")])
+        .unwrap();
+    assert!(
+        store.page_before(USER, CHAT, None, 10).unwrap().is_empty(),
+        "a re-delivered message must stay deleted across a repair"
+    );
+
+    // A bounded prune must not forget either.
+    store
+        .upsert(
+            USER,
+            CHAT,
+            &[
+                sealed("m2", 20, 0, b"b", b"n2"),
+                sealed("m3", 30, 0, b"c", b"n3"),
+            ],
+        )
+        .unwrap();
+    store.prune(USER, CHAT, 1).unwrap();
+    assert!(store.is_tombstoned(USER, CHAT, "m1").unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // Three-state load state
 // ---------------------------------------------------------------------------
