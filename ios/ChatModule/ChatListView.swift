@@ -1267,7 +1267,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return components.string ?? "vibe://chat/\(engineChatId)?message=\(messageId)"
   }
 
-  func submitContextMenuReaction(_ emoji: String, messageId: String) {
+  func submitContextMenuReaction(
+    _ emoji: String, messageId: String, completion: ((Bool) -> Void)? = nil
+  ) {
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     chatListEngineBindingQueue.async { [weak self] in
       let result = ChatEngine.shared.reactToMessage([
@@ -1275,9 +1277,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         "messageId": messageId,
         "emoji": emoji,
       ])
-      guard result["accepted"] as? Bool != true else { return }
+      let accepted = result["accepted"] as? Bool == true
       DispatchQueue.main.async {
-        self?.onNativeEvent(["type": "agentToast", "message": "Reaction could not be sent"])
+        completion?(accepted)
+        if !accepted {
+          self?.onNativeEvent(["type": "agentToast", "message": "Reaction could not be sent"])
+        }
       }
     }
   }
@@ -16754,32 +16759,88 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return mediaKey(fromRawRow: liveEngineRow)
   }
 
-  private func rowByApplyingReactionEmoji(
-    _ emoji: String,
+  private func rowByApplyingReactions(
+    _ reactions: [ChatListRow.Reaction],
     toMessageId targetMessageId: String,
     row: [String: Any]
   ) -> (row: [String: Any], changed: Bool) {
     guard messageId(fromRawRow: row) == targetMessageId else { return (row, false) }
     guard var message = row["message"] as? [String: Any] else { return (row, false) }
-    let existing = (message["reactionEmoji"] as? String)?.trimmingCharacters(
-      in: .whitespacesAndNewlines)
-    if existing == emoji {
-      return (row, false)
+    let payload: [[String: Any]] = reactions.map {
+      ["emoji": $0.emoji, "count": $0.count, "isSelected": $0.isSelected]
     }
-    message["reactionEmoji"] = emoji
+    let previous = message
+    message["reactions"] = payload
+    message.removeValue(forKey: "reactionEmoji")
+    guard !(message as NSDictionary).isEqual(to: previous) else { return (row, false) }
     var patched = row
     patched["message"] = message
     return (patched, true)
   }
 
-  func applyLocalReactionEmoji(_ emoji: String, toMessageId messageId: String) {
+  private func toggledLocalReactions(
+    _ reactions: [ChatListRow.Reaction], emoji: String
+  ) -> [ChatListRow.Reaction] {
+    var next = reactions
+    if let selected = next.firstIndex(where: \.isSelected) {
+      let current = next[selected]
+      next[selected] = ChatListRow.Reaction(
+        emoji: current.emoji, count: max(0, current.count - 1), isSelected: false)
+    }
+    if reactions.contains(where: { $0.isSelected && $0.emoji == emoji }) {
+      return next.filter { $0.count > 0 }
+    }
+    if let index = next.firstIndex(where: { $0.emoji == emoji }) {
+      let current = next[index]
+      next[index] = ChatListRow.Reaction(
+        emoji: current.emoji, count: current.count + 1, isSelected: true)
+    } else {
+      next.append(ChatListRow.Reaction(emoji: emoji, count: 1, isSelected: true))
+    }
+    return next.filter { $0.count > 0 }
+  }
+
+  func reactionSnapshot(messageId: String) -> [ChatListRow.Reaction]? {
+    let target = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    return rows.first(where: { $0.kind == .message && $0.messageId == target })?.reactions
+  }
+
+  @discardableResult
+  func applyLocalReactionEmoji(
+    _ emoji: String, toMessageId messageId: String
+  ) -> [ChatListRow.Reaction]? {
     let targetMessageId = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
     let trimmedEmoji = emoji.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !targetMessageId.isEmpty, !trimmedEmoji.isEmpty else { return }
+    guard !targetMessageId.isEmpty, !trimmedEmoji.isEmpty,
+      let previous = reactionSnapshot(messageId: targetMessageId)
+    else { return nil }
+    let next = toggledLocalReactions(previous, emoji: trimmedEmoji)
+    applyLocalReactionState(next, toMessageId: targetMessageId)
+    return previous
+  }
+
+  func restoreLocalReactionSnapshot(
+    _ reactions: [ChatListRow.Reaction], toMessageId messageId: String
+  ) {
+    let target = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !target.isEmpty else { return }
+    applyLocalReactionState(reactions, toMessageId: target)
+  }
+
+  func visibleReactionCell(messageId: String) -> ChatListCell? {
+    collectionView.layoutIfNeeded()
+    guard let index = indexForMessage(messageId) else { return nil }
+    return collectionView.cellForItem(
+      at: IndexPath(item: index, section: 0)) as? ChatListCell
+  }
+
+  private func applyLocalReactionState(
+    _ reactions: [ChatListRow.Reaction], toMessageId targetMessageId: String
+  ) {
     reactionDebugTargetMessageId = targetMessageId
     reactionDebugRemainingRowsChecks = 12
     reactionDebugLog(
-      "applyLocal start id=\(targetMessageId) emoji=\(trimmedEmoji) sourceCount=\(sourceRowsPayload.count) nativeOut=\(nativeOutgoingRowsById[targetMessageId] != nil ? "Y" : "N") nativeEngine=\(nativeEngineRowsById[targetMessageId] != nil ? "Y" : "N")"
+      "applyLocal start id=\(targetMessageId) buckets=\(reactions.count) sourceCount=\(sourceRowsPayload.count) nativeOut=\(nativeOutgoingRowsById[targetMessageId] != nil ? "Y" : "N") nativeEngine=\(nativeEngineRowsById[targetMessageId] != nil ? "Y" : "N")"
     )
 
     var didPatch = false
@@ -16790,8 +16851,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     if !sourceRowsPayload.isEmpty {
       let patched = sourceRowsPayload.map { row -> [String: Any] in
-        let result = rowByApplyingReactionEmoji(
-          trimmedEmoji, toMessageId: targetMessageId, row: row)
+        let result = rowByApplyingReactions(
+          reactions, toMessageId: targetMessageId, row: row)
         if result.changed {
           didPatch = true
           sourcePatched = true
@@ -16803,14 +16864,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
 
     if let row = nativeOutgoingRowsById[targetMessageId] {
-      let result = rowByApplyingReactionEmoji(trimmedEmoji, toMessageId: targetMessageId, row: row)
+      let result = rowByApplyingReactions(reactions, toMessageId: targetMessageId, row: row)
       nativeOutgoingRowsById[targetMessageId] = result.row
       didPatch = didPatch || result.changed
       outgoingPatched = result.changed
     }
 
     if let row = nativeEngineRowsById[targetMessageId] {
-      let result = rowByApplyingReactionEmoji(trimmedEmoji, toMessageId: targetMessageId, row: row)
+      let result = rowByApplyingReactions(reactions, toMessageId: targetMessageId, row: row)
       nativeEngineRowsById[targetMessageId] = result.row
       didPatch = didPatch || result.changed
       enginePatched = result.changed

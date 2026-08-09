@@ -1,6 +1,8 @@
 import UIKit
 
 private let chatContextHoldDebugLogs = true
+/// Near-zero scale for picker/menu birth and collapse; animate to/from identity.
+private let chatContextMenuCollapsedScale: CGFloat = 0.001
 
 public protocol ChatContextMenuOverlayDelegate: AnyObject {
   func contextMenuDidDismiss(overlay: ChatContextMenuOverlay)
@@ -183,6 +185,10 @@ public final class ChatContextMenuOverlay: UIView {
     // 3. Reaction picker (above bubble)
     reactionPicker.alpha = 0
     reactionPicker.delegate = self
+    reactionPicker.onContentSizeChange = { [weak self] in
+      guard let self, !self.isDismissing else { return }
+      _ = self.layoutMenus()
+    }
     let pickerSize = reactionPicker.intrinsicContentSize
     reactionPicker.frame = CGRect(origin: .zero, size: pickerSize)
     reactionPicker.isHidden = hidesReactionPicker
@@ -216,25 +222,6 @@ public final class ChatContextMenuOverlay: UIView {
     }
     holdDebugLog("backgroundTap accepted point=\(NSCoder.string(for: point))")
     animateOut(reason: "backgroundTap")
-  }
-
-  private func reactionLandingPointInWindow() -> CGPoint {
-    guard let window = self.window else { return .zero }
-    let frame = originalBubbleFrame
-    let badgeSize = CGSize(width: 34.0, height: 24.0)
-    let insetLeft: CGFloat = 8.0
-    let insetBottom: CGFloat = 6.0
-    let incomingTailInset: CGFloat = bubbleIsMe ? 0.0 : 24.0
-    let bodyMinX = frame.minX + incomingTailInset
-    let badgeX = min(
-      max(bodyMinX + insetLeft, bodyMinX + 2.0),
-      frame.maxX - badgeSize.width - 4.0
-    )
-    let pointInOverlay = CGPoint(
-      x: badgeX + (badgeSize.width * 0.5),
-      y: frame.maxY - insetBottom - (badgeSize.height * 0.5)
-    )
-    return self.convert(pointInOverlay, to: window)
   }
 
   // MARK: - Layout
@@ -428,7 +415,8 @@ public final class ChatContextMenuOverlay: UIView {
       x: pickerFinalCenter.x,
       y: originalBubbleFrame.minY - 8
     )
-    reactionPicker.transform = CGAffineTransform(scaleX: 0.35, y: 0.35)
+    reactionPicker.transform = CGAffineTransform(
+      scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
     reactionPicker.alpha = 0
 
     // --- Context menu: top edge pinned under the bubble, scaling up in place
@@ -440,7 +428,8 @@ public final class ChatContextMenuOverlay: UIView {
       x: menuFinalCenter.x,
       y: originalBubbleFrame.maxY + 4
     )
-    contextMenu.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
+    contextMenu.transform = CGAffineTransform(
+      scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
     contextMenu.alpha = 1
 
     // Only the blur picker fades; the glass card stays at one resolved opacity.
@@ -487,12 +476,14 @@ public final class ChatContextMenuOverlay: UIView {
         x: self.originalBubbleFrame.midX,
         y: self.originalBubbleFrame.midY
       )
-      self.contextMenu.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
+      self.contextMenu.transform = CGAffineTransform(
+        scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
       self.contextMenu.center = CGPoint(
         x: self.contextMenu.center.x,
         y: self.originalBubbleFrame.maxY + 4
       )
-      self.reactionPicker.transform = CGAffineTransform(scaleX: 0.35, y: 0.35)
+      self.reactionPicker.transform = CGAffineTransform(
+        scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
       self.reactionPicker.center = CGPoint(
         x: self.reactionPicker.center.x,
         y: self.originalBubbleFrame.minY - 8
@@ -552,36 +543,25 @@ extension ChatContextMenuOverlay: ChatContextMenuOverlayDelegate {
     reactionPicker.isUserInteractionEnabled = false
     contextMenu.isUserInteractionEnabled = false
 
-    let fallbackSource = CGPoint(
-      x: reactionPicker.frame.midX,
-      y: reactionPicker.frame.minY + (reactionPicker.frame.height * 0.4)
-    )
-    let sourcePointInView = sourcePoint ?? fallbackSource
-    let sourceInWindow = self.convert(sourcePointInView, to: nil)
-    let targetInWindow = reactionLandingPointInWindow()
+    // Prefer the tapped icon's window point; list coordinator owns the only flight.
+    let sourceInWindow: CGPoint = {
+      if let sourcePoint { return sourcePoint }
+      let fallback = CGPoint(
+        x: reactionPicker.frame.midX,
+        y: reactionPicker.frame.minY + (reactionPicker.frame.height * 0.4)
+      )
+      return convert(fallback, to: nil)
+    }()
     let captureMessageId = self.messageId
 
-    // Submit before dismissal can release the overlay; the flight is presentation only.
     delegate?.contextMenuDidSelectReaction(
       reaction,
       messageId: captureMessageId,
-      sourcePoint: targetInWindow
+      sourcePoint: sourceInWindow
     )
 
-    self.animateOut(reason: "reactionSelected")
-
-    if let window = self.window {
-      ChatReactionFxModule.shared.animateReactionFlight(
-        emoji: reaction,
-        from: sourceInWindow,
-        to: targetInWindow,
-        in: window,
-        bubbleView: nil
-      ) { [weak self] in
-        self?.isSelectingReaction = false
-      }
-    } else {
-      isSelectingReaction = false
+    animateOut(reason: "reactionSelected") {
+      self.isSelectingReaction = false
     }
   }
 
@@ -628,6 +608,7 @@ final class ChatReactionIconNode: UIControl {
   }
 
   func playSelectionEffect() {
+    // Pulse only — list coordinator owns flight and landing FX.
     UIView.animate(
       withDuration: 0.12, delay: 0.0, options: [.curveEaseIn, .beginFromCurrentState]
     ) {
@@ -637,36 +618,64 @@ final class ChatReactionIconNode: UIControl {
         self.transform = .identity
       }
     }
-    ChatReactionFxModule.shared.playLandingEffect(
-      emoji: emoji, at: CGPoint(x: bounds.midX, y: bounds.midY), in: self, tintOverride: nil)
   }
 }
 
 final class ReactionPickerView: UIView {
   weak var delegate: ChatContextMenuOverlayDelegate?
+  /// Called inside expand/collapse animation so the overlay can relayout safely.
+  var onContentSizeChange: (() -> Void)?
 
   private let blurView: UIVisualEffectView
   private let blurTintView = UIView()
   private let tailBlobLarge: UIVisualEffectView
   private let tailBlobSmall: UIVisualEffectView
-  private let stack: UIStackView
-  private let emojis = ["⭐️", "❤️", "👍", "👎", "🔥", "🥰", "👏", "😁"]
+  private let iconsHost = UIView()
+  private var iconNodes: [ChatReactionIconNode] = []
+  private let expandControl = UIButton(type: .system)
+  private var blurHeightConstraint: NSLayoutConstraint!
+  private var isExpanded = false
+  private var blobsOnRightSide = false
+
   private static let pickerButtonSize: CGFloat = 40.0
   private static let pickerSpacing: CGFloat = 4.0
   private static let pickerPadding: CGFloat = 8.0
   private static let pickerPillHeight: CGFloat = 52.0
   private static let pickerTailHeight: CGFloat = 12.0
-  private var blobsOnRightSide = false
+  private static let pickerVerticalInset: CGFloat = 6.0
 
   let messageId: String
 
-  override var intrinsicContentSize: CGSize {
-    let emojiCount = CGFloat(emojis.count)
-    let width =
-      emojiCount * Self.pickerButtonSize
-      + (emojiCount - 1.0) * Self.pickerSpacing
+  private var gridColumns: Int {
+    max(1, ChatReactionCatalog.collapsedEmojis.count + 1)
+  }
+
+  private var contentRowCount: Int {
+    let primary = ChatReactionCatalog.collapsedEmojis.count
+    guard isExpanded else { return 1 }
+    let remaining = max(0, ChatReactionCatalog.allEmojis.count - primary)
+    let extraRows = remaining == 0 ? 0 : Int(ceil(Double(remaining) / Double(gridColumns)))
+    return 1 + extraRows
+  }
+
+  private var blurContentHeight: CGFloat {
+    let rows = CGFloat(contentRowCount)
+    let gridH =
+      rows * Self.pickerButtonSize
+      + max(0, rows - 1) * Self.pickerSpacing
+      + Self.pickerVerticalInset * 2.0
+    return max(Self.pickerPillHeight, gridH)
+  }
+
+  private var preferredWidth: CGFloat {
+    let cols = CGFloat(gridColumns)
+    return cols * Self.pickerButtonSize
+      + max(0, cols - 1) * Self.pickerSpacing
       + Self.pickerPadding * 2.0
-    return CGSize(width: width, height: Self.pickerPillHeight + Self.pickerTailHeight)
+  }
+
+  override var intrinsicContentSize: CGSize {
+    CGSize(width: preferredWidth, height: blurContentHeight + Self.pickerTailHeight)
   }
 
   init(appearance: ChatListAppearance, messageId: String) {
@@ -685,7 +694,6 @@ final class ReactionPickerView: UIView {
       style: blurStyle,
       cornerRadius: 3.5
     )
-    self.stack = UIStackView()
 
     super.init(frame: .zero)
 
@@ -696,49 +704,34 @@ final class ReactionPickerView: UIView {
     addSubview(tailBlobLarge)
     addSubview(tailBlobSmall)
 
-    stack.axis = .horizontal
-    stack.distribution = .fillEqually
-    stack.spacing = Self.pickerSpacing
-    stack.alignment = .center
-    stack.translatesAutoresizingMaskIntoConstraints = false
-
     blurTintView.backgroundColor = .clear
     blurTintView.translatesAutoresizingMaskIntoConstraints = false
     blurView.contentView.addSubview(blurTintView)
 
-    // Add stack to blur view's contentView so it renders above the blur.
-    blurView.contentView.addSubview(stack)
+    iconsHost.translatesAutoresizingMaskIntoConstraints = false
+    iconsHost.backgroundColor = .clear
+    blurView.contentView.addSubview(iconsHost)
 
-    let stackTop = stack.topAnchor.constraint(
-      greaterThanOrEqualTo: blurView.contentView.topAnchor,
-      constant: 4
-    )
-    let stackBottom = stack.bottomAnchor.constraint(
-      lessThanOrEqualTo: blurView.contentView.bottomAnchor,
-      constant: -4
-    )
-    let stackCenterY = stack.centerYAnchor.constraint(equalTo: blurView.contentView.centerYAnchor)
-    stackTop.priority = .defaultHigh
-    stackBottom.priority = .defaultHigh
-    stackCenterY.priority = .defaultHigh
+    blurHeightConstraint = blurView.heightAnchor.constraint(equalToConstant: Self.pickerPillHeight)
 
     NSLayoutConstraint.activate([
       blurView.topAnchor.constraint(equalTo: topAnchor),
       blurView.leadingAnchor.constraint(equalTo: leadingAnchor),
       blurView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      blurView.heightAnchor.constraint(equalToConstant: Self.pickerPillHeight),
+      blurHeightConstraint,
 
       blurTintView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
       blurTintView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
       blurTintView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
       blurTintView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
 
-      stackTop,
-      stackBottom,
-      stackCenterY,
-      stack.leadingAnchor.constraint(
+      iconsHost.topAnchor.constraint(
+        equalTo: blurView.contentView.topAnchor, constant: Self.pickerVerticalInset),
+      iconsHost.bottomAnchor.constraint(
+        equalTo: blurView.contentView.bottomAnchor, constant: -Self.pickerVerticalInset),
+      iconsHost.leadingAnchor.constraint(
         equalTo: blurView.contentView.leadingAnchor, constant: Self.pickerPadding),
-      stack.trailingAnchor.constraint(
+      iconsHost.trailingAnchor.constraint(
         equalTo: blurView.contentView.trailingAnchor, constant: -Self.pickerPadding),
     ])
 
@@ -747,30 +740,171 @@ final class ReactionPickerView: UIView {
     tailBlobLarge.layer.borderWidth = 0
     tailBlobSmall.layer.borderWidth = 0
 
-    for emoji in emojis {
+    for emoji in ChatReactionCatalog.allEmojis {
       let node = ChatReactionIconNode(emoji: emoji)
-      node.translatesAutoresizingMaskIntoConstraints = false
-      let width = node.widthAnchor.constraint(equalToConstant: Self.pickerButtonSize)
-      width.priority = .defaultHigh
-      width.isActive = true
-      let height = node.heightAnchor.constraint(equalToConstant: Self.pickerButtonSize)
-      height.priority = .defaultHigh
-      height.isActive = true
       node.addTarget(self, action: #selector(didTapEmoji(_:)), for: .touchUpInside)
-      stack.addArrangedSubview(node)
+      iconsHost.addSubview(node)
+      iconNodes.append(node)
     }
+
+    configureExpandControl(isDark: appearance.isDark)
+    iconsHost.addSubview(expandControl)
+    applyCollapsedVisibility()
   }
 
   required init?(coder: NSCoder) { fatalError() }
 
+  private func configureExpandControl(isDark: Bool) {
+    let config = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+    expandControl.setImage(UIImage(systemName: "chevron.down", withConfiguration: config), for: .normal)
+    expandControl.tintColor = isDark ? UIColor.white.withAlphaComponent(0.72) : .secondaryLabel
+    expandControl.backgroundColor = UIColor.label.withAlphaComponent(0.08)
+    expandControl.layer.cornerRadius = Self.pickerButtonSize * 0.5
+    expandControl.clipsToBounds = true
+    expandControl.accessibilityTraits = .button
+    expandControl.addTarget(self, action: #selector(didTapExpand), for: .touchUpInside)
+    updateExpandControlChrome()
+  }
+
+  private func updateExpandControlChrome() {
+    let config = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+    let symbol = isExpanded ? "chevron.up" : "chevron.down"
+    expandControl.setImage(UIImage(systemName: symbol, withConfiguration: config), for: .normal)
+    expandControl.accessibilityLabel = isExpanded ? "Show fewer reactions" : "Show more reactions"
+    expandControl.accessibilityHint = isExpanded
+      ? "Collapses the reaction list"
+      : "Expands the full reaction list"
+  }
+
   override func layoutSubviews() {
     super.layoutSubviews()
+    layoutIconGrid()
+    let blurH = blurView.bounds.height
     let largeX = blobsOnRightSide ? (bounds.width - 24.0) : 24.0
     let smallX = blobsOnRightSide ? (bounds.width - 14.0) : 14.0
-    let largeCenter = CGPoint(x: largeX, y: Self.pickerPillHeight + 1.5)
-    let smallCenter = CGPoint(x: smallX, y: Self.pickerPillHeight + 9.0)
-    tailBlobLarge.center = largeCenter
-    tailBlobSmall.center = smallCenter
+    tailBlobLarge.center = CGPoint(x: largeX, y: blurH + 1.5)
+    tailBlobSmall.center = CGPoint(x: smallX, y: blurH + 9.0)
+  }
+
+  private func layoutIconGrid() {
+    let button = Self.pickerButtonSize
+    let spacing = Self.pickerSpacing
+    let cols = gridColumns
+    let primaryCount = ChatReactionCatalog.collapsedEmojis.count
+    let hostBounds = iconsHost.bounds
+    guard hostBounds.width > 0, hostBounds.height > 0 else { return }
+
+    // First row: primary emojis + trailing expand control.
+    for index in 0..<primaryCount {
+      guard index < iconNodes.count else { break }
+      let col = index
+      let x = CGFloat(col) * (button + spacing)
+      iconNodes[index].frame = CGRect(x: x, y: 0, width: button, height: button)
+    }
+    let expandCol = min(primaryCount, cols - 1)
+    expandControl.frame = CGRect(
+      x: CGFloat(expandCol) * (button + spacing),
+      y: 0,
+      width: button,
+      height: button
+    )
+
+    guard isExpanded else { return }
+
+    // Extra rows: remaining catalog emojis, width-bounded columns.
+    let remaining = iconNodes.dropFirst(primaryCount)
+    for (offset, node) in remaining.enumerated() {
+      let col = offset % cols
+      let row = 1 + offset / cols
+      let x = CGFloat(col) * (button + spacing)
+      let y = CGFloat(row) * (button + spacing)
+      node.frame = CGRect(x: x, y: y, width: button, height: button)
+    }
+  }
+
+  private func applyCollapsedVisibility() {
+    let primaryCount = ChatReactionCatalog.collapsedEmojis.count
+    for (index, node) in iconNodes.enumerated() {
+      let isPrimary = index < primaryCount
+      node.isHidden = !isPrimary
+      node.alpha = isPrimary ? 1 : 0
+      node.transform = .identity
+    }
+    updateExpandControlChrome()
+    blurHeightConstraint.constant = blurContentHeight
+    blurView.layer.cornerRadius = min(blurContentHeight * 0.5, 26)
+    invalidateIntrinsicContentSize()
+  }
+
+  @objc private func didTapExpand() {
+    setExpanded(!isExpanded, animated: true)
+  }
+
+  /// Height-morph expand/collapse; new rows spring in with scale/alpha.
+  func setExpanded(_ expanded: Bool, animated: Bool) {
+    guard expanded != isExpanded else { return }
+    isExpanded = expanded
+    updateExpandControlChrome()
+
+    let primaryCount = ChatReactionCatalog.collapsedEmojis.count
+    let extra = Array(iconNodes.dropFirst(primaryCount))
+
+    if expanded {
+      for node in extra {
+        node.isHidden = false
+        node.alpha = 0
+        node.transform = CGAffineTransform(
+          scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
+      }
+    }
+
+    invalidateIntrinsicContentSize()
+    setNeedsLayout()
+
+    let animations = {
+      self.blurHeightConstraint.constant = self.blurContentHeight
+      self.blurView.layer.cornerRadius = min(self.blurContentHeight * 0.5, 26)
+      self.layoutIfNeeded()
+      self.onContentSizeChange?()
+      if expanded {
+        for node in extra {
+          node.alpha = 1
+          node.transform = .identity
+        }
+      } else {
+        for node in extra {
+          node.alpha = 0
+          node.transform = CGAffineTransform(
+            scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
+        }
+      }
+    }
+
+    if animated {
+      UIView.animate(
+        withDuration: 0.38,
+        delay: 0,
+        usingSpringWithDamping: 0.82,
+        initialSpringVelocity: 0.2,
+        options: [.beginFromCurrentState, .allowUserInteraction],
+        animations: animations
+      ) { _ in
+        if !expanded {
+          for node in extra {
+            node.isHidden = true
+            node.transform = .identity
+          }
+        }
+      }
+    } else {
+      animations()
+      if !expanded {
+        for node in extra {
+          node.isHidden = true
+          node.transform = .identity
+        }
+      }
+    }
   }
 
   func setThinkingBlobDirection(isRightAligned: Bool) {
@@ -779,18 +913,30 @@ final class ReactionPickerView: UIView {
     setNeedsLayout()
   }
 
-  /// Emoji tiles cascade in from the pill's anchored side while it morph-grows:
-  /// each springs up from a small scale, staggered in the growth direction.
+  /// Emoji tiles cascade in from the pill's anchored side while it morph-grows.
   func animateIconsIn(fromTrailing: Bool) {
-    let nodes = fromTrailing ? Array(stack.arrangedSubviews.reversed()) : stack.arrangedSubviews
-    for (index, view) in nodes.enumerated() {
-      (view as? ChatReactionIconNode)?.playIntro(delay: 0.05 + 0.04 * Double(index))
+    let primaryCount = min(ChatReactionCatalog.collapsedEmojis.count, iconNodes.count)
+    let visible = Array(iconNodes.prefix(primaryCount))
+    let ordered = fromTrailing ? Array(visible.reversed()) : visible
+    for (index, node) in ordered.enumerated() {
+      node.playIntro(delay: 0.05 + 0.04 * Double(index))
+    }
+    expandControl.alpha = 0
+    expandControl.transform = CGAffineTransform(scaleX: 0.2, y: 0.2)
+    UIView.animate(
+      withDuration: 0.34, delay: 0.05 + 0.04 * Double(primaryCount),
+      usingSpringWithDamping: 0.68, initialSpringVelocity: 0,
+      options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.expandControl.alpha = 1
+      self.expandControl.transform = .identity
     }
   }
 
   @objc private func didTapEmoji(_ sender: ChatReactionIconNode) {
     let emoji = sender.emoji
     sender.playSelectionEffect()
+    // Window coordinates for the list coordinator's single flight.
     let sourcePoint = sender.convert(
       CGPoint(x: sender.bounds.midX, y: sender.bounds.midY),
       to: nil

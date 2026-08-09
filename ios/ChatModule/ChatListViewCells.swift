@@ -2163,6 +2163,16 @@ private final class ChatReactionChipView: UIView {
     countLabel.frame = CGRect(
       x: emojiLabel.frame.maxX + 5.0, y: 0.0, width: countWidth, height: bounds.height)
   }
+
+  func playLandingPulse() {
+    layer.removeAnimation(forKey: "reactionLanding")
+    let pulse = CAKeyframeAnimation(keyPath: "transform.scale")
+    pulse.values = [1.0, 1.24, 0.96, 1.0]
+    pulse.keyTimes = [0.0, 0.34, 0.72, 1.0]
+    pulse.duration = 0.42
+    pulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    layer.add(pulse, forKey: "reactionLanding")
+  }
 }
 
 private final class ChatReactionStripView: UIView {
@@ -2221,6 +2231,15 @@ private final class ChatReactionStripView: UIView {
   var firstChipCenter: CGPoint? {
     guard let first = reactions.first, let chip = chips[first.emoji] else { return nil }
     return CGPoint(x: chip.frame.midX, y: chip.frame.midY)
+  }
+
+  func landingCenter(for emoji: String, in view: UIView) -> CGPoint? {
+    guard let chip = chips[emoji], chip.window != nil else { return nil }
+    return chip.convert(CGPoint(x: chip.bounds.midX, y: chip.bounds.midY), to: view)
+  }
+
+  func playLandingPulse(for emoji: String) {
+    chips[emoji]?.playLandingPulse()
   }
 }
 
@@ -15987,14 +16006,29 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return captureRect
   }
 
-  func reactionBadgeCenter(in view: UIView) -> CGPoint? {
+  func reactionBadgeCenter(for emoji: String? = nil, in view: UIView) -> CGPoint? {
     guard row?.kind == .message else {
       return nil
     }
     contentView.layoutIfNeeded()
+    if let emoji, !reactionStripView.isHidden,
+      let center = reactionStripView.landingCenter(for: emoji, in: view)
+    {
+      return center
+    }
     let bubbleRect = bubbleView.convert(bubbleView.bounds, to: view)
     let frame = reactionBadgeFrame(in: bubbleRect)
     return CGPoint(x: frame.midX, y: frame.midY)
+  }
+
+  func playReactionLandingEffect(_ emoji: String, in view: UIView) -> Bool {
+    guard !reactionStripView.isHidden,
+      let point = reactionStripView.landingCenter(for: emoji, in: view)
+    else { return false }
+    reactionStripView.playLandingPulse(for: emoji)
+    ChatReactionFxModule.shared.playLandingEffect(
+      emoji: emoji, at: point, in: view, tintOverride: nil)
+    return true
   }
 
   func bubbleSnapshotView(in view: UIView) -> UIView? {

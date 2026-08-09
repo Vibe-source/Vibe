@@ -1,5 +1,70 @@
 import UIKit
 
+enum ChatReactionCatalog {
+  static let collapsedEmojis: [String] = ["⭐️", "❤️", "👍", "👎", "🔥", "🥰", "👏"]
+
+  static let allEmojis: [String] = collapsedEmojis + [
+    "😁", "😂", "🤣", "😢", "😭", "😡", "🤯", "😱", "🤔", "😍", "🤩", "😎", "🙏",
+    "💪", "🤝", "👌", "💯", "⚡️", "🚀", "🎂", "🍾", "🎉", "💩",
+  ]
+}
+
+final class ChatReactionTransitionCoordinator {
+  static let shared = ChatReactionTransitionCoordinator()
+
+  struct Token: Hashable {
+    fileprivate let chatId: String
+    fileprivate let messageId: String
+    fileprivate let id: UUID
+  }
+
+  private struct MessageKey: Hashable {
+    let chatId: String
+    let messageId: String
+  }
+
+  private let lock = NSLock()
+  private var currentIds: [MessageKey: UUID] = [:]
+
+  private init() {}
+
+  func begin(chatId: String, messageId: String, emoji _: String) -> Token {
+    let token = Token(chatId: chatId, messageId: messageId, id: UUID())
+    withLock {
+      currentIds[MessageKey(chatId: chatId, messageId: messageId)] = token.id
+    }
+    return token
+  }
+
+  func isCurrent(_ token: Token) -> Bool {
+    withLock {
+      currentIds[MessageKey(chatId: token.chatId, messageId: token.messageId)] == token.id
+    }
+  }
+
+  func finish(_ token: Token) {
+    retire(token)
+  }
+
+  func cancel(_ token: Token) {
+    retire(token)
+  }
+
+  private func retire(_ token: Token) {
+    withLock {
+      let key = MessageKey(chatId: token.chatId, messageId: token.messageId)
+      guard currentIds[key] == token.id else { return }
+      currentIds.removeValue(forKey: key)
+    }
+  }
+
+  private func withLock<T>(_ body: () -> T) -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return body()
+  }
+}
+
 private struct ChatReactionFxStyle {
   let accent: UIColor
   let ring: UIColor
@@ -80,19 +145,6 @@ final class ChatReactionFxModule {
     group.isRemovedOnCompletion = false
     label.layer.add(group, forKey: "reactionFlight")
     label.layer.position = targetPoint
-
-    UIView.animateKeyframes(
-      withDuration: duration,
-      delay: 0.0,
-      options: [.calculationModeCubic, .beginFromCurrentState]
-    ) {
-      UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 0.76) {
-        label.alpha = 1.0
-      }
-      UIView.addKeyframe(withRelativeStartTime: 0.72, relativeDuration: 0.28) {
-        label.alpha = 0.0
-      }
-    }
 
     if let bubbleView {
       let base = bubbleView.transform
@@ -208,34 +260,8 @@ final class ChatReactionFxModule {
       )
     }
 
-    let emojiPop = UILabel()
-    emojiPop.text = emoji
-    emojiPop.font = UIFont.systemFont(ofSize: 24)
-    emojiPop.sizeToFit()
-    emojiPop.center = point
-    emojiPop.alpha = 0.0
-    emojiPop.transform = CGAffineTransform(scaleX: 0.56, y: 0.56)
-    hostView.addSubview(emojiPop)
-
-    UIView.animateKeyframes(
-      withDuration: 0.56,
-      delay: 0.0,
-      options: [.calculationModeCubic, .beginFromCurrentState]
-    ) {
-      UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 0.28) {
-        emojiPop.alpha = 1.0
-        emojiPop.transform = CGAffineTransform(scaleX: 1.15, y: 1.15)
-      }
-      UIView.addKeyframe(withRelativeStartTime: 0.28, relativeDuration: 0.72) {
-        emojiPop.alpha = 0.0
-        emojiPop.center = CGPoint(x: point.x, y: point.y - 12.0)
-        emojiPop.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
-      }
-    }
-
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.90) {
       effectLayer.removeFromSuperlayer()
-      emojiPop.removeFromSuperview()
     }
   }
 
@@ -300,175 +326,159 @@ final class ChatReactionFxModule {
 
   private func style(for emoji: String, tintOverride: UIColor?) -> ChatReactionFxStyle {
     let fallback = tintOverride ?? UIColor(red: 0.25, green: 0.67, blue: 0.99, alpha: 1.0)
-    switch emoji {
-    case "⭐️", "⭐":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 1.00, green: 0.74, blue: 0.10, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.87, blue: 0.38, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.65, blue: 0.08, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.88, blue: 0.30, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.97, blue: 0.67, alpha: 1.0),
-        ],
-        particleCount: 13,
-        spread: 18.0...38.0,
-        rise: 8.0...22.0,
-        ringEndScale: 2.6,
-        bubblePulseScale: 1.028,
-        flightRotation: 0.24
-      )
-    case "❤️":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 1.00, green: 0.30, blue: 0.47, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.56, blue: 0.69, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.25, blue: 0.43, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.56, blue: 0.69, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.74, blue: 0.82, alpha: 1.0),
-        ],
-        particleCount: 10,
-        spread: 14.0...32.0,
-        rise: 6.0...18.0,
-        ringEndScale: 2.4,
-        bubblePulseScale: 1.022,
-        flightRotation: -0.10
-      )
-    case "👍":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 0.22, green: 0.63, blue: 0.99, alpha: 1.0),
-        ring: UIColor(red: 0.53, green: 0.77, blue: 1.00, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 0.27, green: 0.66, blue: 1.00, alpha: 1.0),
-          UIColor(red: 0.62, green: 0.85, blue: 1.00, alpha: 1.0),
-        ],
-        particleCount: 8,
-        spread: 14.0...30.0,
-        rise: 2.0...10.0,
-        ringEndScale: 2.0,
-        bubblePulseScale: 1.019,
-        flightRotation: 0.08
-      )
-    case "🔥":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 1.00, green: 0.49, blue: 0.16, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.68, blue: 0.29, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.42, blue: 0.12, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.70, blue: 0.24, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.86, blue: 0.42, alpha: 1.0),
-        ],
-        particleCount: 11,
-        spread: 12.0...28.0,
-        rise: 12.0...30.0,
-        ringEndScale: 2.2,
-        bubblePulseScale: 1.025,
-        flightRotation: -0.14
-      )
-    case "🎉":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 0.95, green: 0.29, blue: 0.53, alpha: 1.0),
-        ring: UIColor(red: 0.98, green: 0.69, blue: 0.25, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.27, blue: 0.51, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.81, blue: 0.20, alpha: 1.0),
-          UIColor(red: 0.31, green: 0.83, blue: 0.95, alpha: 1.0),
-          UIColor(red: 0.56, green: 0.78, blue: 0.30, alpha: 1.0),
-        ],
-        particleCount: 14,
-        spread: 18.0...36.0,
-        rise: 4.0...14.0,
-        ringEndScale: 2.5,
-        bubblePulseScale: 1.026,
-        flightRotation: 0.11
-      )
-    case "👎":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 0.58, green: 0.64, blue: 0.78, alpha: 1.0),
-        ring: UIColor(red: 0.72, green: 0.77, blue: 0.88, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 0.54, green: 0.59, blue: 0.71, alpha: 1.0),
-          UIColor(red: 0.72, green: 0.77, blue: 0.88, alpha: 1.0),
-        ],
-        particleCount: 7,
-        spread: 12.0...25.0,
-        rise: 1.0...8.0,
-        ringEndScale: 1.9,
-        bubblePulseScale: 1.017,
-        flightRotation: -0.07
-      )
-    case "💩":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 0.62, green: 0.45, blue: 0.30, alpha: 1.0),
-        ring: UIColor(red: 0.74, green: 0.59, blue: 0.42, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 0.56, green: 0.40, blue: 0.27, alpha: 1.0),
-          UIColor(red: 0.72, green: 0.55, blue: 0.37, alpha: 1.0),
-        ],
-        particleCount: 6,
-        spread: 10.0...22.0,
-        rise: 2.0...9.0,
-        ringEndScale: 1.8,
-        bubblePulseScale: 1.015,
-        flightRotation: 0.06
-      )
-    case "🥰":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 1.00, green: 0.43, blue: 0.60, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.67, blue: 0.76, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.35, blue: 0.54, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.70, blue: 0.78, alpha: 1.0),
-        ],
-        particleCount: 12,
-        spread: 16.0...34.0,
-        rise: 8.0...22.0,
-        ringEndScale: 2.4,
-        bubblePulseScale: 1.024,
-        flightRotation: -0.12
-      )
-    case "👏":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 1.00, green: 0.68, blue: 0.23, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.82, blue: 0.47, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 1.00, green: 0.59, blue: 0.16, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.86, blue: 0.45, alpha: 1.0),
-        ],
-        particleCount: 10,
-        spread: 20.0...40.0,
-        rise: 2.0...12.0,
-        ringEndScale: 2.2,
-        bubblePulseScale: 1.03,
-        flightRotation: 0.16
-      )
-    case "😁":
-      return ChatReactionFxStyle(
-        accent: UIColor(red: 0.98, green: 0.76, blue: 0.12, alpha: 1.0),
-        ring: UIColor(red: 1.00, green: 0.88, blue: 0.40, alpha: 1.0),
-        particleColors: [
-          UIColor(red: 0.99, green: 0.70, blue: 0.08, alpha: 1.0),
-          UIColor(red: 1.00, green: 0.92, blue: 0.48, alpha: 1.0),
-        ],
-        particleCount: 9,
-        spread: 14.0...31.0,
-        rise: 4.0...15.0,
-        ringEndScale: 2.1,
-        bubblePulseScale: 1.022,
-        flightRotation: 0.09
-      )
-    default:
-      return ChatReactionFxStyle(
+    return Self.styleRegistry[Self.normalizedEmoji(emoji)]
+      ?? Self.makeStyle(
         accent: fallback,
         ring: fallback.withAlphaComponent(0.74),
-        particleColors: [fallback, fallback.withAlphaComponent(0.76)],
-        particleCount: 8,
-        spread: 13.0...29.0,
-        rise: 3.0...12.0,
-        ringEndScale: 2.0,
-        bubblePulseScale: 1.018,
-        flightRotation: 0.05
+        particles: [fallback, fallback.withAlphaComponent(0.76)]
       )
-    }
+  }
+
+  private static let styleRegistry: [String: ChatReactionFxStyle] = {
+    let star = makeStyle(
+      accent: UIColor(red: 1.00, green: 0.74, blue: 0.10, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.87, blue: 0.38, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.65, blue: 0.08, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.88, blue: 0.30, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.97, blue: 0.67, alpha: 1.0),
+      ],
+      count: 13, spread: 18.0...38.0, rise: 8.0...22.0, ringScale: 2.6,
+      bubbleScale: 1.028, rotation: 0.24
+    )
+    let heart = makeStyle(
+      accent: UIColor(red: 1.00, green: 0.30, blue: 0.47, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.56, blue: 0.69, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.25, blue: 0.43, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.56, blue: 0.69, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.74, blue: 0.82, alpha: 1.0),
+      ],
+      count: 10, spread: 14.0...32.0, rise: 6.0...18.0, ringScale: 2.4,
+      bubbleScale: 1.022, rotation: -0.10
+    )
+    let positive = makeStyle(
+      accent: UIColor(red: 0.22, green: 0.63, blue: 0.99, alpha: 1.0),
+      ring: UIColor(red: 0.53, green: 0.77, blue: 1.00, alpha: 1.0),
+      particles: [
+        UIColor(red: 0.27, green: 0.66, blue: 1.00, alpha: 1.0),
+        UIColor(red: 0.62, green: 0.85, blue: 1.00, alpha: 1.0),
+      ],
+      spread: 14.0...30.0, rise: 2.0...10.0, rotation: 0.08
+    )
+    let negative = makeStyle(
+      accent: UIColor(red: 0.58, green: 0.64, blue: 0.78, alpha: 1.0),
+      ring: UIColor(red: 0.72, green: 0.77, blue: 0.88, alpha: 1.0),
+      particles: [
+        UIColor(red: 0.54, green: 0.59, blue: 0.71, alpha: 1.0),
+        UIColor(red: 0.72, green: 0.77, blue: 0.88, alpha: 1.0),
+      ],
+      count: 7, spread: 12.0...25.0, rise: 1.0...8.0, ringScale: 1.9,
+      bubbleScale: 1.017, rotation: -0.07
+    )
+    let fire = makeStyle(
+      accent: UIColor(red: 1.00, green: 0.49, blue: 0.16, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.68, blue: 0.29, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.42, blue: 0.12, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.70, blue: 0.24, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.86, blue: 0.42, alpha: 1.0),
+      ],
+      count: 11, spread: 12.0...28.0, rise: 12.0...30.0, ringScale: 2.2,
+      bubbleScale: 1.025, rotation: -0.14
+    )
+    let love = makeStyle(
+      accent: UIColor(red: 1.00, green: 0.43, blue: 0.60, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.67, blue: 0.76, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.35, blue: 0.54, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.70, blue: 0.78, alpha: 1.0),
+      ],
+      count: 12, spread: 16.0...34.0, rise: 8.0...22.0, ringScale: 2.4,
+      bubbleScale: 1.024, rotation: -0.12
+    )
+    let applause = makeStyle(
+      accent: UIColor(red: 1.00, green: 0.68, blue: 0.23, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.82, blue: 0.47, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.59, blue: 0.16, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.86, blue: 0.45, alpha: 1.0),
+      ],
+      count: 10, spread: 20.0...40.0, rise: 2.0...12.0, ringScale: 2.2,
+      bubbleScale: 1.03, rotation: 0.16
+    )
+    let happy = makeStyle(
+      accent: UIColor(red: 0.98, green: 0.76, blue: 0.12, alpha: 1.0),
+      ring: UIColor(red: 1.00, green: 0.88, blue: 0.40, alpha: 1.0),
+      particles: [
+        UIColor(red: 0.99, green: 0.70, blue: 0.08, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.92, blue: 0.48, alpha: 1.0),
+      ],
+      count: 9, spread: 14.0...31.0, rise: 4.0...15.0, ringScale: 2.1,
+      bubbleScale: 1.022, rotation: 0.09
+    )
+    let celebration = makeStyle(
+      accent: UIColor(red: 0.95, green: 0.29, blue: 0.53, alpha: 1.0),
+      ring: UIColor(red: 0.98, green: 0.69, blue: 0.25, alpha: 1.0),
+      particles: [
+        UIColor(red: 1.00, green: 0.27, blue: 0.51, alpha: 1.0),
+        UIColor(red: 1.00, green: 0.81, blue: 0.20, alpha: 1.0),
+        UIColor(red: 0.31, green: 0.83, blue: 0.95, alpha: 1.0),
+        UIColor(red: 0.56, green: 0.78, blue: 0.30, alpha: 1.0),
+      ],
+      count: 14, spread: 18.0...36.0, rise: 4.0...14.0, ringScale: 2.5,
+      bubbleScale: 1.026, rotation: 0.11
+    )
+    let earthy = makeStyle(
+      accent: UIColor(red: 0.62, green: 0.45, blue: 0.30, alpha: 1.0),
+      ring: UIColor(red: 0.74, green: 0.59, blue: 0.42, alpha: 1.0),
+      particles: [
+        UIColor(red: 0.56, green: 0.40, blue: 0.27, alpha: 1.0),
+        UIColor(red: 0.72, green: 0.55, blue: 0.37, alpha: 1.0),
+      ],
+      count: 6, spread: 10.0...22.0, rise: 2.0...9.0, ringScale: 1.8,
+      bubbleScale: 1.015, rotation: 0.06
+    )
+
+    return [
+      "⭐": star, "❤": heart, "👍": positive, "👎": negative, "🔥": fire,
+      "🥰": love, "👏": applause, "😁": happy, "😂": happy, "🤣": happy,
+      "😢": negative, "😭": negative, "😡": fire, "🤯": celebration,
+      "😱": celebration, "🤔": earthy, "😍": love, "🤩": celebration,
+      "😎": happy, "🙏": applause, "💪": positive, "🤝": positive, "👌": positive,
+      "💯": fire, "⚡": fire, "🚀": fire, "🎂": celebration, "🍾": celebration,
+      "🎉": celebration, "💩": earthy,
+    ]
+  }()
+
+  private static func normalizedEmoji(_ emoji: String) -> String {
+    emoji
+      .replacingOccurrences(of: "\u{FE0E}", with: "")
+      .replacingOccurrences(of: "\u{FE0F}", with: "")
+  }
+
+  private static func makeStyle(
+    accent: UIColor,
+    ring: UIColor,
+    particles: [UIColor],
+    count: Int = 8,
+    spread: ClosedRange<CGFloat> = 13.0...29.0,
+    rise: ClosedRange<CGFloat> = 3.0...12.0,
+    ringScale: CGFloat = 2.0,
+    bubbleScale: CGFloat = 1.018,
+    rotation: CGFloat = 0.05
+  ) -> ChatReactionFxStyle {
+    ChatReactionFxStyle(
+      accent: accent,
+      ring: ring,
+      particleColors: particles,
+      particleCount: count,
+      spread: spread,
+      rise: rise,
+      ringEndScale: ringScale,
+      bubblePulseScale: bubbleScale,
+      flightRotation: rotation
+    )
   }
 
   private func random(_ range: ClosedRange<CGFloat>) -> CGFloat {

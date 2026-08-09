@@ -845,35 +845,55 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     holdDebugLog(
       "contextMenuDidSelectReaction id=\(messageId) emoji=\(reaction) source=\(sourcePoint.map { NSCoder.string(for: $0) } ?? "nil")"
     )
-    var resolvedSourcePoint = sourcePoint
-    if let window, let hostCell = contextMenuHostCell as? ChatListCell,
-      let badgePoint = hostCell.reactionBadgeCenter(in: window)
-    {
-      resolvedSourcePoint = badgePoint
-    }
+    guard let window else { return }
     let resolvedMessageId = messageId
+    let chatId = contextMenuChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let coordinator = ChatReactionTransitionCoordinator.shared
+    let token = coordinator.begin(
+      chatId: chatId, messageId: resolvedMessageId, emoji: reaction)
+    let previous = applyLocalReactionEmoji(reaction, toMessageId: resolvedMessageId)
+    let hostCell = visibleReactionCell(messageId: resolvedMessageId)
+      ?? contextMenuHostCell as? ChatListCell
+    let targetPoint = hostCell?.reactionBadgeCenter(for: reaction, in: window)
+      ?? sourcePoint ?? CGPoint(x: bounds.midX, y: bounds.midY)
+    let flightSource = sourcePoint ?? targetPoint
 
-    let emitReactionEvent = { [weak self] in
-      guard let self else { return }
-      var payload: [String: Any] = [
-        "type": "contextMenuReaction",
-        "emoji": reaction,
-        "messageId": resolvedMessageId,
-      ]
-      if let resolvedSourcePoint {
-        payload["sourceX"] = resolvedSourcePoint.x
-        payload["sourceY"] = resolvedSourcePoint.y
+    var payload: [String: Any] = [
+      "type": "contextMenuReaction",
+      "emoji": reaction,
+      "messageId": resolvedMessageId,
+      "sourceX": flightSource.x,
+      "sourceY": flightSource.y,
+    ]
+    payload["targetX"] = targetPoint.x
+    payload["targetY"] = targetPoint.y
+    holdDebugLog(
+      "emit contextMenuReaction id=\(resolvedMessageId) emoji=\(reaction) source=\(NSCoder.string(for: flightSource)) target=\(NSCoder.string(for: targetPoint))"
+    )
+    onNativeEvent(payload)
+    submitContextMenuReaction(reaction, messageId: resolvedMessageId) { [weak self] accepted in
+      guard let self, !accepted, coordinator.isCurrent(token) else { return }
+      if let previous {
+        self.restoreLocalReactionSnapshot(previous, toMessageId: resolvedMessageId)
       }
-      self.holdDebugLog(
-        "emit contextMenuReaction id=\(resolvedMessageId) emoji=\(reaction) source=\(resolvedSourcePoint.map { NSCoder.string(for: $0) } ?? "nil")"
-      )
-      self.playReactionFx(payload)
-      self.submitContextMenuReaction(reaction, messageId: resolvedMessageId)
-      self.onNativeEvent(payload)
+      coordinator.cancel(token)
     }
 
-    // The overlay already completed its icon flight and began dismissal.
-    emitReactionEvent()
+    ChatReactionFxModule.shared.animateReactionFlight(
+      emoji: reaction,
+      from: flightSource,
+      to: targetPoint,
+      in: window,
+      bubbleView: nil
+    ) { [weak self, weak window] in
+      guard let self, let window, coordinator.isCurrent(token) else { return }
+      let cell = self.visibleReactionCell(messageId: resolvedMessageId)
+      if cell?.playReactionLandingEffect(reaction, in: window) != true {
+        ChatReactionFxModule.shared.playLandingEffect(
+          emoji: reaction, at: targetPoint, in: window, tintOverride: nil)
+      }
+      coordinator.finish(token)
+    }
   }
 
   public func contextMenuDidSelectAction(_ actionId: String, messageId _: String) {
