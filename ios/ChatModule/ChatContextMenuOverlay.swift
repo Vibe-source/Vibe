@@ -22,7 +22,7 @@ func makeChatContextLiquidGlassView(
   if #available(iOS 26.0, *) {
     let effect = UIGlassEffect(style: .regular)
     effect.isInteractive = interactive
-    effect.tintColor = .clear
+    effect.tintColor = nil
     view.effect = effect
     if capsuleCorners {
       view.cornerConfiguration = .capsule()
@@ -172,8 +172,8 @@ public final class ChatContextMenuOverlay: UIView {
   // MARK: - Setup
 
   private func setupViews() {
-    // 1. Full-screen glass background
-    backgroundGlassView.alpha = 0
+    // Keep the resolved backdrop stable while glass is visible above it.
+    backgroundGlassView.alpha = 1
     addSubview(backgroundGlassView)
 
     // 2. Bubble snapshot (already has correct frame in window coords)
@@ -189,7 +189,7 @@ public final class ChatContextMenuOverlay: UIView {
     if !hidesReactionPicker { addSubview(reactionPicker) }
 
     // 4. Context menu (below or above bubble)
-    contextMenu.alpha = 0
+    contextMenu.alpha = 1
     contextMenu.delegate = self
     contextMenu.frame = CGRect(x: 0, y: 0, width: 220, height: 1)
     addSubview(contextMenu)
@@ -400,11 +400,6 @@ public final class ChatContextMenuOverlay: UIView {
       "animateIn arm interactions now=\(String(format: "%.3f", now)) until=\(String(format: "%.3f", ignoreBackgroundTapUntil))"
     )
 
-    // --- Background glass fade in ---
-    UIView.animate(withDuration: 0.20, delay: 0, options: .curveEaseOut) {
-      self.backgroundGlassView.alpha = 1
-    }
-
     // --- Bubble: continue from the cell's settled sink (0.95) — the menus
     // morph out of that state on the SAME spring, so nothing pops.
     let startCenter = CGPoint(x: originalBubbleFrame.midX, y: originalBubbleFrame.midY)
@@ -446,13 +441,11 @@ public final class ChatContextMenuOverlay: UIView {
       y: originalBubbleFrame.maxY + 4
     )
     contextMenu.transform = CGAffineTransform(scaleX: 0.4, y: 0.4)
-    contextMenu.alpha = 0
+    contextMenu.alpha = 1
 
-    // Alpha resolves quickly so the entire remaining flight is pure geometry —
-    // a small-scale birth with a bouncy spring reads as a morph, never a fade.
+    // Only the blur picker fades; the glass card stays at one resolved opacity.
     let fadeAnimator = UIViewPropertyAnimator(duration: 0.12, curve: .easeOut) {
       self.reactionPicker.alpha = 1
-      self.contextMenu.alpha = 1
     }
     // One under-damped spring drives bubble, picker, and menu together: both
     // menus grow out of the bubble's edges with a visible expansion overshoot.
@@ -487,9 +480,7 @@ public final class ChatContextMenuOverlay: UIView {
     UIView.animate(
       withDuration: 0.18, delay: 0, options: [.curveEaseIn, .beginFromCurrentState]
     ) {
-      self.backgroundGlassView.alpha = 0
       self.reactionPicker.alpha = 0
-      self.contextMenu.alpha = 0
       self.bubbleSnapshot.transform = .identity
       self.bubbleSnapshot.bounds = CGRect(origin: .zero, size: self.originalBubbleFrame.size)
       self.bubbleSnapshot.center = CGPoint(
@@ -507,9 +498,17 @@ public final class ChatContextMenuOverlay: UIView {
         y: self.originalBubbleFrame.minY - 8
       )
     } completion: { _ in
-      self.removeFromSuperview()
-      self.delegate?.contextMenuDidDismiss(overlay: self)
-      completion?()
+      self.contextMenu.isHidden = true
+      self.reactionPicker.isHidden = true
+      UIView.animate(
+        withDuration: 0.10, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]
+      ) {
+        self.backgroundGlassView.alpha = 0
+      } completion: { _ in
+        self.removeFromSuperview()
+        self.delegate?.contextMenuDidDismiss(overlay: self)
+        completion?()
+      }
     }
   }
 }
@@ -560,12 +559,18 @@ extension ChatContextMenuOverlay: ChatContextMenuOverlayDelegate {
     let sourcePointInView = sourcePoint ?? fallbackSource
     let sourceInWindow = self.convert(sourcePointInView, to: nil)
     let targetInWindow = reactionLandingPointInWindow()
+    let captureMessageId = self.messageId
 
-    // Immediately dismiss the menu UI and snap cell back
+    // Submit before dismissal can release the overlay; the flight is presentation only.
+    delegate?.contextMenuDidSelectReaction(
+      reaction,
+      messageId: captureMessageId,
+      sourcePoint: targetInWindow
+    )
+
     self.animateOut(reason: "reactionSelected")
 
     if let window = self.window {
-      let captureMessageId = self.messageId
       ChatReactionFxModule.shared.animateReactionFlight(
         emoji: reaction,
         from: sourceInWindow,
@@ -574,16 +579,9 @@ extension ChatContextMenuOverlay: ChatContextMenuOverlayDelegate {
         bubbleView: nil
       ) { [weak self] in
         self?.isSelectingReaction = false
-        self?.delegate?.contextMenuDidSelectReaction(
-          reaction,
-          messageId: captureMessageId,
-          sourcePoint: targetInWindow
-        )
       }
     } else {
       isSelectingReaction = false
-      delegate?.contextMenuDidSelectReaction(
-        reaction, messageId: self.messageId, sourcePoint: targetInWindow)
     }
   }
 

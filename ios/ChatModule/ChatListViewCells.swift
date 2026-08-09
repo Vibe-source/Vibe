@@ -10468,6 +10468,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     clipsToBounds = false
     contentView.clipsToBounds = false
+    automaticallyUpdatesContentConfiguration = false
+    automaticallyUpdatesBackgroundConfiguration = false
 
     contentView.addSubview(bubbleView)
     contentView.addSubview(tailView)
@@ -11717,7 +11719,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   override func prepareForReuse() {
-    super.prepareForReuse()
+    let reuseStartedAt = ProcessInfo.processInfo.systemUptime
+    // Tear down animated/media owners before UIKit resets its cell configuration state.
+    layer.removeAllAnimations()
+    contentView.layer.removeAllAnimations()
+    pendingStatusView.stopAnimating()
+    stopTypingShimmer()
+    stopInlineVideoPlayback(resetMutedState: true)
+    stopVideoNoteProgressRing()
+    resetStickerAnimation()
     lastTouchPointInCell = nil
     resetTallBubbleInnerContentAnimation()
     clipsToBounds = false
@@ -11806,7 +11816,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     statusImageView.isHidden = true
     statusImageView.image = nil
     pendingStatusView.isHidden = true
-    pendingStatusView.stopAnimating()
     statusLabel.isHidden = true
     statusLabel.text = nil
     retryButton.isHidden = true
@@ -11828,23 +11837,26 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     musicCoverTask = nil
     mediaImageView.image = nil
     mediaPixelQuality = .none
-    stopInlineVideoPlayback(resetMutedState: true)
-    stopVideoNoteProgressRing()
     mediaContainerView.transform = .identity
     bubbleView.transform = .identity
     tailView.transform = .identity
     metaContainerView.transform = .identity
     setMediaPlaceholderHidden(true)
-    resetStickerAnimation()
     lastReactionDebugSignature = nil
     applyContextMenuExtractionIfNeeded()
     applyContextMenuHoldIfNeeded(animated: false, strategy: "scaleCell")
     contentView.alpha = 1.0
     contentView.transform = .identity
-    layer.removeAllAnimations()
-    contentView.layer.removeAllAnimations()
-    stopTypingShimmer()
     messageLabel.resetStreamingState()
+    let superStartedAt = ProcessInfo.processInfo.systemUptime
+    super.prepareForReuse()
+    let finishedAt = ProcessInfo.processInfo.systemUptime
+    let totalMs = (finishedAt - reuseStartedAt) * 1_000.0
+    if totalMs > 8.0 {
+      NSLog(
+        "[CellCost] prepareForReuse total=%.1fms super=%.1fms",
+        totalMs, (finishedAt - superStartedAt) * 1_000.0)
+    }
   }
 
   /// Always clear the reconfigure gate alongside a body reset: after `reset()` the body
