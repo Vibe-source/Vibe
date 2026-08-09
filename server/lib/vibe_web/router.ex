@@ -165,6 +165,7 @@ defmodule VibeWeb.Router do
     # Saved Messages
     get "/saved_messages/:user_id", SavedMessageController, :index
     post "/saved_messages", SavedMessageController, :create
+    put "/saved_messages/:original_message_id/reaction", SavedMessageController, :reaction
     delete "/saved_messages/:user_id/:original_message_id", SavedMessageController, :delete
 
     # Subscription & Plans

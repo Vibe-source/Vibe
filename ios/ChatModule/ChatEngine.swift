@@ -650,6 +650,7 @@ final class ChatEngine {
   private var agentDMStorePurgedChats = Set<String>()
   private static let agentDMChatIdsDefaultsKey = "VibeAgentDMChatIds"
   private var cachedSavedMessagesResponse: [[String: Any]]?
+  private var savedReactionGenerationByMessageId: [String: UInt64] = [:]
   private var historyLoadingChats = Set<String>()
   private var historyOlderExhaustedChats = Set<String>()
   private var historyLoadingOlderChats = Set<String>()
@@ -5705,6 +5706,10 @@ final class ChatEngine {
       let emoji = normalizedString(payload["emoji"]), !emoji.isEmpty
     else { return ["accepted": false, "reason": "invalid_payload"] }
 
+    if chatId == "saved_messages" {
+      return reactToSavedMessage(messageId: messageId, emoji: emoji)
+    }
+
     return syncOnQueue {
       guard let client = phoenixClient else {
         return ["accepted": false, "reason": "no_native_socket"]
@@ -5728,6 +5733,143 @@ final class ChatEngine {
         chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "reaction")
       return ["accepted": true, "transport": "native", "ref": ref]
     }
+  }
+
+  private func reactToSavedMessage(messageId: String, emoji: String) -> [String: Any] {
+    typealias Prepared = (
+      apiBase: URL,
+      token: String,
+      previous: [[String: Any]],
+      optimistic: [[String: Any]],
+      generation: UInt64
+    )
+    let prepared: Prepared? = syncOnQueue {
+      guard let apiBase = apiBaseURLLocked(),
+        let existing = findMessagePayloadLocked(
+          chatId: "saved_messages", messageId: messageId)
+      else { return nil }
+
+      let previous = existing["reactions"] as? [[String: Any]] ?? []
+      let optimistic = optimisticReactionBucketsLocked(
+        chatId: "saved_messages", messageId: messageId, emoji: emoji)
+      let generation = (savedReactionGenerationByMessageId[messageId] ?? 0) &+ 1
+      savedReactionGenerationByMessageId[messageId] = generation
+      applySavedReactionBucketsLocked(messageId: messageId, reactions: optimistic)
+      publishSavedReactionChangeLocked(messageId: messageId, source: "savedReactionOptimistic")
+      return (apiBase, authHeaderTokenLocked() ?? "", previous, optimistic, generation)
+    }
+
+    guard let prepared else {
+      return ["accepted": false, "reason": "saved_message_not_ready"]
+    }
+    performSavedMessageReactionRequest(
+      apiBase: prepared.apiBase,
+      token: prepared.token,
+      messageId: messageId,
+      emoji: emoji,
+      previous: prepared.previous,
+      optimistic: prepared.optimistic,
+      generation: prepared.generation
+    )
+    return [
+      "accepted": true,
+      "transport": "http",
+      "chatId": "saved_messages",
+      "messageId": messageId,
+    ]
+  }
+
+  private func performSavedMessageReactionRequest(
+    apiBase: URL,
+    token: String,
+    messageId: String,
+    emoji: String,
+    previous: [[String: Any]],
+    optimistic: [[String: Any]],
+    generation: UInt64
+  ) {
+    let url =
+      apiBase
+      .appendingPathComponent("api")
+      .appendingPathComponent("saved_messages")
+      .appendingPathComponent(messageId)
+      .appendingPathComponent("reaction")
+    var request = URLRequest(url: url)
+    request.httpMethod = "PUT"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    request.httpBody = try? JSONSerialization.data(
+      withJSONObject: ["emoji": emoji], options: [])
+
+    ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      guard let self else { return }
+      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      let success = error == nil && (200...299).contains(status)
+      let canonical = data.flatMap(self.savedReactionBucketsFromResponse)
+      self.queue.async {
+        guard self.savedReactionGenerationByMessageId[messageId] == generation else { return }
+        if success {
+          self.applySavedReactionBucketsLocked(
+            messageId: messageId, reactions: canonical ?? optimistic)
+          self.publishSavedReactionChangeLocked(
+            messageId: messageId, source: "savedReactionReply")
+          self.appendJournalLocked(
+            event: "saved-message-reaction-reply",
+            payload: ["messageId": messageId, "status": status])
+        } else {
+          self.applySavedReactionBucketsLocked(messageId: messageId, reactions: previous)
+          self.publishSavedReactionChangeLocked(
+            messageId: messageId, source: "savedReactionRollback")
+          self.appendJournalLocked(
+            event: "saved-message-reaction-failed",
+            payload: [
+              "messageId": messageId,
+              "status": status,
+              "error": error?.localizedDescription ?? "",
+            ])
+        }
+      }
+    }.resume()
+  }
+
+  private func savedReactionBucketsFromResponse(_ data: Data) -> [[String: Any]]? {
+    guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    if let reactions = body["reactions"] as? [[String: Any]] { return reactions }
+    if let result = body["data"] as? [String: Any] {
+      return result["reactions"] as? [[String: Any]]
+    }
+    return nil
+  }
+
+  private func applySavedReactionBucketsLocked(
+    messageId: String, reactions: [[String: Any]]
+  ) {
+    _ = applyMessageEngagementLocked(
+      chatId: "saved_messages", messageId: messageId, reactions: reactions, viewCount: nil)
+    guard var cached = cachedSavedMessagesResponse else { return }
+    for index in cached.indices where normalizedString(cached[index]["id"]) == messageId {
+      cached[index]["reactions"] = reactions
+      break
+    }
+    cachedSavedMessagesResponse = cached
+  }
+
+  private func publishSavedReactionChangeLocked(messageId: String, source: String) {
+    postChangeLocked(
+      reason: "chatMessageReactionChanged",
+      userInfo: ["chatId": "saved_messages", "messageId": messageId])
+    postChatDeltaLocked(
+      chatId: "saved_messages",
+      inserted: [],
+      updated: [messageId],
+      deleted: [],
+      source: source)
   }
 
   func markMessagesViewed(_ payload: [String: Any]) -> [String: Any] {
@@ -16322,6 +16464,9 @@ final class ChatEngine {
       }
       if let isEdited = raw["isEdited"] as? Bool {
         normalized["isEdited"] = isEdited
+      }
+      if let reactions = raw["reactions"] as? [[String: Any]] {
+        normalized["reactions"] = reactions
       }
       if let replyToId = normalizedString(decryptedFields["replyToId"]) {
         normalized["replyToId"] = replyToId

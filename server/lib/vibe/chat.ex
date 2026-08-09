@@ -153,6 +153,73 @@ defmodule Vibe.Chat do
     |> Enum.map(&to_client_saved_message/1)
   end
 
+  @doc "Toggles the caller's private Saved Messages reaction; one emoji per saved item."
+  def toggle_saved_message_reaction(user_id, original_message_id, emoji) do
+    with {:ok, normalized} <- normalize_emoji(emoji),
+         {:ok, actor_id} <- normalize_saved_message_actor(user_id),
+         {:ok, key} <- normalize_saved_message_key(original_message_id) do
+      Repo.transaction(fn ->
+        case lock_saved_message(actor_id, key) do
+          %SavedMessage{} = saved -> apply_saved_message_reaction(saved, normalized)
+          nil -> Repo.rollback(:not_found)
+        end
+      end)
+    end
+  end
+
+  # Row lock, so two devices toggling at once serialize instead of splitting state.
+  defp lock_saved_message(user_id, original_message_id) do
+    Repo.one(
+      from(sm in SavedMessage,
+        where: sm.user_id == ^user_id and sm.original_message_id == ^original_message_id,
+        lock: "FOR UPDATE"
+      )
+    )
+  end
+
+  defp apply_saved_message_reaction(%SavedMessage{} = saved, emoji) do
+    {next, action} =
+      cond do
+        saved.reaction_emoji == emoji -> {nil, :removed}
+        is_nil(saved.reaction_emoji) or saved.reaction_emoji == "" -> {emoji, :added}
+        true -> {emoji, :replaced}
+      end
+
+    from(sm in SavedMessage, where: sm.id == ^saved.id)
+    |> Repo.update_all(
+      set: [
+        reaction_emoji: next,
+        updated_at: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+      ]
+    )
+
+    %{
+      original_message_id: saved.original_message_id,
+      action: action,
+      emoji: emoji,
+      reactions: saved_message_reactions(next)
+    }
+  end
+
+  defp normalize_saved_message_actor(user_id) do
+    case present_string(user_id) do
+      nil -> {:error, :invalid_id}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp normalize_saved_message_key(original_message_id) do
+    case present_string(original_message_id) do
+      nil -> {:error, :invalid_id}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp saved_message_reactions(emoji) when is_binary(emoji) and emoji != "",
+    do: [%{emoji: emoji, count: 1, isSelected: true}]
+
+  defp saved_message_reactions(_emoji), do: []
+
   def is_participant?(chat_id, user_id) do
     Repo.exists?(
       from(p in Participant,
@@ -3706,6 +3773,7 @@ defmodule Vibe.Chat do
       media_url: rewrite_media_url(message.media_url),
       timestamp: message.timestamp,
       extra: message.extra,
+      reactions: saved_message_reactions(message.reaction_emoji),
       inserted_at: message.inserted_at
     }
   end
