@@ -69,6 +69,12 @@ struct BubbleShape {
 }
 
 struct ChatListRow {
+  struct Reaction: Equatable, Hashable {
+    let emoji: String
+    let count: Int
+    let isSelected: Bool
+  }
+
   struct AgentProgressNode: Equatable {
     let id: String
     let label: String
@@ -521,6 +527,7 @@ struct ChatListRow {
   let isMe: Bool
   let status: String?
   let isEdited: Bool
+  let editedAtMs: Int64?
   let isPinned: Bool
   let messageId: String?
   let chatId: String?
@@ -551,6 +558,8 @@ struct ChatListRow {
     return !hasTitle && !hasText
   }
   let reactionEmoji: String?
+  let reactions: [Reaction]
+  let viewCount: Int?
   let shape: BubbleShape
   let messageType: String
   let mediaUrl: String?
@@ -821,6 +830,7 @@ struct ChatListRow {
       isMe = false
       status = nil
       isEdited = false
+      editedAtMs = nil
       isPinned = false
       messageId = nil
       chatId = nil
@@ -830,6 +840,8 @@ struct ChatListRow {
       replyPreviewText = nil
       replyPreviewUserId = nil
       reactionEmoji = nil
+      reactions = []
+      viewCount = nil
       shape = BubbleShape(
         isMe: false, showTail: false, borderTopLeftRadius: 18, borderTopRightRadius: 18,
         borderBottomLeftRadius: 18, borderBottomRightRadius: 18)
@@ -918,6 +930,8 @@ struct ChatListRow {
     isMe = (message["isMe"] as? Bool) ?? false
     status = message["status"] as? String
     isEdited = (message["isEdited"] as? Bool) ?? false
+    editedAtMs = Self.int64Value(
+      message["editedAt"] ?? message["edited_at"] ?? metadata?["editedAt"])
     isPinned = (message["isPinned"] as? Bool) ?? false
     messageId = parseNonEmptyString(message["id"])
     chatId =
@@ -975,7 +989,22 @@ struct ChatListRow {
         "from_id", "fromId",
       ]
     )
-    reactionEmoji = message["reactionEmoji"] as? String
+    let parsedReactions = ((message["reactions"] as? [[String: Any]]) ?? []).compactMap {
+      item -> Reaction? in
+      guard let emoji = parseNonEmptyString(item["emoji"]),
+        let count = Self.intValue(item["count"]), count > 0
+      else { return nil }
+      return Reaction(
+        emoji: emoji,
+        count: count,
+        isSelected: (item["isSelected"] as? Bool) ?? (item["is_selected"] as? Bool) ?? false)
+    }
+    let legacyReaction = parseNonEmptyString(message["reactionEmoji"])
+    reactions = parsedReactions.isEmpty
+      ? legacyReaction.map { [Reaction(emoji: $0, count: 1, isSelected: true)] } ?? []
+      : parsedReactions
+    reactionEmoji = reactions.first?.emoji
+    viewCount = Self.intValue(message["viewCount"] ?? message["view_count"])
     messageType = ((message["type"] as? String) ?? "text").lowercased()
     shape = BubbleShape.from(raw: message["bubbleShape"] as? [String: Any], isMe: isMe)
 
@@ -1316,6 +1345,22 @@ struct ChatListRow {
       ChatServiceMessage.parse(metadata?["service"])
       ?? ChatServiceMessage.parse(message["service"])
   }
+
+  private static func intValue(_ value: Any?) -> Int? {
+    if let value = value as? Int { return value }
+    if let value = value as? UInt64 { return Int(clamping: value) }
+    if let value = value as? NSNumber { return value.intValue }
+    if let value = value as? String { return Int(value) }
+    return nil
+  }
+
+  private static func int64Value(_ value: Any?) -> Int64? {
+    if let value = value as? Int64 { return value }
+    if let value = value as? UInt64 { return Int64(clamping: value) }
+    if let value = value as? NSNumber { return value.int64Value }
+    if let value = value as? String { return Int64(value) }
+    return nil
+  }
 }
 
 private func bubbleShapeEqual(_ lhs: BubbleShape, _ rhs: BubbleShape) -> Bool {
@@ -1579,8 +1624,9 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
   return lhs.kind == rhs.kind && lhs.key == rhs.key && lhs.label == rhs.label
     && lhs.text == rhs.text && lhs.timestamp == rhs.timestamp && lhs.isMe == rhs.isMe
     && lhs.status == rhs.status
-    && lhs.isEdited == rhs.isEdited && lhs.isPinned == rhs.isPinned
-    && lhs.messageId == rhs.messageId && lhs.reactionEmoji == rhs.reactionEmoji
+    && lhs.isEdited == rhs.isEdited && lhs.editedAtMs == rhs.editedAtMs
+    && lhs.isPinned == rhs.isPinned && lhs.messageId == rhs.messageId
+    && lhs.reactions == rhs.reactions && lhs.viewCount == rhs.viewCount
     // Render-aware: agent-turn bubbles never render reply bands (zero replyPreview
     // reads in the whole VibeAgentKit stack), and reply fields on agent rows are
     // pipeline-unstable — they ride only the live delivery, so history/store copies

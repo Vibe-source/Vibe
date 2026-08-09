@@ -9365,15 +9365,7 @@ private final class ChatHomePreviewActionMenuView: UIView {
       style: isDark ? .systemMaterialDark : .systemMaterial,
       cornerRadius: 24,
       capsuleCorners: false,
-      interactive: false,
-      // Near-opaque near-black surface. A translucent tint still let the moving
-      // preview rows refract/swim through the Liquid Glass (and carried a cool
-      // blue cast + a bright rim that read as a border). Pushing the tint to
-      // near-full opacity makes it a clean, flat Telegram-style dark menu: no
-      // blue, no visible rim, nothing scrolling through it.
-      glassTint: isDark
-        ? UIColor(white: 0.085, alpha: 0.985)
-        : UIColor(white: 0.98, alpha: 0.98)
+      interactive: false
     )
     super.init(frame: .zero)
     setup()
@@ -9650,6 +9642,7 @@ private final class ChatHomeMiniPreviewController: UIViewController {
     mainView.setGroupMembers(row.members)
     mainView.setIsGroupOrChannel(row.isGroup || row.isChannel)
     mainView.setIsChannel(row.isChannel)
+    mainView.setChannelShareLink(row.shareLink ?? "")
     mainView.setStatusAuthorityEnabled(true)
     mainView.setInputBarEnabled(false)
     mainView.isUserInteractionEnabled = true
@@ -11316,6 +11309,7 @@ final class ChatConversationController: UIViewController {
       route.isChannel || GroupProfileActionRouter.resolvedIsChannel(chatId: route.chatId)
     mainView.setIsGroupOrChannel(route.isGroup || route.isChannel || resolvedChannel)
     mainView.setIsChannel(resolvedChannel)
+    mainView.setChannelShareLink(route.shareLink ?? "")
     mainView.setGroupMembers(resolvedRouteMembers)
     mainView.setGroupMemberCount(
       route.isGroup ? max(route.roomParticipantCount, resolvedRouteMembers.count) : nil)

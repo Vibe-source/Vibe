@@ -117,6 +117,54 @@ defmodule VibeWeb.ChatController do
     end
   end
 
+  def report_message(conn, %{"chat_id" => chat_id, "message_id" => message_id} = params) do
+    user_id = conn.assigns.current_user.id
+
+    case Chat.report_message(chat_id, message_id, user_id, params) do
+      {:ok, %{report: report, blocked: blocked}} ->
+        json(conn, %{
+          success: true,
+          blocked: blocked,
+          report: %{
+            id: report.id,
+            chatId: report.chat_id,
+            messageId: report.source_message_id,
+            reason: report.reason,
+            details: report.details,
+            status: report.status,
+            reportedUserId: report.reported_user_id,
+            createdAt: report.inserted_at
+          }
+        })
+
+      {:error, :invalid_id} ->
+        conn |> put_status(:bad_request) |> json(%{error: "Invalid message id"})
+
+      {:error, :invalid_reason} ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{error: "Invalid reason", reasons: Chat.report_reasons()})
+
+      {:error, :details_too_long} ->
+        conn |> put_status(:bad_request) |> json(%{error: "Details too long"})
+
+      {:error, :invalid_details} ->
+        conn |> put_status(:bad_request) |> json(%{error: "Invalid details"})
+
+      {:error, :invalid_target} ->
+        conn |> put_status(:bad_request) |> json(%{error: "Cannot report this message"})
+
+      {:error, :forbidden} ->
+        conn |> put_status(:forbidden) |> json(%{error: "Not a participant"})
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: "Message not found"})
+
+      {:error, reason} ->
+        conn |> put_status(:bad_request) |> json(%{error: inspect(reason)})
+    end
+  end
+
   def list_pinned_messages(conn, %{"chat_id" => chat_id}) do
     user_id = conn.assigns.current_user.id
 

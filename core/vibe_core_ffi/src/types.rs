@@ -33,6 +33,13 @@ use vibe_core::types::{
     VibeTimelineOpV1, VibeTimelineWindowV1, VibeWindowBounds,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VibeFfiReaction {
+    pub emoji: String,
+    pub count: u64,
+    pub is_selected: bool,
+}
+
 /// Which ingest source a frame arrived on. Mirrors [`VibeEventSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum VibeFfiSource {
@@ -386,6 +393,8 @@ pub struct VibeFfiMessage {
     pub agent: Option<VibeFfiAgent>,
     pub service: Option<VibeFfiService>,
     pub edited_at_ms: Option<i64>,
+    pub reactions: Vec<VibeFfiReaction>,
+    pub view_count: Option<u64>,
 }
 
 impl From<&VibeMessageSnapshotV1> for VibeFfiMessage {
@@ -416,6 +425,16 @@ impl From<&VibeMessageSnapshotV1> for VibeFfiMessage {
             agent: m.agent.as_ref().map(Into::into),
             service: m.service.as_ref().map(Into::into),
             edited_at_ms: m.edit.map(|e| e.edited_at_ms),
+            reactions: m
+                .reactions
+                .iter()
+                .map(|reaction| VibeFfiReaction {
+                    emoji: reaction.emoji.clone(),
+                    count: reaction.count,
+                    is_selected: reaction.is_selected,
+                })
+                .collect(),
+            view_count: m.view_count,
         }
     }
 }

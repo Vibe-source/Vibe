@@ -5754,6 +5754,10 @@ public final class ChatMainView: UIView,
     updateAvatarViews()
   }
 
+  func setChannelShareLink(_ value: String) {
+    chatListView.setChannelShareLink(value)
+  }
+
   /// Broadcast channel vs multi-member group. Forwarded so History loading can
   /// pick skeleton (channel) vs modern spinner (direct / group).
   func setIsChannel(_ value: Bool) {

@@ -2038,8 +2038,190 @@ struct ChatMessageBubbleLayoutMetrics {
 private struct ChatBubbleMetaWidths {
   let edited: CGFloat
   let pinned: CGFloat
+  let views: CGFloat
   let timestamp: CGFloat
   let total: CGFloat
+}
+
+private let reactionChipHeight: CGFloat = 24.0
+private let reactionChipGap: CGFloat = 4.0
+private let reactionChipRowGap: CGFloat = 4.0
+private let reactionEmojiFont = UIFont.systemFont(ofSize: 14.0)
+private let reactionCountFont = UIFont.monospacedDigitSystemFont(ofSize: 12.0, weight: .semibold)
+
+private func compactEngagementCount(_ count: Int) -> String {
+  if count >= 1_000_000 {
+    let value = String(format: "%.1f", Double(count) / 1_000_000.0)
+    return (value.hasSuffix(".0") ? String(value.dropLast(2)) : value) + "M"
+  }
+  if count >= 1_000 {
+    let value = String(format: "%.1f", Double(count) / 1_000.0)
+    return (value.hasSuffix(".0") ? String(value.dropLast(2)) : value) + "K"
+  }
+  return String(count)
+}
+
+private func reactionChipWidth(_ reaction: ChatListRow.Reaction) -> CGFloat {
+  let emoji = ceil((reaction.emoji as NSString).size(withAttributes: [.font: reactionEmojiFont]).width)
+  let count = ceil((compactEngagementCount(reaction.count) as NSString).size(
+    withAttributes: [.font: reactionCountFont]).width)
+  return max(42.0, emoji + count + 21.0)
+}
+
+private func reactionStripMeasuredSize(
+  _ reactions: [ChatListRow.Reaction], maxWidth: CGFloat
+) -> CGSize {
+  guard !reactions.isEmpty, maxWidth > 0 else { return .zero }
+  var rowWidth: CGFloat = 0.0
+  var widest: CGFloat = 0.0
+  var rows = 1
+  for reaction in reactions {
+    let width = min(maxWidth, reactionChipWidth(reaction))
+    let proposed = rowWidth == 0.0 ? width : rowWidth + reactionChipGap + width
+    if proposed > maxWidth, rowWidth > 0.0 {
+      widest = max(widest, rowWidth)
+      rowWidth = width
+      rows += 1
+    } else {
+      rowWidth = proposed
+    }
+  }
+  widest = max(widest, rowWidth)
+  let height = CGFloat(rows) * reactionChipHeight + CGFloat(rows - 1) * reactionChipRowGap
+  return CGSize(width: ceil(widest), height: height)
+}
+
+private final class ChatRollingCounterLabel: UILabel {
+  func setCounterText(_ value: String, animated: Bool) {
+    guard text != value else { return }
+    let previous = text
+    text = value
+    guard animated, previous != nil, window != nil, let host = superview else { return }
+
+    let departing = UILabel(frame: convert(bounds, to: host))
+    departing.font = font
+    departing.textAlignment = textAlignment
+    departing.textColor = textColor
+    departing.text = previous
+    host.addSubview(departing)
+    alpha = 0.0
+    transform = CGAffineTransform(translationX: 0.0, y: 7.0).scaledBy(x: 0.92, y: 0.92)
+    UIView.animate(
+      withDuration: 0.28, delay: 0.0, usingSpringWithDamping: 0.82,
+      initialSpringVelocity: 0.25, options: [.allowUserInteraction, .beginFromCurrentState]
+    ) {
+      departing.alpha = 0.0
+      departing.transform = CGAffineTransform(translationX: 0.0, y: -7.0).scaledBy(x: 0.92, y: 0.92)
+      self.alpha = 1.0
+      self.transform = .identity
+    } completion: { _ in
+      departing.removeFromSuperview()
+    }
+  }
+}
+
+private final class ChatReactionChipView: UIView {
+  let emojiLabel = UILabel()
+  let countLabel = ChatRollingCounterLabel()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    layer.cornerCurve = .continuous
+    layer.borderWidth = 1.0 / UIScreen.main.scale
+    clipsToBounds = true
+    emojiLabel.font = reactionEmojiFont
+    emojiLabel.textAlignment = .center
+    countLabel.font = reactionCountFont
+    countLabel.textAlignment = .center
+    addSubview(emojiLabel)
+    addSubview(countLabel)
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  func apply(
+    reaction: ChatListRow.Reaction, appearance: ChatListAppearance, isMe: Bool, animated: Bool
+  ) {
+    emojiLabel.text = reaction.emoji
+    countLabel.textColor = reaction.isSelected ? appearance.accent : UIColor.white.withAlphaComponent(0.86)
+    countLabel.setCounterText(compactEngagementCount(reaction.count), animated: animated)
+    backgroundColor = reaction.isSelected
+      ? appearance.accent.withAlphaComponent(appearance.isDark ? 0.28 : 0.18)
+      : UIColor(white: isMe ? 1.0 : 0.0, alpha: isMe ? 0.15 : 0.24)
+    layer.borderColor = (reaction.isSelected ? appearance.accent : UIColor.white)
+      .withAlphaComponent(reaction.isSelected ? 0.50 : 0.20).cgColor
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    layer.cornerRadius = bounds.height * 0.5
+    let emojiWidth = ceil(emojiLabel.intrinsicContentSize.width)
+    let countWidth = ceil(countLabel.intrinsicContentSize.width)
+    let contentWidth = emojiWidth + 5.0 + countWidth
+    let startX = floor((bounds.width - contentWidth) * 0.5)
+    emojiLabel.frame = CGRect(x: startX, y: 0.0, width: emojiWidth, height: bounds.height)
+    countLabel.frame = CGRect(
+      x: emojiLabel.frame.maxX + 5.0, y: 0.0, width: countWidth, height: bounds.height)
+  }
+}
+
+private final class ChatReactionStripView: UIView {
+  private var chips: [String: ChatReactionChipView] = [:]
+  private var reactions: [ChatListRow.Reaction] = []
+  private var animatesNextLayout = false
+
+  func configure(
+    reactions: [ChatListRow.Reaction], appearance: ChatListAppearance, isMe: Bool,
+    animated: Bool
+  ) {
+    self.reactions = reactions
+    animatesNextLayout = animated
+    let live = Set(reactions.map(\.emoji))
+    let stale = chips.keys.filter { !live.contains($0) }
+    for emoji in stale {
+      chips.removeValue(forKey: emoji)?.removeFromSuperview()
+    }
+    for reaction in reactions {
+      let chip = chips[reaction.emoji] ?? ChatReactionChipView()
+      if chip.superview == nil { addSubview(chip) }
+      chips[reaction.emoji] = chip
+      chip.apply(reaction: reaction, appearance: appearance, isMe: isMe, animated: animated)
+    }
+    setNeedsLayout()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let shouldAnimate = animatesNextLayout && window != nil
+    animatesNextLayout = false
+    var x: CGFloat = 0.0
+    var y: CGFloat = 0.0
+    for reaction in reactions {
+      guard let chip = chips[reaction.emoji] else { continue }
+      let width = min(bounds.width, reactionChipWidth(reaction))
+      if x > 0.0, x + width > bounds.width {
+        x = 0.0
+        y += reactionChipHeight + reactionChipRowGap
+      }
+      let frame = pixelAlignedRect(CGRect(x: x, y: y, width: width, height: reactionChipHeight))
+      if shouldAnimate, chip.bounds.width > 0.0, chip.frame != frame {
+        UIView.animate(
+          withDuration: 0.28, delay: 0.0, usingSpringWithDamping: 0.84,
+          initialSpringVelocity: 0.2, options: [.allowUserInteraction, .beginFromCurrentState]
+        ) {
+          chip.frame = frame
+        }
+      } else {
+        chip.frame = frame
+      }
+      x += width + reactionChipGap
+    }
+  }
+
+  var firstChipCenter: CGPoint? {
+    guard let first = reactions.first, let chip = chips[first.emoji] else { return nil }
+    return CGPoint(x: chip.frame.midX, y: chip.frame.midY)
+  }
 }
 
 /// Per-row expand/streaming state for the inline agent-turn bubble, owned by
@@ -2455,14 +2637,21 @@ private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
     || agentResponsePlaceholder(row)
     || bubbleUsesAgentTurnContent(row)
   {
-    return ChatBubbleMetaWidths(edited: 0.0, pinned: 0.0, timestamp: 0.0, total: 0.0)
+    return ChatBubbleMetaWidths(edited: 0.0, pinned: 0.0, views: 0.0, timestamp: 0.0, total: 0.0)
   }
 
   var items: [CGFloat] = []
   let editedWidth = measuredTextWidth("edited", font: bubbleMetaFont)
   let pinnedWidth = measuredTextWidth("pinned", font: bubbleMetaFont)
+  let viewTextWidth = row.viewCount.map {
+    measuredTextWidth(compactEngagementCount($0), font: bubbleMetaFont)
+  } ?? 0.0
+  let viewsWidth = viewTextWidth > 0.0 ? 12.0 + 2.0 + viewTextWidth : 0.0
   let timestampWidth = measuredTextWidth(row.timestamp, font: bubbleMetaFont)
 
+  if viewsWidth > 0.0 {
+    items.append(viewsWidth)
+  }
   if row.isEdited {
     items.append(editedWidth)
   }
@@ -2477,6 +2666,7 @@ private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
   return ChatBubbleMetaWidths(
     edited: editedWidth,
     pinned: pinnedWidth,
+    views: viewsWidth,
     timestamp: timestampWidth,
     total: total
   )
@@ -4902,9 +5092,15 @@ func measureMessageBubbleLayout(
       streamingStartDate: agentTurnState.streamingStartDate,
       showsLoaderView: agentTurnBubbleShowsWorkedSummary(row)
     )
-    let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
-    let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
-    let bubbleWidth = max(bubbleMinWidth, contentWidth + (agentTurnHorizontalPadding * 2.0))
+    let reactionSize = reactionStripMeasuredSize(
+      row.reactions, maxWidth: max(1.0, agentMaxBubbleWidth - 12.0))
+    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
+    let bubbleWidth = min(
+      agentMaxBubbleWidth,
+      max(
+        bubbleMinWidth,
+        contentWidth + (agentTurnHorizontalPadding * 2.0),
+        reactionSize.width + 12.0))
     // Same tall-content collapse as plain text bubbles, but only once the turn SETTLES —
     // a live feed keeps growing and pinning it to the cap would fight the stream (and the
     // list's bottom pin). Content stays full; plate height caps and soft-fades.
@@ -5151,10 +5347,11 @@ func measureMessageBubbleLayout(
       hasMediaCaption
       ? (isEdgeCaption ? captionMaxWidth : max(contentWidth, captionWidth))
       : contentWidth
-    let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
-    let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
+    let reactionSize = reactionStripMeasuredSize(
+      row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0))
+    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
     let bodyHeight: CGFloat
-    let bubbleWidth: CGFloat
+    var bubbleWidth: CGFloat
     let bubbleHeight: CGFloat
     if isTransparentSticker {
       bodyHeight = mediaHeight + metaTopSpacing + bubbleMetaHeight
@@ -5193,6 +5390,7 @@ func measureMessageBubbleLayout(
         ? max(56.0, bodyHeight + reactionHeightOffset)
         : max(isVoice ? 66.0 : 48.0, bodyHeight + topPad + bottomPad + reactionHeightOffset)
     }
+    bubbleWidth = min(maxBubbleWidth, max(bubbleWidth, reactionSize.width + 12.0))
     var metrics = ChatMessageBubbleLayoutMetrics(
       bubbleWidth: bubbleWidth,
       bubbleHeight: bubbleHeight,
@@ -5320,7 +5518,11 @@ func measureMessageBubbleLayout(
   } else {
     desiredContentWidth = max(textWidth + bubbleMetaInlineSpacing + meta.total, replyPreviewWidth)
   }
-  let contentWidth = max(meta.total, min(maxContentWidth, desiredContentWidth))
+  let reactionSize = reactionStripMeasuredSize(
+    row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0))
+  let contentWidth = max(
+    meta.total,
+    min(maxContentWidth, max(desiredContentWidth, reactionSize.width)))
   let appliedRTLTailSideReserve =
     usesRTLColumn && row.isMe
     ? min(bubbleRTLTailSideReserve, max(0.0, contentWidth - max(textWidth, meta.total, replyPreviewWidth)))
@@ -5339,8 +5541,7 @@ func measureMessageBubbleLayout(
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
     : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
-  let hasReaction = row.reactionEmoji != nil && row.reactionEmoji?.isEmpty == false
-  let reactionHeightOffset: CGFloat = hasReaction ? 28.0 : 0.0
+  let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 8.0 : 0.0
   // No fudge: the plate is exactly the content box plus its two paddings. Shaving 4pt here
   // made the bubble narrower than the content it advertises, so the body label (laid out at
   // contentX + contentWidth) ended 4pt to the right of the meta (right-aligned to
@@ -9765,7 +9966,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     for _ in 0..<3 { _ = ChatListCell(frame: frame) }
   }
 
-  private static let reactionBadgeBaseSize = CGSize(width: 34.0, height: 24.0)
   private static let reactionBadgeInsetLeft: CGFloat = 8.0
   private static let reactionBadgeInsetBottom: CGFloat = 6.0
 
@@ -9992,6 +10192,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   let metaContainerView = UIView()
   private let editedLabel = UILabel()
   private let pinnedLabel = UILabel()
+  private let viewIconView = UIImageView()
+  private let viewCountLabel = ChatRollingCounterLabel()
   private let timestampLabel = UILabel()
   private let statusImageView = UIImageView()
   private let statusLabel = UILabel()
@@ -10045,8 +10247,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
   private let serviceActionBarView = ChatServiceActionBarView()
   private let dayLabel = UILabel()
-  private let reactionPillView = UIView()
-  private let reactionLabel = UILabel()
+  private let reactionStripView = ChatReactionStripView()
   private let selectionCircleView = MessageSelectionCircleView()
   private var appearance = ChatListAppearance.current
   var row: ChatListRow?
@@ -10309,6 +10510,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.addSubview(metaContainerView)
     metaContainerView.addSubview(editedLabel)
     metaContainerView.addSubview(pinnedLabel)
+    metaContainerView.addSubview(viewIconView)
+    metaContainerView.addSubview(viewCountLabel)
     metaContainerView.addSubview(timestampLabel)
     metaContainerView.addSubview(statusImageView)
     metaContainerView.addSubview(statusLabel)
@@ -10328,8 +10531,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // `agentActionBarView` is built and wired on first use, not here.
     // `agentTurnContentView` is built and wired on first use, not here.
 
-    contentView.addSubview(reactionPillView)
-    reactionPillView.addSubview(reactionLabel)
+    contentView.addSubview(reactionStripView)
     contentView.addSubview(selectionCircleView)
     selectionCircleView.addTarget(self, action: #selector(handleSelectionToggle), for: .touchUpInside)
 
@@ -10451,6 +10653,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     editedLabel.font = bubbleMetaFont
     pinnedLabel.font = bubbleMetaFont
+    viewIconView.contentMode = .scaleAspectFit
+    viewIconView.image = UIImage(
+      systemName: "eye.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 9.0, weight: .medium))
+    viewCountLabel.font = bubbleMetaFont
     timestampLabel.font = bubbleMetaFont
     timestampLabel.textColor = UIColor(white: 1.0, alpha: 0.72)
     statusImageView.contentMode = .scaleAspectFit
@@ -10540,16 +10747,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     dayLabel.addGestureRecognizer(
       UITapGestureRecognizer(target: self, action: #selector(handleAgentErrorNoticeTap)))
 
-    reactionPillView.backgroundColor = UIColor(white: 0.0, alpha: 0.25)
-    reactionPillView.layer.cornerRadius = 12
-    reactionPillView.layer.cornerCurve = .continuous
-    reactionPillView.clipsToBounds = true
-    reactionPillView.layer.borderWidth = 1.0 / UIScreen.main.scale
-    reactionPillView.layer.borderColor = UIColor.white.withAlphaComponent(0.24).cgColor
-
-    reactionLabel.font = UIFont.systemFont(ofSize: 14)
-    reactionLabel.textAlignment = .center
-
     bubbleView.isHidden = true
     tailView.isHidden = true
     // agentSenderLabel removed
@@ -10572,11 +10769,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     metaContainerView.isHidden = true
     editedLabel.isHidden = true
     pinnedLabel.isHidden = true
+    viewIconView.isHidden = true
+    viewCountLabel.isHidden = true
     timestampLabel.isHidden = true
     statusImageView.isHidden = true
     statusLabel.isHidden = true
     dayLabel.isHidden = true
-    reactionPillView.isHidden = true
+    reactionStripView.isHidden = true
     _agentActionBarView?.isHidden = true
 
     guard censusActive else { return }
@@ -10882,7 +11081,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     replyAccentColors: (UIColor, UIColor)? = nil
   ) {
     let previousRow = self.row
-    if previousRow.map({ ($0.messageId ?? $0.key) != (row.messageId ?? row.key) }) == true {
+    let isSameMessageIdentity = previousRow.map {
+      ($0.messageId ?? $0.key) == (row.messageId ?? row.key)
+    } ?? false
+    if previousRow != nil, !isSameMessageIdentity {
       resetTallBubbleInnerContentAnimation()
     }
     // Status, roster, foreground, and selection updates reconfigure the same visible
@@ -11063,7 +11265,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaContainerView.isHidden = true
       inlineAttachmentView.isHidden = true
       metaContainerView.isHidden = true
-      reactionPillView.isHidden = true
+      reactionStripView.isHidden = true
       retryButton.isHidden = true
       selectionCircleView.isHidden = true
       mediaProgressSpinner.stopAnimating()
@@ -11101,7 +11303,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaContainerView.isHidden = true
       inlineAttachmentView.isHidden = true
       metaContainerView.isHidden = true
-      reactionPillView.isHidden = true
+      reactionStripView.isHidden = true
       mediaProgressSpinner.stopAnimating()
       mediaProgressOverlayView.isHidden = true
       mediaProgressSizeLabel.isHidden = true
@@ -11137,7 +11339,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaContainerView.isHidden = true
         inlineAttachmentView.isHidden = true
         metaContainerView.isHidden = true
-        reactionPillView.isHidden = true
+        reactionStripView.isHidden = true
         retryButton.isHidden = true
         _agentActionBarView?.isHidden = true
         if liveActions.isEmpty {
@@ -11182,7 +11384,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaContainerView.isHidden = true
         inlineAttachmentView.isHidden = true
         metaContainerView.isHidden = true
-        reactionPillView.isHidden = true
+        reactionStripView.isHidden = true
         retryButton.isHidden = true
         agentRegenerateButton.isHidden = true
         agentViewButton.isHidden = true
@@ -11344,20 +11546,22 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       pinnedLabel.text = "pinned"
       editedLabel.isHidden = !row.isEdited
       pinnedLabel.isHidden = !row.isPinned
+      if let viewCount = row.viewCount {
+        viewCountLabel.setCounterText(
+          compactEngagementCount(viewCount), animated: isSameMessageIdentity)
+      }
       timestampLabel.text = row.timestamp
 
-      if let reactionEmoji = row.reactionEmoji, !reactionEmoji.isEmpty {
-        reactionPillView.isHidden = isGhostHidden || usesTransparentAgentStreaming
-        reactionLabel.text = reactionEmoji
-        reactionPillView.backgroundColor =
-          row.isMe
-          ? UIColor(white: 1.0, alpha: 0.18)
-          : UIColor(white: 0.0, alpha: 0.24)
+      if !row.reactions.isEmpty {
+        reactionStripView.isHidden = isGhostHidden || usesTransparentAgentStreaming
+        reactionStripView.configure(
+          reactions: row.reactions, appearance: appearance, isMe: row.isMe,
+          animated: isSameMessageIdentity)
         reactionDebugLog(
-          "configure id=\(row.messageId ?? "nil") emoji=\(reactionEmoji) hidden=\(isGhostHidden ? "Y" : "N")"
+          "configure id=\(row.messageId ?? "nil") reactions=\(row.reactions.count) hidden=\(isGhostHidden ? "Y" : "N")"
         )
       } else {
-        reactionPillView.isHidden = true
+        reactionStripView.isHidden = true
       }
 
       if row.isAgentMessage {
@@ -11445,6 +11649,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       messageLabel.textColor = textColor
       editedLabel.textColor = metaColor
       pinnedLabel.textColor = metaColor
+      viewIconView.tintColor = metaColor
+      viewCountLabel.textColor = metaColor
       timestampLabel.textColor = metaColor
       if row.visualKind == .videoNote {
         metaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.38)
@@ -11489,13 +11695,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       inlineAttachmentView.alpha = 1.0
       mediaContainerView.alpha = 1.0
       metaContainerView.alpha = 0.72
-      reactionPillView.alpha = 1.0
+      reactionStripView.alpha = 1.0
     }
 
     if hasSavedExtractionState {
       savedBubbleHiddenBeforeExtraction = bubbleView.isHidden
       savedTailHiddenBeforeExtraction = tailView.isHidden
-      savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
+      savedReactionHiddenBeforeExtraction = reactionStripView.isHidden
       savedMessageAlphaBeforeExtraction = messageLabel.alpha
       savedAgentTurnContentAlphaBeforeExtraction = _agentTurnContentView?.alpha ?? 1.0
       savedRichTextAlphaBeforeExtraction = richTextView.alpha
@@ -11582,7 +11788,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     wallpaperBackdropContainerSize = .zero
     bubbleView.applyWallpaperBackdrop(snapshot: nil, containerSize: .zero, sampleRect: .zero)
     tailView.applyWallpaperBackdrop(snapshot: nil, containerSize: .zero, sampleRect: .zero)
-    reactionPillView.isHidden = true
+    reactionStripView.isHidden = true
     selectionCircleView.isHidden = true
     externalVoiceMessageId = nil
     externalVoiceIsPlaying = false
@@ -12417,14 +12623,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     let reactionFrame = pixelAlignedRect(reactionBadgeFrame(in: bubbleFrame))
-    reactionPillView.frame = reactionFrame
-    reactionPillView.layer.cornerRadius = floor(reactionFrame.height * 0.5)
-    reactionLabel.frame = CGRect(
-      x: 0.0,
-      y: 0.0,
-      width: reactionFrame.width,
-      height: reactionFrame.height
-    )
+    reactionStripView.frame = reactionFrame
 
     // Glyph box is 22pt (the touch target is grown separately below); it centres on the
     // bubble the way the "not sent" mark does, rather than hanging off its bottom corner
@@ -12510,9 +12709,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
     }
 
-    if !reactionPillView.isHidden {
+    if !reactionStripView.isHidden {
       let signature =
-        "\(row.messageId ?? "nil"):\(Int(reactionFrame.origin.x)):\(Int(reactionFrame.origin.y)):\(reactionLabel.text ?? "nil")"
+        "\(row.messageId ?? "nil"):\(Int(reactionFrame.origin.x)):\(Int(reactionFrame.origin.y)):\(row.reactions.count)"
       if signature != lastReactionDebugSignature {
         lastReactionDebugSignature = signature
         reactionDebugLog(
@@ -15317,6 +15516,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       cursorX += width + bubbleMetaItemGap
     }
 
+    if widths.views > 0.0 {
+      viewIconView.isHidden = false
+      viewCountLabel.isHidden = false
+      viewIconView.frame = CGRect(x: cursorX, y: baselineY + 1.0, width: 12.0, height: 10.0)
+      let countWidth = max(0.0, widths.views - 14.0)
+      viewCountLabel.frame = CGRect(
+        x: viewIconView.frame.maxX + 2.0, y: baselineY, width: countWidth, height: 12.0)
+      cursorX += widths.views + bubbleMetaItemGap
+    } else {
+      viewIconView.isHidden = true
+      viewIconView.frame = .zero
+      hide(viewCountLabel)
+    }
+
     if row.isEdited {
       place(editedLabel, width: widths.edited)
     } else {
@@ -15510,7 +15723,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if !hasSavedExtractionState {
         savedBubbleHiddenBeforeExtraction = bubbleView.isHidden
         savedTailHiddenBeforeExtraction = tailView.isHidden
-        savedReactionHiddenBeforeExtraction = reactionPillView.isHidden
+        savedReactionHiddenBeforeExtraction = reactionStripView.isHidden
         savedMessageAlphaBeforeExtraction = messageLabel.alpha
         savedAgentTurnContentAlphaBeforeExtraction = _agentTurnContentView?.alpha ?? 1.0
         savedRichTextAlphaBeforeExtraction = richTextView.alpha
@@ -15523,7 +15736,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
       bubbleView.isHidden = true
       tailView.isHidden = true
-      reactionPillView.isHidden = true
+      reactionStripView.isHidden = true
       // Keep text/media/meta rendering alive for snapshot correctness, but hide them.
       messageLabel.alpha = 0.0
       _agentTurnContentView?.alpha = 0.0
@@ -15541,7 +15754,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard hasSavedExtractionState else { return }
     bubbleView.isHidden = savedBubbleHiddenBeforeExtraction
     tailView.isHidden = savedTailHiddenBeforeExtraction
-    reactionPillView.isHidden = savedReactionHiddenBeforeExtraction
+    reactionStripView.isHidden = savedReactionHiddenBeforeExtraction
     messageLabel.alpha = savedMessageAlphaBeforeExtraction
     _agentTurnContentView?.alpha = savedAgentTurnContentAlphaBeforeExtraction
     richTextView.alpha = savedRichTextAlphaBeforeExtraction
@@ -15782,8 +15995,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let tailRect = tailView.convert(tailView.bounds, to: contentView)
       captureRect = captureRect.union(tailRect)
     }
-    if !reactionPillView.isHidden {
-      let reactionRect = reactionPillView.convert(reactionPillView.bounds, to: contentView)
+    if !reactionStripView.isHidden {
+      let reactionRect = reactionStripView.convert(reactionStripView.bounds, to: contentView)
       captureRect = captureRect.union(reactionRect)
     }
     captureRect = captureRect.integral
@@ -15823,9 +16036,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if !tailView.isHidden {
       captureRect = captureRect.union(tailView.convert(tailView.bounds, to: contentView))
     }
-    if !reactionPillView.isHidden {
+    if !reactionStripView.isHidden {
       captureRect = captureRect.union(
-        reactionPillView.convert(reactionPillView.bounds, to: contentView))
+        reactionStripView.convert(reactionStripView.bounds, to: contentView))
     }
     captureRect = captureRect.integral
     guard captureRect.width > 1.0, captureRect.height > 1.0 else { return nil }
@@ -15854,8 +16067,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       20.0,
       bubbleFrame.width - Self.reactionBadgeInsetLeft - 4.0
     )
-    let width = min(Self.reactionBadgeBaseSize.width, maxBadgeWidth)
-    let height = Self.reactionBadgeBaseSize.height
+    let measured = reactionStripMeasuredSize(row?.reactions ?? [], maxWidth: maxBadgeWidth)
+    let width = measured.width
+    let height = measured.height
     return CGRect(
       x: bubbleFrame.minX + Self.reactionBadgeInsetLeft,
       y: bubbleFrame.maxY - Self.reactionBadgeInsetBottom - height,

@@ -1,5 +1,6 @@
 import AudioToolbox
 import ObjectiveC
+import Photos
 import UIKit
 
 private let swipeReplyTrigger: CGFloat = 56.0
@@ -687,6 +688,13 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
       showEditAction: showEditAction,
+      showEditedInfo: row.isEdited,
+      editedAtMs: row.editedAtMs,
+      showSaveImageAction: row.visualKind == .media
+        && (row.mediaUrl?.isEmpty == false || row.localMediaUrl?.isEmpty == false),
+      showCopyLinkAction: contextMenuSupportsChannelActions,
+      showForwardAction: !showResendAction,
+      showReportAction: contextMenuSupportsChannelActions && !row.isMe,
       restrictSavingContent: restrictSavingContent,
       failedSendOnly: showResendAction
     )
@@ -844,7 +852,6 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       resolvedSourcePoint = badgePoint
     }
     let resolvedMessageId = messageId
-    applyLocalReactionEmoji(reaction, toMessageId: resolvedMessageId)
 
     let emitReactionEvent = { [weak self] in
       guard let self else { return }
@@ -860,23 +867,22 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       self.holdDebugLog(
         "emit contextMenuReaction id=\(resolvedMessageId) emoji=\(reaction) source=\(resolvedSourcePoint.map { NSCoder.string(for: $0) } ?? "nil")"
       )
+      self.playReactionFx(payload)
+      self.submitContextMenuReaction(reaction, messageId: resolvedMessageId)
       self.onNativeEvent(payload)
     }
 
-    // Overlay handles icon flight first. Dispatch reaction only after dismiss so
-    // the final native FX is visible above chat content, not behind the overlay.
-    if customContextMenuOverlay != nil {
-      customContextMenuOverlay?.animateOut(reason: "reaction", completion: emitReactionEvent)
-    } else {
-      emitReactionEvent()
-    }
+    // The overlay already completed its icon flight and began dismissal.
+    emitReactionEvent()
   }
 
   public func contextMenuDidSelectAction(_ actionId: String, messageId _: String) {
     guard let overlay = customContextMenuOverlay else { return }
     let mid = overlay.messageId
 
-    if restrictSavingContent, (actionId == "copy" || actionId == "select") {
+    if restrictSavingContent,
+      ["copy", "saveImage", "copyLink", "forward", "select"].contains(actionId)
+    {
       overlay.animateOut(reason: "content-protected", completion: nil)
       onNativeEvent(["type": "agentToast", "message": "Content protection is enabled"])
       return
@@ -939,6 +945,47 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       return
     }
 
+    if actionId == "copyLink" {
+      UIPasteboard.general.string = contextMessageShareLink(mid)
+      overlay.animateOut(reason: "action:copyLink") { [weak self] in
+        self?.onNativeEvent(["type": "agentToast", "message": "Link copied"])
+      }
+      return
+    }
+
+    if actionId == "saveImage" {
+      let image = (contextMenuHostCell as? ChatListCell)?.mediaImage(atGridIndex: 0)
+      overlay.animateOut(reason: "action:saveImage") { [weak self] in
+        guard let self else { return }
+        guard let image else {
+          self.onNativeEvent(["type": "agentToast", "message": "Image is still loading"])
+          return
+        }
+        self.saveContextMenuImage(image)
+      }
+      return
+    }
+
+    if actionId == "forward" {
+      overlay.animateOut(reason: "action:forward") { [weak self] in
+        guard let self else { return }
+        self.beginMessageSelection(messageId: mid)
+        self.inputBarDidRequestSelectionAction("shareInside", payload: nil)
+      }
+      return
+    }
+
+    if actionId == "report" {
+      guard let row = rows.first(where: { $0.messageId == mid }) else {
+        overlay.animateOut(reason: "report-missing-row", completion: nil)
+        return
+      }
+      overlay.animateOut(reason: "action:report") { [weak self] in
+        self?.presentMessageReportFlow(row: row, messageId: mid)
+      }
+      return
+    }
+
     overlay.animateOut(reason: "action:\(actionId)", completion: nil)
 
     onNativeEvent([
@@ -969,6 +1016,119 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
         }
       }
     }
+  }
+
+  private func saveContextMenuImage(_ image: UIImage) {
+    PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+      guard status == .authorized || status == .limited else {
+        DispatchQueue.main.async {
+          self?.onNativeEvent(["type": "agentToast", "message": "Photo access is required"])
+        }
+        return
+      }
+      PHPhotoLibrary.shared().performChanges {
+        PHAssetChangeRequest.creationRequestForAsset(from: image)
+      } completionHandler: { success, _ in
+        DispatchQueue.main.async {
+          self?.onNativeEvent([
+            "type": "agentToast",
+            "message": success ? "Image saved" : "Image could not be saved",
+          ])
+        }
+      }
+    }
+  }
+
+  private func presentMessageReportFlow(row: ChatListRow, messageId: String) {
+    guard let presenter = contextMenuPresenter() else { return }
+    let sheet = UIAlertController(title: "Report Message", message: nil, preferredStyle: .actionSheet)
+    let reasons: [(String, String)] = [
+      ("Spam", "spam"),
+      ("Violence", "violence"),
+      ("Abuse or harassment", "abuse"),
+      ("Sexual content", "sexual_content"),
+      ("Copyright", "copyright"),
+      ("Personal data", "personal_data"),
+      ("Other", "other"),
+    ]
+    for reason in reasons {
+      sheet.addAction(UIAlertAction(title: reason.0, style: .default) { [weak self] _ in
+        guard let self else { return }
+        if reason.1 == "other" {
+          self.presentOtherReportDetails(row: row, messageId: messageId, presenter: presenter)
+        } else {
+          self.confirmMessageReport(
+            row: row, messageId: messageId, reason: reason.1, details: nil,
+            presenter: presenter)
+        }
+      })
+    }
+    sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    if let popover = sheet.popoverPresentationController {
+      popover.sourceView = self
+      popover.sourceRect = CGRect(x: bounds.midX, y: bounds.midY, width: 1.0, height: 1.0)
+    }
+    presenter.present(sheet, animated: true)
+  }
+
+  private func presentOtherReportDetails(
+    row: ChatListRow, messageId: String, presenter: UIViewController
+  ) {
+    let alert = UIAlertController(
+      title: "What happened?", message: "Add a short note for the moderation team.",
+      preferredStyle: .alert)
+    alert.addTextField { field in
+      field.placeholder = "Details"
+      field.clearButtonMode = .whileEditing
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    alert.addAction(UIAlertAction(title: "Continue", style: .default) { [weak self, weak alert] _ in
+      self?.confirmMessageReport(
+        row: row, messageId: messageId, reason: "other",
+        details: alert?.textFields?.first?.text, presenter: presenter)
+    })
+    presenter.present(alert, animated: true)
+  }
+
+  private func confirmMessageReport(
+    row: ChatListRow, messageId: String, reason: String, details: String?,
+    presenter: UIViewController
+  ) {
+    let alert = UIAlertController(
+      title: "Send report?", message: "The message and its metadata will be queued for review.",
+      preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    alert.addAction(UIAlertAction(title: "Report", style: .destructive) { [weak self] _ in
+      self?.submitMessageReport(
+        messageId: messageId, reason: reason, details: details, blockSender: false)
+    })
+    if row.senderUserId?.isEmpty == false {
+      alert.addAction(UIAlertAction(title: "Report and Block", style: .destructive) { [weak self] _ in
+        self?.submitMessageReport(
+          messageId: messageId, reason: reason, details: details, blockSender: true)
+      })
+    }
+    presenter.present(alert, animated: true)
+  }
+
+  private func submitMessageReport(
+    messageId: String, reason: String, details: String?, blockSender: Bool
+  ) {
+    onNativeEvent(["type": "agentToast", "message": "Sending report…"])
+    submitContextMenuReport(
+      messageId: messageId, reason: reason, details: details, blockSender: blockSender
+    ) { [weak self] success, error in
+      self?.onNativeEvent([
+        "type": "agentToast",
+        "message": success ? "Report submitted" : (error ?? "Report could not be submitted"),
+      ])
+    }
+  }
+
+  private func contextMenuPresenter() -> UIViewController? {
+    guard var presenter = window?.rootViewController else { return nil }
+    while let next = presenter.presentedViewController { presenter = next }
+    return presenter
   }
 
   func dismissCustomContextMenu(animated: Bool) {

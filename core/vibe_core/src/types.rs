@@ -808,6 +808,13 @@ pub struct VibeServiceNode {
     pub folded_count: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VibeReactionSummary {
+    pub emoji: String,
+    pub count: u64,
+    pub is_selected: bool,
+}
+
 impl std::fmt::Debug for VibeServiceNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VibeServiceNode")
@@ -848,6 +855,8 @@ pub struct VibeMessageSnapshotV1 {
     pub media: Option<VibeMediaRef>,
     pub agent: Option<VibeAgentRef>,
     pub service: Option<VibeServiceNode>,
+    pub reactions: Vec<VibeReactionSummary>,
+    pub view_count: Option<u64>,
     /// FNV-1a over the rendered fields. Recomputed by
     /// [`VibeMessageSnapshotV1::rehash`]; never trusted from ingress.
     pub content_hash: u64,
@@ -956,6 +965,20 @@ impl VibeMessageSnapshotV1 {
             None => h.write_sep(0x1e),
         }
 
+        h.write_u64(self.reactions.len() as u64);
+        for reaction in &self.reactions {
+            h.write_str(&reaction.emoji);
+            h.write_u64(reaction.count);
+            h.write_bool(reaction.is_selected);
+        }
+        match self.view_count {
+            Some(count) => {
+                h.write_bool(true);
+                h.write_u64(count);
+            }
+            None => h.write_bool(false),
+        }
+
         h.finish()
     }
 
@@ -988,6 +1011,8 @@ impl VibeMessageSnapshotV1 {
             media: None,
             agent: None,
             service: None,
+            reactions: Vec::new(),
+            view_count: None,
             content_hash: 0,
         };
         m.rehash();

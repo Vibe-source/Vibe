@@ -552,6 +552,61 @@ defmodule VibeWeb.ChatChannel do
   end
 
   @impl true
+  def handle_in("react-message", %{"messageId" => msg_id, "emoji" => emoji}, socket) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+
+    case Chat.toggle_reaction(chat_id, msg_id, user_id, emoji) do
+      {:ok, %{reactions: reactions} = result} ->
+        # Broadcast carries counts only; `isSelected` is per-caller.
+        public = Enum.map(reactions, &Map.take(&1, [:emoji, :count]))
+
+        mutation_payload = %{
+          chatId: chat_id,
+          messageId: msg_id,
+          reactions: public,
+          actorId: user_id
+        }
+
+        broadcast!(socket, "message-reaction-updated", mutation_payload)
+
+        {:reply, {:ok, %{action: to_string(result.action), reactions: reactions}}, socket}
+
+      {:error, reason} ->
+        {:reply, {:error, %{reason: engagement_error(reason)}}, socket}
+    end
+  end
+
+  # A malformed payload must not take the whole topic down with it.
+  @impl true
+  def handle_in("react-message", _payload, socket),
+    do: {:reply, {:error, %{reason: "invalid_payload"}}, socket}
+
+  @impl true
+  def handle_in("messages-viewed", %{"messageIds" => message_ids}, socket)
+      when is_list(message_ids) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+
+    case Chat.mark_messages_viewed(chat_id, user_id, message_ids) do
+      {:ok, []} ->
+        {:reply, {:ok, %{counts: []}}, socket}
+
+      {:ok, counts} ->
+        mutation_payload = %{chatId: chat_id, counts: counts}
+        broadcast!(socket, "message-view-counts-updated", mutation_payload)
+        {:reply, {:ok, %{counts: counts}}, socket}
+
+      {:error, reason} ->
+        {:reply, {:error, %{reason: engagement_error(reason)}}, socket}
+    end
+  end
+
+  @impl true
+  def handle_in("messages-viewed", _payload, socket),
+    do: {:reply, {:error, %{reason: "invalid_payload"}}, socket}
+
+  @impl true
   def handle_in("delete-message", %{"messageId" => msg_id} = payload, socket) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
@@ -612,7 +667,7 @@ defmodule VibeWeb.ChatChannel do
           chatId: chat_id,
           messageId: msg_id,
           encryptedContent: encrypted_content,
-          editedAt: edited_at || :os.system_time(:millisecond),
+          editedAt: message.edited_at,
           editedBy: user_id,
           message:
             message
@@ -638,6 +693,9 @@ defmodule VibeWeb.ChatChannel do
         {:reply, {:error, %{reason: inspect(reason)}}, socket}
     end
   end
+
+  defp engagement_error(reason) when is_atom(reason), do: to_string(reason)
+  defp engagement_error(reason), do: inspect(reason)
 
   # ── Agent Dispatch ──
 

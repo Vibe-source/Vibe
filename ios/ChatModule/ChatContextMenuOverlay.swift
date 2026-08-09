@@ -16,18 +16,13 @@ func makeChatContextLiquidGlassView(
   style: UIBlurEffect.Style = .systemMaterial,
   cornerRadius: CGFloat,
   capsuleCorners: Bool = false,
-  interactive: Bool = false,
-  // A non-nil tint mutes the glass: pure UIGlassEffect(.regular) REFRACTS moving
-  // content behind it (the home preview's scrolling bubbles swam through the
-  // menu). A tint gives it a stable, Telegram-style surface that reads through
-  // the refraction instead of the live content. Ignored on the < iOS 26 blur.
-  glassTint: UIColor? = nil
+  interactive: Bool = false
 ) -> UIVisualEffectView {
   let view = UIVisualEffectView(effect: nil)
   if #available(iOS 26.0, *) {
     let effect = UIGlassEffect(style: .regular)
     effect.isInteractive = interactive
-    if let glassTint { effect.tintColor = glassTint }
+    effect.tintColor = .clear
     view.effect = effect
     if capsuleCorners {
       view.cornerConfiguration = .capsule()
@@ -106,6 +101,12 @@ public final class ChatContextMenuOverlay: UIView {
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
     showEditAction: Bool = false,
+    showEditedInfo: Bool = false,
+    editedAtMs: Int64? = nil,
+    showSaveImageAction: Bool = false,
+    showCopyLinkAction: Bool = false,
+    showForwardAction: Bool = false,
+    showReportAction: Bool = false,
     restrictSavingContent: Bool = false,
     failedSendOnly: Bool = false
   ) {
@@ -117,16 +118,13 @@ public final class ChatContextMenuOverlay: UIView {
     self.appearance = appearance
 
     // Full-screen background: native system glass blur
-    let bgStyle: UIBlurEffect.Style =
-      appearance.isDark
-      ? .systemMaterialDark
-      : .systemMaterialLight
-    self.backgroundGlassView = UIVisualEffectView(effect: UIBlurEffect(style: bgStyle))
+    self.backgroundGlassView = UIVisualEffectView(
+      effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
 
     let colorOverlay = UIView()
     let isDarkMode = appearance.isDark
     let overlayBaseColor: UIColor = .black
-    let overlayAlpha: CGFloat = isDarkMode ? 0.38 : 0.28
+    let overlayAlpha: CGFloat = isDarkMode ? 0.64 : 0.52
     colorOverlay.backgroundColor = overlayBaseColor.withAlphaComponent(overlayAlpha)
     colorOverlay.translatesAutoresizingMaskIntoConstraints = false
     self.backgroundGlassView.contentView.addSubview(colorOverlay)
@@ -147,6 +145,12 @@ public final class ChatContextMenuOverlay: UIView {
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
       showEditAction: showEditAction,
+      showEditedInfo: showEditedInfo,
+      editedAtMs: editedAtMs,
+      showSaveImageAction: showSaveImageAction,
+      showCopyLinkAction: showCopyLinkAction,
+      showForwardAction: showForwardAction,
+      showReportAction: showReportAction,
       restrictSavingContent: restrictSavingContent,
       failedSendOnly: failedSendOnly
     )
@@ -590,6 +594,56 @@ extension ChatContextMenuOverlay: ChatContextMenuOverlayDelegate {
 
 // MARK: - Reaction Picker View
 
+final class ChatReactionIconNode: UIControl {
+  let emoji: String
+  private let label = UILabel()
+
+  init(emoji: String) {
+    self.emoji = emoji
+    super.init(frame: .zero)
+    label.text = emoji
+    label.font = UIFont.systemFont(ofSize: 28)
+    label.textAlignment = .center
+    label.isUserInteractionEnabled = false
+    addSubview(label)
+    accessibilityLabel = emoji
+    accessibilityTraits = .button
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    label.frame = bounds
+  }
+
+  func playIntro(delay: TimeInterval) {
+    alpha = 0.0
+    transform = CGAffineTransform(scaleX: 0.2, y: 0.2)
+    UIView.animate(
+      withDuration: 0.34, delay: delay, usingSpringWithDamping: 0.68,
+      initialSpringVelocity: 0.0, options: [.beginFromCurrentState, .allowUserInteraction]
+    ) {
+      self.alpha = 1.0
+      self.transform = .identity
+    }
+  }
+
+  func playSelectionEffect() {
+    UIView.animate(
+      withDuration: 0.12, delay: 0.0, options: [.curveEaseIn, .beginFromCurrentState]
+    ) {
+      self.transform = CGAffineTransform(scaleX: 1.28, y: 1.28)
+    } completion: { _ in
+      UIView.animate(withDuration: 0.18, delay: 0.0, options: .curveEaseOut) {
+        self.transform = .identity
+      }
+    }
+    ChatReactionFxModule.shared.playLandingEffect(
+      emoji: emoji, at: CGPoint(x: bounds.midX, y: bounds.midY), in: self, tintOverride: nil)
+  }
+}
+
 final class ReactionPickerView: UIView {
   weak var delegate: ChatContextMenuOverlayDelegate?
 
@@ -598,10 +652,10 @@ final class ReactionPickerView: UIView {
   private let tailBlobLarge: UIVisualEffectView
   private let tailBlobSmall: UIVisualEffectView
   private let stack: UIStackView
-  private let emojis = ["👍", "❤️", "👎", "🔥", "🥰", "👏", "😁"]
-  private static let pickerButtonSize: CGFloat = 44.0
+  private let emojis = ["⭐️", "❤️", "👍", "👎", "🔥", "🥰", "👏", "😁"]
+  private static let pickerButtonSize: CGFloat = 40.0
   private static let pickerSpacing: CGFloat = 4.0
-  private static let pickerPadding: CGFloat = 12.0
+  private static let pickerPadding: CGFloat = 8.0
   private static let pickerPillHeight: CGFloat = 52.0
   private static let pickerTailHeight: CGFloat = 12.0
   private var blobsOnRightSide = false
@@ -621,20 +675,17 @@ final class ReactionPickerView: UIView {
     self.messageId = messageId
     let blurStyle: UIBlurEffect.Style =
       appearance.isDark ? .systemMaterialDark : .systemMaterialLight
-    self.blurView = makeChatContextLiquidGlassView(
+    self.blurView = makeBlurMaterialView(
       style: blurStyle,
-      cornerRadius: Self.pickerPillHeight * 0.5,
-      capsuleCorners: true
+      cornerRadius: Self.pickerPillHeight * 0.5
     )
-    self.tailBlobLarge = makeChatContextLiquidGlassView(
+    self.tailBlobLarge = makeBlurMaterialView(
       style: blurStyle,
-      cornerRadius: 5.5,
-      capsuleCorners: false
+      cornerRadius: 5.5
     )
-    self.tailBlobSmall = makeChatContextLiquidGlassView(
+    self.tailBlobSmall = makeBlurMaterialView(
       style: blurStyle,
-      cornerRadius: 3.5,
-      capsuleCorners: false
+      cornerRadius: 3.5
     )
     self.stack = UIStackView()
 
@@ -687,8 +738,10 @@ final class ReactionPickerView: UIView {
       stackTop,
       stackBottom,
       stackCenterY,
-      stack.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor, constant: 12),
-      stack.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor, constant: -12),
+      stack.leadingAnchor.constraint(
+        equalTo: blurView.contentView.leadingAnchor, constant: Self.pickerPadding),
+      stack.trailingAnchor.constraint(
+        equalTo: blurView.contentView.trailingAnchor, constant: -Self.pickerPadding),
     ])
 
     tailBlobLarge.bounds = CGRect(x: 0.0, y: 0.0, width: 11.0, height: 11.0)
@@ -697,18 +750,16 @@ final class ReactionPickerView: UIView {
     tailBlobSmall.layer.borderWidth = 0
 
     for emoji in emojis {
-      let btn = UIButton(type: .system)
-      btn.setTitle(emoji, for: .normal)
-      btn.titleLabel?.font = UIFont.systemFont(ofSize: 28)
-      btn.translatesAutoresizingMaskIntoConstraints = false
-      let width = btn.widthAnchor.constraint(equalToConstant: Self.pickerButtonSize)
+      let node = ChatReactionIconNode(emoji: emoji)
+      node.translatesAutoresizingMaskIntoConstraints = false
+      let width = node.widthAnchor.constraint(equalToConstant: Self.pickerButtonSize)
       width.priority = .defaultHigh
       width.isActive = true
-      let height = btn.heightAnchor.constraint(equalToConstant: Self.pickerButtonSize)
+      let height = node.heightAnchor.constraint(equalToConstant: Self.pickerButtonSize)
       height.priority = .defaultHigh
       height.isActive = true
-      btn.addTarget(self, action: #selector(didTapEmoji(_:)), for: .touchUpInside)
-      stack.addArrangedSubview(btn)
+      node.addTarget(self, action: #selector(didTapEmoji(_:)), for: .touchUpInside)
+      stack.addArrangedSubview(node)
     }
   }
 
@@ -733,34 +784,15 @@ final class ReactionPickerView: UIView {
   /// Emoji tiles cascade in from the pill's anchored side while it morph-grows:
   /// each springs up from a small scale, staggered in the growth direction.
   func animateIconsIn(fromTrailing: Bool) {
-    let buttons = fromTrailing ? Array(stack.arrangedSubviews.reversed()) : stack.arrangedSubviews
-    for (index, button) in buttons.enumerated() {
-      button.alpha = 0
-      button.transform = CGAffineTransform(scaleX: 0.2, y: 0.2)
-      UIView.animate(
-        withDuration: 0.34,
-        delay: 0.05 + 0.04 * Double(index),
-        usingSpringWithDamping: 0.68,
-        initialSpringVelocity: 0,
-        options: [.beginFromCurrentState, .allowUserInteraction]
-      ) {
-        button.alpha = 1
-        button.transform = .identity
-      }
+    let nodes = fromTrailing ? Array(stack.arrangedSubviews.reversed()) : stack.arrangedSubviews
+    for (index, view) in nodes.enumerated() {
+      (view as? ChatReactionIconNode)?.playIntro(delay: 0.05 + 0.04 * Double(index))
     }
   }
 
-  @objc private func didTapEmoji(_ sender: UIButton) {
-    guard let emoji = sender.title(for: .normal) else { return }
-    // Spring bounce on tap
-    UIView.animate(
-      withDuration: 0.12, delay: 0, options: .curveEaseIn,
-      animations: { sender.transform = CGAffineTransform(scaleX: 1.3, y: 1.3) }
-    ) { _ in
-      UIView.animate(withDuration: 0.18, delay: 0, options: .curveEaseOut) {
-        sender.transform = .identity
-      }
-    }
+  @objc private func didTapEmoji(_ sender: ChatReactionIconNode) {
+    let emoji = sender.emoji
+    sender.playSelectionEffect()
     let sourcePoint = sender.convert(
       CGPoint(x: sender.bounds.midX, y: sender.bounds.midY),
       to: nil
@@ -782,6 +814,18 @@ final class ContextMenuView: UIView {
     let title: String
     let iconName: String
     let isDestructive: Bool
+    let isInformational: Bool
+
+    init(
+      id: String, title: String, iconName: String, isDestructive: Bool,
+      isInformational: Bool = false
+    ) {
+      self.id = id
+      self.title = title
+      self.iconName = iconName
+      self.isDestructive = isDestructive
+      self.isInformational = isInformational
+    }
   }
 
   private let actions: [ActionItem]
@@ -795,20 +839,51 @@ final class ContextMenuView: UIView {
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
     showEditAction: Bool = false,
+    showEditedInfo: Bool = false,
+    editedAtMs: Int64? = nil,
+    showSaveImageAction: Bool = false,
+    showCopyLinkAction: Bool = false,
+    showForwardAction: Bool = false,
+    showReportAction: Bool = false,
     restrictSavingContent: Bool = false,
     failedSendOnly: Bool = false
   ) {
     self.messageId = messageId
-    var resolvedActions: [ActionItem] = [
+    var resolvedActions: [ActionItem] = []
+    if showEditedInfo {
+      resolvedActions.append(
+        ActionItem(
+          id: "editedInfo", title: editedAtMs.map(Self.editedTitle) ?? "edited",
+          iconName: "clock.arrow.circlepath", isDestructive: false, isInformational: true))
+    }
+    resolvedActions.append(
       ActionItem(
-        id: "reply", title: "Reply", iconName: "arrowshape.turn.up.left", isDestructive: false),
-      ActionItem(id: "pin", title: "Pin", iconName: "pin", isDestructive: false),
-    ]
+        id: "reply", title: "Reply", iconName: "arrowshape.turn.up.left", isDestructive: false))
     if !restrictSavingContent {
-      resolvedActions.insert(
-        ActionItem(id: "copy", title: "Copy", iconName: "doc.on.doc", isDestructive: false),
-        at: 1
-      )
+      resolvedActions.append(
+        ActionItem(id: "copy", title: "Copy", iconName: "doc.on.doc", isDestructive: false))
+      if showSaveImageAction {
+        resolvedActions.append(
+          ActionItem(
+            id: "saveImage", title: "Save Image", iconName: "square.and.arrow.down",
+            isDestructive: false))
+      }
+      if showCopyLinkAction {
+        resolvedActions.append(
+          ActionItem(id: "copyLink", title: "Copy Link", iconName: "link", isDestructive: false))
+      }
+      if showForwardAction {
+        resolvedActions.append(
+          ActionItem(
+            id: "forward", title: "Forward", iconName: "arrowshape.turn.up.right",
+            isDestructive: false))
+      }
+    }
+    if showReportAction {
+      resolvedActions.append(
+        ActionItem(
+          id: "report", title: "Report", iconName: "exclamationmark.circle",
+          isDestructive: false))
     }
     if showEditAction {
       resolvedActions.append(
@@ -905,6 +980,22 @@ final class ContextMenuView: UIView {
 
   required init?(coder: NSCoder) { fatalError() }
 
+  private static func editedTitle(_ timestamp: Int64) -> String {
+    let seconds = Double(timestamp) / (timestamp > 100_000_000_000 ? 1_000.0 : 1.0)
+    let date = Date(timeIntervalSince1970: seconds)
+    let time = DateFormatter()
+    time.locale = .current
+    time.dateStyle = .none
+    time.timeStyle = .short
+    if Calendar.current.isDateInToday(date) {
+      return "edited today at \(time.string(from: date))"
+    }
+    let day = DateFormatter()
+    day.locale = .current
+    day.setLocalizedDateFormatFromTemplate("MMM d")
+    return "edited \(day.string(from: date)) at \(time.string(from: date))"
+  }
+
   private func installActions(_ actions: [ActionItem]) {
     for arranged in stack.arrangedSubviews {
       stack.removeArrangedSubview(arranged)
@@ -912,7 +1003,8 @@ final class ContextMenuView: UIView {
     }
 
     for (index, action) in actions.enumerated() {
-      if action.id == "select" && index > 0 {
+      let startsActions = index > 0 && actions[index - 1].isInformational
+      if (action.id == "select" || startsActions) && index > 0 {
         let sepContainer = UIView()
         sepContainer.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(sepContainer)
@@ -934,7 +1026,9 @@ final class ContextMenuView: UIView {
         ])
       }
       let row = ContextMenuRow(action: action)
-      row.addTarget(self, action: #selector(didTapAction(_:)), for: .touchUpInside)
+      if !action.isInformational {
+        row.addTarget(self, action: #selector(didTapAction(_:)), for: .touchUpInside)
+      }
       stack.addArrangedSubview(row)
     }
   }
@@ -1010,18 +1104,23 @@ final class ContextMenuRow: UIControl {
   let actionId: String
   private let titleLabel: UILabel
   private let iconView: UIImageView
+  private let isInformational: Bool
 
   init(action: ContextMenuView.ActionItem) {
     self.actionId = action.id
     self.titleLabel = UILabel()
     self.iconView = UIImageView()
+    self.isInformational = action.isInformational
     super.init(frame: .zero)
 
     backgroundColor = .clear
 
     titleLabel.text = action.title
-    titleLabel.font = UIFont.systemFont(ofSize: 17.5, weight: .regular)
-    titleLabel.textColor = action.isDestructive ? .systemRed : .label
+    titleLabel.font = UIFont.systemFont(
+      ofSize: action.isInformational ? 15.0 : 17.5,
+      weight: action.isInformational ? .medium : .regular)
+    titleLabel.textColor = action.isInformational
+      ? UIColor.secondaryLabel : (action.isDestructive ? .systemRed : .label)
     titleLabel.lineBreakMode = .byTruncatingTail
     titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1031,11 +1130,13 @@ final class ContextMenuRow: UIControl {
       let image = UIImage(systemName: action.iconName, withConfiguration: config)
     {
       iconView.image = image
-      iconView.tintColor = action.isDestructive ? .systemRed : .label
+      iconView.tintColor = action.isInformational
+        ? UIColor.secondaryLabel : (action.isDestructive ? .systemRed : .label)
     } else {
       iconView.isHidden = true
     }
     iconView.contentMode = .scaleAspectFit
+    isUserInteractionEnabled = !action.isInformational
 
     addSubview(titleLabel)
     addSubview(iconView)
@@ -1067,6 +1168,7 @@ final class ContextMenuRow: UIControl {
 
   override var isHighlighted: Bool {
     didSet {
+      guard !isInformational else { return }
       UIView.animate(withDuration: 0.1) {
         self.backgroundColor =
           self.isHighlighted

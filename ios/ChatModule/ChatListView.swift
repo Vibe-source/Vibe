@@ -1243,6 +1243,65 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var lastAgentPinLogSignature: String?
   private var engineSurfaceId: String = ""
   private var engineChatId: String = ""
+  var contextMenuChatId: String { engineChatId }
+  var contextMenuSupportsChannelActions: Bool { isGroupOrChannel }
+  private var channelShareLink: String = ""
+
+  func setChannelShareLink(_ value: String) {
+    channelShareLink = value.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  func contextMessageShareLink(_ messageId: String) -> String {
+    if !channelShareLink.isEmpty, var components = URLComponents(string: channelShareLink) {
+      var items = components.queryItems ?? []
+      items.removeAll { $0.name == "message" }
+      items.append(URLQueryItem(name: "message", value: messageId))
+      components.queryItems = items
+      if let value = components.string { return value }
+    }
+    var components = URLComponents()
+    components.scheme = "vibe"
+    components.host = "chat"
+    components.path = "/\(engineChatId)"
+    components.queryItems = [URLQueryItem(name: "message", value: messageId)]
+    return components.string ?? "vibe://chat/\(engineChatId)?message=\(messageId)"
+  }
+
+  func submitContextMenuReaction(_ emoji: String, messageId: String) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    chatListEngineBindingQueue.async { [weak self] in
+      let result = ChatEngine.shared.reactToMessage([
+        "chatId": chatId,
+        "messageId": messageId,
+        "emoji": emoji,
+      ])
+      guard result["accepted"] as? Bool != true else { return }
+      DispatchQueue.main.async {
+        self?.onNativeEvent(["type": "agentToast", "message": "Reaction could not be sent"])
+      }
+    }
+  }
+
+  func submitContextMenuReport(
+    messageId: String, reason: String, details: String?, blockSender: Bool,
+    completion: @escaping (Bool, String?) -> Void
+  ) {
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    chatListEngineBindingQueue.async {
+      var payload: [String: Any] = [
+        "chatId": chatId,
+        "messageId": messageId,
+        "reason": reason,
+        "blockSender": blockSender,
+      ]
+      if let details, !details.isEmpty { payload["details"] = details }
+      let accepted = ChatEngine.shared.reportMessage(payload, completion: completion)
+      guard accepted["accepted"] as? Bool != true else { return }
+      DispatchQueue.main.async {
+        completion(false, accepted["reason"] as? String)
+      }
+    }
+  }
   private var engineMyUserId: String = ""
   private var enginePeerUserId: String = ""
   private var enginePeerAgentId: String = ""
@@ -1433,6 +1492,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// `resolvedDisplayStatus`), so we only ever receipt the newest incoming row. Reset in
   /// `setEngineChatId`.
   private var lastReadReceiptSentMessageId: String?
+  private var viewedMessageIdsSent: Set<String> = []
   private var documentPreviewDataSource: ChatListDocumentPreviewDataSource?
   private var documentPreviewCacheByRemoteURL: [String: URL] = [:]
   private var documentPreviewInFlightURLs = Set<String>()
@@ -12484,6 +12544,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     liveAgentTurnHighWaterByKey.removeAll()
     nativeDeletedMessageIds.removeAll()
     lastReadReceiptSentMessageId = nil
+    viewedMessageIdsSent.removeAll(keepingCapacity: true)
     // NOTE: bridge-agent fresh-surface tracking (bridgeFreshHiddenIdsByChat /
     // bridgeFreshOwnSentIdsByChat) is intentionally NOT cleared here — it's keyed by
     // chatId in a process-lifetime static store precisely so that switching away from
@@ -18369,8 +18430,37 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       "atBottom": atBottom,
     ])
 
+    sendVisibleMessageViewsIfNeeded()
+
     if atBottom {
       sendReadReceiptForNewestIncomingIfNeeded()
+    }
+  }
+
+  private func sendVisibleMessageViewsIfNeeded() {
+    guard isGroupOrChannel, window != nil else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    let messageIds = collectionView.indexPathsForVisibleItems.compactMap { indexPath -> String? in
+      guard indexPath.item < rows.count else { return nil }
+      let row = rows[indexPath.item]
+      guard row.kind == .message, !row.isMe, let messageId = row.messageId,
+        !messageId.isEmpty, !viewedMessageIdsSent.contains(messageId)
+      else { return nil }
+      return messageId
+    }
+    guard !messageIds.isEmpty else { return }
+    viewedMessageIdsSent.formUnion(messageIds)
+
+    chatListEngineBindingQueue.async { [weak self] in
+      let result = ChatEngine.shared.markMessagesViewed([
+        "chatId": chatId,
+        "messageIds": messageIds,
+      ])
+      guard result["accepted"] as? Bool != true else { return }
+      DispatchQueue.main.async {
+        self?.viewedMessageIdsSent.subtract(messageIds)
+      }
     }
   }
 

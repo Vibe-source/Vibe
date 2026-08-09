@@ -5699,6 +5699,100 @@ final class ChatEngine {
     sendDeleteMessage(payload)
   }
 
+  func reactToMessage(_ payload: [String: Any]) -> [String: Any] {
+    guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]),
+      let messageId = normalizedString(payload["messageId"] ?? payload["message_id"]),
+      let emoji = normalizedString(payload["emoji"]), !emoji.isEmpty
+    else { return ["accepted": false, "reason": "invalid_payload"] }
+
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId) else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+
+      let optimistic = optimisticReactionBucketsLocked(
+        chatId: chatId, messageId: messageId, emoji: emoji)
+      _ = applyMessageEngagementLocked(
+        chatId: chatId, messageId: messageId, reactions: optimistic, viewCount: nil)
+      let ref = client.push(
+        topic: chatTopic(for: chatId), event: "react-message",
+        payload: ["messageId": messageId, "emoji": emoji])
+      postChangeLocked(
+        reason: "chatMessageReactionChanged",
+        userInfo: ["chatId": chatId, "messageId": messageId])
+      postChatDeltaLocked(
+        chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "reaction")
+      return ["accepted": true, "transport": "native", "ref": ref]
+    }
+  }
+
+  func markMessagesViewed(_ payload: [String: Any]) -> [String: Any] {
+    guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) else {
+      return ["accepted": false, "reason": "invalid_chat"]
+    }
+    let messageIds = (payload["messageIds"] as? [Any] ?? []).compactMap(normalizedString)
+    guard !messageIds.isEmpty else { return ["accepted": false, "reason": "empty_messages"] }
+
+    return syncOnQueue {
+      guard let client = phoenixClient, nativeJoinedChatIds.contains(chatId) else {
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+      let ref = client.push(
+        topic: chatTopic(for: chatId), event: "messages-viewed",
+        payload: ["messageIds": Array(Set(messageIds)).prefix(200).map { $0 }])
+      return ["accepted": true, "transport": "native", "ref": ref]
+    }
+  }
+
+  func reportMessage(
+    _ payload: [String: Any], completion: @escaping (Bool, String?) -> Void
+  ) -> [String: Any] {
+    guard let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]),
+      let messageId = normalizedString(payload["messageId"] ?? payload["message_id"]),
+      let reason = normalizedString(payload["reason"])
+    else { return ["accepted": false, "reason": "invalid_payload"] }
+
+    let context: (URL, String)? = syncOnQueue {
+      guard let base = apiBaseURLLocked() else { return nil }
+      return (base, authHeaderTokenLocked() ?? "")
+    }
+    guard let (base, token) = context else {
+      return ["accepted": false, "reason": "missing_config"]
+    }
+
+    let url = base.appendingPathComponent("api").appendingPathComponent("chat")
+      .appendingPathComponent(chatId).appendingPathComponent("messages")
+      .appendingPathComponent(messageId).appendingPathComponent("report")
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
+    if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    var body: [String: Any] = [
+      "reason": reason,
+      "blockSender": parseBooleanLike(payload["blockSender"] ?? payload["block_sender"]) ?? false,
+    ]
+    if let details = normalizedString(payload["details"]), !details.isEmpty {
+      body["details"] = details
+    }
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      let success = error == nil && (200...299).contains(status)
+      let responseReason: String? = data.flatMap {
+        (try? JSONSerialization.jsonObject(with: $0) as? [String: Any])
+      }.flatMap { self?.normalizedString($0["error"] ?? $0["reason"]) }
+      DispatchQueue.main.async { completion(success, error?.localizedDescription ?? responseReason) }
+    }.resume()
+    return ["accepted": true, "queued": true]
+  }
+
   func clearChat(_ payload: [String: Any]) -> [String: Any] {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"])
     guard let chatId, !chatId.isEmpty else {
@@ -9091,6 +9185,57 @@ final class ChatEngine {
             source: removedStreamIds.isEmpty ? "live" : "streamSettle")
           return
         }
+        if frame.event == "message-reaction-updated",
+          let messageId = self.normalizedString(
+            frame.payload["messageId"] ?? frame.payload["message_id"]),
+          let incoming = frame.payload["reactions"] as? [[String: Any]]
+        {
+          let selectedEmoji = (self.findMessagePayloadLocked(
+            chatId: chatId, messageId: messageId)?["reactions"] as? [[String: Any]])?
+            .first(where: {
+              self.parseBooleanLike($0["isSelected"] ?? $0["is_selected"]) == true
+            }).flatMap { self.normalizedString($0["emoji"]) }
+          let reactions = incoming.map { bucket -> [String: Any] in
+            var next = bucket
+            next["isSelected"] = self.normalizedString(bucket["emoji"]) == selectedEmoji
+            return next
+          }
+          if self.applyMessageEngagementLocked(
+            chatId: chatId, messageId: messageId, reactions: reactions, viewCount: nil)
+          {
+            self.postChangeLocked(
+              reason: "chatMessageReactionChanged",
+              userInfo: ["chatId": chatId, "messageId": messageId])
+            self.postChatDeltaLocked(
+              chatId: chatId, inserted: [], updated: [messageId], deleted: [],
+              source: "reaction")
+          }
+          return
+        }
+        if frame.event == "message-view-counts-updated",
+          let counts = frame.payload["counts"] as? [[String: Any]]
+        {
+          var changedIds: [String] = []
+          for count in counts.prefix(200) {
+            guard let messageId = self.normalizedString(
+              count["messageId"] ?? count["message_id"]),
+              let viewCount = self.parseLongValue(count["viewCount"] ?? count["view_count"])
+            else { continue }
+            if self.applyMessageEngagementLocked(
+              chatId: chatId, messageId: messageId, reactions: nil, viewCount: viewCount)
+            {
+              changedIds.append(messageId)
+            }
+          }
+          if !changedIds.isEmpty {
+            self.postChangeLocked(
+              reason: "chatMessageViewCountChanged",
+              userInfo: ["chatId": chatId, "messageIds": changedIds])
+            self.postChatDeltaLocked(
+              chatId: chatId, inserted: [], updated: changedIds, deleted: [], source: "views")
+          }
+          return
+        }
         if let mutationUpdate = self.applyNativeChatMutationEventLocked(
           chatId: chatId, event: frame.event, payload: frame.payload)
         {
@@ -11127,6 +11272,73 @@ final class ChatEngine {
     return nil
   }
 
+  private func optimisticReactionBucketsLocked(
+    chatId: String, messageId: String, emoji: String
+  ) -> [[String: Any]] {
+    let existing = findMessagePayloadLocked(chatId: chatId, messageId: messageId)?["reactions"]
+      as? [[String: Any]] ?? []
+    var buckets: [(emoji: String, count: Int, selected: Bool)] = existing.compactMap { bucket in
+      guard let value = normalizedString(bucket["emoji"]),
+        let count = parseLongValue(bucket["count"]), count > 0
+      else { return nil }
+      return (
+        value,
+        Int(clamping: count),
+        parseBooleanLike(bucket["isSelected"] ?? bucket["is_selected"]) ?? false)
+    }
+    let selectedIndex = buckets.firstIndex(where: \.selected)
+    if let selectedIndex, buckets[selectedIndex].emoji == emoji {
+      buckets[selectedIndex].count -= 1
+      buckets[selectedIndex].selected = false
+    } else {
+      if let selectedIndex {
+        buckets[selectedIndex].count -= 1
+        buckets[selectedIndex].selected = false
+      }
+      if let next = buckets.firstIndex(where: { $0.emoji == emoji }) {
+        buckets[next].count += 1
+        buckets[next].selected = true
+      } else {
+        buckets.append((emoji, 1, true))
+      }
+    }
+    return buckets.filter { $0.count > 0 }.map {
+      ["emoji": $0.emoji, "count": $0.count, "isSelected": $0.selected]
+    }
+  }
+
+  @discardableResult
+  private func applyMessageEngagementLocked(
+    chatId: String, messageId: String, reactions: [[String: Any]]?, viewCount: Int64?
+  ) -> Bool {
+    var changed = mutateLiveMessagePayloadLocked(chatId: chatId, messageId: messageId) { message in
+      if let reactions { message["reactions"] = reactions }
+      if let viewCount { message["viewCount"] = viewCount }
+    }
+    if var rows = historyRowsByChat[chatId] {
+      for index in rows.indices {
+        guard var message = rows[index]["message"] as? [String: Any],
+          normalizedString(message["id"]) == messageId
+        else { continue }
+        let previous = message
+        if let reactions { message["reactions"] = reactions }
+        if let viewCount { message["viewCount"] = viewCount }
+        if !(message as NSDictionary).isEqual(to: previous) {
+          rows[index]["message"] = message
+          changed = true
+        }
+        break
+      }
+      historyRowsByChat[chatId] = rows
+    }
+    guard changed,
+      let message = findMessagePayloadLocked(chatId: chatId, messageId: messageId)
+    else { return changed }
+    feedCoreRawFramesLocked(chatId: chatId, rawMessages: [message], source: .chatTopic)
+    storeMergedChatHistoryIfLoadedLocked(chatId: chatId)
+    return true
+  }
+
   private func buildLiveRowPayloadLocked(
     chatId: String,
     messageId: String,
@@ -11751,7 +11963,7 @@ final class ChatEngine {
         hydratedFields["text"] = plain
         hydratedFields["plainContent"] = plain
       }
-      let row = buildLiveRowPayloadLocked(
+      var row = buildLiveRowPayloadLocked(
         chatId: chatId,
         messageId: messageId,
         fromId: fromId,
@@ -11764,6 +11976,11 @@ final class ChatEngine {
         forceEdited: true,
         forceEditedAt: editedAtValue
       )
+      if var nextMessage = row["message"] as? [String: Any] {
+        if let reactions = existingMessage["reactions"] { nextMessage["reactions"] = reactions }
+        if let viewCount = existingMessage["viewCount"] { nextMessage["viewCount"] = viewCount }
+        row["message"] = nextMessage
+      }
       upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: row)
       appendJournalLocked(
         event: "native-message-edited",
@@ -15445,8 +15662,8 @@ final class ChatEngine {
       let encryptedContent = normalizedString(raw["encryptedContent"] ?? raw["encrypted_content"])
       let plaintextFallback = normalizedString(raw["plaintext"] ?? raw["text"]) ?? ""
       let serverStatus = normalizedString(raw["status"])?.lowercased()
-      let isEdited = ((raw["isEdited"] as? Bool) == true)
-      let editedAt = raw["editedAt"] ?? raw["edited_at"]
+      let editedAt = parseLongValue(raw["editedAt"] ?? raw["edited_at"])
+      let isEdited = ((raw["isEdited"] as? Bool) == true) || editedAt != nil
       let rawMediaUrl = normalizedString(raw["mediaUrl"] ?? raw["media_url"])
       let rawFileName = normalizedString(raw["fileName"] ?? raw["file_name"])
       let rawMediaKey = normalizedString(raw["mediaKey"] ?? raw["media_key"])
@@ -15659,6 +15876,12 @@ final class ChatEngine {
       }
       if var message = row["message"] as? [String: Any] {
         if let serverStatus { message["status"] = serverStatus }
+        if let reactions = raw["reactions"] as? [[String: Any]] {
+          message["reactions"] = reactions
+        }
+        if let viewCount = parseLongValue(raw["viewCount"] ?? raw["view_count"]) {
+          message["viewCount"] = viewCount
+        }
         if let reactionEmoji = normalizedString(raw["reactionEmoji"] ?? raw["reaction_emoji"]) {
           message["reactionEmoji"] = reactionEmoji
         }

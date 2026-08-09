@@ -153,6 +153,7 @@ defmodule VibeWeb.Router do
     delete "/chat/:chat_id/messages/:message_id", ChatController, :delete_message
     get "/chat/:chat_id/pinned_messages", ChatController, :list_pinned_messages
     post "/chat/:chat_id/messages/:message_id/pin", ChatController, :pin_message
+    post "/chat/:chat_id/messages/:message_id/report", ChatController, :report_message
     delete "/chats/:chat_id", ChatController, :delete
 
     # Settings

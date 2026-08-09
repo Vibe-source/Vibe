@@ -32,8 +32,8 @@ use crate::secret::VibeOpaqueBlob;
 use crate::types::{
     VibeAgentProgressNode, VibeAgentRef, VibeAuthorRef, VibeDeliveryState, VibeDisplayStatus,
     VibeMediaEnvelope, VibeMediaRef, VibeMessageBody, VibeMessageFlags, VibeMessageKind,
-    VibeMessageSnapshotV1, VibeReplyRef, VibeServiceChip, VibeServiceNode, VibeSize,
-    VibeThumbHandle,
+    VibeMessageSnapshotV1, VibeReactionSummary, VibeReplyRef, VibeServiceChip, VibeServiceNode,
+    VibeSize, VibeThumbHandle,
 };
 
 /// Ceiling on a single raw frame.
@@ -441,6 +441,9 @@ fn build_snapshot(
         media,
         agent,
         service,
+        reactions: resolve_reactions(raw),
+        view_count: pick_i64(raw, &["viewCount", "view_count"])
+            .and_then(|value| u64::try_from(value).ok()),
         content_hash: 0,
     };
     snapshot.rehash();
@@ -788,6 +791,26 @@ fn as_object(value: Value) -> Option<Map<String, Value>> {
     }
 }
 
+fn resolve_reactions(raw: &Map<String, Value>) -> Vec<VibeReactionSummary> {
+    let Some(Value::Array(items)) = raw.get("reactions") else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|item| {
+            let emoji = pick_str(item, &["emoji"])?;
+            let count = pick_i64(item, &["count"]).and_then(|value| u64::try_from(value).ok())?;
+            (count > 0).then(|| VibeReactionSummary {
+                emoji,
+                count,
+                is_selected: pick_bool(item, &["isSelected", "is_selected"]).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 fn pick_str(map: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     for key in keys {
         match map.get(*key) {
@@ -1035,8 +1058,14 @@ mod tests {
 
         let a = canonicalize_frame(mine, &uppercased).unwrap();
         let b = canonicalize_frame(theirs, &uppercased).unwrap();
-        assert!(a.messages[0].author.is_me, "own message must resolve as mine");
-        assert!(!b.messages[0].author.is_me, "peer message must stay the peer's");
+        assert!(
+            a.messages[0].author.is_me,
+            "own message must resolve as mine"
+        );
+        assert!(
+            !b.messages[0].author.is_me,
+            "peer message must stay the peer's"
+        );
     }
 
     #[test]
@@ -1054,6 +1083,29 @@ mod tests {
         assert_eq!(a.messages[0].body.text, "hello");
         assert_eq!(a.messages[0].ts_ms, 1_700_000_000_000);
         assert!(!a.messages[0].author.is_me);
+    }
+
+    #[test]
+    fn canonicalizes_reactions_and_view_count_as_rendered_state() {
+        let aead = VibeDenyAllAead;
+        let unwrap = VibeDenyAllKeyUnwrapper;
+        let c = ctx(&aead, &unwrap, false);
+        let frame = r#"{"id":"m1","chatId":"chat-1","senderId":"peer","timestamp":1,"reactions":[{"emoji":"❤️","count":8,"isSelected":true},{"emoji":"🔥","count":2}],"viewCount":340800}"#;
+
+        let snapshot = canonicalize_frame(frame.as_bytes(), &c)
+            .unwrap()
+            .messages
+            .remove(0);
+        assert_eq!(snapshot.reactions.len(), 2);
+        assert_eq!(snapshot.reactions[0].emoji, "❤️");
+        assert_eq!(snapshot.reactions[0].count, 8);
+        assert!(snapshot.reactions[0].is_selected);
+        assert_eq!(snapshot.view_count, Some(340_800));
+
+        let mut changed = snapshot.clone();
+        changed.reactions[0].count += 1;
+        changed.rehash();
+        assert_ne!(snapshot.content_hash, changed.content_hash);
     }
 
     #[test]

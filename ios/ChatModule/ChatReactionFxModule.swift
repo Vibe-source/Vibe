@@ -301,6 +301,22 @@ final class ChatReactionFxModule {
   private func style(for emoji: String, tintOverride: UIColor?) -> ChatReactionFxStyle {
     let fallback = tintOverride ?? UIColor(red: 0.25, green: 0.67, blue: 0.99, alpha: 1.0)
     switch emoji {
+    case "⭐️", "⭐":
+      return ChatReactionFxStyle(
+        accent: UIColor(red: 1.00, green: 0.74, blue: 0.10, alpha: 1.0),
+        ring: UIColor(red: 1.00, green: 0.87, blue: 0.38, alpha: 1.0),
+        particleColors: [
+          UIColor(red: 1.00, green: 0.65, blue: 0.08, alpha: 1.0),
+          UIColor(red: 1.00, green: 0.88, blue: 0.30, alpha: 1.0),
+          UIColor(red: 1.00, green: 0.97, blue: 0.67, alpha: 1.0),
+        ],
+        particleCount: 13,
+        spread: 18.0...38.0,
+        rise: 8.0...22.0,
+        ringEndScale: 2.6,
+        bubblePulseScale: 1.028,
+        flightRotation: 0.24
+      )
     case "❤️":
       return ChatReactionFxStyle(
         accent: UIColor(red: 1.00, green: 0.30, blue: 0.47, alpha: 1.0),
@@ -394,6 +410,51 @@ final class ChatReactionFxModule {
         ringEndScale: 1.8,
         bubblePulseScale: 1.015,
         flightRotation: 0.06
+      )
+    case "🥰":
+      return ChatReactionFxStyle(
+        accent: UIColor(red: 1.00, green: 0.43, blue: 0.60, alpha: 1.0),
+        ring: UIColor(red: 1.00, green: 0.67, blue: 0.76, alpha: 1.0),
+        particleColors: [
+          UIColor(red: 1.00, green: 0.35, blue: 0.54, alpha: 1.0),
+          UIColor(red: 1.00, green: 0.70, blue: 0.78, alpha: 1.0),
+        ],
+        particleCount: 12,
+        spread: 16.0...34.0,
+        rise: 8.0...22.0,
+        ringEndScale: 2.4,
+        bubblePulseScale: 1.024,
+        flightRotation: -0.12
+      )
+    case "👏":
+      return ChatReactionFxStyle(
+        accent: UIColor(red: 1.00, green: 0.68, blue: 0.23, alpha: 1.0),
+        ring: UIColor(red: 1.00, green: 0.82, blue: 0.47, alpha: 1.0),
+        particleColors: [
+          UIColor(red: 1.00, green: 0.59, blue: 0.16, alpha: 1.0),
+          UIColor(red: 1.00, green: 0.86, blue: 0.45, alpha: 1.0),
+        ],
+        particleCount: 10,
+        spread: 20.0...40.0,
+        rise: 2.0...12.0,
+        ringEndScale: 2.2,
+        bubblePulseScale: 1.03,
+        flightRotation: 0.16
+      )
+    case "😁":
+      return ChatReactionFxStyle(
+        accent: UIColor(red: 0.98, green: 0.76, blue: 0.12, alpha: 1.0),
+        ring: UIColor(red: 1.00, green: 0.88, blue: 0.40, alpha: 1.0),
+        particleColors: [
+          UIColor(red: 0.99, green: 0.70, blue: 0.08, alpha: 1.0),
+          UIColor(red: 1.00, green: 0.92, blue: 0.48, alpha: 1.0),
+        ],
+        particleCount: 9,
+        spread: 14.0...31.0,
+        rise: 4.0...15.0,
+        ringEndScale: 2.1,
+        bubblePulseScale: 1.022,
+        flightRotation: 0.09
       )
     default:
       return ChatReactionFxStyle(

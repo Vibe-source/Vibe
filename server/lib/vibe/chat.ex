@@ -9,6 +9,8 @@ defmodule Vibe.Chat do
   alias Vibe.RepoRLS
   alias Vibe.Storage
 
+  alias Vibe.Accounts.UserBlock
+
   alias Vibe.Chat.{
     Room,
     Message,
@@ -17,6 +19,9 @@ defmodule Vibe.Chat do
     ChannelJoinRequest,
     ChannelAgentAssignment,
     MessageRead,
+    MessageReaction,
+    MessageReport,
+    MessageView,
     SavedMessage,
     ScheduledPost,
     PinnedMessage,
@@ -875,7 +880,11 @@ defmodule Vibe.Chat do
           end
 
         %{
-          messages: page_desc |> Enum.reverse() |> Enum.map(&to_client_message/1),
+          messages:
+            page_desc
+            |> Enum.reverse()
+            |> Enum.map(&to_client_message/1)
+            |> decorate_engagement(chat_id, user_id),
           next_cursor: next_cursor,
           has_more: has_more
         }
@@ -1016,19 +1025,17 @@ defmodule Vibe.Chat do
                   if message.from_id != user_id do
                     {:error, :forbidden}
                   else
-                    next_timestamp =
-                      cond do
-                        is_integer(edited_at) and edited_at > 0 ->
-                          max(message.timestamp || 0, edited_at)
-
-                        true ->
-                          message.timestamp
-                      end
+                    # The original send time is the ordering key — an edit stamps
+                    # :edited_at and never moves the message in history.
+                    next_edited_at =
+                      if is_integer(edited_at) and edited_at > 0,
+                        do: edited_at,
+                        else: :os.system_time(:millisecond)
 
                     message
                     |> Ecto.Changeset.change(
                       encrypted_content: encrypted_content,
-                      timestamp: next_timestamp
+                      edited_at: next_edited_at
                     )
                     |> Repo.update()
                   end
@@ -1046,6 +1053,333 @@ defmodule Vibe.Chat do
         other
     end
   end
+
+  # ── Reactions, views, reports ───────────────────────────────────
+
+  @engagement_batch_limit 200
+  @no_user_uuid "00000000-0000-0000-0000-000000000000"
+
+  @doc "Toggles the same reaction off or replaces it, then returns fresh counts."
+  def toggle_reaction(chat_id, message_id, user_id, emoji) do
+    with {:ok, normalized} <- normalize_emoji(emoji),
+         {:ok, uuid} <- cast_message_uuid(message_id) do
+      RepoRLS.with_user(user_id, fn ->
+        with :ok <- ensure_participant(chat_id, user_id),
+             {:ok, _message} <- fetch_chat_message(chat_id, uuid),
+             :ok <- ensure_reactions_enabled(chat_id) do
+          action = apply_reaction(chat_id, uuid, user_id, normalized)
+
+          {:ok,
+           %{
+             action: action,
+             emoji: normalized,
+             reactions: message_reactions(uuid, user_id)
+           }}
+        end
+      end)
+    end
+  end
+
+  @doc "Reaction summary for one message, with the caller's bucket flagged."
+  def message_reactions(message_id, user_id \\ nil) do
+    [message_id]
+    |> message_reaction_summaries(user_id)
+    |> Enum.flat_map(fn {_message_id, rows} -> rows end)
+  end
+
+  @doc "Batched `%{message_id => [%{emoji, count, isSelected}]}` for a page of messages."
+  def message_reaction_summaries(message_ids, user_id \\ nil) do
+    case normalize_message_uuids(message_ids) do
+      [] ->
+        %{}
+
+      ids ->
+        caller_id = normalize_actor_id(user_id) || @no_user_uuid
+
+        from(r in MessageReaction,
+          where: r.message_id in ^ids,
+          group_by: [r.message_id, r.emoji],
+          select: %{
+            message_id: r.message_id,
+            emoji: r.emoji,
+            count: count(r.id),
+            selected: fragment("bool_or(? = ?)", r.user_id, type(^caller_id, :binary_id))
+          }
+        )
+        |> Repo.all()
+        |> Enum.group_by(& &1.message_id)
+        |> Map.new(fn {message_id, rows} ->
+          {message_id,
+           rows
+           |> Enum.sort_by(&{-&1.count, &1.emoji})
+           |> Enum.map(&%{emoji: &1.emoji, count: &1.count, isSelected: &1.selected == true})}
+        end)
+    end
+  end
+
+  @doc "Batched `%{message_id => view_count}`; messages with no views are absent."
+  def message_view_counts(message_ids) do
+    case normalize_message_uuids(message_ids) do
+      [] ->
+        %{}
+
+      ids ->
+        from(v in MessageView,
+          where: v.message_id in ^ids,
+          group_by: v.message_id,
+          select: {v.message_id, count(v.id)}
+        )
+        |> Repo.all()
+        |> Map.new()
+    end
+  end
+
+  @doc "Records idempotent group/channel views, excluding the caller's own messages."
+  def mark_messages_viewed(chat_id, user_id, message_ids) do
+    ids = normalize_message_uuids(message_ids)
+
+    cond do
+      ids == [] ->
+        {:error, :invalid_id}
+
+      not is_participant?(chat_id, user_id) ->
+        {:error, :forbidden}
+
+      get_room_type(chat_id) not in ["group", "channel"] ->
+        {:error, :unsupported_chat}
+
+      true ->
+        RepoRLS.with_user(user_id, fn -> insert_message_views(chat_id, user_id, ids) end)
+    end
+  end
+
+  @doc "Files a moderation report without reading or copying message plaintext."
+  def report_message(chat_id, message_id, reporter_id, attrs) when is_map(attrs) do
+    with {:ok, uuid} <- cast_message_uuid(message_id),
+         {:ok, reason} <- normalize_report_reason(attrs),
+         {:ok, details} <- normalize_report_details(attrs) do
+      block_sender =
+        report_flag(attrs["blockSender"] || attrs["block_sender"] || attrs[:blockSender])
+
+      RepoRLS.with_user(reporter_id, fn ->
+        with :ok <- ensure_participant(chat_id, reporter_id),
+             {:ok, message} <- fetch_chat_message(chat_id, uuid),
+             :ok <- ensure_report_target(message, reporter_id) do
+          insert_message_report(chat_id, message, reporter_id, reason, details, block_sender)
+        end
+      end)
+    end
+  end
+
+  @doc "Report reasons accepted by `report_message/4`."
+  def report_reasons, do: MessageReport.reasons()
+
+  defp insert_message_views(chat_id, user_id, ids) do
+    eligible =
+      Repo.all(
+        from(m in Message,
+          where: m.id in ^ids and m.chat_id == ^chat_id and m.from_id != ^user_id,
+          select: m.id
+        )
+      )
+
+    if eligible == [] do
+      {:ok, []}
+    else
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+      entries =
+        Enum.map(eligible, fn message_id ->
+          %{
+            id: Ecto.UUID.generate(),
+            message_id: message_id,
+            chat_id: chat_id,
+            user_id: user_id,
+            inserted_at: now
+          }
+        end)
+
+      Repo.insert_all(MessageView, entries,
+        on_conflict: :nothing,
+        conflict_target: [:message_id, :user_id]
+      )
+
+      counts = message_view_counts(eligible)
+      {:ok, Enum.map(eligible, &%{messageId: &1, viewCount: Map.get(counts, &1, 0)})}
+    end
+  end
+
+  defp insert_message_report(chat_id, %Message{} = message, reporter_id, reason, details, block?) do
+    attrs = %{
+      message_id: message.id,
+      source_message_id: message.id,
+      chat_id: chat_id,
+      reporter_id: reporter_id,
+      reported_user_id: message.from_id,
+      reason: reason,
+      details: details,
+      status: "pending"
+    }
+
+    case %MessageReport{} |> MessageReport.changeset(attrs) |> Repo.insert() do
+      {:ok, report} ->
+        if block?, do: ensure_user_block(reporter_id, message.from_id)
+        {:ok, %{report: report, blocked: Accounts.blocked?(reporter_id, message.from_id)}}
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  # Idempotent: re-reporting an already-blocked sender must still succeed.
+  defp ensure_user_block(user_id, blocked_user_id) do
+    %UserBlock{}
+    |> UserBlock.changeset(%{user_id: user_id, blocked_user_id: blocked_user_id})
+    |> Repo.insert(on_conflict: :nothing, conflict_target: [:user_id, :blocked_user_id])
+  end
+
+  defp apply_reaction(chat_id, message_uuid, user_id, emoji) do
+    existing =
+      Repo.one(
+        from(r in MessageReaction,
+          where: r.message_id == ^message_uuid and r.user_id == ^user_id
+        )
+      )
+
+    cond do
+      is_nil(existing) ->
+        %MessageReaction{}
+        |> MessageReaction.changeset(%{
+          message_id: message_uuid,
+          chat_id: chat_id,
+          user_id: user_id,
+          emoji: emoji
+        })
+        |> Repo.insert!(
+          on_conflict: {:replace, [:emoji, :updated_at]},
+          conflict_target: [:message_id, :user_id]
+        )
+
+        :added
+
+      existing.emoji == emoji ->
+        # Row-scoped, not struct-scoped: a second device toggling the same
+        # reaction must not raise StaleEntryError and kill the channel.
+        from(r in MessageReaction, where: r.id == ^existing.id) |> Repo.delete_all()
+        :removed
+
+      true ->
+        from(r in MessageReaction, where: r.id == ^existing.id)
+        |> Repo.update_all(
+          set: [
+            emoji: emoji,
+            updated_at: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+          ]
+        )
+
+        :replaced
+    end
+  end
+
+  defp ensure_participant(chat_id, user_id) do
+    if is_participant?(chat_id, user_id), do: :ok, else: {:error, :forbidden}
+  end
+
+  defp fetch_chat_message(chat_id, message_uuid) do
+    case Repo.one(from(m in Message, where: m.id == ^message_uuid and m.chat_id == ^chat_id)) do
+      %Message{} = message -> {:ok, message}
+      _ -> {:error, :not_found}
+    end
+  end
+
+  defp ensure_reactions_enabled(chat_id) do
+    case Repo.get(Room, chat_id) do
+      %Room{} = room ->
+        if channel_settings(room)["reactionsEnabled"] == false,
+          do: {:error, :reactions_disabled},
+          else: :ok
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp ensure_report_target(%Message{from_id: from_id}, reporter_id)
+       when is_binary(from_id) and from_id != "" do
+    if from_id == reporter_id, do: {:error, :invalid_target}, else: :ok
+  end
+
+  defp ensure_report_target(_message, _reporter_id), do: {:error, :invalid_target}
+
+  defp normalize_emoji(emoji) when is_binary(emoji) do
+    trimmed = String.trim(emoji)
+
+    cond do
+      trimmed == "" -> {:error, :invalid_emoji}
+      # 64 bytes, not 32: a ZWJ family/couple sequence is ~35 bytes.
+      byte_size(trimmed) > 64 -> {:error, :invalid_emoji}
+      String.match?(trimmed, ~r/[[:space:][:cntrl:]]/u) -> {:error, :invalid_emoji}
+      true -> {:ok, trimmed}
+    end
+  end
+
+  defp normalize_emoji(_emoji), do: {:error, :invalid_emoji}
+
+  defp cast_message_uuid(message_id) when is_binary(message_id) do
+    case Ecto.UUID.cast(message_id) do
+      {:ok, uuid} -> {:ok, uuid}
+      :error -> {:error, :invalid_id}
+    end
+  end
+
+  defp cast_message_uuid(_message_id), do: {:error, :invalid_id}
+
+  defp normalize_message_uuids(message_ids) do
+    message_ids
+    |> List.wrap()
+    |> Enum.flat_map(fn id ->
+      case cast_message_uuid(id) do
+        {:ok, uuid} -> [uuid]
+        _ -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.take(@engagement_batch_limit)
+  end
+
+  defp normalize_report_reason(attrs) do
+    raw = attrs["reason"] || attrs[:reason]
+
+    normalized =
+      raw |> to_string() |> String.trim() |> String.downcase() |> String.replace("-", "_")
+
+    if normalized in MessageReport.reasons(),
+      do: {:ok, normalized},
+      else: {:error, :invalid_reason}
+  end
+
+  defp normalize_report_details(attrs) do
+    case attrs["details"] || attrs[:details] do
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" ->
+            {:ok, nil}
+
+          trimmed ->
+            if String.length(trimmed) > MessageReport.details_limit(),
+              do: {:error, :details_too_long},
+              else: {:ok, trimmed}
+        end
+
+      _ ->
+        {:error, :invalid_details}
+    end
+  end
+
+  defp report_flag(value), do: value in [true, "true", "1", 1, "yes"]
 
   def list_pinned_messages(chat_id, user_id) do
     RepoRLS.with_user(user_id, fn ->
@@ -3469,9 +3803,43 @@ defmodule Vibe.Chat do
       status: message.status,
       media_url: rewrite_media_url(message.media_url),
       metadata: message.metadata || %{},
-      reply_to_id: message.reply_to_id
+      reply_to_id: message.reply_to_id,
+      editedAt: message.edited_at
     }
   end
+
+  # Frozen engagement contract on a page of client messages: one batched query
+  # per kind, never per row. `viewCount` is group/channel only.
+  defp decorate_engagement([], _chat_id, _user_id), do: []
+
+  defp decorate_engagement(client_messages, chat_id, user_id) do
+    ids = for %{id: id} <- client_messages, is_binary(id), do: id
+
+    if ids == [] do
+      client_messages
+    else
+      chunks = Enum.chunk_every(ids, @engagement_batch_limit)
+      reactions = chunks |> Enum.map(&message_reaction_summaries(&1, user_id)) |> merge_maps()
+      views? = get_room_type(chat_id) in ["group", "channel"]
+
+      counts =
+        if views?, do: chunks |> Enum.map(&message_view_counts/1) |> merge_maps(), else: %{}
+
+      Enum.map(client_messages, fn
+        %{id: id} = message when is_binary(id) ->
+          message
+          |> Map.put(:reactions, Map.get(reactions, id, []))
+          |> then(fn m ->
+            if views?, do: Map.put(m, :viewCount, Map.get(counts, id, 0)), else: m
+          end)
+
+        other ->
+          other
+      end)
+    end
+  end
+
+  defp merge_maps(maps), do: Enum.reduce(maps, %{}, &Map.merge(&2, &1))
 
   defp rewrite_media_url(url), do: Storage.rewrite_public_url(url)
 

@@ -4021,6 +4021,8 @@ public struct VibeFfiMessage {
     public var agent: VibeFfiAgent?
     public var service: VibeFfiService?
     public var editedAtMs: Int64?
+    public var reactions: [VibeFfiReaction]
+    public var viewCount: UInt64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4046,7 +4048,7 @@ public struct VibeFfiMessage {
         /**
          * FNV-1a over the rendered fields. A renderer can skip a reconfigure when
          * this is unchanged.
-         */contentHash: UInt64, hasMedia: Bool, hasReply: Bool, hasAgent: Bool, hasService: Bool, isEdited: Bool, media: VibeFfiMedia?, reply: VibeFfiReply?, agent: VibeFfiAgent?, service: VibeFfiService?, editedAtMs: Int64?) {
+         */contentHash: UInt64, hasMedia: Bool, hasReply: Bool, hasAgent: Bool, hasService: Bool, isEdited: Bool, media: VibeFfiMedia?, reply: VibeFfiReply?, agent: VibeFfiAgent?, service: VibeFfiService?, editedAtMs: Int64?, reactions: [VibeFfiReaction], viewCount: UInt64?) {
         self.messageId = messageId
         self.clientMessageId = clientMessageId
         self.tsMs = tsMs
@@ -4072,6 +4074,8 @@ public struct VibeFfiMessage {
         self.agent = agent
         self.service = service
         self.editedAtMs = editedAtMs
+        self.reactions = reactions
+        self.viewCount = viewCount
     }
 }
 
@@ -4154,6 +4158,12 @@ extension VibeFfiMessage: Equatable, Hashable {
         if lhs.editedAtMs != rhs.editedAtMs {
             return false
         }
+        if lhs.reactions != rhs.reactions {
+            return false
+        }
+        if lhs.viewCount != rhs.viewCount {
+            return false
+        }
         return true
     }
 
@@ -4183,6 +4193,8 @@ extension VibeFfiMessage: Equatable, Hashable {
         hasher.combine(agent)
         hasher.combine(service)
         hasher.combine(editedAtMs)
+        hasher.combine(reactions)
+        hasher.combine(viewCount)
     }
 }
 
@@ -4218,7 +4230,9 @@ public struct FfiConverterTypeVibeFfiMessage: FfiConverterRustBuffer {
                 reply: FfiConverterOptionTypeVibeFfiReply.read(from: &buf), 
                 agent: FfiConverterOptionTypeVibeFfiAgent.read(from: &buf), 
                 service: FfiConverterOptionTypeVibeFfiService.read(from: &buf), 
-                editedAtMs: FfiConverterOptionInt64.read(from: &buf)
+                editedAtMs: FfiConverterOptionInt64.read(from: &buf),
+                reactions: FfiConverterSequenceTypeVibeFfiReaction.read(from: &buf),
+                viewCount: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
 
@@ -4248,6 +4262,8 @@ public struct FfiConverterTypeVibeFfiMessage: FfiConverterRustBuffer {
         FfiConverterOptionTypeVibeFfiAgent.write(value.agent, into: &buf)
         FfiConverterOptionTypeVibeFfiService.write(value.service, into: &buf)
         FfiConverterOptionInt64.write(value.editedAtMs, into: &buf)
+        FfiConverterSequenceTypeVibeFfiReaction.write(value.reactions, into: &buf)
+        FfiConverterOptionUInt64.write(value.viewCount, into: &buf)
     }
 }
 
@@ -4264,6 +4280,80 @@ public func FfiConverterTypeVibeFfiMessage_lift(_ buf: RustBuffer) throws -> Vib
 #endif
 public func FfiConverterTypeVibeFfiMessage_lower(_ value: VibeFfiMessage) -> RustBuffer {
     return FfiConverterTypeVibeFfiMessage.lower(value)
+}
+
+
+public struct VibeFfiReaction {
+    public var emoji: String
+    public var count: UInt64
+    public var isSelected: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(emoji: String, count: UInt64, isSelected: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.isSelected = isSelected
+    }
+}
+
+
+
+extension VibeFfiReaction: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiReaction, rhs: VibeFfiReaction) -> Bool {
+        if lhs.emoji != rhs.emoji {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        if lhs.isSelected != rhs.isSelected {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(emoji)
+        hasher.combine(count)
+        hasher.combine(isSelected)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiReaction: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiReaction {
+        return
+            try VibeFfiReaction(
+                emoji: FfiConverterString.read(from: &buf),
+                count: FfiConverterUInt64.read(from: &buf),
+                isSelected: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiReaction, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.emoji, into: &buf)
+        FfiConverterUInt64.write(value.count, into: &buf)
+        FfiConverterBool.write(value.isSelected, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiReaction_lift(_ buf: RustBuffer) throws -> VibeFfiReaction {
+    return try FfiConverterTypeVibeFfiReaction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiReaction_lower(_ value: VibeFfiReaction) -> RustBuffer {
+    return FfiConverterTypeVibeFfiReaction.lower(value)
 }
 
 
@@ -5896,6 +5986,30 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
     typealias SwiftType = Int64?
 
@@ -6349,6 +6463,31 @@ fileprivate struct FfiConverterSequenceTypeVibeFfiMessage: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeVibeFfiMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeVibeFfiReaction: FfiConverterRustBuffer {
+    typealias SwiftType = [VibeFfiReaction]
+
+    public static func write(_ value: [VibeFfiReaction], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeVibeFfiReaction.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [VibeFfiReaction] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [VibeFfiReaction]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeVibeFfiReaction.read(from: &buf))
         }
         return seq
     }

@@ -88,6 +88,12 @@ enum VibeCoreRowPayload {
     if !message.authorUserId.isEmpty { payload["fromId"] = message.authorUserId }
     if message.authorIsMe { payload["status"] = deliveryStatus(message) }
     if let editedAtMs = message.editedAtMs { payload["editedAt"] = editedAtMs }
+    if !message.reactions.isEmpty {
+      payload["reactions"] = message.reactions.map {
+        ["emoji": $0.emoji, "count": $0.count, "isSelected": $0.isSelected]
+      }
+    }
+    if let viewCount = message.viewCount { payload["viewCount"] = viewCount }
     if let caption = message.caption, !caption.isEmpty { payload["caption"] = caption }
 
     if let media = message.media {

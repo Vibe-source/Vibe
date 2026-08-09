@@ -56,7 +56,9 @@ final class VibeTimelineHostTests: XCTestCase {
       reply: nil,
       agent: nil,
       service: nil,
-      editedAtMs: nil
+      editedAtMs: nil,
+      reactions: [],
+      viewCount: nil
     )
   }
 
