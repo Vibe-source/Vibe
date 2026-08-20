@@ -305,6 +305,12 @@ final class ChatWallpaperView: UIView {
     appearance: ChatListAppearance, size: CGSize, scale: CGFloat, maskImage: CGImage?
   ) -> CGImage? {
     let box = CGRect(origin: .zero, size: size)
+    // Building layers off-main opens an IMPLICIT CATransaction on this thread, which Core
+    // Animation then commits from a run-loop observer — that background commit is the
+    // "layout engine modified from a background thread" crash. Own it and close it here.
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    defer { CATransaction.commit() }
 
     let baseLayer = CAGradientLayer()
     baseLayer.frame = box

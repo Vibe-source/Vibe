@@ -1951,7 +1951,27 @@ struct ChatTallToggleAnchor {
   let isMe: Bool
 }
 
+/// Rendered ticks, keyed by shape + resolved colour. Two shapes and a handful of ink
+/// colours, so this stays tiny; without it every cell configure ran a full raster pass.
+private let bubbleStatusCheckImageCache = NSCache<NSString, UIImage>()
+
 private func bubbleStatusCheckImage(double: Bool, color: UIColor) -> UIImage? {
+  // Colour identity is not stable across appearance changes, so key on the components.
+  // A colour that cannot report them (pattern, unusual space) skips the cache entirely
+  // rather than collide with every other one.
+  var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+  guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else {
+    return bubbleStatusCheckImageUncached(double: double, color: color)
+  }
+  let cacheKey = String(
+    format: "%@|%.3f,%.3f,%.3f,%.3f", double ? "d" : "s", r, g, b, a) as NSString
+  if let cached = bubbleStatusCheckImageCache.object(forKey: cacheKey) { return cached }
+  let image = bubbleStatusCheckImageUncached(double: double, color: color)
+  if let image { bubbleStatusCheckImageCache.setObject(image, forKey: cacheKey) }
+  return image
+}
+
+private func bubbleStatusCheckImageUncached(double: Bool, color: UIColor) -> UIImage? {
   let size = CGSize(width: bubbleStatusSlotWidth, height: bubbleStatusSlotHeight)
   let renderer = UIGraphicsImageRenderer(size: size)
   return renderer.image { ctx in
@@ -2046,8 +2066,17 @@ private struct ChatBubbleMetaWidths {
 private let reactionChipHeight: CGFloat = 24.0
 private let reactionChipGap: CGFloat = 4.0
 private let reactionChipRowGap: CGFloat = 4.0
+private let reactionStripTopGap: CGFloat = 4.0
+private let reactionStripBottomInset: CGFloat = 6.0
 private let reactionEmojiFont = UIFont.systemFont(ofSize: 14.0)
 private let reactionCountFont = UIFont.monospacedDigitSystemFont(ofSize: 12.0, weight: .semibold)
+
+/// Height a reaction strip adds to a bubble: the strip and its gap, less the bottom
+/// padding it already sits inside (the strip is laid out `reactionStripBottomInset` up).
+private func reactionStripHeightOffset(_ size: CGSize, bottomPadding: CGFloat) -> CGFloat {
+  guard size.height > 0.0 else { return 0.0 }
+  return size.height + reactionStripTopGap + max(0.0, reactionStripBottomInset - bottomPadding)
+}
 
 private func compactEngagementCount(_ count: Int) -> String {
   if count >= 1_000_000 {
@@ -2154,13 +2183,25 @@ private final class ChatReactionChipView: UIView {
     emojiLabel.isHidden = hidesEmoji
     alpha = hidesEmoji ? 0.0 : 1.0
     countLabel.isHidden = !showsCount
-    countLabel.textColor = reaction.isSelected ? appearance.accent : UIColor.white.withAlphaComponent(0.86)
+    // Own bubbles: the pill takes the message text colour, so it tracks the theme.
+    let outgoingInk = appearance.textColorMe
+    let outgoingPlate = appearance.bubbleMeGradient.first ?? appearance.accent
+    countLabel.textColor =
+      reaction.isSelected
+      ? appearance.accent
+      : (isMe ? outgoingPlate : UIColor.white.withAlphaComponent(0.86))
     countLabel.setCounterText(compactEngagementCount(reaction.count), animated: animated)
-    backgroundColor = reaction.isSelected
-      ? appearance.accent.withAlphaComponent(appearance.isDark ? 0.36 : 0.25)
-      : UIColor(white: isMe ? 1.0 : 0.0, alpha: isMe ? 0.20 : 0.16)
-    layer.borderColor = (reaction.isSelected ? appearance.accent : UIColor.white)
-      .withAlphaComponent(reaction.isSelected ? 0.58 : 0.16).cgColor
+    backgroundColor =
+      isMe
+      ? outgoingInk
+      : (reaction.isSelected
+        ? appearance.accent.withAlphaComponent(appearance.isDark ? 0.36 : 0.25)
+        : UIColor(white: 0.0, alpha: 0.16))
+    layer.borderColor =
+      isMe
+      ? UIColor.clear.cgColor
+      : (reaction.isSelected ? appearance.accent : UIColor.white)
+        .withAlphaComponent(reaction.isSelected ? 0.58 : 0.16).cgColor
   }
 
   @objc private func handleHold(_ gesture: UILongPressGestureRecognizer) {
@@ -5142,7 +5183,8 @@ func measureMessageBubbleLayout(
     let reactionSize = reactionStripMeasuredSize(
       row.reactions, maxWidth: max(1.0, agentMaxBubbleWidth - 12.0),
       showsCount: row.isGroupOrChannel)
-    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
+    let reactionHeightOffset = reactionStripHeightOffset(
+      reactionSize, bottomPadding: agentTurnVerticalPadding)
     let bubbleWidth = min(
       agentMaxBubbleWidth,
       max(
@@ -5398,14 +5440,14 @@ func measureMessageBubbleLayout(
     let reactionSize = reactionStripMeasuredSize(
       row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0),
       showsCount: row.isGroupOrChannel)
-    let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
     let bodyHeight: CGFloat
     var bubbleWidth: CGFloat
     let bubbleHeight: CGFloat
     if isTransparentSticker {
       bodyHeight = mediaHeight + metaTopSpacing + bubbleMetaHeight
       bubbleWidth = max(meta.total, contentWidth)
-      bubbleHeight = bodyHeight + reactionHeightOffset
+      bubbleHeight =
+        bodyHeight + reactionStripHeightOffset(reactionSize, bottomPadding: 0.0)
     } else {
       let isVoice = row.visualKind == .voice
       let captionBlockHeight: CGFloat
@@ -5436,8 +5478,11 @@ func measureMessageBubbleLayout(
         isVoice ? 7.0 : (isEdgeCaption ? mediaCaptionBottomPadding : bubbleBottomPadding)
       bubbleHeight =
         isFullBleed
-        ? max(56.0, bodyHeight + reactionHeightOffset)
-        : max(isVoice ? 66.0 : 48.0, bodyHeight + topPad + bottomPad + reactionHeightOffset)
+        ? max(56.0, bodyHeight + reactionStripHeightOffset(reactionSize, bottomPadding: 0.0))
+        : max(
+          isVoice ? 66.0 : 48.0,
+          bodyHeight + topPad + bottomPad
+            + reactionStripHeightOffset(reactionSize, bottomPadding: bottomPad))
     }
     bubbleWidth = min(maxBubbleWidth, max(bubbleWidth, reactionSize.width + 12.0))
     var metrics = ChatMessageBubbleLayoutMetrics(
@@ -5591,7 +5636,8 @@ func measureMessageBubbleLayout(
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
       + bubbleMetaTopSpacing + bubbleMetaHeight
     : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
-  let reactionHeightOffset: CGFloat = reactionSize.height > 0.0 ? reactionSize.height + 14.0 : 0.0
+  let reactionHeightOffset = reactionStripHeightOffset(
+    reactionSize, bottomPadding: bubbleBottomPadding)
   // No fudge: the plate is exactly the content box plus its two paddings. Shaving 4pt here
   // made the bubble narrower than the content it advertises, so the body label (laid out at
   // contentX + contentWidth) ended 4pt to the right of the meta (right-aligned to
@@ -10017,7 +10063,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   private static let reactionBadgeInsetLeft: CGFloat = 8.0
-  private static let reactionBadgeInsetBottom: CGFloat = 6.0
+  private static let reactionBadgeInsetBottom: CGFloat = reactionStripBottomInset
 
   /// Authoritative chat id stamped by the list at configure time. Per-message payloads often
   /// omit `chat_id` (so `row.chatId` is nil for music), so this is the fallback used to key
@@ -11757,8 +11803,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     if hasSavedExtractionState {
-      savedBubbleHiddenBeforeExtraction = bubbleView.isHidden
-      savedTailHiddenBeforeExtraction = tailView.isHidden
+      // Extraction forces bubble/tail hidden; re-saving those here would latch it as the
+      // restore target and leave the cell showing only its reaction pill.
+      if !isContextMenuExtracted {
+        savedBubbleHiddenBeforeExtraction = bubbleView.isHidden
+        savedTailHiddenBeforeExtraction = tailView.isHidden
+      }
       savedReactionHiddenBeforeExtraction = reactionStripView.isHidden
       savedMessageAlphaBeforeExtraction = messageLabel.alpha
       savedAgentTurnContentAlphaBeforeExtraction = _agentTurnContentView?.alpha ?? 1.0
@@ -13074,7 +13124,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     // Video notes: larger top-left mute control (Telegram diagram).
-    let pointSize: CGFloat = row.visualKind == .videoNote ? 13.0 : 10.5
+    let pointSize: CGFloat = 10.5
     let badgeSymbolConfig = UIImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
     let hasKnownAudio =
       mediaVideoHasAudio
@@ -16063,6 +16113,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return reactionStripView.convert(reactionStripView.bounds, to: view).contains(point)
   }
 
+  /// Where the reaction pill sits, so the context menu can tell a tap on it from a
+  /// tap on the bubble it is snapshotted into.
+  func reactionStripFrame(in view: UIView) -> CGRect? {
+    guard row?.kind == .message, !reactionStripView.isHidden else { return nil }
+    let frame = reactionStripView.convert(reactionStripView.bounds, to: view)
+    return frame.width > 1.0 && frame.height > 1.0 ? frame : nil
+  }
+
   func playReactionLandingEffect(_ emoji: String, in view: UIView) -> Bool {
     guard !reactionStripView.isHidden,
       let point = reactionStripView.landingCenter(for: emoji, in: view)
@@ -16076,6 +16134,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   func bubbleSnapshotView(in view: UIView) -> UIView? {
     guard let row = row, row.kind == .message else {
       return nil
+    }
+    // A capture taken with a stale extraction still applied returns blank pixels, so the
+    // menu would open on an empty bubble. Any leftover hold is stale by the time we re-open.
+    if isContextMenuExtracted || hasSavedExtractionState {
+      setContextMenuExtracted(false)
+      contentView.layoutIfNeeded()
     }
 
     var captureRect = bubbleRenderCaptureRect(in: contentView)

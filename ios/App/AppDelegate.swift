@@ -56,11 +56,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     window.makeKeyAndVisible()
 
     self.window = window
-    // Where a chat open's cost actually goes: cell construction, not sizing. Runs once,
-    // well after launch, so it never rides the first paint. Remove once the lazy
-    // conversion it informs has shipped.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-      ChatListCell.logConstructionCostCensus()
+    // Where a chat open's cost actually goes: cell construction, not sizing. Opt-in — it
+    // builds and destroys ~200 views on main and was measured blocking it for 0.44s.
+    if ProcessInfo.processInfo.arguments.contains("-VibeCellCostCensus") {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+        ChatListCell.logConstructionCostCensus()
+      }
     }
     configureCallNotifications()
     VibeNativeCallManager.shared.start()

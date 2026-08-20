@@ -31,11 +31,50 @@ defmodule Vibe.AI.StandaloneAgent do
       message == nil ->
         {:error, :missing_message}
 
-      response_mode == "send" and is_nil(vibe_chat_id) ->
+      response_mode in ["send", "post"] and is_nil(vibe_chat_id) ->
         {:error, :missing_chat_id}
 
-      response_mode == "send" and not Chat.is_participant?(vibe_chat_id, agent.agent_user_id) ->
+      response_mode in ["send", "post"] and
+          not Chat.is_participant?(vibe_chat_id, agent.agent_user_id) ->
         {:error, :chat_not_attached}
+
+      # "post": deliver the caller's own words, with no model in the path.
+      #
+      # Some callers are not asking the agent anything — a monitor, a deploy script, a
+      # cron job. Their text is already written, and running it through the model first
+      # buys nothing: it costs a completion, adds seconds of latency, and makes the
+      # message depend on the most failure-prone thing in the system.
+      #
+      # That is not hypothetical. An agix alerting hook posted through `send`, and when the
+      # account's model credit ran out every alert stopped arriving — 422 request_failed
+      # out of `generate_outputs`, with the API, the secret, the publication state and the
+      # chat attachment all perfectly healthy. A notification channel that goes down
+      # because a *language model* is unavailable is a notification channel that fails at
+      # exactly the moment it is needed.
+      #
+      # Everything else still applies: the agent must be published, hold a valid secret,
+      # and be a participant in the chat. This skips generation, not authorisation.
+      response_mode == "post" ->
+        agent_turn_id =
+          normalize_string(params["agentTurnId"] || params["agent_turn_id"]) ||
+            Ecto.UUID.generate()
+
+        outputs =
+          []
+          |> maybe_append_text_output(message, %{"verbatim" => true})
+          |> finalize_batch(agent_turn_id: agent_turn_id)
+          |> put_provider_content_on_outputs(provider_content)
+
+        with {:ok, deliveries} <-
+               maybe_deliver(agent, vibe_chat_id, outputs, "send", reply_to_id) do
+          {:ok,
+           %{
+             outputs: outputs,
+             vibe_deliveries: deliveries,
+             status: response_status(outputs),
+             agent_turn_id: agent_turn_id
+           }}
+        end
 
       true ->
         agent_turn_id =
@@ -424,6 +463,9 @@ defmodule Vibe.AI.StandaloneAgent do
   defp normalize_response_mode(value) do
     case normalize_string(value) do
       "send" -> "send"
+      # Deliver the caller's text as it stands, without asking a model for anything. See
+      # the "post" branch in invoke/2 for why this exists.
+      "post" -> "post"
       _ -> "reply"
     end
   end

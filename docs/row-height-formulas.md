@@ -57,8 +57,15 @@ cellHeight = metrics.bubbleHeight + metrics.tallOuterToggleReserve + extras.extr
 Reaction add-on (many kinds):
 
 ```
-reactionHeightOffset = (row.reactionEmoji non-empty) ? 28.0 : 0.0
+stripHeight          = rows * reactionChipHeight(24) + (rows - 1) * reactionChipRowGap(4)
+reactionHeightOffset = stripHeight
+                     + reactionStripTopGap(4)
+                     + max(0, reactionStripBottomInset(6) - bottomPadding)
 ```
+
+The strip is laid out `reactionStripBottomInset` above the plate's bottom edge, so the
+plate only grows by the pill plus its gap — one row costs 28 on a text bubble, 34 where
+there is no bottom padding (full-bleed media, sticker).
 
 ---
 
@@ -245,7 +252,7 @@ else:  // inline meta beside short LTR text
 
 ```
 bubbleHeight = max(34, bodyHeight + bubbleTopPadding(5) + bubbleBottomPadding(6) + reactionHeightOffset)
-             = max(34, bodyHeight + 11 + reaction)
+             = max(34, bodyHeight + 11 + reaction)   // reaction = 28 for one chip row
 ```
 
 **Preview heights** (`bubbleRowPreviewHeight` `:3392–3395`):

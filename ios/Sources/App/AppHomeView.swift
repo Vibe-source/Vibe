@@ -9549,6 +9549,11 @@ private final class ChatHomeMiniPreviewController: UIViewController {
       view.isHidden = true
       window.insertSubview(view, at: 0)
     }
+    // Second parking site: a full-screen chat parked in the WINDOW, not the nav container.
+    // `isHidden` is only set on the attach branch, so an already-attached view stays visible.
+    flashProbeLog(
+      "preview-prewarm parked hidden=\(view.isHidden ? "Y" : "N") "
+        + "inWindow=\(view.window == nil ? "N" : "Y") frame=\(NSCoder.string(for: view.frame))")
     view.layoutIfNeeded()
     mainView.layoutIfNeeded()
     mainView.scrollToBottom(animated: false)
@@ -10836,9 +10841,13 @@ final class ChatConversationController: UIViewController {
     guard let root = view as? ChatPrestageRootView else {
       // No hook available (a root view we did not create): fall back to the old behaviour
       // rather than pushing a permanently invisible page.
+      flashProbeLog(
+        "reveal-fallback chat=\(route.chatId.prefix(12)) "
+          + "— root is \(type(of: view)), unhiding while parked")
       view.isHidden = false
       return
     }
+    root.prestageProbeLabel = String(route.chatId.prefix(12))
     root.onSuperviewChanged = { [weak self] superview in
       guard let self, self.prestageRevealToken == token else { return }
       // Still parked (or detached mid-teardown) — keep it invisible.
@@ -10863,6 +10872,7 @@ final class ChatConversationController: UIViewController {
     // The watchdog exists so a page is never permanently invisible, not so a parked one
     // gets shown: if the push never took the view, take it out of the container instead.
     // UIKit re-adds it wherever it belongs the moment a transition does start.
+    let stillParked = prestageParkingSuperview.map { view.superview === $0 } ?? false
     if let parking = prestageParkingSuperview, view.superview === parking {
       view.removeFromSuperview()
     }
@@ -10872,6 +10882,15 @@ final class ChatConversationController: UIViewController {
     NSLog(
       "[ChatOpen] prestage-reveal chat=%@ by=%@ sinceTapMs=%d",
       String(route.chatId.prefix(12)), reason, VibeChatOpenTap.msSinceTap())
+    // Unhiding a still-parked view IS the flash; record the geometry that would make it
+    // full-screen, plus whether a transition was actually running.
+    flashProbeLog(
+      "reveal chat=\(route.chatId.prefix(12)) by=\(reason) "
+        + "stillParked=\(stillParked ? "Y" : "N") "
+        + "super=\(view.superview.map { String(describing: type(of: $0)) } ?? "nil") "
+        + "frame=\(NSCoder.string(for: view.frame)) "
+        + "superBounds=\(NSCoder.string(for: view.superview?.bounds ?? .zero)) "
+        + "anims=\(view.superview?.layer.animationKeys()?.count ?? 0)")
   }
 
   /// Was the destination still parked in the navigation container one turn after the push
@@ -11180,7 +11199,13 @@ final class ChatConversationController: UIViewController {
     mainView.setGeometryFrozenForDismissal(true)
     // Capture while the transcript is still on screen (drawHierarchy needs live
     // content) — this bitmap becomes the next open's first frame.
+    let captureStartedAt = ProcessInfo.processInfo.systemUptime
     mainView.captureReopenSnapshot()
+    // Timed on the pop path: this runs on main at the exact instant the back-flash is
+    // reported, so a long capture here would be a dropped transition frame.
+    flashProbeLog(
+      "capture-on-dismiss chat=\(route.chatId.prefix(12)) "
+        + "ms=\(Int((ProcessInfo.processInfo.systemUptime - captureStartedAt) * 1000))")
   }
 
   override func viewDidDisappear(_ animated: Bool) {
@@ -16512,10 +16537,44 @@ final class ChatPrestageRootView: UIView {
   /// Called on every superview change while a push reveal is armed.
   var onSuperviewChanged: ((UIView?) -> Void)?
 
+  /// Names the parked view in a probe line. Set by whoever parks it.
+  var prestageProbeLabel: String = "?"
+
   override func didMoveToSuperview() {
     super.didMoveToSuperview()
+    // Unconditional: the flash is a frame the reveal path does not know it produced,
+    // so every parent change is recorded whether or not a reveal is armed.
+    flashProbeLog(
+      "prestage-root superview chat=\(prestageProbeLabel) "
+        + "super=\(superview.map { String(describing: type(of: $0)) } ?? "nil") "
+        + "hidden=\(isHidden ? "Y" : "N") alpha=\(String(format: "%.2f", alpha)) "
+        + "frame=\(NSCoder.string(for: frame))")
     onSuperviewChanged?(superview)
   }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    flashProbeLog(
+      "prestage-root window chat=\(prestageProbeLabel) window=\(window == nil ? "N" : "Y") "
+        + "hidden=\(isHidden ? "Y" : "N") alpha=\(String(format: "%.2f", alpha)) "
+        + "frame=\(NSCoder.string(for: frame))")
+  }
+}
+
+/// Flash probes ride the diagnostics ring, not NSLog — an export is the only way these
+/// ever reach us, and NSLog never reaches an export.
+func flashProbeLog(_ message: @autoclosure () -> String) {
+  VibeLog.info("[FlashProbe] \(message())", category: "chatopen")
+}
+
+/// One-line z-order dump of a container, for the flash probes. Index 0 is the back.
+func flashProbeSubviewDump(_ container: UIView) -> String {
+  container.subviews.enumerated()
+    .map { index, view in
+      "\(index):\(type(of: view))\(view.isHidden ? "/hidden" : "")"
+        + (view.alpha < 0.999 ? String(format: "/a%.2f", view.alpha) : "")
+    }
+    .joined(separator: " ")
 }
 
 /// Root navigation controller that wraps the whole `AppRootTabBarController`.
@@ -16536,6 +16595,32 @@ final class AppRootNavigationController: UINavigationController, UIGestureRecogn
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
     installToastOverlayWindowIfNeeded()
+  }
+
+  /// The flash is reported as a full-screen frame BEFORE the transition. These dump the
+  /// container's z-order at the transition boundary and again one turn later.
+  private func logFlashProbeStack(_ phase: String) {
+    flashProbeLog(
+      "nav \(phase) stack=\(viewControllers.count) subviews=[\(flashProbeSubviewDump(view))]")
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      flashProbeLog("nav \(phase)+1turn subviews=[\(flashProbeSubviewDump(self.view))]")
+    }
+  }
+
+  override func pushViewController(_ viewController: UIViewController, animated: Bool) {
+    logFlashProbeStack("push-enter")
+    super.pushViewController(viewController, animated: animated)
+  }
+
+  override func popViewController(animated: Bool) -> UIViewController? {
+    logFlashProbeStack("pop-enter")
+    return super.popViewController(animated: animated)
+  }
+
+  override func popToRootViewController(animated: Bool) -> [UIViewController]? {
+    logFlashProbeStack("pop-to-root-enter")
+    return super.popToRootViewController(animated: animated)
   }
 
   override func viewDidLayoutSubviews() {
@@ -16964,7 +17049,7 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
     }
     // Immediate paint from memory/disk cache (seeded on photo upload).
     if let cached = ChatAvatarImageStore.cached(for: uri) {
-      applySettingsTabImage(cached)
+      applySettingsTabImage(cached, cacheKey: uri)
       return
     }
     settingsAvatarTask = Task { [weak self] in
@@ -16972,13 +17057,17 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       if Task.isCancelled { return }
       await MainActor.run {
         if let img = image {
-          self?.applySettingsTabImage(img)
+          self?.applySettingsTabImage(img, cacheKey: uri)
         } else {
           self?.applySettingsTabFallback(profile: profile)
         }
       }
     }
   }
+
+  /// Circular tab icons by avatar URI. Rendering one decodes the full-size photo into a
+  /// 26pt circle; on the launch path that was measured blocking main for 0.40s.
+  private static let settingsTabImageCache = NSCache<NSString, UIImage>()
 
   private func applySettingsTabFallback(profile: AppUserProfile?) {
     let name = profile?.name ?? profile?.username ?? "U"
@@ -17024,22 +17113,36 @@ final class AppRootTabBarController: UITabBarController, UITabBarControllerDeleg
       )
       letters.draw(in: textRect, withAttributes: attributes)
     }
-    applySettingsTabImage(image)
+    applySettingsTabImage(image, cacheKey: "fallback:\(letters):\(profile?.userID ?? "-")")
   }
 
-  private func applySettingsTabImage(_ image: UIImage?) {
+  private func applySettingsTabImage(_ image: UIImage?, cacheKey: String?) {
+    guard let image else {
+      setSettingsTabImage(nil)
+      return
+    }
+    let key = cacheKey.map { $0 as NSString }
+    if let key, let cached = Self.settingsTabImageCache.object(forKey: key) {
+      setSettingsTabImage(cached)
+      return
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let circular = Self.circularTabImage(from: image, size: 26)
+      DispatchQueue.main.async { [weak self] in
+        if let key, let circular { Self.settingsTabImageCache.setObject(circular, forKey: key) }
+        self?.setSettingsTabImage(circular)
+      }
+    }
+  }
+
+  private func setSettingsTabImage(_ circular: UIImage?) {
     guard let settingsIndex = Self.tabIndex(for: .settings),
       let controllers = viewControllers, settingsIndex < controllers.count
     else { return }
     let item = controllers[settingsIndex].tabBarItem
-    if let image, let circular = Self.circularTabImage(from: image, size: 26) {
-      item?.image = circular
-      item?.selectedImage = circular
-    } else {
-      let fallback = UIImage(systemName: "gearshape")
-      item?.image = fallback
-      item?.selectedImage = fallback
-    }
+    let resolved = circular ?? UIImage(systemName: "gearshape")
+    item?.image = resolved
+    item?.selectedImage = resolved
   }
 
   private static func circularTabImage(from source: UIImage, size: CGFloat) -> UIImage? {
@@ -17346,9 +17449,11 @@ final class ChatAgentConversationController: UIViewController {
     let token = prestageRevealToken
     prestageParkingSuperview = container
     guard let root = view as? ChatPrestageRootView else {
+      flashProbeLog("reveal-fallback agent — root is \(type(of: view)), unhiding while parked")
       view.isHidden = false
       return
     }
+    root.prestageProbeLabel = "vibe_agent"
     root.onSuperviewChanged = { [weak self] superview in
       guard let self, self.prestageRevealToken == token else { return }
       guard let superview, superview !== self.prestageParkingSuperview else { return }
@@ -17364,6 +17469,7 @@ final class ChatAgentConversationController: UIViewController {
   private func revealPrestagedView(reason: String) {
     guard view.isHidden else { return }
     // Never unhide a view that is still parked — see the chat surface's copy of this.
+    let stillParked = prestageParkingSuperview.map { view.superview === $0 } ?? false
     if let parking = prestageParkingSuperview, view.superview === parking {
       view.removeFromSuperview()
     }
@@ -17371,6 +17477,12 @@ final class ChatAgentConversationController: UIViewController {
     prestageParkingSuperview = nil
     view.isHidden = false
     NSLog("[AgentOpen] prestage-reveal by=%@", reason)
+    flashProbeLog(
+      "reveal agent by=\(reason) stillParked=\(stillParked ? "Y" : "N") "
+        + "super=\(view.superview.map { String(describing: type(of: $0)) } ?? "nil") "
+        + "frame=\(NSCoder.string(for: view.frame)) "
+        + "superBounds=\(NSCoder.string(for: view.superview?.bounds ?? .zero)) "
+        + "anims=\(view.superview?.layer.animationKeys()?.count ?? 0)")
   }
 
   private func stageInitialRowsIfPossible(reason: String) {

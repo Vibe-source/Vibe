@@ -2695,12 +2695,16 @@ final class ChatNativeAgentConfigPanelController: UIViewController {
         }
 
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let payload = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
         guard (200..<300).contains(statusCode) else {
-          self.onToast?(publish ? "Could not publish agent" : "Could not revert agent")
+          // Publish refuses on missing prompt / output modes / voice support.
+          // Show the server reason so the fix is obvious instead of a retry.
+          let serverMessage = chatNativeAgentNormalizedString(payload?["error"])
+          self.onToast?(
+            serverMessage ?? (publish ? "Could not publish agent" : "Could not revert agent"))
           return
         }
 
-        let payload = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
         let resolvedStatus =
           chatNativeAgentNormalizedString(payload?["status"])
           ?? (publish ? "published" : "draft")

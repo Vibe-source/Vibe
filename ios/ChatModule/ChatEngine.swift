@@ -11429,7 +11429,7 @@ final class ChatEngine {
         parseBooleanLike(bucket["isSelected"] ?? bucket["is_selected"]) ?? false)
     }
     let selectedIndex = buckets.firstIndex(where: \.selected)
-    if let selectedIndex, buckets[selectedIndex].emoji == emoji {
+    if let selectedIndex, ChatReactionKey.matches(buckets[selectedIndex].emoji, emoji) {
       buckets[selectedIndex].count -= 1
       buckets[selectedIndex].selected = false
     } else {
@@ -11437,7 +11437,7 @@ final class ChatEngine {
         buckets[selectedIndex].count -= 1
         buckets[selectedIndex].selected = false
       }
-      if let next = buckets.firstIndex(where: { $0.emoji == emoji }) {
+      if let next = buckets.firstIndex(where: { ChatReactionKey.matches($0.emoji, emoji) }) {
         buckets[next].count += 1
         buckets[next].selected = true
       } else {

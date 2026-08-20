@@ -331,13 +331,20 @@ private func makeLiquidGlassView(
   return view
 }
 
+private final class NativeStoryComposerPassthroughView: UIView {
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    let hit = super.hitTest(point, with: event)
+    return hit === self ? nil : hit
+  }
+}
+
 final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
   var onEvent: (([String: Any]) -> Void)?
 
   private let cardContainer = UIView()
   private let mediaView = NativeStoryComposerMediaView()
   private let overlaysContainer = UIView()
-  private let topBar = UIView()
+  private let topBar = NativeStoryComposerPassthroughView()
   private var closeButtonGlassView = UIVisualEffectView()
   private let closeButton = UIButton(type: .system)
   private var topActionsView = UIVisualEffectView()
@@ -462,28 +469,30 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     overlaysContainer.frame = cardContainer.bounds
 
     let topY = safeTop + 4.0
-    topBar.frame = CGRect(x: 14.0, y: topY, width: max(0.0, bounds.width - 28.0), height: 44.0)
+    let railWidth: CGFloat = 40.0
+    let actionButtonSize: CGFloat = 36.0
+    let actionSpacing: CGFloat = 4.0
+    let railPadding: CGFloat = 4.0
+    let railHeight = (actionButtonSize * 5.0) + (actionSpacing * 4.0) + (railPadding * 2.0)
+
+    topBar.frame = CGRect(x: 14.0, y: topY, width: max(0.0, bounds.width - 28.0), height: railHeight)
 
     closeButtonGlassView.frame = CGRect(x: 0.0, y: 0.0, width: 44.0, height: 44.0)
     closeButton.frame = closeButtonGlassView.bounds
 
-    let topActionButtonWidth: CGFloat = 38.0
-    let topActionSpacing: CGFloat = 4.0
-    let topActionCount: CGFloat = 5.0
-    let topActionsWidth = (topActionButtonWidth * topActionCount) + (topActionSpacing * 2.0)
     topActionsView.frame = CGRect(
-      x: max(52.0, topBar.bounds.width - topActionsWidth),
+      x: max(52.0, topBar.bounds.width - railWidth),
       y: 0.0,
-      width: topActionsWidth,
-      height: 44.0
+      width: railWidth,
+      height: railHeight
     )
     let topButtons = [downloadButton, addTextButton, emojiButton, musicButton, settingsButton]
     for (index, button) in topButtons.enumerated() {
       button.frame = CGRect(
-        x: topActionSpacing + (CGFloat(index) * topActionButtonWidth),
-        y: 3.0,
-        width: topActionButtonWidth,
-        height: 38.0
+        x: (railWidth - actionButtonSize) * 0.5,
+        y: railPadding + (CGFloat(index) * (actionButtonSize + actionSpacing)),
+        width: actionButtonSize,
+        height: actionButtonSize
       )
     }
 
@@ -881,31 +890,37 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     closeButtonGlassView = makeLiquidGlassView(cornerRadius: 22.0, capsule: true)
     topBar.addSubview(closeButtonGlassView)
 
-    configureChromeButton(closeButton, symbol: "xmark")
+    configureChromeButton(closeButton, glyph: .close)
+    closeButton.accessibilityLabel = "Close"
     closeButton.backgroundColor = .clear
     closeButton.layer.borderWidth = 0.0
     closeButtonGlassView.contentView.addSubview(closeButton)
 
-    topActionsView = makeLiquidGlassView(cornerRadius: 22.0, capsule: true)
+    topActionsView = makeLiquidGlassView(cornerRadius: 20.0, capsule: true)
     topBar.addSubview(topActionsView)
 
-    configureTopActionButton(downloadButton, symbol: "arrow.down.circle")
+    configureTopActionButton(downloadButton, glyph: .download)
+    downloadButton.accessibilityLabel = "Save"
     downloadButton.addTarget(self, action: #selector(handleDownloadPress), for: .touchUpInside)
     topActionsView.contentView.addSubview(downloadButton)
 
-    configureTopActionButton(addTextButton, symbol: "textformat")
+    configureTopActionButton(addTextButton, glyph: .text)
+    addTextButton.accessibilityLabel = "Add Text"
     addTextButton.addTarget(self, action: #selector(handleAddTextPress), for: .touchUpInside)
     topActionsView.contentView.addSubview(addTextButton)
 
-    configureTopActionButton(emojiButton, symbol: "face.smiling")
+    configureTopActionButton(emojiButton, glyph: .emoji)
+    emojiButton.accessibilityLabel = "Add Emoji"
     emojiButton.addTarget(self, action: #selector(handleEmojiPress), for: .touchUpInside)
     topActionsView.contentView.addSubview(emojiButton)
 
-    configureTopActionButton(musicButton, symbol: "music.note")
+    configureTopActionButton(musicButton, glyph: .music)
+    musicButton.accessibilityLabel = "Add Music"
     musicButton.addTarget(self, action: #selector(handleMusicPress), for: .touchUpInside)
     topActionsView.contentView.addSubview(musicButton)
 
-    configureTopActionButton(settingsButton, symbol: "gearshape")
+    configureTopActionButton(settingsButton, glyph: .settings)
+    settingsButton.accessibilityLabel = "Story Settings"
     settingsButton.addTarget(self, action: #selector(handleSettingsPress), for: .touchUpInside)
     topActionsView.contentView.addSubview(settingsButton)
 
@@ -913,11 +928,13 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     selectedActionBarGlassView.isHidden = true
     cardContainer.addSubview(selectedActionBarGlassView)
 
-    configureSmallActionButton(selectedEditButton, symbol: "pencil")
+    configureSmallActionButton(selectedEditButton, glyph: .edit)
+    selectedEditButton.accessibilityLabel = "Edit Text"
     selectedEditButton.addTarget(self, action: #selector(handleSelectedEditPress), for: .touchUpInside)
     selectedActionBarGlassView.contentView.addSubview(selectedEditButton)
 
-    configureSmallActionButton(selectedDeleteButton, symbol: "trash")
+    configureSmallActionButton(selectedDeleteButton, glyph: .delete)
+    selectedDeleteButton.accessibilityLabel = "Delete Text"
     selectedDeleteButton.tintColor = UIColor(red: 1.0, green: 0.36, blue: 0.32, alpha: 1.0)
     selectedDeleteButton.addTarget(self, action: #selector(handleSelectedDeletePress), for: .touchUpInside)
     selectedActionBarGlassView.contentView.addSubview(selectedDeleteButton)
@@ -947,13 +964,8 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     promptSendButton.layer.cornerRadius = 18.0
     promptSendButton.layer.cornerCurve = .continuous
     promptSendButton.tintColor = .white
-    promptSendButton.setImage(
-      UIImage(
-        systemName: "arrow.up",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 14.0, weight: .bold)
-      ),
-      for: .normal
-    )
+    promptSendButton.setImage(UIImage.appStoryGlyph(.send, pointSize: 14.0), for: .normal)
+    promptSendButton.accessibilityLabel = "Send Edit Prompt"
     promptSendButton.addTarget(self, action: #selector(handlePromptSendPress), for: .touchUpInside)
     promptChromeView.contentView.addSubview(promptSendButton)
 
@@ -1023,7 +1035,8 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     editorControlsGlassView = makeLiquidGlassView(cornerRadius: 22.0)
     editorOverlay.addSubview(editorControlsGlassView)
 
-    configureRoundSymbolButton(colorToggleButton, symbol: "circle.fill")
+    configureRoundSymbolButton(colorToggleButton, glyph: .color)
+    colorToggleButton.accessibilityLabel = "Text Color"
     colorToggleButton.addTarget(self, action: #selector(handleColorTogglePress), for: .touchUpInside)
     editorControlsGlassView.contentView.addSubview(colorToggleButton)
 
@@ -1031,7 +1044,8 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     fontCycleButton.addTarget(self, action: #selector(handleFontCyclePress), for: .touchUpInside)
     editorControlsGlassView.contentView.addSubview(fontCycleButton)
 
-    configureRoundSymbolButton(alignCycleButton, symbol: "text.aligncenter")
+    configureRoundSymbolButton(alignCycleButton, glyph: .alignCenter)
+    alignCycleButton.accessibilityLabel = "Text Alignment"
     alignCycleButton.addTarget(self, action: #selector(handleAlignCyclePress), for: .touchUpInside)
     editorControlsGlassView.contentView.addSubview(alignCycleButton)
 
@@ -1110,42 +1124,24 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     updateDurationButtons()
   }
 
-  private func configureChromeButton(_ button: UIButton, symbol: String) {
+  private func configureChromeButton(_ button: UIButton, glyph: AppStoryVectorGlyph) {
     button.backgroundColor = UIColor.black.withAlphaComponent(0.28)
     button.layer.cornerRadius = 22.0
     button.layer.cornerCurve = .continuous
     button.layer.borderWidth = 1.0
     button.layer.borderColor = UIColor.white.withAlphaComponent(0.08).cgColor
     button.tintColor = .white
-    button.setImage(
-      UIImage(
-        systemName: symbol,
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 18.0, weight: .semibold)
-      ),
-      for: .normal
-    )
+    button.setImage(UIImage.appStoryGlyph(glyph, pointSize: 18.0), for: .normal)
   }
 
-  private func configureTopActionButton(_ button: UIButton, symbol: String) {
+  private func configureTopActionButton(_ button: UIButton, glyph: AppStoryVectorGlyph) {
     button.tintColor = .white
-    button.setImage(
-      UIImage(
-        systemName: symbol,
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 17.0, weight: .semibold)
-      ),
-      for: .normal
-    )
+    button.setImage(UIImage.appStoryGlyph(glyph, pointSize: 18.0), for: .normal)
   }
 
-  private func configureSmallActionButton(_ button: UIButton, symbol: String) {
+  private func configureSmallActionButton(_ button: UIButton, glyph: AppStoryVectorGlyph) {
     button.tintColor = .white
-    button.setImage(
-      UIImage(
-        systemName: symbol,
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold)
-      ),
-      for: .normal
-    )
+    button.setImage(UIImage.appStoryGlyph(glyph, pointSize: 15.0), for: .normal)
   }
 
   private func configureRoundButton(_ button: UIButton, title: String) {
@@ -1157,18 +1153,12 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     button.titleLabel?.font = .systemFont(ofSize: 13.0, weight: .semibold)
   }
 
-  private func configureRoundSymbolButton(_ button: UIButton, symbol: String) {
+  private func configureRoundSymbolButton(_ button: UIButton, glyph: AppStoryVectorGlyph) {
     button.backgroundColor = UIColor.white.withAlphaComponent(0.12)
     button.layer.cornerRadius = 18.0
     button.layer.cornerCurve = .continuous
     button.tintColor = .white
-    button.setImage(
-      UIImage(
-        systemName: symbol,
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .medium)
-      ),
-      for: .normal
-    )
+    button.setImage(UIImage.appStoryGlyph(glyph, pointSize: 15.0), for: .normal)
   }
 
   private func configureColorButtons() {
@@ -1300,29 +1290,11 @@ final class AppNativeStoryComposerView: UIView, UITextViewDelegate {
     alignCycleButton.tintColor = .white
     switch editorAlignment {
     case .left:
-      alignCycleButton.setImage(
-        UIImage(
-          systemName: "text.alignleft",
-          withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .medium)
-        ),
-        for: .normal
-      )
+      alignCycleButton.setImage(UIImage.appStoryGlyph(.alignLeft, pointSize: 15.0), for: .normal)
     case .center:
-      alignCycleButton.setImage(
-        UIImage(
-          systemName: "text.aligncenter",
-          withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .medium)
-        ),
-        for: .normal
-      )
+      alignCycleButton.setImage(UIImage.appStoryGlyph(.alignCenter, pointSize: 15.0), for: .normal)
     case .right:
-      alignCycleButton.setImage(
-        UIImage(
-          systemName: "text.alignright",
-          withConfiguration: UIImage.SymbolConfiguration(pointSize: 15.0, weight: .medium)
-        ),
-        for: .normal
-      )
+      alignCycleButton.setImage(UIImage.appStoryGlyph(.alignRight, pointSize: 15.0), for: .normal)
     default:
       break
     }

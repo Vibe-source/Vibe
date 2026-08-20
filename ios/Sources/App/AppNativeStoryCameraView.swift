@@ -5,6 +5,16 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+private func appStoryTransitionLog(_ event: String, metadata: [String: String] = [:]) {
+  VibeLog.info(event, category: "story-transition", metadata: metadata)
+  NSLog("[StoryTransition] %@ %@", event, metadata.description)
+}
+
+private func appStoryCameraLog(_ event: String, metadata: [String: String] = [:]) {
+  VibeLog.info(event, category: "story-camera", metadata: metadata)
+  NSLog("[StoryCamera] %@ %@", event, metadata.description)
+}
+
 struct AppNativeStoryCapturedMedia: Identifiable, Equatable {
   enum Kind: String {
     case image
@@ -165,7 +175,21 @@ final class AppNativeStoryViewController: UIViewController {
     view.backgroundColor = .black
 
     let page = AppNativeStoryCameraPage { [weak self] in
-      self?.dismiss(animated: true)
+      guard let self else { return }
+      let presenter = self.presentingViewController
+      appStoryTransitionLog(
+        "close requested",
+        metadata: [
+          "presenterWindow": presenter?.viewIfLoaded?.window == nil ? "N" : "Y",
+          "storyWindow": self.viewIfLoaded?.window == nil ? "N" : "Y",
+        ]
+      )
+      self.dismiss(animated: true) {
+        appStoryTransitionLog(
+          "close completion",
+          metadata: ["presenterWindow": presenter?.viewIfLoaded?.window == nil ? "N" : "Y"]
+        )
+      }
     }
     let hosting = UIHostingController(rootView: page)
     hosting.view.backgroundColor = .clear
@@ -175,6 +199,22 @@ final class AppNativeStoryViewController: UIViewController {
     view.addSubview(hosting.view)
     hosting.didMove(toParent: self)
     hostingController = hosting
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    appStoryTransitionLog("story appeared", metadata: ["window": view.window == nil ? "N" : "Y"])
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    appStoryTransitionLog(
+      "story disappeared",
+      metadata: [
+        "dismissed": isBeingDismissed ? "Y" : "N",
+        "window": view.window == nil ? "N" : "Y",
+      ]
+    )
   }
 
   override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
@@ -208,6 +248,28 @@ private final class AppNativeStoryPresentationController: UIPresentationControll
   override var frameOfPresentedViewInContainerView: CGRect {
     containerView?.bounds ?? .zero
   }
+
+  override func presentationTransitionDidEnd(_ completed: Bool) {
+    super.presentationTransitionDidEnd(completed)
+    appStoryTransitionLog(
+      "presentation ended",
+      metadata: [
+        "completed": completed ? "Y" : "N",
+        "presenterWindow": presentingViewController.viewIfLoaded?.window == nil ? "N" : "Y",
+      ]
+    )
+  }
+
+  override func dismissalTransitionDidEnd(_ completed: Bool) {
+    super.dismissalTransitionDidEnd(completed)
+    appStoryTransitionLog(
+      "dismissal ended",
+      metadata: [
+        "completed": completed ? "Y" : "N",
+        "presenterWindow": presentingViewController.viewIfLoaded?.window == nil ? "N" : "Y",
+      ]
+    )
+  }
 }
 
 /// Reveals Story behind Home on the same clock as a navigation transition.
@@ -218,9 +280,10 @@ private final class AppNativeStoryPresentAnimator: NSObject, UIViewControllerAni
 
   func animateTransition(using transitionContext: UIViewControllerContextTransitioning) {
     guard
+      let fromVC = transitionContext.viewController(forKey: .from),
       let toVC = transitionContext.viewController(forKey: .to),
-      let fromView = transitionContext.view(forKey: .from),
-      let toView = transitionContext.view(forKey: .to)
+      let fromView = transitionContext.view(forKey: .from) ?? fromVC.view,
+      let toView = transitionContext.view(forKey: .to) ?? toVC.view
     else {
       transitionContext.completeTransition(false)
       return
@@ -232,22 +295,39 @@ private final class AppNativeStoryPresentAnimator: NSObject, UIViewControllerAni
 
     toView.frame = finalFrame
     toView.transform = CGAffineTransform(translationX: -parallax, y: 0)
+    var foregroundView = fromView
+    var foregroundSnapshot: UIView?
+    let presenterInContainer = fromView.superview === container
     if fromView.superview === container {
       container.insertSubview(toView, belowSubview: fromView)
     } else {
       container.addSubview(toView)
-      container.bringSubviewToFront(fromView)
+      if let snapshot = fromView.snapshotView(afterScreenUpdates: false) {
+        snapshot.frame = container.bounds
+        container.addSubview(snapshot)
+        foregroundView = snapshot
+        foregroundSnapshot = snapshot
+      }
     }
+    appStoryTransitionLog(
+      "present start",
+      metadata: [
+        "presenterInContainer": presenterInContainer ? "Y" : "N",
+        "snapshot": foregroundSnapshot == nil ? "N" : "Y",
+        "subviews": String(container.subviews.count),
+      ]
+    )
 
     let animator = UIViewPropertyAnimator(
       duration: transitionDuration(using: transitionContext),
       curve: .easeInOut
     ) {
-      fromView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
+      foregroundView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
       toView.transform = .identity
     }
     animator.addCompletion { _ in
       let cancelled = transitionContext.transitionWasCancelled
+      foregroundSnapshot?.removeFromSuperview()
       if cancelled {
         fromView.transform = .identity
         toView.transform = .identity
@@ -256,6 +336,13 @@ private final class AppNativeStoryPresentAnimator: NSObject, UIViewControllerAni
         container.bringSubviewToFront(toView)
         fromView.transform = .identity
       }
+      appStoryTransitionLog(
+        "present animator ended",
+        metadata: [
+          "cancelled": cancelled ? "Y" : "N",
+          "storyWindow": toView.window == nil ? "N" : "Y",
+        ]
+      )
       transitionContext.completeTransition(!cancelled)
     }
     animator.startAnimation()
@@ -270,9 +357,10 @@ private final class AppNativeStoryDismissAnimator: NSObject, UIViewControllerAni
 
   func animateTransition(using transitionContext: UIViewControllerContextTransitioning) {
     guard
+      let fromVC = transitionContext.viewController(forKey: .from),
       let toVC = transitionContext.viewController(forKey: .to),
-      let fromView = transitionContext.view(forKey: .from),
-      let toView = transitionContext.view(forKey: .to)
+      let fromView = transitionContext.view(forKey: .from) ?? fromVC.view,
+      let toView = transitionContext.view(forKey: .to) ?? toVC.view
     else {
       transitionContext.completeTransition(false)
       return
@@ -282,24 +370,39 @@ private final class AppNativeStoryDismissAnimator: NSObject, UIViewControllerAni
     let finalFrame = transitionContext.finalFrame(for: toVC)
     let parallax = finalFrame.width * 0.28
 
-    toView.frame = finalFrame
-    if toView.superview !== container {
-      if fromView.superview === container {
-        container.insertSubview(toView, belowSubview: fromView)
-      } else {
-        container.addSubview(toView)
-      }
+    let presenterInContainer = toView.superview === container
+    var foregroundView = toView
+    var foregroundSnapshot: UIView?
+    var storyExitX = -parallax
+    if presenterInContainer {
+      container.bringSubviewToFront(toView)
+      toView.frame = finalFrame
+      toView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
+    } else if let snapshot = toView.snapshotView(afterScreenUpdates: false) {
+      snapshot.frame = finalFrame
+      snapshot.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
+      container.addSubview(snapshot)
+      foregroundView = snapshot
+      foregroundSnapshot = snapshot
+    } else {
+      storyExitX = -finalFrame.width
     }
-    container.bringSubviewToFront(toView)
-    toView.transform = CGAffineTransform(translationX: finalFrame.width, y: 0)
     fromView.transform = .identity
+    appStoryTransitionLog(
+      "dismiss start",
+      metadata: [
+        "presenterInContainer": presenterInContainer ? "Y" : "N",
+        "snapshot": foregroundSnapshot == nil ? "N" : "Y",
+        "presenterWindow": toView.window == nil ? "N" : "Y",
+      ]
+    )
 
     let animator = UIViewPropertyAnimator(
       duration: transitionDuration(using: transitionContext),
       curve: .easeInOut
     ) {
-      toView.transform = .identity
-      fromView.transform = CGAffineTransform(translationX: -parallax, y: 0)
+      foregroundView.transform = .identity
+      fromView.transform = CGAffineTransform(translationX: storyExitX, y: 0)
     }
     animator.addCompletion { _ in
       let cancelled = transitionContext.transitionWasCancelled
@@ -307,8 +410,19 @@ private final class AppNativeStoryDismissAnimator: NSObject, UIViewControllerAni
         container.bringSubviewToFront(fromView)
       }
       fromView.transform = .identity
-      toView.transform = .identity
+      if presenterInContainer {
+        toView.transform = .identity
+      }
+      appStoryTransitionLog(
+        "dismiss animator ended",
+        metadata: [
+          "cancelled": cancelled ? "Y" : "N",
+          "presenterWindow": toView.window == nil ? "N" : "Y",
+          "presenterSuperview": String(describing: toView.superview.map { type(of: $0) }),
+        ]
+      )
       transitionContext.completeTransition(!cancelled)
+      foregroundSnapshot?.removeFromSuperview()
     }
     animator.startAnimation()
   }
@@ -801,6 +915,7 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
 
     if session.canAddOutput(photoOutput) {
       session.addOutput(photoOutput)
+      photoOutput.maxPhotoQualityPrioritization = .quality
     }
 
     if session.canAddOutput(movieOutput) {
@@ -829,13 +944,22 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
       session.addInput(nextInput)
       videoInput = nextInput
       currentPosition = position
+      configurePhotoOutput(for: device)
       return
     }
 
     if let previousInput, session.canAddInput(previousInput) {
       session.addInput(previousInput)
       videoInput = previousInput
+      configurePhotoOutput(for: previousInput.device)
     }
+  }
+
+  private func configurePhotoOutput(for device: AVCaptureDevice) {
+    guard let dimensions = device.activeFormat.supportedMaxPhotoDimensions.max(by: {
+      Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
+    }) else { return }
+    photoOutput.maxPhotoDimensions = dimensions
   }
 
   private func addAudioInputIfPossible() {
@@ -878,14 +1002,7 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
   }
 
   private func updatePreviewOrientation() {
-    guard let connection = previewView.previewLayer.connection else { return }
-    if connection.isVideoOrientationSupported {
-      connection.videoOrientation = window?.windowScene?.interfaceOrientation.storyCameraOrientation ?? .portrait
-    }
-    if connection.isVideoMirroringSupported {
-      connection.automaticallyAdjustsVideoMirroring = false
-      connection.isVideoMirrored = currentPosition == .front
-    }
+    configureOutputConnection(previewView.previewLayer.connection, mirrorFrontCamera: true)
   }
 
   private func capturePhoto() {
@@ -898,9 +1015,22 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
       return
     }
     let settings = AVCapturePhotoSettings()
+    settings.photoQualityPrioritization = .quality
+    if photoOutput.maxPhotoDimensions.width > 0, photoOutput.maxPhotoDimensions.height > 0 {
+      settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+    }
     if let device = videoInput?.device, device.hasFlash {
       settings.flashMode = .off
     }
+    configureOutputConnection(photoOutput.connection(with: .video), mirrorFrontCamera: true)
+    appStoryCameraLog(
+      "photo requested",
+      metadata: [
+        "camera": currentPosition == .front ? "front" : "back",
+        "maxDimensions": "\(settings.maxPhotoDimensions.width)x\(settings.maxPhotoDimensions.height)",
+        "quality": "quality",
+      ]
+    )
     photoOutput.capturePhoto(with: settings, delegate: self)
     flashPreview()
   }
@@ -933,15 +1063,22 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
       return
     }
     let url = temporaryOutputURL(fileExtension: "mov")
-    if let connection = movieOutput.connection(with: .video) {
-      if connection.isVideoOrientationSupported {
-        connection.videoOrientation = window?.windowScene?.interfaceOrientation.storyCameraOrientation ?? .portrait
-      }
-      if connection.isVideoMirroringSupported {
-        connection.isVideoMirrored = currentPosition == .front
-      }
-    }
+    configureOutputConnection(movieOutput.connection(with: .video), mirrorFrontCamera: true)
     movieOutput.startRecording(to: url, recordingDelegate: self)
+  }
+
+  private func configureOutputConnection(
+    _ connection: AVCaptureConnection?,
+    mirrorFrontCamera: Bool
+  ) {
+    guard let connection else { return }
+    if connection.isVideoOrientationSupported {
+      connection.videoOrientation = window?.windowScene?.interfaceOrientation.storyCameraOrientation ?? .portrait
+    }
+    if connection.isVideoMirroringSupported {
+      connection.automaticallyAdjustsVideoMirroring = false
+      connection.isVideoMirrored = mirrorFrontCamera && currentPosition == .front
+    }
   }
 
   private func stopRecording() {
@@ -1022,11 +1159,20 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
     let outputURL = temporaryOutputURL(fileExtension: "jpg")
     do {
       try data.write(to: outputURL, options: [.atomic])
+      let dimensions = photo.resolvedSettings.photoDimensions
+      appStoryCameraLog(
+        "photo captured",
+        metadata: [
+          "bytes": String(data.count),
+          "dimensions": "\(dimensions.width)x\(dimensions.height)",
+          "mirroredPixels": currentPosition == .front ? "Y" : "N",
+        ]
+      )
       DispatchQueue.main.async {
         self.emitCapture(
           url: outputURL,
           mediaType: "image",
-          mirrored: self.currentPosition == .front
+          mirrored: false
         )
       }
     } catch {
@@ -1076,7 +1222,7 @@ private final class AppNativeStoryCameraView: UIView, AVCapturePhotoCaptureDeleg
       self.emitCapture(
         url: outputFileURL,
         mediaType: "video",
-        mirrored: self.currentPosition == .front
+        mirrored: false
       )
     }
   }

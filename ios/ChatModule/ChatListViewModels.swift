@@ -1,5 +1,26 @@
 import UIKit
 
+/// Which part of a message cell a long press landed on.
+enum ChatContextMenuHoldTarget: Equatable {
+  case bubble
+  case reaction(emoji: String)
+}
+
+/// Emoji arrive with and without presentation selectors depending on the source
+/// (catalog literal, server payload, core engine), so compare on this form only.
+enum ChatReactionKey {
+  static func normalized(_ emoji: String) -> String {
+    emoji
+      .replacingOccurrences(of: "\u{FE0E}", with: "")
+      .replacingOccurrences(of: "\u{FE0F}", with: "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  static func matches(_ lhs: String, _ rhs: String) -> Bool {
+    normalized(lhs) == normalized(rhs)
+  }
+}
+
 final class ChatListRegistry {
   static let shared = ChatListRegistry()
 
@@ -705,9 +726,10 @@ struct ChatListRow {
     {
       return .media
     }
-    let inferredVideo = isVideoMediaReference(mediaUrl: mediaUrl, fileName: fileName)
-    let inferredImage = isImageMediaReference(mediaUrl: mediaUrl, fileName: fileName)
-    let inferredAudio = isAudioMediaReference(mediaUrl: mediaUrl, fileName: fileName)
+    let references = ChatMediaReferenceExtensions(mediaUrl: mediaUrl, fileName: fileName)
+    let inferredVideo = references.isVideo
+    let inferredImage = references.isImage
+    let inferredAudio = references.isAudio
     switch messageType {
     case "voice", "music", "mp3", "audio":
       return .voice
@@ -1414,52 +1436,67 @@ private func parseNonEmptyString(_ raw: Any?) -> String? {
   return nil
 }
 
+private let videoMediaExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm"]
+private let imageMediaExtensions: Set<String> = [
+  "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp",
+]
+private let audioMediaExtensions: Set<String> = [
+  "mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac",
+]
+
 private func normalizedMediaExtension(_ value: String?) -> String? {
   guard let value else { return nil }
   let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
   guard !trimmed.isEmpty else { return nil }
   let pathExtension: String
-  if let url = URL(string: trimmed), !url.pathExtension.isEmpty {
+  // `URL(string:)` is only needed to keep a query string out of the extension. Parsing a
+  // bare file name through it costs the same as parsing a URL, and this runs per row per
+  // sizing pass — `isVideoMediaReference` was the top frame of a 0.44s main-thread hang.
+  if trimmed.contains("?") || trimmed.contains("#"), let url = URL(string: trimmed),
+    !url.pathExtension.isEmpty
+  {
     pathExtension = url.pathExtension
   } else {
     pathExtension = (trimmed as NSString).pathExtension
   }
-  let normalized = pathExtension.replacingOccurrences(of: ".", with: "").lowercased()
+  guard !pathExtension.isEmpty else { return nil }
+  let normalized = pathExtension.hasPrefix(".")
+    ? String(pathExtension.dropFirst()).lowercased() : pathExtension.lowercased()
   return normalized.isEmpty ? nil : normalized
 }
 
+/// Both references' extensions, resolved once. `visualKind` asks three questions about
+/// the same pair, and resolving per question parsed each string three times over.
+struct ChatMediaReferenceExtensions {
+  let fileNameExt: String?
+  let mediaUrlExt: String?
+
+  init(mediaUrl: String?, fileName: String?) {
+    fileNameExt = normalizedMediaExtension(fileName)
+    mediaUrlExt = normalizedMediaExtension(mediaUrl)
+  }
+
+  private func matches(_ set: Set<String>) -> Bool {
+    if let fileNameExt, set.contains(fileNameExt) { return true }
+    if let mediaUrlExt, set.contains(mediaUrlExt) { return true }
+    return false
+  }
+
+  var isVideo: Bool { matches(videoMediaExtensions) }
+  var isImage: Bool { matches(imageMediaExtensions) }
+  var isAudio: Bool { matches(audioMediaExtensions) }
+}
+
 private func isVideoMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
-  let extensions = [
-    normalizedMediaExtension(fileName),
-    normalizedMediaExtension(mediaUrl),
-  ]
-  return extensions.contains(where: { ext in
-    guard let ext else { return false }
-    return ["mp4", "mov", "m4v", "avi", "mkv", "webm"].contains(ext)
-  })
+  ChatMediaReferenceExtensions(mediaUrl: mediaUrl, fileName: fileName).isVideo
 }
 
 private func isImageMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
-  let extensions = [
-    normalizedMediaExtension(fileName),
-    normalizedMediaExtension(mediaUrl),
-  ]
-  return extensions.contains(where: { ext in
-    guard let ext else { return false }
-    return ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp"].contains(ext)
-  })
+  ChatMediaReferenceExtensions(mediaUrl: mediaUrl, fileName: fileName).isImage
 }
 
 private func isAudioMediaReference(mediaUrl: String?, fileName: String?) -> Bool {
-  let extensions = [
-    normalizedMediaExtension(fileName),
-    normalizedMediaExtension(mediaUrl),
-  ]
-  return extensions.contains(where: { ext in
-    guard let ext else { return false }
-    return ["mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "oga", "opus", "caf", "alac"]
-      .contains(ext)
-  })
+  ChatMediaReferenceExtensions(mediaUrl: mediaUrl, fileName: fileName).isAudio
 }
 
 private func firstNonEmptyString(

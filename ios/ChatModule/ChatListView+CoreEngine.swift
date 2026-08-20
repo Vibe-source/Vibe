@@ -346,6 +346,10 @@ extension ChatListView: VibeMessageListHost {
   /// Saved Messages is named explicitly because it slipped through a DM-only allowlist
   /// once already: it answers `false` to `isGroupOrChannel`, and its dual-id history is
   /// exactly the kind of ordering quirk that earns its own soak.
+  static let builtInAgentChatIds: Set<String> = [
+    "vibe_agent", "vibeagent", "vibe-ai", "vibe_ai",
+  ]
+
   static func makeCoreDriverIfEligible(
     chatId: String,
     isGroupOrChannel: Bool,
@@ -357,6 +361,9 @@ extension ChatListView: VibeMessageListHost {
     guard !isGroupOrChannel else { return nil }
     let trimmed = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, !trimmed.hasPrefix("saved_messages") else { return nil }
+    // The built-in agent DM is never mirrored into the core store, so arming a driver on
+    // it only produced `[VibeCore] error unknown chat` on every open.
+    guard !Self.builtInAgentChatIds.contains(trimmed.lowercased()) else { return nil }
     NSLog("[VibeCore] driver ARMED chat=%@", String(trimmed.prefix(12)))
     return VibeCoreListDriver(chatId: trimmed, listHost: listHost)
   }

@@ -636,7 +636,9 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     openContextMenu(at: CGPoint(x: frame.midX, y: frame.midY))
   }
 
-  private func openContextMenu(at point: CGPoint) {
+  private func openContextMenu(
+    at point: CGPoint, holdTarget requestedHoldTarget: ChatContextMenuHoldTarget = .bubble
+  ) {
     guard customContextMenuOverlay == nil else { return }
     guard let indexPath = collectionView.indexPathForItem(at: point),
       let cell = collectionView.cellForItem(at: indexPath) as? ChatListCell
@@ -684,6 +686,10 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     // the previous extracted/hidden render state even though the model is restored.
     let deletionBubbleImage = cell.bubbleSnapshotImage(in: window)?.image
     let bubbleFrame = bubbleSnapshot.frame
+    // Snapshot-local so the overlay can hit-test the pill after it shifts the bubble.
+    let bubbleReactionRect = cell.reactionStripFrame(in: window).map {
+      $0.offsetBy(dx: -bubbleFrame.minX, dy: -bubbleFrame.minY)
+    }
     holdDebugLog(
       "openContextMenu snapshot mid=\(messageId) bubbleFrame=\(NSCoder.string(for: bubbleFrame)) deletePixels=\(deletionBubbleImage == nil ? "N" : "Y")"
     )
@@ -695,12 +701,28 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
       : hostWindow.convert(bubbleFrame, from: window)
     bubbleSnapshot.frame = bubbleFrameInHost
 
+    // A hold that landed on the pill gets the reaction menu; anywhere else gets the bubble menu.
+    let selectedReactionEmoji = row.reactions.first(where: { $0.isSelected })?.emoji
+    var holdTarget = requestedHoldTarget
+    if case .bubble = holdTarget,
+      cell.containsReactionPoint(collectionView.convert(point, to: window), in: window),
+      let held = selectedReactionEmoji ?? row.reactions.first?.emoji
+    {
+      holdTarget = .reaction(emoji: held)
+    }
+    holdDebugLog(
+      "openContextMenu target=\(holdTarget == .bubble ? "bubble" : "reaction") current=\(selectedReactionEmoji ?? "nil")"
+    )
+
     let overlay = ChatContextMenuOverlay(
       messageId: messageId,
       bubbleSnapshot: bubbleSnapshot,
       deletionBubbleImage: deletionBubbleImage,
       bubbleFrame: bubbleFrameInHost,
       bubbleIsMe: isMe,
+      bubbleReactionRect: bubbleReactionRect,
+      holdTarget: holdTarget,
+      currentReactionEmoji: selectedReactionEmoji,
       appearance: self.resolvedAppearance(),
       showResendAction: showResendAction,
       showRegenerateAction: showRegenerateAction,
@@ -916,6 +938,14 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     }
   }
 
+  /// Hold on a reaction pill: same backdrop as the bubble menu, reaction content inside it.
+  func openReactionContextMenu(for row: ChatListRow, emoji: String) {
+    guard let messageId = row.messageId, let index = indexForMessage(messageId),
+      let cell = collectionView.cellForItem(at: IndexPath(item: index, section: 0)) as? ChatListCell
+    else { return }
+    openContextMenu(at: cell.center, holdTarget: .reaction(emoji: emoji))
+  }
+
   func presentReactionDetails(
     for row: ChatListRow, emoji: String, sourcePoint _: CGPoint
   ) {
@@ -949,7 +979,7 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
   private func localReactionDetailActors(
     for row: ChatListRow, emoji: String
   ) -> [ChatReactionDetailActor] {
-    guard row.reactions.first(where: { $0.emoji == emoji })?.isSelected == true,
+    guard row.reactions.first(where: { ChatReactionKey.matches($0.emoji, emoji) })?.isSelected == true,
       let config = AppSessionConfig.current
     else { return [] }
     let name = config.name ?? config.username ?? "You"

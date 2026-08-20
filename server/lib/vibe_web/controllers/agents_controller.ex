@@ -147,9 +147,28 @@ defmodule VibeWeb.AgentsController do
         conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
 
       {:error, reason} ->
-        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: publish_error_message(reason), code: publish_error_code(reason)})
     end
   end
+
+  # publish_agent/2 refuses on a few known preconditions. Return a message the
+  # client can show verbatim plus a stable code, not `inspect/1` on the atom.
+  defp publish_error_message(:missing_system_prompt),
+    do: "Add a system prompt before publishing this agent."
+
+  defp publish_error_message(:missing_output_modes),
+    do: "Pick at least one output mode before publishing this agent."
+
+  defp publish_error_message(:voice_unavailable),
+    do: "Voice output is not configured on this server. Remove voice from the output modes to publish."
+
+  defp publish_error_message(:forbidden), do: "You do not own this agent."
+  defp publish_error_message(_reason), do: "Could not publish agent."
+
+  defp publish_error_code(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp publish_error_code(_reason), do: "publish_failed"
 
   def rotate_secret(conn, %{"id" => id} = params) do
     owner_id = conn.assigns.current_user.id

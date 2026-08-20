@@ -692,6 +692,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private var defersPresentationSeedMountUnderRaster = false
   /// Currently mounting a full snapshot under the cover.
   private var isMountingPresentationSeedUnderRaster = false
+  /// One-shot per push: the reconcile yielded a turn so an expensive mount could paint.
+  private var hasYieldedAfterCoveredSeedMount = false
 
   /// Home materializes a destination view behind the current page before UIKit has made
   /// that controller a child of the navigation controller. During that detached pass the
@@ -1440,7 +1442,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// correcting 412→612 twice inside one second — once as `kind=media mediaSize=memo`, once
   /// as `kind=document` with no size source at all. This map is what turns that inference
   /// into a stated fact.
-  private var rowVisualKindByKey: [String: String] = [:]
+  private var rowVisualKindByKey: [String: (kind: String, inputs: String)] = [:]
+
+  /// Every input `ChatListRow.visualKind` reads, in one line. Both sides of a flip log it,
+  /// so the export names the field that moved instead of leaving it to inference.
+  private func visualKindInputSignature(_ row: ChatListRow) -> String {
+    let url = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let ext = url.contains("?") ? (URL(string: url)?.pathExtension ?? "") : (url as NSString).pathExtension
+    return "t=\(row.messageType.isEmpty ? "-" : row.messageType)"
+      + " url=\(url.isEmpty ? "N" : "Y") ext=\(ext.isEmpty ? "-" : ext.lowercased())"
+      + " file=\(row.fileName?.isEmpty == false ? (row.fileName! as NSString).pathExtension : "-")"
+      + " att=\(row.agentBridgeAttachmentsEnc.count) thumb=\(row.attachmentThumbnailsB64.count)"
+      + " vnote=\(row.isVideoNote ? "Y" : "N")"
+  }
   /// Per-key slack from the reporting cell, so the coalesced repair log describes each row
   /// instead of reprinting the first one's number for all of them.
   private var pendingSlotRepairSlack: [String: CGFloat] = [:]
@@ -2341,8 +2355,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       selected
       ?? (row.messageId.map { selectedMessageIds.contains($0) } ?? false)
     cell.hostChatId = engineChatId
-    cell.onReactionHold = { [weak self] heldRow, emoji, sourcePoint in
-      self?.presentReactionDetails(for: heldRow, emoji: emoji, sourcePoint: sourcePoint)
+    cell.onReactionHold = { [weak self] heldRow, emoji, _ in
+      self?.openReactionContextMenu(for: heldRow, emoji: emoji)
     }
     cell.configure(
       row: row,
@@ -3445,10 +3459,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     Self.reopenSnapshotCache.setObject(image, forKey: key)
     Self.verifyCapturedRasterOffMain(
       image, key: key, chatId: engineChatId, url: Self.reopenSnapshotFileURL(for: key))
-    NSLog(
-      "[ChatOpen] reopen-snapshot CAPTURE chat=%@ size=%.0fx%.0f atBottom=%@ key=%@",
-      String(engineChatId.prefix(12)), size.width, size.height,
-      capturedAtBottom ? "Y" : "N", key)
+    VibeLog.info(
+      "[ChatOpen] reopen-snapshot CAPTURE chat=\(engineChatId.prefix(12)) "
+        + "size=\(Int(size.width))x\(Int(size.height)) "
+        + "atBottom=\(capturedAtBottom ? "Y" : "N") key=\(key)",
+      category: "chatopen")
   }
 
   /// Probes a freshly captured raster off the main thread, then persists it.
@@ -3762,12 +3777,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       String(engineChatId.prefix(12)), reason, fileExists ? "Y" : "N",
       chatOpenStartedAt > 0
         ? Int((ProcessInfo.processInfo.systemUptime - chatOpenStartedAt) * 1000) : -1)
-    // A raster miss is not itself a bug, but it removes the cover that hides every
-    // other slow step — so an open that looked bad almost always has one of these in
-    // front of it, and `diskFile=Y` narrows it further: the capture existed and the
-    // key did not match (theme flip, width change), which is a different fix from
-    // never having captured one.
-    VibeOpenTrace.shared.mark("raster-miss", "\(reason) file=\(fileExists ? "Y" : "N")")
+    // `diskFile=Y` narrows a real miss further: the capture existed and the key did not
+    // match (theme flip, width change) — a different fix from never having captured one.
+    // Deferred one turn and re-checked: this runs as early as engine bind, and a cover
+    // installed by prestage a few ms later means there was no miss. Reported eagerly it
+    // fired on 171 of 171 opens that all ended up covered, which reads as a broken raster.
+    let detail = "\(reason) file=\(fileExists ? "Y" : "N") key=\(key ?? "nil")"
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.reopenSnapshotOverlay == nil else { return }
+      VibeOpenTrace.shared.mark("raster-miss", detail)
+    }
   }
 
   /// THE number for this whole mechanism: how long the user looked at bare wallpaper.
@@ -6472,9 +6491,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           if theme == "dark" {
             // Key is logged on both sides: a no-file whose key differs from the last
             // CAPTURE is appearance churn orphaning the pile, not a missing capture.
-            NSLog(
-              "[ChatOpen] reopen-snapshot PREWARM-MISS chat=%@ reason=no-file key=%@",
-              String(trimmed.prefix(12)), key)
+            VibeLog.warning(
+              "[ChatOpen] reopen-snapshot PREWARM-MISS chat=\(trimmed.prefix(12)) "
+                + "reason=no-file key=\(key)",
+              category: "chatopen")
           }
           return
         }
@@ -7051,12 +7071,20 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     var reuseMissCount = 0
     var reuseMissDiffs: [String] = []
     var reuseMissFieldCounts: [String: Int] = [:]
+    let isGroup = isGroupOrChannel
     for raw in rawRows {
       let rawKey = (raw["key"] as? String) ?? ""
       if !rawKey.isEmpty, let cached = reusableParsedRowsByKey[rawKey] {
         if cached.raw.isEqual(to: Self.renderComparableRaw(raw)) {
-          parsed.append(cached.row)
-          nextCache[rawKey] = cached
+          if cached.row.isGroupOrChannel == isGroup {
+            parsed.append(cached.row)
+            nextCache[rawKey] = cached
+          } else {
+            var restamped = cached.row
+            restamped.isGroupOrChannel = isGroup
+            parsed.append(restamped)
+            nextCache[rawKey] = (cached.raw, restamped)
+          }
           continue
         }
         // Cached entry exists but the raw changed — this re-parse is what turns the
@@ -7086,7 +7114,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           }
         }
       }
-      guard let row = ChatListRow(raw: raw) else { continue }
+      guard var row = ChatListRow(raw: raw) else { continue }
+      row.isGroupOrChannel = isGroup
       parsed.append(row)
       if !rawKey.isEmpty {
         nextCache[rawKey] = (Self.renderComparableRaw(raw) as NSDictionary, row)
@@ -8422,7 +8451,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // flag flips — `installPresentationSeedIfNeeded` refuses to seed once presentation
     // is no longer deferred, so a mount ordered after the assignment silently does
     // nothing and the chat arrives empty behind its own raster.
-    if !value { mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED") }
+    if !value {
+      let mountStartedAt = ProcessInfo.processInfo.systemUptime
+      mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED")
+      let mountMs = (ProcessInfo.processInfo.systemUptime - mountStartedAt) * 1000
+      // A big transcript mounts in ~195ms and the reconcile below adds ~139ms — one
+      // 334ms block with no frame between. Yield so the mount can paint first.
+      if mountMs > 16, !hasYieldedAfterCoveredSeedMount {
+        hasYieldedAfterCoveredSeedMount = true
+        NSLog(
+          "[ChatOpen] presentation-complete YIELD chat=%@ mountMs=%d — reconcile next turn",
+          String(engineChatId.prefix(12)), Int(mountMs))
+        DispatchQueue.main.async { [weak self] in
+          self?.setDefersTranscriptUpdatesForPresentation(false)
+        }
+        return
+      }
+    }
     defersTranscriptUpdatesForPresentation = value
     // Background measurement yields for the length of the push.
     value ? VibeChatOpenGate.noteStarted() : VibeChatOpenGate.noteFinished()
@@ -8554,6 +8599,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     isNavigationPushPrestaging = true
     freezesPresentationSeedDuringNavigation = false
     defersPresentationSeedMountUnderRaster = false
+    hasYieldedAfterCoveredSeedMount = false
   }
 
   /// Supplies the safe-area geometry owned by the already-attached navigation container
@@ -8735,9 +8781,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         self.mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED")
       }
     } else {
-      NSLog(
-        "[ChatOpen] seed-mount DEFER-TO-TRANSITION chat=%@ rows=%d > budget=%d",
-        String(engineChatId.prefix(12)), stashedRows, Self.coveredEagerSeedMountRowBudget)
+      VibeLog.warning(
+        "[ChatOpen] seed-mount DEFER-TO-TRANSITION chat=\(engineChatId.prefix(12)) "
+          + "rows=\(stashedRows) > budget=\(Self.coveredEagerSeedMountRowBudget)",
+        category: "chatopen")
     }
     // The watchdog is scheduled either way, and deferring makes it MORE load-bearing, not
     // less: it is now the only thing standing between "the transition never reported
@@ -8745,9 +8792,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
       guard let self, self.coveredPresentationSeedMountToken == token else { return }
       guard self.defersPresentationSeedMountUnderRaster else { return }
-      NSLog(
-        "[ChatOpen] seed-mount WATCHDOG chat=%@ — transition never reported complete",
-        String(self.engineChatId.prefix(12)))
+      VibeLog.warning(
+        "[ChatOpen] seed-mount WATCHDOG chat=\(self.engineChatId.prefix(12)) "
+          + "— transition never reported complete",
+        category: "chatopen")
       self.mountCoveredPresentationSeedIfOwed(stage: "PUSH-COVERED-WATCHDOG")
     }
   }
@@ -10521,7 +10569,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     {
       parsed = Array(parsed.suffix(Self.agentTranscriptWindow))
     }
-    if isGroupOrChannel {
+    // Stamped at parse time now (see `parsedRowsReusingCache`); this only catches rows
+    // from a producer that could not know, e.g. the off-main warm-transcript prewarm.
+    // Unconditionally it copied every row struct on every pass — the `map` +
+    // `outlined destroy of ChatListRow` in a 0.86s block on the 1387-row group.
+    if isGroupOrChannel, parsed.contains(where: { !$0.isGroupOrChannel }) {
       parsed = parsed.map { row in
         var next = row
         next.isGroupOrChannel = true
@@ -11492,6 +11544,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         let wasNearBottom = currentDistanceFromBottom() <= listBottomThreshold
         let contentHBefore = collectionView.contentSize.height
         let offsetBefore = collectionView.contentOffset.y
+        // Scrolled-up reloads have no bottom pin to fall back on, so hold the topmost
+        // visible row still and let the height change move everything else around it.
+        let anchorIndexPath =
+          wasNearBottom ? nil : collectionView.indexPathsForVisibleItems.min()
+        let anchorTopBefore = anchorIndexPath.flatMap {
+          collectionView.layoutAttributesForItem(at: $0)?.frame.minY
+        }
         // DIAG: which rows grew and by how much (layout shift root-cause).
         var heightDeltas: [String] = []
         for ip in safeReloads where ip.item < previousRows.count && ip.item < rows.count {
@@ -11544,6 +11603,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           // Growing a bottom stream row without pin makes the whole list "jump".
           if wasNearBottom {
             scrollToBottom(animated: false)
+          } else if let anchorIndexPath, let anchorTopBefore,
+            let anchorTopAfter = collectionView.layoutAttributesForItem(at: anchorIndexPath)?
+              .frame.minY,
+            abs(anchorTopAfter - anchorTopBefore) > 0.5
+          {
+            var anchored = collectionView.contentOffset
+            anchored.y = max(
+              -collectionView.adjustedContentInset.top,
+              anchored.y + (anchorTopAfter - anchorTopBefore))
+            collectionView.setContentOffset(anchored, animated: false)
           }
           if isGroupOrChannel {
             updateFloatingSenderAvatars(animateShift: true)
@@ -12550,6 +12619,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
     nativeEngineRowsById.removeAll()
     nativeEngineOrder.removeAll()
+    engineMediaKeyMemo.removeAll()
+    hasScheduledEngineMediaKeyPrefill = false
     liveAgentTurnHighWaterByKey.removeAll()
     nativeDeletedMessageIds.removeAll()
     lastReadReceiptSentMessageId = nil
@@ -16000,28 +16071,22 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // can absorb. Every sizing decision funnels through here, so this catches the flip at
     // the moment it happens rather than inferring it from two shift lines afterwards.
     let kindNow = "\(row.visualKind)"
-    if let kindBefore = rowVisualKindByKey[row.key], kindBefore != kindNow {
+    let inputsNow = visualKindInputSignature(row)
+    if let before = rowVisualKindByKey[row.key], before.kind != kindNow {
       VibeLog.warning(
         "row changed visual kind between sizing passes", category: "shift",
         metadata: [
           "chat": String(engineChatId.prefix(12)), "row": String(row.key.suffix(14)),
-          "was": kindBefore, "now": kindNow, "origin": origin.rawValue,
+          "was": before.kind, "now": kindNow, "origin": origin.rawValue,
           "h": String(format: "%.0f", height),
           "sizeSource": chatMediaNaturalSizeSourceLabel(for: row),
-          "mediaUrl": row.mediaUrl?.isEmpty == false ? "Y" : "N",
           "mediaWH": row.mediaWidth != nil && row.mediaHeight != nil ? "Y" : "N",
-          // `visualKind` is a pure function of exactly these three inputs (see
-          // `ChatListRow.visualKind`), so whichever one differs between two passes IS the
-          // cause of the flip. Without them the previous run proved a flip was happening
-          // but could not say which field moved — `mediaUrl=Y` on both sides ruled out
-          // presence, and the extension parser is query-string safe, which leaves the
-          // declared type and the filename as the only remaining suspects.
-          "msgType": row.messageType.isEmpty ? "-" : row.messageType,
-          "fileName": row.fileName?.isEmpty == false ? "Y" : "N",
-          "urlExt": row.mediaUrl.flatMap { URL(string: $0)?.pathExtension } ?? "-",
+          // `visualKind` is pure, and both passes call it — so the ROW moved, not the
+          // rule. Both sides' inputs are recorded so the export names the field.
+          "inWas": before.inputs, "inNow": inputsNow,
         ])
     }
-    rowVisualKindByKey[row.key] = kindNow
+    rowVisualKindByKey[row.key] = (kind: kindNow, inputs: inputsNow)
     if let entry = liveHeightStore[row.key], entry.origin != origin {
       liveHeightStore[row.key] = RowHeightCacheEntry(
         row: entry.row, rowWidth: entry.rowWidth, state: entry.state,
@@ -16433,6 +16498,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
   private func finishRowsUpdate(historyRevealCompleted: Bool = false) {
     isApplyingRowsUpdate = false
+    // A key can arrive late (a send completing, media landing), so only the misses go —
+    // a resolved key never changes for a message id.
+    engineMediaKeyMemo = engineMediaKeyMemo.filter { $0.value != nil }
     if historyRevealCompleted {
       completeCachedHistoryReveal()
     }
@@ -16729,6 +16797,32 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       ?? nonEmptyString(from: row["media_key"])
   }
 
+  /// Engine answers for message ids no local row could resolve, hits and misses alike.
+  /// The engine read is a `syncOnQueue` hop; `cellForItemAt` was measured blocked 0.61s
+  /// inside one, and a cell asks again on every reconfigure.
+  private var engineMediaKeyMemo: [String: String?] = [:]
+  private var hasScheduledEngineMediaKeyPrefill = false
+
+  /// Pulls the whole chat's live rows in one off-main hop and fills the memo, so the
+  /// render path finds an answer instead of taking the hop itself.
+  private func prefillEngineMediaKeysIfNeeded() {
+    guard !hasScheduledEngineMediaKeyPrefill else { return }
+    let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty else { return }
+    hasScheduledEngineMediaKeyPrefill = true
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      let liveRows = ChatEngine.shared.getLiveMessageRows(["chatId": chatId])
+      guard !liveRows.isEmpty else { return }
+      DispatchQueue.main.async {
+        guard let self, self.engineChatId.trimmingCharacters(in: .whitespacesAndNewlines) == chatId
+        else { return }
+        for (messageId, rawRow) in liveRows where self.engineMediaKeyMemo[messageId] == nil {
+          self.engineMediaKeyMemo[messageId] = self.mediaKey(fromRawRow: rawRow)
+        }
+      }
+    }
+  }
+
   private func resolvedMediaKey(for row: ChatListRow) -> String? {
     if let mediaKey = nonEmptyString(from: row.mediaKey) {
       return mediaKey
@@ -16753,14 +16847,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       guard let candidate, let mediaKey = mediaKey(fromRawRow: candidate) else { continue }
       return mediaKey
     }
+    if let memoized = engineMediaKeyMemo[messageId] { return memoized }
+    prefillEngineMediaKeysIfNeeded()
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty,
       let liveEngineRow = ChatEngine.shared.getLiveMessageRow([
         "chatId": chatId,
         "messageId": messageId,
       ])
-    else { return nil }
-    return mediaKey(fromRawRow: liveEngineRow)
+    else {
+      if !chatId.isEmpty { engineMediaKeyMemo[messageId] = String?.none }
+      return nil
+    }
+    let resolved = mediaKey(fromRawRow: liveEngineRow)
+    engineMediaKeyMemo[messageId] = resolved
+    return resolved
   }
 
   private func rowByApplyingReactions(
@@ -16782,6 +16883,23 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return (patched, true)
   }
 
+  /// Reactions travel in the `reactions` array; `reactionEmoji` is stripped when patching.
+  private func reactionDebugSummary(_ message: [String: Any]) -> String {
+    guard let buckets = message["reactions"] as? [[String: Any]], !buckets.isEmpty else {
+      return (message["reactionEmoji"] as? String) ?? "nil"
+    }
+    return buckets.map { bucket in
+      let emoji = (bucket["emoji"] as? String) ?? "?"
+      let selected = (bucket["isSelected"] as? Bool) ?? false
+      return selected ? "\(emoji)*" : emoji
+    }.joined(separator: ",")
+  }
+
+  /// Scalars, not glyphs — a variation-selector mismatch is invisible in a normal log line.
+  private func reactionScalarTrace(_ emoji: String) -> String {
+    emoji.unicodeScalars.map { String(format: "U+%04X", $0.value) }.joined(separator: "+")
+  }
+
   private func toggledLocalReactions(
     _ reactions: [ChatListRow.Reaction], emoji: String
   ) -> [ChatListRow.Reaction] {
@@ -16791,10 +16909,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       next[selected] = ChatListRow.Reaction(
         emoji: current.emoji, count: max(0, current.count - 1), isSelected: false)
     }
-    if reactions.contains(where: { $0.isSelected && $0.emoji == emoji }) {
+    if reactions.contains(where: { $0.isSelected && ChatReactionKey.matches($0.emoji, emoji) }) {
       return next.filter { $0.count > 0 }
     }
-    if let index = next.firstIndex(where: { $0.emoji == emoji }) {
+    if let index = next.firstIndex(where: { ChatReactionKey.matches($0.emoji, emoji) }) {
       let current = next[index]
       next[index] = ChatListRow.Reaction(
         emoji: current.emoji, count: current.count + 1, isSelected: true)
@@ -16819,6 +16937,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let previous = reactionSnapshot(messageId: targetMessageId)
     else { return nil }
     let next = toggledLocalReactions(previous, emoji: trimmedEmoji)
+    reactionDebugTargetMessageId = targetMessageId
+    reactionDebugLog(
+      "toggle id=\(targetMessageId) tapped=\(reactionScalarTrace(trimmedEmoji)) stored=[\(previous.map { "\(reactionScalarTrace($0.emoji))\($0.isSelected ? "*" : "")" }.joined(separator: " "))] -> \(next.count) bucket(s)"
+    )
     applyLocalReactionState(next, toMessageId: targetMessageId)
     return previous
   }
@@ -17291,9 +17413,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       let baseId = normalizedMessageId(baseMessage["id"]),
       baseId == targetMessageId
     {
-      let baseReaction = (baseMessage["reactionEmoji"] as? String) ?? "nil"
-      let overlayReaction = (overlayMessage["reactionEmoji"] as? String) ?? "nil"
-      let mergedReaction = (mergedMessage["reactionEmoji"] as? String) ?? "nil"
+      let baseReaction = reactionDebugSummary(baseMessage)
+      let overlayReaction = reactionDebugSummary(overlayMessage)
+      let mergedReaction = reactionDebugSummary(mergedMessage)
       reactionDebugLog(
         "mergeRow id=\(targetMessageId) baseReaction=\(baseReaction) overlayReaction=\(overlayReaction) mergedReaction=\(mergedReaction)"
       )
@@ -17939,7 +18061,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     }
   }
 
-  private func indexForMessage(_ messageId: String) -> Int? {
+  func indexForMessage(_ messageId: String) -> Int? {
     rows.firstIndex(where: { row in
       row.kind == .message && row.messageId == messageId
     })
@@ -19339,18 +19461,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let wasNearBottom = distanceBeforeInsetChange <= listBottomThreshold
 
     let effectiveKeyboardHeight: CGFloat
-    let safeBottom: CGFloat
     if bar.isGifPanelPresented {
       effectiveKeyboardHeight = bar.isGifPanelSearchActive ? keyboardHeight : 0
-      safeBottom = 0
     } else if bar.isGifPanelPresentationPending {
       effectiveKeyboardHeight = max(keyboardHeight, bar.reservedGifPanelHeight)
-      safeBottom = 0
     } else {
-      effectiveKeyboardHeight = keyboardHeight
-      safeBottom = keyboardHeight > 0 ? 0 : effectiveRestingBottomSafeArea
+      // Panel leaving → keyboard arriving: hold the slot until the height lands, or the bar
+      // drops to the bottom for those frames and springs back.
+      effectiveKeyboardHeight = max(keyboardHeight, bar.reservedKeyboardHeight)
     }
-    bar.bottomSafeAreaInset = safeBottom
+    // The bar itself decides whether anything owns the slot below the composer. Deriving
+    // it here too gave the swap frames where neither side claimed it and the composer
+    // dropped by the resting inset before the next surface arrived.
+    bar.bottomSafeAreaInset = bar.bottomSlotOccupied ? 0 : effectiveRestingBottomSafeArea
     // Size the bar by updating its width (avoiding y-origin jumps during UIView animations)
     bar.frame = CGRect(x: 0, y: bar.frame.minY, width: w, height: bar.frame.height)
     bar.layoutIfNeeded()

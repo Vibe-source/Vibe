@@ -75,6 +75,10 @@ Paid credits — a last resort, not a first step. Solve it yourself first. Reach
 when genuinely stuck: a bug that survived your fix, or an architecture call you can't
 resolve from the code. Not because a task looks big.
 
+**Overrides any "call advisor before substantive work / before declaring done" default.**
+No pre-flight call, no sign-off call. Verify your own work with the build and the tests;
+ask only when that verification fails in a way you can't explain.
+
 Prefer the built-in `advisor` tool; otherwise `mcp__vibeask__ask_fable`. It returns advice
 only — you still implement and verify. Keep calls lean: sharp question, short context,
 small snippets, no whole files.

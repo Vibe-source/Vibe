@@ -85,6 +85,13 @@ struct ChatReactionDetailActor {
 final class ChatReactionDetailOverlay: UIView {
   var onDismiss: (() -> Void)?
   var onActorSelected: ((ChatReactionDetailActor) -> Void)?
+  var onRemoveReaction: (() -> Void)?
+
+  /// Set when hosted inside the context menu: the card follows the pill instead of
+  /// centring on screen, and the host's glass provides the backdrop.
+  var anchorRect: CGRect? {
+    didSet { applyAnchor() }
+  }
 
   private let backdropView = UIVisualEffectView(
     effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
@@ -102,10 +109,15 @@ final class ChatReactionDetailOverlay: UIView {
   private let actorNameLabel = UILabel()
   private let actorSubtitleLabel = UILabel()
   private let cardEmojiLabel = UILabel()
+  private let removeButton = UIButton(type: .system)
   private var actors: [ChatReactionDetailActor] = []
   private var selectedActorID: String?
   private var fallbackEmoji: String
   private var isDismissing = false
+  private var contentCenterY: NSLayoutConstraint?
+  private var contentTop: NSLayoutConstraint?
+  private var removeTopConstraint: NSLayoutConstraint?
+  private var removeHeightConstraint: NSLayoutConstraint?
 
   init(emoji: String, actors: [ChatReactionDetailActor] = [], selectedActorID: String? = nil) {
     self.fallbackEmoji = emoji
@@ -149,6 +161,7 @@ final class ChatReactionDetailOverlay: UIView {
   func present(in hostView: UIView, animated: Bool = true) {
     frame = hostView.bounds
     autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    applyAnchor()
     alpha = 1
     contentView.transform = .identity
     isUserInteractionEnabled = true
@@ -236,8 +249,27 @@ final class ChatReactionDetailOverlay: UIView {
     contentView.addSubview(actorCard)
     setupActorCard()
 
+    removeButton.translatesAutoresizingMaskIntoConstraints = false
+    removeButton.setTitle("Remove my reaction", for: .normal)
+    removeButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+    removeButton.setTitleColor(UIColor(red: 1.0, green: 0.36, blue: 0.36, alpha: 1.0), for: .normal)
+    removeButton.backgroundColor = UIColor.white.withAlphaComponent(0.10)
+    removeButton.layer.cornerRadius = 22
+    removeButton.layer.cornerCurve = .continuous
+    removeButton.isHidden = true
+    removeButton.addTarget(self, action: #selector(didTapRemove), for: .touchUpInside)
+    contentView.addSubview(removeButton)
+
     let guide = selectorScrollView.contentLayoutGuide
     let frameGuide = selectorScrollView.frameLayoutGuide
+    let centerY = contentView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12)
+    contentCenterY = centerY
+    let top = contentView.topAnchor.constraint(equalTo: topAnchor, constant: 0)
+    contentTop = top
+    let removeTop = removeButton.topAnchor.constraint(equalTo: actorCard.bottomAnchor, constant: 0)
+    removeTopConstraint = removeTop
+    let removeHeight = removeButton.heightAnchor.constraint(equalToConstant: 0)
+    removeHeightConstraint = removeHeight
     NSLayoutConstraint.activate([
       backdropView.topAnchor.constraint(equalTo: topAnchor),
       backdropView.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -253,7 +285,7 @@ final class ChatReactionDetailOverlay: UIView {
       dismissControl.trailingAnchor.constraint(equalTo: trailingAnchor),
 
       contentView.centerXAnchor.constraint(equalTo: centerXAnchor),
-      contentView.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
+      centerY,
       contentView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 20),
       contentView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
       contentView.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
@@ -284,7 +316,12 @@ final class ChatReactionDetailOverlay: UIView {
       actorCard.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
       actorCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
       actorCard.heightAnchor.constraint(equalToConstant: 82),
-      actorCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+      removeTop,
+      removeButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+      removeButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+      removeHeight,
+      removeButton.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
     ])
 
     let contentWidth = contentView.widthAnchor.constraint(equalToConstant: 340)
@@ -377,8 +414,44 @@ final class ChatReactionDetailOverlay: UIView {
     )
   }
 
+  /// Hosted inside the context menu the glass is already painted, so drop our own.
+  func setChromeHidden(_ hidden: Bool) {
+    backdropView.isHidden = hidden
+    dimView.isHidden = hidden
+  }
+
+  func setRemoveActionVisible(_ visible: Bool) {
+    removeButton.isHidden = !visible
+    removeTopConstraint?.constant = visible ? 12 : 0
+    removeHeightConstraint?.constant = visible ? 44 : 0
+    applyAnchor()
+    setNeedsLayout()
+  }
+
+  /// Hangs the card off the pill (below it, or above when there is no room).
+  private func applyAnchor() {
+    guard let rect = anchorRect, bounds.height > 1 else {
+      contentTop?.isActive = false
+      contentCenterY?.isActive = true
+      return
+    }
+    contentCenterY?.isActive = false
+    let cardHeight = 282.0 + (removeButton.isHidden ? 0.0 : 56.0)
+    let below = rect.maxY + 14
+    let top =
+      below + cardHeight > bounds.height - safeAreaInsets.bottom - 16
+      ? max(safeAreaInsets.top + 12, rect.minY - cardHeight - 14)
+      : below
+    contentTop?.constant = top
+    contentTop?.isActive = true
+  }
+
   @objc private func didTapBackdrop() {
     dismiss()
+  }
+
+  @objc private func didTapRemove() {
+    onRemoveReaction?()
   }
 
   @objc private func didSelectActor(_ sender: ChatReactionDetailActorControl) {
@@ -495,6 +568,12 @@ public final class ChatContextMenuOverlay: UIView {
   // The bubble's original frame in window coords (before any shifting)
   private let originalBubbleFrame: CGRect
   private let bubbleIsMe: Bool
+  /// Reaction pill inside `bubbleSnapshot`, in the snapshot's own coords.
+  private let bubbleReactionRect: CGRect?
+  /// Which part of the cell the long press landed on. Drives which menu is shown.
+  let holdTarget: ChatContextMenuHoldTarget
+  /// Emoji this message currently carries, so the picker can mark it selected.
+  let currentReactionEmoji: String?
 
   private let appearance: ChatListAppearance
 
@@ -509,10 +588,17 @@ public final class ChatContextMenuOverlay: UIView {
   // Action menu card
   private let contextMenu: ContextMenuView
 
+  /// A real control over the pill: the snapshot bakes the pill in, so a gesture on
+  /// the overlay alone cannot separate a tap on it from a tap on the bubble.
+  private let reactionHitControl = UIControl()
+  /// Shown instead of the action menu when the hold landed on the pill.
+  private var reactionDetail: ChatReactionDetailOverlay?
+
   private var isDismissing = false
   private var ignoreBackgroundTapUntil: CFTimeInterval = 0
   private var enableControlsWorkItem: DispatchWorkItem?
   private var isSelectingReaction = false
+  private var entryAnimator: UIViewPropertyAnimator?
 
   private func holdDebugLog(_ message: String) {
     guard chatContextHoldDebugLogs else { return }
@@ -527,6 +613,9 @@ public final class ChatContextMenuOverlay: UIView {
     deletionBubbleImage: UIImage?,
     bubbleFrame: CGRect,
     bubbleIsMe: Bool,
+    bubbleReactionRect: CGRect? = nil,
+    holdTarget: ChatContextMenuHoldTarget = .bubble,
+    currentReactionEmoji: String? = nil,
     appearance: ChatListAppearance,
     showResendAction: Bool,
     showRegenerateAction: Bool = false,
@@ -545,6 +634,9 @@ public final class ChatContextMenuOverlay: UIView {
     self.deletionBubbleImage = deletionBubbleImage
     self.originalBubbleFrame = bubbleFrame
     self.bubbleIsMe = bubbleIsMe
+    self.bubbleReactionRect = bubbleReactionRect
+    self.holdTarget = holdTarget
+    self.currentReactionEmoji = currentReactionEmoji
     self.appearance = appearance
 
     // Full-screen background: native system glass blur
@@ -587,12 +679,28 @@ public final class ChatContextMenuOverlay: UIView {
     // No reactions on a message that was never delivered — there is nobody on the other
     // end to have reacted to, and a picker above a two-item menu is most of the chrome
     // for none of the meaning.
-    self.hidesReactionPicker = failedSendOnly
+    // The reaction menu owns its own emoji row, so the quick picker would double it.
+    self.hidesReactionPicker = failedSendOnly || holdTarget != .bubble
 
     super.init(frame: .zero)
 
     setupViews()
     setupGestures()
+  }
+
+  /// The emoji a tap on the pill toggles: the held one, else the message's own.
+  private var pillEmoji: String? {
+    if case let .reaction(emoji) = holdTarget { return emoji }
+    return currentReactionEmoji
+  }
+
+  /// Feeds the reaction detail card once the list has resolved who reacted.
+  func updateReactionDetail(
+    actors: [ChatReactionDetailActor],
+    selectedActorID: String? = nil
+  ) {
+    guard let reactionDetail, let emoji = pillEmoji else { return }
+    reactionDetail.update(emoji: emoji, actors: actors, selectedActorID: selectedActorID)
   }
 
   required init?(coder: NSCoder) {
@@ -610,13 +718,30 @@ public final class ChatContextMenuOverlay: UIView {
     bubbleSnapshot.alpha = 0
     addSubview(bubbleSnapshot)
 
+    reactionHitControl.backgroundColor = .clear
+    reactionHitControl.isHidden = bubbleReactionRect == nil
+    reactionHitControl.isUserInteractionEnabled = false
+    reactionHitControl.accessibilityLabel = pillEmoji
+    reactionHitControl.accessibilityTraits = .button
+    reactionHitControl.addTarget(
+      self, action: #selector(handleReactionPillTap), for: .touchUpInside)
+    addSubview(reactionHitControl)
+
     // 3. Reaction picker (above bubble)
     reactionPicker.alpha = 1
     reactionPicker.delegate = self
     reactionPicker.onContentSizeChange = { [weak self] in
       guard let self, !self.isDismissing else { return }
+      // Stop the entry animation to prevent frame/center conflicts during expand/collapse.
+      self.entryAnimator?.stopAnimation(true)
+      self.entryAnimator = nil
+      // stopAnimation leaves mid-flight transforms; frames are only meaningful at identity.
+      self.bubbleSnapshot.transform = .identity
+      self.reactionPicker.transform = .identity
+      self.contextMenu.transform = .identity
       _ = self.layoutMenus()
     }
+    reactionPicker.setSelectedReaction(currentReactionEmoji)
     let pickerSize = reactionPicker.intrinsicContentSize
     reactionPicker.frame = CGRect(origin: .zero, size: pickerSize)
     reactionPicker.isHidden = hidesReactionPicker
@@ -627,6 +752,41 @@ public final class ChatContextMenuOverlay: UIView {
     contextMenu.delegate = self
     contextMenu.frame = CGRect(x: 0, y: 0, width: 220, height: 1)
     addSubview(contextMenu)
+
+    setupReactionDetailIfNeeded()
+  }
+
+  /// A hold on the pill swaps the action list for the reaction detail card.
+  private func setupReactionDetailIfNeeded() {
+    guard case let .reaction(emoji) = holdTarget else { return }
+    contextMenu.isHidden = true
+    contextMenu.alpha = 0
+    let detail = ChatReactionDetailOverlay(emoji: emoji, actors: seededDetailActors(emoji))
+    detail.setChromeHidden(true)
+    detail.setRemoveActionVisible(
+      currentReactionEmoji.map { ChatReactionKey.matches($0, emoji) } ?? false)
+    detail.onDismiss = { [weak self] in
+      self?.animateOut(reason: "reactionDetailDismiss")
+    }
+    detail.onRemoveReaction = { [weak self] in
+      guard let self else { return }
+      self.contextMenuDidSelectReaction(
+        emoji, messageId: self.messageId, sourcePoint: self.pillSourcePoint())
+    }
+    detail.alpha = 0
+    addSubview(detail)
+    reactionDetail = detail
+  }
+
+  /// Until the list feeds real actors, show the one reaction we already know about.
+  private func seededDetailActors(_ emoji: String) -> [ChatReactionDetailActor] {
+    guard let current = currentReactionEmoji, ChatReactionKey.matches(current, emoji) else {
+      return []
+    }
+    return [
+      ChatReactionDetailActor(
+        id: "self", displayName: "You", subtitle: "Reacted with \(emoji)", emoji: emoji)
+    ]
   }
 
   private func setupGestures() {
@@ -636,6 +796,14 @@ public final class ChatContextMenuOverlay: UIView {
     tap.delaysTouchesBegan = false
     tap.delaysTouchesEnded = false
     addGestureRecognizer(tap)
+  }
+
+  /// The pill is baked into the bubble snapshot, so hit-test the laid-out control
+  /// first and fall back to snapshot coords before the first layout pass.
+  private func pointHitsBubbleReaction(_ point: CGPoint) -> Bool {
+    if !reactionHitControl.isHidden, reactionHitControl.frame.contains(point) { return true }
+    guard let rect = bubbleReactionRect, bubbleSnapshot.superview === self else { return false }
+    return rect.insetBy(dx: -6.0, dy: -6.0).contains(convert(point, to: bubbleSnapshot))
   }
 
   @objc private func handleBackgroundTap(_ gesture: UITapGestureRecognizer) {
@@ -648,8 +816,33 @@ public final class ChatContextMenuOverlay: UIView {
       )
       return
     }
+    if pointHitsBubbleReaction(point) {
+      holdDebugLog("reactionPillTap via gesture point=\(NSCoder.string(for: point))")
+      handleReactionPillTap()
+      return
+    }
     holdDebugLog("backgroundTap accepted point=\(NSCoder.string(for: point))")
     animateOut(reason: "backgroundTap")
+  }
+
+  /// Tapping the applied reaction re-selects it, which the list reads as toggle-off.
+  @objc private func handleReactionPillTap() {
+    guard !isDismissing, !isSelectingReaction else { return }
+    guard let emoji = pillEmoji else {
+      holdDebugLog("reactionPillTap dismiss-only rect=\(bubbleReactionRect == nil ? "N" : "Y")")
+      animateOut(reason: "reactionPillTap")
+      return
+    }
+    holdDebugLog("reactionPillTap toggle emoji=\(emoji)")
+    contextMenuDidSelectReaction(emoji, messageId: messageId, sourcePoint: pillSourcePoint())
+  }
+
+  /// Window-space centre of the pill, so the flight starts where the user touched.
+  private func pillSourcePoint() -> CGPoint? {
+    guard !reactionHitControl.isHidden else { return nil }
+    let center = CGPoint(
+      x: reactionHitControl.frame.midX, y: reactionHitControl.frame.midY)
+    return convert(center, to: nil)
   }
 
   // MARK: - Layout
@@ -662,15 +855,25 @@ public final class ChatContextMenuOverlay: UIView {
 
     // Measure reaction picker. Zero height and zero gap when it is suppressed, so the
     // menu sits against the bubble instead of leaving a hole where the emoji row was.
-    let pickerSize = hidesReactionPicker ? .zero : reactionPicker.intrinsicContentSize
-    let pickerHeight = pickerSize.height
-    let pickerGap: CGFloat = hidesReactionPicker ? 0 : 8
+    let pickerExpanded = !hidesReactionPicker && reactionPicker.isExpanded
 
     // Measure context menu
     let menuWidth: CGFloat = min(220, bounds.width - 32)
-    let menuHeight = contextMenu.systemLayoutSizeFitting(
-      CGSize(width: menuWidth, height: UIView.layoutFittingCompressedSize.height)
-    ).height
+    let menuHeight =
+      contextMenu.isHidden
+      ? 0
+      : contextMenu.systemLayoutSizeFitting(
+        CGSize(width: menuWidth, height: UIView.layoutFittingCompressedSize.height)
+      ).height
+
+    // Expanded, the panel scrolls inside a capped height so the bubble and the
+    // action menu both stay on screen instead of being pushed off it.
+    let panelRoom = safeBottom - safeTop - originalBubbleFrame.height - menuHeight - 34
+    reactionPicker.expandedHeightLimit = max(
+      200, min(ReactionPickerView.maxExpandedHeight, panelRoom))
+    let pickerSize = hidesReactionPicker ? .zero : reactionPicker.intrinsicContentSize
+    let pickerHeight = pickerSize.height
+    let pickerGap: CGFloat = hidesReactionPicker ? 0 : 8
     // Keep the action menu visually attached to the bubble (Telegram-like spacing).
     let menuGap: CGFloat = 4
 
@@ -711,6 +914,17 @@ public final class ChatContextMenuOverlay: UIView {
       menuY += allowedShiftDown
     }
 
+    // Expanded and out of room above: pin the panel and hang the bubble off it.
+    if pickerExpanded, pickerY < safeTop {
+      pickerY = safeTop
+      bubbleY = pickerY + pickerHeight + pickerGap
+      menuY = bubbleY + originalBubbleFrame.height + menuGap
+    }
+    if !contextMenu.isHidden {
+      contextMenu.alpha = 1.0
+      contextMenu.isUserInteractionEnabled = true
+    }
+
     reactionPicker.frame = CGRect(
       x: pickerX,
       y: max(safeTop, pickerY),  // Ensure picker doesn't go off-screen even if bubble is huge
@@ -726,6 +940,25 @@ public final class ChatContextMenuOverlay: UIView {
       height: originalBubbleFrame.height
     )
     bubbleSnapshot.frame = finalBubbleFrame
+
+    // The pill rides inside the snapshot, so its tap target tracks the final frame.
+    if let rect = bubbleReactionRect {
+      reactionHitControl.frame =
+        rect
+        .offsetBy(dx: finalBubbleFrame.minX, dy: finalBubbleFrame.minY)
+        .insetBy(dx: -6, dy: -6)
+      reactionHitControl.isHidden = false
+      insertSubview(reactionHitControl, aboveSubview: bubbleSnapshot)
+    } else {
+      reactionHitControl.isHidden = true
+    }
+
+    if let reactionDetail {
+      reactionDetail.frame = bounds
+      reactionDetail.anchorRect =
+        reactionHitControl.isHidden ? finalBubbleFrame : reactionHitControl.frame
+      bringSubviewToFront(reactionDetail)
+    }
 
     // Context menu: align to bubble edge
     let menuX: CGFloat
@@ -802,11 +1035,15 @@ public final class ChatContextMenuOverlay: UIView {
     ignoreBackgroundTapUntil = now + 0.65
     reactionPicker.isUserInteractionEnabled = false
     contextMenu.isUserInteractionEnabled = false
+    reactionHitControl.isUserInteractionEnabled = false
+    reactionDetail?.isUserInteractionEnabled = false
     enableControlsWorkItem?.cancel()
     let enableWork = DispatchWorkItem { [weak self] in
       guard let self = self, !self.isDismissing else { return }
       self.reactionPicker.isUserInteractionEnabled = true
       self.contextMenu.isUserInteractionEnabled = true
+      self.reactionHitControl.isUserInteractionEnabled = true
+      self.reactionDetail?.isUserInteractionEnabled = true
       self.holdDebugLog("controls enabled")
     }
     enableControlsWorkItem = enableWork
@@ -862,7 +1099,7 @@ public final class ChatContextMenuOverlay: UIView {
 
     // One under-damped spring drives bubble, picker, and menu together: both
     // menus grow out of the bubble's edges with a visible expansion overshoot.
-    let springAnimator = UIViewPropertyAnimator(duration: 0.38, dampingRatio: 0.78) {
+    entryAnimator = UIViewPropertyAnimator(duration: 0.38, dampingRatio: 0.78) {
       self.bubbleSnapshot.transform = .identity
       self.bubbleSnapshot.center = endCenter
       self.reactionPicker.transform = .identity
@@ -870,9 +1107,20 @@ public final class ChatContextMenuOverlay: UIView {
       self.contextMenu.transform = .identity
       self.contextMenu.center = menuFinalCenter
     }
-    springAnimator.startAnimation()
+    entryAnimator?.startAnimation()
     // Emoji tiles cascade in from the anchored side while the pill grows.
     reactionPicker.animateIconsIn(fromTrailing: isRightAligned)
+
+    if let reactionDetail {
+      reactionDetail.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
+      UIView.animate(
+        withDuration: 0.26, delay: 0.04, usingSpringWithDamping: 0.86,
+        initialSpringVelocity: 0, options: [.beginFromCurrentState, .allowUserInteraction]
+      ) {
+        reactionDetail.alpha = 1
+        reactionDetail.transform = .identity
+      }
+    }
   }
 
   func animateOut(reason: String = "unknown", completion: (() -> Void)? = nil) {
@@ -881,11 +1129,21 @@ public final class ChatContextMenuOverlay: UIView {
       return
     }
     isDismissing = true
+    entryAnimator?.stopAnimation(true)
+    entryAnimator = nil
     enableControlsWorkItem?.cancel()
     enableControlsWorkItem = nil
     reactionPicker.isUserInteractionEnabled = false
     contextMenu.isUserInteractionEnabled = false
+    reactionHitControl.isUserInteractionEnabled = false
+    reactionDetail?.isUserInteractionEnabled = false
     holdDebugLog("animateOut start reason=\(reason)")
+    if let reactionDetail {
+      UIView.animate(withDuration: 0.16, delay: 0, options: [.curveEaseIn]) {
+        reactionDetail.alpha = 0
+        reactionDetail.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
+      }
+    }
 
     // Inverse of the open morph: menus collapse back toward their bubble-edge
     // anchors while the bubble returns to its row slot.
@@ -940,11 +1198,17 @@ extension ChatContextMenuOverlay: UIGestureRecognizerDelegate {
       )
       return false
     }
+    // The detail card owns every tap while it is up, including its own dismiss.
+    if reactionDetail != nil { return false }
     let point = gestureRecognizer.location(in: self)
+    // The pill rides inside the bubble snapshot, so it must win over the bubble veto.
+    if pointHitsBubbleReaction(point) { return true }
     // Only dismiss if tap is outside the bubble, picker, and menu
     if bubbleSnapshot.frame.contains(point) { return false }
-    if reactionPicker.frame.contains(point) { return false }
-    if contextMenu.frame.contains(point) { return false }
+    if !reactionPicker.isHidden, reactionPicker.frame.contains(point) { return false }
+    if !contextMenu.isHidden, contextMenu.alpha > 0.01, contextMenu.frame.contains(point) {
+      return false
+    }
     return true
   }
 }
@@ -998,9 +1262,21 @@ final class ChatReactionIconNode: UIControl {
   let emoji: String
   private let label = UILabel()
 
+  /// Marks the reaction already on the message, so re-tapping reads as toggle-off.
+  var isSelectedReaction = false {
+    didSet {
+      guard isSelectedReaction != oldValue else { return }
+      backgroundColor =
+        isSelectedReaction ? UIColor.white.withAlphaComponent(0.22) : .clear
+      layer.borderWidth = isSelectedReaction ? 1.0 : 0.0
+      layer.borderColor = UIColor.white.withAlphaComponent(0.34).cgColor
+    }
+  }
+
   init(emoji: String) {
     self.emoji = emoji
     super.init(frame: .zero)
+    layer.cornerCurve = .continuous
     label.text = emoji
     label.font = UIFont.systemFont(ofSize: 28)
     label.textAlignment = .center
@@ -1015,6 +1291,7 @@ final class ChatReactionIconNode: UIControl {
   override func layoutSubviews() {
     super.layoutSubviews()
     label.frame = bounds
+    layer.cornerRadius = min(bounds.width, bounds.height) * 0.5
   }
 
   func playIntro(delay: TimeInterval) {
@@ -1054,9 +1331,21 @@ final class ReactionPickerView: UIView {
   private let iconsHost = UIView()
   private var iconNodes: [ChatReactionIconNode] = []
   private let expandControl = UIButton(type: .system)
+  private let panelView = ReactionEmojiPanelView()
   private var blurHeightConstraint: NSLayoutConstraint!
-  private var isExpanded = false
+  private(set) var isExpanded = false
   private var blobsOnRightSide = false
+
+  /// Set by the overlay from the room left above the bubble before it reads the size.
+  var expandedHeightLimit: CGFloat = 340.0 {
+    didSet {
+      guard isExpanded, abs(oldValue - expandedHeightLimit) > 0.5 else { return }
+      invalidateIntrinsicContentSize()
+    }
+  }
+
+  /// Ceiling for the expanded panel; past this the grid scrolls instead of growing.
+  static let maxExpandedHeight: CGFloat = 340.0
 
   private static let pickerButtonSize: CGFloat = 40.0
   private static let pickerSpacing: CGFloat = 4.0
@@ -1071,21 +1360,9 @@ final class ReactionPickerView: UIView {
     max(1, ChatReactionCatalog.collapsedEmojis.count + 1)
   }
 
-  private var contentRowCount: Int {
-    let primary = ChatReactionCatalog.collapsedEmojis.count
-    guard isExpanded else { return 1 }
-    let remaining = max(0, ChatReactionCatalog.allEmojis.count - primary)
-    let extraRows = remaining == 0 ? 0 : Int(ceil(Double(remaining) / Double(gridColumns)))
-    return 1 + extraRows
-  }
-
   private var blurContentHeight: CGFloat {
-    let rows = CGFloat(contentRowCount)
-    let gridH =
-      rows * Self.pickerButtonSize
-      + max(0, rows - 1) * Self.pickerSpacing
-      + Self.pickerVerticalInset * 2.0
-    return max(Self.pickerPillHeight, gridH)
+    guard isExpanded else { return Self.pickerPillHeight }
+    return min(Self.maxExpandedHeight, max(Self.pickerPillHeight, expandedHeightLimit))
   }
 
   private var preferredWidth: CGFloat {
@@ -1154,7 +1431,7 @@ final class ReactionPickerView: UIView {
     tailBlobSmall.layer.borderWidth = 0
     tailBlobSmall.layer.borderColor = UIColor.clear.cgColor
 
-    for emoji in ChatReactionCatalog.allEmojis {
+    for emoji in ChatReactionCatalog.collapsedEmojis {
       let node = ChatReactionIconNode(emoji: emoji)
       node.addTarget(self, action: #selector(didTapEmoji(_:)), for: .touchUpInside)
       iconsHost.addSubview(node)
@@ -1163,6 +1440,24 @@ final class ReactionPickerView: UIView {
 
     configureExpandControl(isDark: appearance.isDark)
     iconsHost.addSubview(expandControl)
+
+    panelView.translatesAutoresizingMaskIntoConstraints = false
+    panelView.isDark = appearance.isDark
+    panelView.alpha = 0.0
+    panelView.isHidden = true
+    panelView.onSelect = { [weak self] emoji, sourcePoint in
+      guard let self else { return }
+      self.delegate?.contextMenuDidSelectReaction(
+        emoji, messageId: self.messageId, sourcePoint: sourcePoint)
+    }
+    blurView.contentView.addSubview(panelView)
+    NSLayoutConstraint.activate([
+      panelView.topAnchor.constraint(equalTo: blurView.contentView.topAnchor),
+      panelView.bottomAnchor.constraint(equalTo: blurView.contentView.bottomAnchor),
+      panelView.leadingAnchor.constraint(equalTo: blurView.contentView.leadingAnchor),
+      panelView.trailingAnchor.constraint(equalTo: blurView.contentView.trailingAnchor),
+    ])
+
     applyCollapsedVisibility()
   }
 
@@ -1224,26 +1519,12 @@ final class ReactionPickerView: UIView {
       width: button,
       height: button
     )
-
-    guard isExpanded else { return }
-
-    // Extra rows: remaining catalog emojis, width-bounded columns.
-    let remaining = iconNodes.dropFirst(primaryCount)
-    for (offset, node) in remaining.enumerated() {
-      let col = offset % cols
-      let row = 1 + offset / cols
-      let x = CGFloat(col) * (button + spacing)
-      let y = CGFloat(row) * (button + spacing)
-      node.frame = CGRect(x: x, y: y, width: button, height: button)
-    }
   }
 
   private func applyCollapsedVisibility() {
-    let primaryCount = ChatReactionCatalog.collapsedEmojis.count
-    for (index, node) in iconNodes.enumerated() {
-      let isPrimary = index < primaryCount
-      node.isHidden = !isPrimary
-      node.alpha = isPrimary ? 1 : 0
+    for node in iconNodes {
+      node.isHidden = false
+      node.alpha = 1
       node.transform = .identity
     }
     updateExpandControlChrome()
@@ -1256,23 +1537,19 @@ final class ReactionPickerView: UIView {
     setExpanded(!isExpanded, animated: true)
   }
 
-  /// Height-morph expand/collapse; new rows spring in with scale/alpha.
+  /// Height-morph between the quick pill and the full emoji panel. The overlay
+  /// relayouts inside the same spring, so the bubble rides the growth down.
   func setExpanded(_ expanded: Bool, animated: Bool) {
     guard expanded != isExpanded else { return }
     isExpanded = expanded
     updateExpandControlChrome()
 
-    let primaryCount = ChatReactionCatalog.collapsedEmojis.count
-    let extra = Array(iconNodes.dropFirst(primaryCount))
-
     if expanded {
-      for node in extra {
-        node.isHidden = false
-        node.alpha = 0
-        node.transform = CGAffineTransform(
-          scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
-      }
+      panelView.prepareIfNeeded()
+      panelView.isHidden = false
     }
+    panelView.isUserInteractionEnabled = expanded
+    iconsHost.isUserInteractionEnabled = !expanded
 
     invalidateIntrinsicContentSize()
     setNeedsLayout()
@@ -1280,47 +1557,38 @@ final class ReactionPickerView: UIView {
     let animations = {
       self.blurHeightConstraint.constant = self.blurContentHeight
       self.blurView.layer.cornerRadius = min(self.blurContentHeight * 0.5, 26)
-      self.layoutIfNeeded()
+      self.iconsHost.alpha = expanded ? 0.0 : 1.0
+      self.panelView.alpha = expanded ? 1.0 : 0.0
       self.onContentSizeChange?()
-      if expanded {
-        for node in extra {
-          node.alpha = 1
-          node.transform = .identity
-        }
-      } else {
-        for node in extra {
-          node.alpha = 0
-          node.transform = CGAffineTransform(
-            scaleX: chatContextMenuCollapsedScale, y: chatContextMenuCollapsedScale)
-        }
-      }
+      self.layoutIfNeeded()
+    }
+    let settle: (Bool) -> Void = { [weak self] _ in
+      guard let self, !self.isExpanded else { return }
+      self.panelView.isHidden = true
     }
 
     if animated {
       UIView.animate(
-        withDuration: 0.38,
+        withDuration: 0.42,
         delay: 0,
-        usingSpringWithDamping: 0.82,
-        initialSpringVelocity: 0.2,
+        usingSpringWithDamping: 0.86,
+        initialSpringVelocity: 0.15,
         options: [.beginFromCurrentState, .allowUserInteraction],
-        animations: animations
-      ) { _ in
-        if !expanded {
-          for node in extra {
-            node.isHidden = true
-            node.transform = .identity
-          }
-        }
-      }
+        animations: animations,
+        completion: settle
+      )
     } else {
       animations()
-      if !expanded {
-        for node in extra {
-          node.isHidden = true
-          node.transform = .identity
-        }
-      }
+      settle(true)
     }
+  }
+
+  /// Highlights the emoji already on the message, in the quick row and the panel.
+  func setSelectedReaction(_ emoji: String?) {
+    for node in iconNodes {
+      node.isSelectedReaction = emoji.map { ChatReactionKey.matches(node.emoji, $0) } ?? false
+    }
+    panelView.selectedEmoji = emoji
   }
 
   func setThinkingBlobDirection(isRightAligned: Bool) {
@@ -1358,6 +1626,335 @@ final class ReactionPickerView: UIView {
       to: nil
     )
     delegate?.contextMenuDidSelectReaction(emoji, messageId: messageId, sourcePoint: sourcePoint)
+  }
+}
+
+// MARK: - Expanded Emoji Panel
+
+private final class ReactionEmojiPanelCell: UICollectionViewCell {
+  static let reuseIdentifier = "ReactionEmojiPanelCell"
+  private let label = UILabel()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    label.textAlignment = .center
+    label.isUserInteractionEnabled = false
+    contentView.addSubview(label)
+    contentView.layer.cornerRadius = 10.0
+    contentView.layer.cornerCurve = .continuous
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    label.frame = contentView.bounds
+    label.font = .systemFont(ofSize: floor(contentView.bounds.height * 0.74))
+  }
+
+  override var isSelected: Bool {
+    didSet { applySelectionFill() }
+  }
+
+  func configure(_ emoji: String) {
+    label.text = emoji
+    applySelectionFill()
+  }
+
+  private func applySelectionFill() {
+    contentView.backgroundColor =
+      isSelected ? UIColor.white.withAlphaComponent(0.16) : .clear
+  }
+}
+
+/// The panel the reaction pill morphs into: a pinned search capsule with quick
+/// category filters, over a scrolling 8-column grid of every emoji the device draws.
+final class ReactionEmojiPanelView: UIView, UICollectionViewDataSource, UICollectionViewDelegate {
+  /// Emoji plus the tapped point in window coords, for the list's reaction flight.
+  var onSelect: ((String, CGPoint) -> Void)?
+
+  var isDark: Bool = true {
+    didSet { applyChrome() }
+  }
+
+  /// Emoji already on the message, drawn selected so toggle-off reads as intentional.
+  var selectedEmoji: String? {
+    didSet { applySelectedEmoji() }
+  }
+
+  private static let searchRowHeight: CGFloat = 36.0
+  private static let categoryRowHeight: CGFloat = 34.0
+  private static let padding: CGFloat = 8.0
+  private static let cellSpacing: CGFloat = 4.0
+  private static let columns = 8
+
+  private let searchChrome = UIView()
+  private let searchIcon = UIImageView()
+  private let searchField = UITextField()
+  private let categoryScroll = UIScrollView()
+  private var categoryButtons: [UIButton] = []
+  private let gridLayout = UICollectionViewFlowLayout()
+  private let collectionView: UICollectionView
+  private var entries: [ChatEmojiEntry] = []
+  private var visibleEntries: [ChatEmojiEntry] = []
+  private var selectedCategoryIndex: Int?
+  private var didPrepare = false
+
+  /// Reference row order: the quick reactions first, then the rest of the catalog.
+  private static let catalog: [ChatEmojiEntry] = {
+    let all = ChatEmojiCatalogBuilder.build()
+    var byValue: [String: ChatEmojiEntry] = [:]
+    for entry in all { byValue[entry.value] = entry }
+    var seen = Set<String>()
+    var head: [ChatEmojiEntry] = []
+    for emoji in ChatReactionCatalog.allEmojis {
+      let entry =
+        byValue[emoji]
+        ?? ChatEmojiEntry(
+          value: emoji,
+          searchText: (emoji.unicodeScalars.first?.properties.name ?? "").lowercased(),
+          category: ChatReactionCatalog.browseGroup(for: emoji) ?? .smileys)
+      guard seen.insert(entry.value).inserted else { continue }
+      head.append(entry)
+    }
+    return head + all.filter { !seen.contains($0.value) }
+  }()
+
+  private static let categories = ChatReactionCatalog.categories
+
+  override init(frame: CGRect) {
+    collectionView = UICollectionView(frame: .zero, collectionViewLayout: gridLayout)
+    super.init(frame: frame)
+
+    gridLayout.minimumInteritemSpacing = Self.cellSpacing
+    gridLayout.minimumLineSpacing = Self.cellSpacing
+    gridLayout.sectionInset = UIEdgeInsets(
+      top: 0.0, left: Self.padding, bottom: Self.padding, right: Self.padding)
+
+    searchChrome.layer.cornerCurve = .continuous
+    searchChrome.clipsToBounds = true
+    addSubview(searchChrome)
+
+    searchIcon.image = UIImage(
+      systemName: "magnifyingglass",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold))
+    searchIcon.contentMode = .scaleAspectFit
+    searchChrome.addSubview(searchIcon)
+
+    searchField.font = .systemFont(ofSize: 16)
+    searchField.autocorrectionType = .no
+    searchField.autocapitalizationType = .none
+    searchField.returnKeyType = .search
+    searchField.clearButtonMode = .never
+    searchField.addTarget(self, action: #selector(searchChanged), for: .editingChanged)
+    searchChrome.addSubview(searchField)
+
+    categoryScroll.showsHorizontalScrollIndicator = false
+    categoryScroll.alwaysBounceHorizontal = false
+    addSubview(categoryScroll)
+
+    // Tag 0 is "all"; every later tag indexes ChatReactionCatalog.categories.
+    for index in 0...Self.categories.count {
+      let button = UIButton(type: .system)
+      button.tag = index
+      let config = UIImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+      let symbol = index == 0 ? "square.grid.2x2" : Self.categories[index - 1].symbolName
+      if let image = UIImage(systemName: symbol, withConfiguration: config) {
+        button.setImage(image, for: .normal)
+      } else {
+        button.setTitle(index == 0 ? "★" : Self.categories[index - 1].glyph, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 17)
+      }
+      button.accessibilityLabel = index == 0 ? "All emoji" : Self.categories[index - 1].title
+      button.layer.cornerRadius = 8.0
+      button.layer.cornerCurve = .continuous
+      button.addTarget(self, action: #selector(categoryTapped(_:)), for: .touchUpInside)
+      categoryScroll.addSubview(button)
+      categoryButtons.append(button)
+    }
+
+    collectionView.backgroundColor = .clear
+    collectionView.alwaysBounceVertical = true
+    collectionView.showsVerticalScrollIndicator = false
+    collectionView.keyboardDismissMode = .onDrag
+    collectionView.dataSource = self
+    collectionView.delegate = self
+    collectionView.register(
+      ReactionEmojiPanelCell.self,
+      forCellWithReuseIdentifier: ReactionEmojiPanelCell.reuseIdentifier)
+    addSubview(collectionView)
+
+    applyChrome()
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  /// Builds the catalog on first expand — walking Unicode is not launch work.
+  func prepareIfNeeded() {
+    guard !didPrepare else { return }
+    didPrepare = true
+    entries = Self.catalog
+    visibleEntries = entries
+    collectionView.reloadData()
+    applySelectedEmoji()
+  }
+
+  private func applyChrome() {
+    let ink = UIColor(white: isDark ? 1.0 : 0.0, alpha: 1.0)
+    searchChrome.backgroundColor = ink.withAlphaComponent(isDark ? 0.12 : 0.06)
+    searchIcon.tintColor = ink.withAlphaComponent(0.45)
+    searchField.textColor = ink.withAlphaComponent(0.92)
+    searchField.attributedPlaceholder = NSAttributedString(
+      string: "Search emoji",
+      attributes: [.foregroundColor: ink.withAlphaComponent(0.45)])
+    for (index, button) in categoryButtons.enumerated() {
+      let selected = (selectedCategoryIndex.map { $0 + 1 } ?? 0) == index
+      let alpha: CGFloat = selected ? 0.98 : 0.42
+      button.tintColor = ink.withAlphaComponent(alpha)
+      button.setTitleColor(ink.withAlphaComponent(alpha), for: .normal)
+      button.backgroundColor = selected ? ink.withAlphaComponent(0.14) : .clear
+    }
+  }
+
+  /// Marks the applied emoji's cell, scrolling to it only on the first build.
+  private func applySelectedEmoji(scroll: Bool = true) {
+    guard didPrepare else { return }
+    guard let emoji = selectedEmoji,
+      let index = visibleEntries.firstIndex(where: { ChatReactionKey.matches($0.value, emoji) })
+    else {
+      collectionView.indexPathsForSelectedItems?.forEach {
+        collectionView.deselectItem(at: $0, animated: false)
+      }
+      return
+    }
+    collectionView.selectItem(
+      at: IndexPath(item: index, section: 0),
+      animated: false,
+      scrollPosition: scroll ? .centeredVertically : []
+    )
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let pad = Self.padding
+    let rowHeight = Self.searchRowHeight
+    // Header rides the panel's own inset, so it never draws a band across the top.
+    let headerTop = max(pad, safeAreaInsets.top)
+    searchChrome.frame = CGRect(
+      x: pad, y: headerTop, width: max(0.0, bounds.width - pad * 2.0), height: rowHeight)
+    searchChrome.layer.cornerRadius = rowHeight * 0.5
+
+    let iconSide: CGFloat = 18.0
+    searchIcon.frame = CGRect(
+      x: 11.0, y: (rowHeight - iconSide) * 0.5, width: iconSide, height: iconSide)
+    let fieldX = searchIcon.frame.maxX + 6.0
+    searchField.frame = CGRect(
+      x: fieldX, y: 0.0,
+      width: max(0.0, searchChrome.bounds.width - fieldX - 10.0), height: rowHeight)
+
+    let buttonSide: CGFloat = 36.0
+    let categoryRow = Self.categoryRowHeight
+    categoryScroll.frame = CGRect(
+      x: pad, y: searchChrome.frame.maxY + 4.0,
+      width: max(0.0, bounds.width - pad * 2.0), height: categoryRow)
+    for (index, button) in categoryButtons.enumerated() {
+      button.frame = CGRect(
+        x: CGFloat(index) * buttonSide, y: 2.0, width: buttonSide, height: categoryRow - 4.0)
+    }
+    categoryScroll.contentSize = CGSize(
+      width: CGFloat(categoryButtons.count) * buttonSide, height: categoryRow)
+
+    let gridTop = categoryScroll.frame.maxY + 2.0
+    collectionView.frame = CGRect(
+      x: 0.0, y: gridTop, width: bounds.width, height: max(0.0, bounds.height - gridTop))
+
+    // Solve the item size so the grid is always `columns` wide, never one short.
+    let available = max(1.0, bounds.width - pad * 2.0)
+    let side = floor(
+      (available - CGFloat(Self.columns - 1) * Self.cellSpacing) / CGFloat(Self.columns))
+    let itemSize = CGSize(width: max(1.0, side), height: max(1.0, side))
+    if gridLayout.itemSize != itemSize {
+      gridLayout.itemSize = itemSize
+      gridLayout.invalidateLayout()
+    }
+  }
+
+  @objc private func searchChanged() {
+    applyFilter()
+  }
+
+  @objc private func categoryTapped(_ sender: UIButton) {
+    let index = sender.tag - 1
+    guard index < Self.categories.count else { return }
+    selectedCategoryIndex = (index < 0 || selectedCategoryIndex == index) ? nil : index
+    applyChrome()
+    applyFilter()
+  }
+
+  /// Category first (curated members, then its Unicode blocks and name hints),
+  /// then the live search query narrows whatever the tab left on screen.
+  private func applyFilter() {
+    prepareIfNeeded()
+    var scoped = entries
+    if let index = selectedCategoryIndex, index < Self.categories.count {
+      let category = Self.categories[index]
+      let curated = Set(category.emojis.map { ChatReactionKey.normalized($0) })
+      let groups = Set(category.browseGroups)
+      var head: [ChatEmojiEntry] = []
+      var tail: [ChatEmojiEntry] = []
+      for entry in entries {
+        if curated.contains(ChatReactionKey.normalized(entry.value)) {
+          head.append(entry)
+        } else if groups.contains(entry.category)
+          || category.searchHints.contains(where: { entry.searchText.contains($0) })
+        {
+          tail.append(entry)
+        }
+      }
+      scoped = head + tail
+    }
+
+    let query = (searchField.text ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if query.isEmpty {
+      visibleEntries = scoped
+    } else {
+      visibleEntries = scoped.filter { $0.searchText.contains(query) || $0.value.contains(query) }
+    }
+    collectionView.reloadData()
+    guard !visibleEntries.isEmpty else { return }
+    collectionView.scrollToItem(
+      at: IndexPath(item: 0, section: 0), at: .top, animated: false)
+    applySelectedEmoji(scroll: false)
+  }
+
+  func collectionView(_: UICollectionView, numberOfItemsInSection _: Int) -> Int {
+    visibleEntries.count
+  }
+
+  func collectionView(
+    _ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath
+  ) -> UICollectionViewCell {
+    let cell = collectionView.dequeueReusableCell(
+      withReuseIdentifier: ReactionEmojiPanelCell.reuseIdentifier, for: indexPath)
+    guard let emojiCell = cell as? ReactionEmojiPanelCell,
+      indexPath.item < visibleEntries.count
+    else { return cell }
+    emojiCell.configure(visibleEntries[indexPath.item].value)
+    return emojiCell
+  }
+
+  func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+    guard indexPath.item < visibleEntries.count else { return }
+    let emoji = visibleEntries[indexPath.item].value
+    let sourcePoint: CGPoint = {
+      guard let cell = collectionView.cellForItem(at: indexPath) else {
+        return convert(CGPoint(x: bounds.midX, y: bounds.midY), to: nil)
+      }
+      return cell.convert(CGPoint(x: cell.bounds.midX, y: cell.bounds.midY), to: nil)
+    }()
+    searchField.resignFirstResponder()
+    onSelect?(emoji, sourcePoint)
   }
 }
 

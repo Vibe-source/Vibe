@@ -557,6 +557,10 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
   /// expanded work card reads like a diff summary (Claude/Codex style), while the verb
   /// + target stay in the muted base color. The minus is U+2212 (the formatter emits
   /// it, not an ASCII hyphen).
+  /// Compiled once. Building it per step row blocked main 0.47s in a device export.
+  fileprivate static let stepDiffCountRegex = try? NSRegularExpression(
+    pattern: "[+\u{2212}]\\d[\\d,]*")
+
   fileprivate static func styledStepLabel(
     _ string: String,
     font: UIFont,
@@ -568,9 +572,7 @@ final class VibeAgentKitAssistantMessageBodyView: UIView {
       attributes: [.font: font, .foregroundColor: baseColor, .paragraphStyle: paragraph]
     )
     let full = string as NSString
-    guard let regex = try? NSRegularExpression(pattern: "[+\u{2212}]\\d[\\d,]*") else {
-      return attributed
-    }
+    guard let regex = Self.stepDiffCountRegex else { return attributed }
     for match in regex.matches(in: string, range: NSRange(location: 0, length: full.length)) {
       let isAdd = full.substring(with: match.range).hasPrefix("+")
       attributed.addAttribute(

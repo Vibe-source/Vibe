@@ -457,7 +457,7 @@ public final class ChatMainView: UIView,
     let profileMs = layoutPhaseMs()
     layoutAgentContent()
     let agentMs = layoutPhaseMs()
-    applyPageState(animated: false, emitEvent: false)
+    applyPageState(animated: false, emitEvent: false, fromLayout: true)
     let pageStateMs = layoutPhaseMs()
     let layoutTotalMs = Int((ProcessInfo.processInfo.systemUptime - layoutStartedAt) * 1000)
     if layoutTotalMs >= 8 {
@@ -540,6 +540,9 @@ public final class ChatMainView: UIView,
     if defersEngineStateRefreshes == value { return }
     defersEngineStateRefreshes = value
     VibeDebugLog.log("[ChatMainView] defersEngineStateRefreshes=%@", value ? "true" : "false")
+    // The flag gates connection/presence chrome, so repaint it here rather than
+    // waiting on an incidental layout pass.
+    updateHeaderTexts()
   }
 
   /// Freeze the transcript's geometry while this chat is off (or leaving) the screen.
@@ -3489,6 +3492,31 @@ public final class ChatMainView: UIView,
     pendingNativePageLockUntil = CACurrentMediaTime() + 2.0
   }
 
+  /// `bringSubviewToFront` dirties the container's layout even when nothing moves.
+  /// These run every layout pass, so re-order only when the view isn't already on top.
+  private func bringToFrontIfNeeded(_ view: UIView, in container: UIView? = nil) {
+    let host = container ?? self
+    guard host.subviews.last !== view else { return }
+    host.bringSubviewToFront(view)
+  }
+
+  /// Header stack setters invalidate its Auto Layout engine even when the value is unchanged,
+  /// which turns the next `systemLayoutSizeFitting` into a full re-solve. Assign only on change.
+  private func setTextIfNeeded(_ label: UILabel, _ text: String) {
+    guard label.text != text else { return }
+    label.text = text
+  }
+
+  private func setFontIfNeeded(_ label: UILabel, _ font: UIFont) {
+    guard label.font != font else { return }
+    label.font = font
+  }
+
+  private func setHiddenIfNeeded(_ view: UIView, _ hidden: Bool) {
+    guard view.isHidden != hidden else { return }
+    view.isHidden = hidden
+  }
+
   private func layoutChrome() {
     // A Home mini-preview is already positioned inside the screen safe area.
     // Reusing the window inset here pushes its centered header down a second time.
@@ -3535,8 +3563,8 @@ public final class ChatMainView: UIView,
       // Sibling on top of blur stack (not inside contentView) so black tint is pure.
       headerMaskOverlayView.frame = headerMaskView.bounds
       headerMaskGradientLayer.frame = headerMaskView.bounds
-      headerMaskView.bringSubviewToFront(headerMaskOverlayView)
-      headerContainer.bringSubviewToFront(headerContentView)
+      bringToFrontIfNeeded(headerMaskOverlayView, in: headerMaskView)
+      bringToFrontIfNeeded(headerContentView, in: headerContainer)
 
       headerContentView.frame = CGRect(
         x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
@@ -3787,7 +3815,7 @@ public final class ChatMainView: UIView,
     profileHeaderBlurView.frame = profileHeaderMaskView.bounds
     profileHeaderOverlayView.frame = profileHeaderBlurView.bounds
     profileHeaderMaskGradientLayer.frame = profileHeaderMaskView.bounds
-    profileHeaderContainer.bringSubviewToFront(profileHeaderContentView)
+    bringToFrontIfNeeded(profileHeaderContentView, in: profileHeaderContainer)
     profileHeaderContentView.frame = CGRect(
       x: 12.0, y: contentY, width: max(0.0, bounds.width - 24.0), height: 44.0)
     profileHeaderContentView.isUserInteractionEnabled = true
@@ -4001,7 +4029,7 @@ public final class ChatMainView: UIView,
       width: bannerWidth,
       height: ChatPinnedBannerView.preferredHeight
     )
-    chatPage.bringSubviewToFront(pinnedBannerView)
+    bringToFrontIfNeeded(pinnedBannerView, in: chatPage)
 
     // Inbox banner stacks directly below the pinned banner (or in its slot when
     // there is no pinned message).
@@ -4015,7 +4043,7 @@ public final class ChatMainView: UIView,
       width: bannerWidth,
       height: ChatPinnedBannerView.preferredHeight
     )
-    chatPage.bringSubviewToFront(inboxBannerView)
+    bringToFrontIfNeeded(inboxBannerView, in: chatPage)
 
     if standaloneProfileMode {
       profilePage.frame = bounds
@@ -4481,8 +4509,8 @@ public final class ChatMainView: UIView,
       resolvedSubtitle = trimmedSubtitle
     }
 
-    chatTitleLabel.text = resolvedTitle
-    chatSubtitleLabel.text = resolvedSubtitle
+    setTextIfNeeded(chatTitleLabel, resolvedTitle)
+    setTextIfNeeded(chatSubtitleLabel, resolvedSubtitle)
     // Line spinner + Connecting/Updating text — no status dot on connection chrome.
     // Spinner slot stays in layout (alpha only) so subtitle text doesn't jump.
     let showsConnectionChrome =
@@ -4490,21 +4518,21 @@ public final class ChatMainView: UIView,
       && (resolvedSubtitle == "Connecting" || resolvedSubtitle == "Updating")
     if showsConnectionChrome {
       chatConnectingSpinner.color = appearance.timeColorThem.withAlphaComponent(0.9)
-      chatConnectingSpinner.isHidden = false
+      setHiddenIfNeeded(chatConnectingSpinner, false)
       chatConnectingSpinner.startAnimating()
       chatConnectingSpinner.alpha = 1
-      chatSubtitleLabel.isHidden = false
+      setHiddenIfNeeded(chatSubtitleLabel, false)
       // Connection chrome: never show the bridge/status colored dot.
-      chatSubtitleDotView.isHidden = true
+      setHiddenIfNeeded(chatSubtitleDotView, true)
       setSubtitleDotPulsing(false)
     } else {
       chatConnectingSpinner.stopAnimating()
       // Collapse the slot: an invisible spinner kept every subtitle indented
       // 15pt off the title's leading edge. The small text shift when
       // Connecting chrome appears is the lesser evil.
-      chatConnectingSpinner.isHidden = true
+      setHiddenIfNeeded(chatConnectingSpinner, true)
       chatConnectingSpinner.alpha = 0
-      chatSubtitleLabel.isHidden = resolvedSubtitle.isEmpty
+      setHiddenIfNeeded(chatSubtitleLabel, resolvedSubtitle.isEmpty)
     }
 
     let showsStableBridgeConfiguration =
@@ -4518,7 +4546,7 @@ public final class ChatMainView: UIView,
       !showsConnectionChrome && !bridgeProvider.isEmpty && !resolvedSubtitle.isEmpty
         && !showsStableBridgeConfiguration
     if !showsConnectionChrome {
-      chatSubtitleDotView.isHidden = !showsBridgeDot
+      setHiddenIfNeeded(chatSubtitleDotView, !showsBridgeDot)
       if showsBridgeDot {
         let dotColor: UIColor
         if resolvedApproval != nil {
@@ -4537,18 +4565,25 @@ public final class ChatMainView: UIView,
     // A direct bridge header is deliberately static. Group typing remains animated.
     setSubtitleTextShimmering(isGroupOrChannel && groupTypingSubtitle != nil)
 
-    chatSubtitleLabel.font = showsStableBridgeConfiguration
-      ? UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-      : UIFont.systemFont(ofSize: 12, weight: .medium)
+    setFontIfNeeded(
+      chatSubtitleLabel,
+      showsStableBridgeConfiguration
+        ? UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        : UIFont.systemFont(ofSize: 12, weight: .medium))
 
-    chatHeaderStack.spacing = resolvedSubtitle.isEmpty ? 0.0 : -1.0
-    profileTitleLabel.text = profileNameText.isEmpty ? resolvedTitle : profileNameText
-    profileSubtitleLabel.text =
+    let headerStackSpacing: CGFloat = resolvedSubtitle.isEmpty ? 0.0 : -1.0
+    if chatHeaderStack.spacing != headerStackSpacing {
+      chatHeaderStack.spacing = headerStackSpacing
+    }
+    setTextIfNeeded(profileTitleLabel, profileNameText.isEmpty ? resolvedTitle : profileNameText)
+    let profileSubtitle =
       isGroupOrChannel
       ? (isChannel ? "Channel Profile" : "Group Profile")
       : "Profile"
-    profileSubtitleLabel.isHidden =
-      profileSubtitleLabel.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? false
+    setTextIfNeeded(profileSubtitleLabel, profileSubtitle)
+    setHiddenIfNeeded(
+      profileSubtitleLabel,
+      profileSubtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     chatSubtitleLabel.textColor =
       {
         if headerMode == .savedMessages {
@@ -5287,8 +5322,12 @@ public final class ChatMainView: UIView,
 
   // MARK: - In-place agent runtime host
 
-  private func applyPageState(animated: Bool, emitEvent: Bool) {
-    updateHeaderTexts()
+  /// `fromLayout` marks the call made by `layoutSubviews`: chrome is already laid out and
+  /// header text is owned by state setters, so re-running either would re-dirty this pass.
+  private func applyPageState(animated: Bool, emitEvent: Bool, fromLayout: Bool = false) {
+    if !fromLayout {
+      updateHeaderTexts()
+    }
 
     if standaloneProfileMode {
       currentPage = .profile
@@ -5308,7 +5347,7 @@ public final class ChatMainView: UIView,
       pinnedBannerView.alpha = 0.0
       inboxBannerView.alpha = 0.0
       avatarGlassView.alpha = 0.0
-      bringSubviewToFront(profileHeaderContainer)
+      bringToFrontIfNeeded(profileHeaderContainer)
       applyHeaderGlassMorph(chatFactor: 0.0)
       if emitEvent {
         onNativeEvent(["type": "mainPageChanged", "page": currentPage.rawValue])
@@ -5349,14 +5388,14 @@ public final class ChatMainView: UIView,
       profilePage.alpha = 1.0
       profilePage.isHidden = false
       profileHeaderContainer.isHidden = false
-      bringSubviewToFront(profileHeaderContainer)
+      bringToFrontIfNeeded(profileHeaderContainer)
     }
     if isAgent && agentPage.isHidden {
       agentPage.transform = agentOffscreenRight
       agentPage.alpha = 1.0
       agentPage.isHidden = false
       profileHeaderContainer.isHidden = false
-      bringSubviewToFront(profileHeaderContainer)
+      bringToFrontIfNeeded(profileHeaderContainer)
     }
 
     headerContainer.isUserInteractionEnabled = isChat
@@ -5369,11 +5408,13 @@ public final class ChatMainView: UIView,
     let agentTargetTransform = isAgent ? CGAffineTransform.identity : agentOffscreenRight
 
     let apply = {
-      self.layoutChrome()
+      if !fromLayout {
+        self.layoutChrome()
+      }
       if isChat {
-        self.bringSubviewToFront(self.headerContainer)
+        self.bringToFrontIfNeeded(self.headerContainer)
       } else {
-        self.bringSubviewToFront(self.profileHeaderContainer)
+        self.bringToFrontIfNeeded(self.profileHeaderContainer)
       }
       self.profilePage.transform = profileTargetTransform
       self.agentPage.transform = agentTargetTransform

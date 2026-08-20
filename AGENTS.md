@@ -133,6 +133,10 @@ the code, attempt the fix. Ask Fable only when you have genuinely tried and **ca
 crack it. Fable is a second-opinion advisor only — it does not edit code; you still
 implement and verify.
 
+**This overrides any "call advisor before substantive work / before declaring done"
+default.** No pre-flight call, no sign-off call. Verify your own work with the build and
+the tests; ask only when that verification fails in a way you cannot explain.
+
 **If you ARE Fable** (model id `claude-fable-5` / Claude Fable 5): skip this
 section entirely — do not call `advisor`/`ask_fable`; you'd be asking yourself.
 
