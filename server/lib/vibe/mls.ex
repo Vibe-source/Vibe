@@ -5,10 +5,10 @@ defmodule Vibe.Mls do
   MLS adds a member to a group by consuming that member's **KeyPackage**, which
   wraps a one-time init key. Reusing a KeyPackage across two group additions
   reuses that init key and breaks the forward-secrecy guarantee MLS exists to
-  provide, so a KeyPackage is single-use: once `claim_key_package/1` hands one
+  provide, so a KeyPackage is single-use: once `claim_key_package/2` hands one
   out it is immediately unclaimable.
 
-  `claim_key_package/1` does this with a single atomic
+  `claim_key_package/2` does this with a single atomic
   `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1)`
   statement — never a read followed by a separate write. See its doc for why
   that matters.
@@ -20,6 +20,9 @@ defmodule Vibe.Mls do
 
   require Logger
 
+  alias Vibe.Accounts
+  alias Vibe.Chat
+  alias Vibe.Chat.Participant
   alias Vibe.Repo
   alias Vibe.Schemas.MlsKeyPackage
   alias Vibe.Schemas.MlsWelcome
@@ -109,7 +112,23 @@ defmodule Vibe.Mls do
   normal, expected state — the caller has run out of published KeyPackages for
   this user, not an error.
   """
-  def claim_key_package(user_id) when is_binary(user_id) do
+  def claim_key_package(target_id) when is_binary(target_id) do
+    claim_key_package(target_id, target_id)
+  end
+
+  def claim_key_package(_target_id), do: {:error, :not_found}
+
+  def claim_key_package(claimer_id, target_id)
+      when is_binary(claimer_id) and is_binary(target_id) do
+    with :ok <- authorize_claim(claimer_id, target_id),
+         :ok <- check_claim_quota(claimer_id, target_id) do
+      do_claim_key_package(target_id)
+    end
+  end
+
+  def claim_key_package(_claimer_id, _target_id), do: {:error, :not_found}
+
+  defp do_claim_key_package(user_id) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     candidate =
@@ -136,8 +155,6 @@ defmodule Vibe.Mls do
         {:error, :not_found}
     end
   end
-
-  def claim_key_package(_user_id), do: {:error, :not_found}
 
   # ── Count ────────────────────────────────────────────────────────────────
 
@@ -307,6 +324,7 @@ defmodule Vibe.Mls do
 
     with {:ok, recipient_id} <- validate_id(recipient_id),
          {:ok, chat_id} <- validate_id(chat_id),
+         :ok <- authorize_welcome(sender_user_id, recipient_id, chat_id),
          {:ok, welcome} <- decode_blob(params["welcome"], @max_welcome_bytes),
          {:ok, tree} <- decode_optional_blob(params["ratchetTree"], @max_ratchet_tree_bytes),
          :ok <- check_pending_quota(recipient_id, sender_user_id) do
@@ -371,26 +389,38 @@ defmodule Vibe.Mls do
   end
 
   @doc """
-  How the Welcomes `sender_user_id` posted for `chat_id` are getting on.
-
-  Returns `%{pending: n, delivered: n}` counted over that sender's own rows.
-
-  Exists because a sender otherwise has **no way to know whether the peer can
-  read anything it sends**. MLS gives the sender no feedback at all: sealing
-  succeeds whether or not the other side ever applied the Welcome, and — since a
-  sender cannot decrypt its own message — a device can seal, store, and display
-  a whole conversation that nobody on earth can open.
-
-  That is not a hypothetical. It is what happened on 2026-08-06: sealing was
-  switched on before establishment had been confirmed end-to-end, and every DM
-  became unreadable on both sides at once. `pending > 0` is the signal to keep
-  using the older path until the peer confirms.
+  Welcome counts for `user_id` on `chat_id`: sent (`pending`/`delivered`) and received (`incoming_*`).
   """
-  def welcome_status(sender_user_id, chat_id)
-      when is_binary(sender_user_id) and is_binary(chat_id) do
+  def welcome_status(user_id, chat_id) when is_binary(user_id) and is_binary(chat_id) do
+    sent = welcome_counts(sender_user_id: user_id, chat_id: chat_id)
+    incoming = welcome_counts(recipient_user_id: user_id, chat_id: chat_id)
+
+    %{
+      pending: sent.pending,
+      delivered: sent.delivered,
+      incoming_pending: incoming.pending,
+      incoming_delivered: incoming.delivered
+    }
+  end
+
+  def welcome_status(_user_id, _chat_id),
+    do: %{pending: 0, delivered: 0, incoming_pending: 0, incoming_delivered: 0}
+
+  defp welcome_counts(sender_user_id: sender_id, chat_id: chat_id) do
+    MlsWelcome
+    |> where([w], w.sender_user_id == ^sender_id and w.chat_id == ^chat_id)
+    |> reduce_welcome_counts()
+  end
+
+  defp welcome_counts(recipient_user_id: recipient_id, chat_id: chat_id) do
+    MlsWelcome
+    |> where([w], w.recipient_user_id == ^recipient_id and w.chat_id == ^chat_id)
+    |> reduce_welcome_counts()
+  end
+
+  defp reduce_welcome_counts(query) do
     rows =
-      MlsWelcome
-      |> where([w], w.sender_user_id == ^sender_user_id and w.chat_id == ^chat_id)
+      query
       |> select([w], {is_nil(w.delivered_at), count(w.id)})
       |> group_by([w], is_nil(w.delivered_at))
       |> Repo.all()
@@ -401,7 +431,94 @@ defmodule Vibe.Mls do
     end)
   end
 
-  def welcome_status(_sender_user_id, _chat_id), do: %{pending: 0, delivered: 0}
+  # Claims are irreversible. Without this, any account can drain a target's pool
+  # and deny every legitimate peer an E2EE session with them.
+  @max_claims_per_peer 8
+  @claim_window_ms 3_600_000
+  @claim_quota_table :mls_claim_quota
+
+  defp authorize_claim(claimer_id, target_id) when claimer_id == target_id, do: :ok
+
+  defp authorize_claim(claimer_id, target_id) do
+    cond do
+      Accounts.blocked?(claimer_id, target_id) or Accounts.blocked?(target_id, claimer_id) ->
+        {:error, :not_allowed}
+
+      share_chat?(claimer_id, target_id) ->
+        :ok
+
+      true ->
+        Logger.warning("[Mls] refused key-package claim with no shared chat")
+        {:error, :not_allowed}
+    end
+  rescue
+    Ecto.Query.CastError -> {:error, :not_allowed}
+  end
+
+  defp share_chat?(user_a, user_b) do
+    Repo.exists?(
+      from(p1 in Participant,
+        join: p2 in Participant,
+        on: p1.chat_id == p2.chat_id,
+        where:
+          p1.user_id == ^user_a and p2.user_id == ^user_b and
+            (is_nil(p1.deleted) or p1.deleted == false) and
+            (is_nil(p2.deleted) or p2.deleted == false)
+      )
+    )
+  end
+
+  defp check_claim_quota(claimer_id, target_id) when claimer_id == target_id, do: :ok
+
+  defp check_claim_quota(claimer_id, target_id) do
+    ensure_claim_quota_table()
+    now = System.monotonic_time(:millisecond)
+    key = {claimer_id, target_id}
+    window_start = now - @claim_window_ms
+
+    case :ets.lookup(@claim_quota_table, key) do
+      [{^key, stamps}] ->
+        recent = Enum.filter(stamps, &(&1 > window_start))
+
+        if length(recent) >= @max_claims_per_peer do
+          {:error, :too_many}
+        else
+          :ets.insert(@claim_quota_table, {key, [now | recent]})
+          :ok
+        end
+
+      [] ->
+        :ets.insert(@claim_quota_table, {key, [now]})
+        :ok
+    end
+  end
+
+  defp ensure_claim_quota_table do
+    case :ets.whereis(@claim_quota_table) do
+      :undefined ->
+        :ets.new(@claim_quota_table, [:set, :public, :named_table, :compressed])
+
+      _tid ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # A Welcome makes the recipient a member of a group the sender built. Without
+  # this, any account could seat a victim in an attacker-controlled group.
+  defp authorize_welcome(sender_id, recipient_id, chat_id) do
+    if Chat.is_participant?(chat_id, sender_id) and Chat.is_participant?(chat_id, recipient_id) do
+      :ok
+    else
+      Logger.warning("[Mls] refused welcome outside chat membership chat=#{String.slice(chat_id, 0, 12)}")
+      {:error, :not_allowed}
+    end
+  rescue
+    # chat_id is a free-form string here but a binary_id column there; a
+    # non-uuid raises rather than returning no rows.
+    Ecto.Query.CastError -> {:error, :not_allowed}
+  end
 
   defp check_pending_quota(recipient_id, sender_id) do
     count =

@@ -25,6 +25,9 @@ defmodule Vibe.Application do
     # MCP tool discovery cache — without it every agent turn pays a tools/list
     # round trip to each connected server before the model starts thinking.
     ensure_ets_table(:vibe_mcp_tool_cache)
+    # Per-(claimer, target) KeyPackage claim cap. Owned here so a request
+    # process dying does not drop the table (see Vibe.Mls.check_claim_quota/2).
+    ensure_ets_table(:mls_claim_quota)
 
     children = [
       # Start the Telemetry supervisor

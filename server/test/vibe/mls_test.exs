@@ -6,7 +6,9 @@ defmodule Vibe.MlsTest do
 
   use ExUnit.Case, async: false
 
+  alias Vibe.Accounts
   alias Vibe.Accounts.User
+  alias Vibe.Chat
   alias Vibe.Mls
   alias Vibe.Repo
   alias Vibe.Schemas.MlsKeyPackage
@@ -47,6 +49,71 @@ defmodule Vibe.MlsTest do
     # The first claim is durably marked claimed, not just absent from a cache.
     reloaded = Repo.get!(MlsKeyPackage, first.id)
     refute is_nil(reloaded.claimed_at)
+  end
+
+  test "a stranger cannot claim another user's KeyPackage", %{user: user} do
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package(1)]
+      })
+
+    stranger = insert_user("mls_stranger")
+    assert {:error, :not_allowed} = Mls.claim_key_package(stranger.id, user.id)
+    assert Mls.count_available(user.id) == 1
+  end
+
+  test "a chat peer can claim one KeyPackage", %{user: user} do
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package(1)]
+      })
+
+    peer = insert_user("mls_peer")
+    chat_id = "chat-claim-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [user.id, peer.id])
+
+    assert {:ok, claimed} = Mls.claim_key_package(peer.id, user.id)
+    assert claimed.user_id == user.id
+    assert Mls.count_available(user.id) == 0
+  end
+
+  test "a blocked peer cannot claim a KeyPackage even with a shared chat", %{user: user} do
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => [fake_key_package(1)]
+      })
+
+    peer = insert_user("mls_blocked_peer")
+    chat_id = "chat-claim-block-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [user.id, peer.id])
+    {:ok, _} = Accounts.block_user(user.id, peer.id)
+
+    assert {:error, :not_allowed} = Mls.claim_key_package(peer.id, user.id)
+    assert Mls.count_available(user.id) == 1
+  end
+
+  test "one peer cannot drain another user's KeyPackage pool", %{user: user} do
+    packages = for i <- 1..10, do: fake_key_package(i)
+
+    {:ok, _} =
+      Mls.publish_key_packages(user.id, %{
+        "deviceId" => "device-a",
+        "keyPackages" => packages
+      })
+
+    peer = insert_user("mls_drain")
+    chat_id = "chat-claim-drain-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [user.id, peer.id])
+
+    for _ <- 1..8 do
+      assert {:ok, _} = Mls.claim_key_package(peer.id, user.id)
+    end
+
+    assert {:error, :too_many} = Mls.claim_key_package(peer.id, user.id)
+    assert Mls.count_available(user.id) == 2
   end
 
   test "claiming when none remain returns not-found, no crash", %{user: user} do
@@ -327,6 +394,7 @@ defmodule Vibe.MlsTest do
   } do
     recipient = insert_user("mls_recipient")
     impostor = insert_user("mls_impostor")
+    {:ok, _} = Chat.create_chat("chat-1", [sender.id, recipient.id])
 
     {:ok, _} =
       Mls.post_welcome(sender.id, %{
@@ -378,6 +446,7 @@ defmodule Vibe.MlsTest do
 
   test "an oversize welcome is rejected rather than stored", %{user: sender} do
     recipient = insert_user("mls_recipient")
+    {:ok, _} = Chat.create_chat("chat-1", [sender.id, recipient.id])
 
     oversize = Base.encode64(:crypto.strong_rand_bytes(256 * 1024 + 1))
 
@@ -393,6 +462,7 @@ defmodule Vibe.MlsTest do
 
   test "non-base64 welcome bytes are rejected", %{user: sender} do
     recipient = insert_user("mls_recipient")
+    {:ok, _} = Chat.create_chat("chat-1", [sender.id, recipient.id])
 
     assert {:error, :invalid_encoding} =
              Mls.post_welcome(sender.id, %{
@@ -416,7 +486,84 @@ defmodule Vibe.MlsTest do
     assert {:ok, _} = post_welcome(other_sender.id, recipient.id, "chat-22")
   end
 
+  test "welcome_status counts sent and received rows separately", %{user: sender} do
+    recipient = insert_user("mls_joiner")
+    outsider = insert_user("mls_outsider")
+    chat_id = "chat-status-1"
+
+    {:ok, row} = post_welcome(sender.id, recipient.id, chat_id)
+
+    assert Mls.welcome_status(sender.id, chat_id) == %{
+             pending: 1,
+             delivered: 0,
+             incoming_pending: 0,
+             incoming_delivered: 0
+           }
+
+    assert Mls.welcome_status(recipient.id, chat_id) == %{
+             pending: 0,
+             delivered: 0,
+             incoming_pending: 1,
+             incoming_delivered: 0
+           }
+
+    assert Mls.welcome_status(outsider.id, chat_id) == %{
+             pending: 0,
+             delivered: 0,
+             incoming_pending: 0,
+             incoming_delivered: 0
+           }
+
+    assert :ok = Mls.ack_welcome(recipient.id, row.id)
+
+    assert Mls.welcome_status(sender.id, chat_id) == %{
+             pending: 0,
+             delivered: 1,
+             incoming_pending: 0,
+             incoming_delivered: 0
+           }
+
+    assert Mls.welcome_status(recipient.id, chat_id) == %{
+             pending: 0,
+             delivered: 0,
+             incoming_pending: 0,
+             incoming_delivered: 1
+           }
+  end
+
+  test "a non-member sender cannot post a welcome", %{user: sender} do
+    recipient = insert_user("mls_recipient")
+    chat_id = "chat-gate-sender-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [recipient.id])
+
+    assert {:error, :not_allowed} =
+             Mls.post_welcome(sender.id, %{
+               "recipientUserId" => recipient.id,
+               "chatId" => chat_id,
+               "welcome" => Base.encode64("welcome-bytes")
+             })
+
+    assert [] = Mls.pending_welcomes(recipient.id)
+  end
+
+  test "a welcome for a non-member recipient is refused", %{user: sender} do
+    recipient = insert_user("mls_recipient")
+    chat_id = "chat-gate-recipient-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [sender.id])
+
+    assert {:error, :not_allowed} =
+             Mls.post_welcome(sender.id, %{
+               "recipientUserId" => recipient.id,
+               "chatId" => chat_id,
+               "welcome" => Base.encode64("welcome-bytes")
+             })
+
+    assert [] = Mls.pending_welcomes(recipient.id)
+  end
+
   defp post_welcome(sender_id, recipient_id, chat_id) do
+    {:ok, _} = Chat.create_chat(chat_id, [sender_id, recipient_id])
+
     Mls.post_welcome(sender_id, %{
       "recipientUserId" => recipient_id,
       "chatId" => chat_id,

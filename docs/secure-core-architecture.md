@@ -449,7 +449,9 @@ Two things that are genuinely new work, and neither is cryptography:
    Commits per group. Phoenix channels do not guarantee that today. The fix is
    a per-group monotonic epoch counter server-side: reject a Commit that does
    not build on the current epoch, client re-fetches and re-proposes. Standard
-   MLS delivery-service behaviour, but real Elixir work.
+   MLS delivery-service behaviour, but real Elixir work. Concrete contract:
+   [`docs/mls-commit-fanout.md`](mls-commit-fanout.md). Not implemented —
+   any group that adds a member after founding is permanently split today.
 2. **KeyPackage distribution.** Replaces public-key fetch. Each device
    publishes KeyPackages; the server hands them out and must not be able to
    substitute them undetectably — which is what Phase 1's identity pinning and

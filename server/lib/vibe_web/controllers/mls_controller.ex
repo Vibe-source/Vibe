@@ -45,14 +45,23 @@ defmodule VibeWeb.MlsController do
   client must handle (prompt a re-publish / retry later), not an error.
   """
   def claim(conn, %{"user_id" => user_id}) do
-    case Mls.claim_key_package(user_id) do
+    claimer_id = conn.assigns.current_user.id
+
+    case Mls.claim_key_package(claimer_id, user_id) do
       {:ok, package} ->
         json(conn, %{
           keyPackage: Base.encode64(package.key_package),
           deviceId: package.device_id
         })
 
-      {:error, :not_found} ->
+      {:error, :too_many} ->
+        conn
+        |> put_status(:too_many_requests)
+        |> json(%{error: "Too many KeyPackage claims"})
+
+      {:error, _reason} ->
+        # :not_allowed and :not_found both 404 so a stranger cannot probe
+        # whether a user has packages or whether the two share a chat.
         conn |> put_status(:not_found) |> json(%{error: "No available KeyPackage"})
     end
   end
@@ -90,6 +99,9 @@ defmodule VibeWeb.MlsController do
         conn
         |> put_status(:too_many_requests)
         |> json(%{error: "Too many undelivered welcomes"})
+
+      {:error, :not_allowed} ->
+        conn |> put_status(:not_found) |> json(%{error: "Not found"})
 
       {:error, :invalid_request} ->
         conn |> put_status(:unprocessable_entity) |> json(%{error: "Invalid request"})
@@ -155,16 +167,19 @@ defmodule VibeWeb.MlsController do
   end
 
   @doc """
-  Whether the Welcomes this caller sent for a chat have been applied.
-
-  The client uses this to decide whether sealing with MLS is safe yet: a sender
-  cannot decrypt its own message, so without this it has no way to tell an
-  established session from one the peer never joined, and would happily produce
-  a conversation nobody can read.
+  Welcome counts for this caller on a chat: sent pending/delivered plus incomingPending/incomingDelivered.
+  Incoming counts distinguish a joiner from an initiator whose Welcome never landed.
   """
   def welcome_status(conn, %{"chat_id" => chat_id}) do
     status = Mls.welcome_status(conn.assigns.current_user.id, chat_id)
-    json(conn, %{chatId: chat_id, pending: status.pending, delivered: status.delivered})
+
+    json(conn, %{
+      chatId: chat_id,
+      pending: status.pending,
+      delivered: status.delivered,
+      incomingPending: status.incoming_pending,
+      incomingDelivered: status.incoming_delivered
+    })
   end
 
   # ── group epoch keys ───────────────────────────────────────────────────────
