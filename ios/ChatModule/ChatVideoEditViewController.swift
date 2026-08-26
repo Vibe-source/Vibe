@@ -473,10 +473,19 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private var suppressNextPreviewToggleTap = false
 
   var onReply: (() -> Void)?
+  var zoomTransition: ChatMediaZoomTransition?
+  private let zoomMessageId: String?
 
-  init(asset: AVAsset, initialCaption: String?, headerTitle: String?, previewOnly: Bool) {
+  init(
+    asset: AVAsset,
+    initialCaption: String?,
+    headerTitle: String?,
+    previewOnly: Bool,
+    messageId: String? = nil
+  ) {
     self.asset = asset
     self.previewOnly = previewOnly
+    self.zoomMessageId = messageId?.trimmingCharacters(in: .whitespacesAndNewlines)
     let normalizedCaption = initialCaption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.captionText = normalizedCaption
     let normalizedHeaderTitle = headerTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -494,7 +503,6 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     }
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .overFullScreen
-    modalTransitionStyle = .crossDissolve
   }
 
   required init?(coder: NSCoder) {
@@ -1683,6 +1691,16 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     dismiss(animated: true)
   }
 
+  private func beginVideoDragEffects() {
+    zoomTransition?.sourceProvider?.chatMediaZoomSetSourceHidden(
+      true, forMessageId: zoomMessageId, pageIndex: 0)
+  }
+
+  private func endVideoDragEffects() {
+    zoomTransition?.sourceProvider?.chatMediaZoomSetSourceHidden(
+      false, forMessageId: zoomMessageId, pageIndex: 0)
+  }
+
   private func dismissGestureProgress(for translation: CGPoint) -> CGFloat {
     let vertical = max(0.0, translation.y)
     let travelDistance = max(220.0, view.bounds.height * 0.46)
@@ -1737,6 +1755,38 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     guard previewOnly, !captionTextView.isFirstResponder else { return }
 
     let translation = gesture.translation(in: view)
+    if zoomTransition != nil {
+      switch gesture.state {
+      case .began:
+        isInteractiveDismissing = true
+      case .changed:
+        if !isInteractiveDismissing { isInteractiveDismissing = true }
+        beginVideoDragEffects()
+        let reach = max(1, view.bounds.height * 0.5)
+        let progress = min(1, max(0, abs(translation.y) / reach))
+        let scale = 1 - progress * 0.35
+        stageView.transform = CGAffineTransform(translationX: translation.x, y: translation.y)
+          .scaledBy(x: scale, y: scale)
+        topContainer.alpha = max(0.0, 1.0 - progress * 0.7)
+        bottomContainer.alpha = max(0.0, 1.0 - progress * 0.7)
+        backgroundView.alpha = max(0.0, 1.0 - progress * 0.65)
+      case .ended, .cancelled, .failed:
+        let velocity = gesture.velocity(in: view)
+        let committed =
+          gesture.state == .ended
+          && (abs(translation.y) > 110 || abs(velocity.y) > 900)
+        if committed {
+          dismiss(animated: true)
+          return
+        }
+        endVideoDragEffects()
+        resetInteractiveDismissState(animated: true)
+      default:
+        break
+      }
+      return
+    }
+
     let vertical = max(0.0, translation.y)
     let progress = dismissGestureProgress(for: translation)
 
@@ -2735,6 +2785,39 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
     let velocity = pan.velocity(in: view)
     return abs(velocity.y) > abs(velocity.x) && velocity.y > 0.0
+  }
+}
+
+extension ChatVideoEditViewController: ChatMediaZoomTransitionTarget {
+  var zoomTransitionImage: UIImage? {
+    guard previewView.bounds.width > 1, previewView.bounds.height > 1 else { return nil }
+    let renderer = UIGraphicsImageRenderer(bounds: previewView.bounds)
+    return renderer.image { ctx in
+      previewView.layer.render(in: ctx.cgContext)
+    }
+  }
+
+  var zoomTransitionMessageId: String? { zoomMessageId }
+
+  var zoomTransitionPageIndex: Int { 0 }
+
+  func zoomTransitionTargetFrame(for image: UIImage?) -> CGRect {
+    zoomTransitionCurrentFrame
+  }
+
+  var zoomTransitionCurrentFrame: CGRect {
+    previewView.convert(previewView.bounds, to: nil)
+  }
+
+  func setZoomTransitionContentHidden(_ hidden: Bool) {
+    previewView.isHidden = hidden
+    playerLayer.isHidden = hidden
+  }
+
+  func installZoomTransitionFlightView(_ flightView: UIView, frameInWindow: CGRect) -> UIView {
+    view.insertSubview(flightView, belowSubview: topContainer)
+    flightView.frame = view.convert(frameInWindow, from: nil)
+    return view
   }
 }
 

@@ -71,99 +71,73 @@ enum ChatReplyMarkShape {
   static let replyGlyphName = "vibe.mark.reply"
   static let forwardGlyphName = "vibe.mark.forward"
 
-  /// Template image of the mark, stroked to sit at the same visual weight as the regular
-  /// SF Symbols beside it. `mirrored` flips the tail to the right — the SAME silhouette
-  /// aimed away instead of back, which is exactly the difference between reply and
-  /// forward, so the pair is learnable from one shape.
   static func glyphImage(
     named name: String, side: CGFloat = 21.0, lineWidth: CGFloat = 1.6
   ) -> UIImage? {
     guard name == replyGlyphName || name == forwardGlyphName else { return nil }
-    let mirrored = name == forwardGlyphName
-    let size = CGSize(width: side, height: side)
-    let image = UIGraphicsImageRenderer(size: size).image { _ in
-      let rect = CGRect(origin: .zero, size: size)
-        .insetBy(dx: lineWidth, dy: side * 0.17)
-      let markPath = path(in: rect, cornerRadius: side * 0.3)
-      if mirrored {
-        markPath.apply(CGAffineTransform(translationX: size.width, y: 0.0).scaledBy(x: -1.0, y: 1.0))
-      }
-      markPath.lineWidth = lineWidth
-      markPath.lineJoinStyle = .round
-      UIColor.label.setStroke()
-      markPath.stroke()
+    guard let base = UIImage(named: "ReplyMark")?.withRenderingMode(.alwaysTemplate) else {
+      return nil
     }
-    return image.withRenderingMode(.alwaysTemplate)
+    if name == forwardGlyphName {
+      return UIImage(cgImage: base.cgImage!, scale: base.scale, orientation: .upMirrored)
+        .withRenderingMode(.alwaysTemplate)
+    }
+    return base
   }
 }
 
 final class ChatSwipeReplyIconView: UIView {
-  static let diameter: CGFloat = 30.0
-  /// Stroked outline that draws itself as the finger travels.
-  private let outlineLayer = CAShapeLayer()
-  /// The same silhouette, gradient-filled — revealed only when the pull commits.
-  private let fillLayer = CAGradientLayer()
-  private let fillMask = CAShapeLayer()
-  /// Expanding ring on the hit; the one piece of the old FX worth keeping.
+  static let diameter: CGFloat = 40.0
+  private let discLayer = CALayer()
+  private let iconView = UIImageView()
+  /// Expanding ring on the hit; pull scale/alpha stay the same as before.
   private let ringLayer = CAShapeLayer()
   private(set) var didPop = false
 
   init() {
     super.init(frame: CGRect(x: 0, y: 0, width: Self.diameter, height: Self.diameter))
     isUserInteractionEnabled = false
+    clipsToBounds = false
+    backgroundColor = .clear
 
-    let markRect = bounds.insetBy(dx: 3.0, dy: 5.0)
-    let markPath = ChatReplyMarkShape.path(in: markRect)
+    discLayer.frame = bounds
+    discLayer.cornerRadius = Self.diameter * 0.5
+    layer.addSublayer(discLayer)
+
+    iconView.image = UIImage(named: "ReplyMark")?.withRenderingMode(.alwaysTemplate)
+    iconView.contentMode = .scaleAspectFit
+    iconView.frame = bounds.insetBy(dx: 9.0, dy: 9.0)
+    iconView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    addSubview(iconView)
 
     ringLayer.frame = bounds
     ringLayer.fillColor = UIColor.clear.cgColor
     ringLayer.lineWidth = 1.4
-    ringLayer.path = ChatReplyMarkShape.path(in: markRect.insetBy(dx: -1.0, dy: -1.0)).cgPath
+    ringLayer.path = UIBezierPath(ovalIn: bounds.insetBy(dx: 1.5, dy: 1.5)).cgPath
     ringLayer.opacity = 0.0
     layer.addSublayer(ringLayer)
-
-    fillLayer.frame = bounds
-    fillLayer.startPoint = CGPoint(x: 0.0, y: 0.0)
-    fillLayer.endPoint = CGPoint(x: 1.0, y: 1.0)
-    fillMask.path = markPath.cgPath
-    fillLayer.mask = fillMask
-    fillLayer.opacity = 0.0
-    layer.addSublayer(fillLayer)
-
-    outlineLayer.frame = bounds
-    outlineLayer.path = markPath.cgPath
-    outlineLayer.fillColor = UIColor.clear.cgColor
-    outlineLayer.lineWidth = 1.6
-    outlineLayer.lineCap = .round
-    outlineLayer.lineJoin = .round
-    outlineLayer.strokeEnd = 0.0
-    layer.addSublayer(outlineLayer)
 
     alpha = 0.0
   }
 
   required init?(coder: NSCoder) { nil }
 
-  /// The mark wears the sender's OWN bubble gradient — the reply is going to become their
-  /// message, so it is already tinted like one before it exists.
   func apply(appearance: ChatListAppearance) {
-    let gradient = appearance.bubbleMeGradient
-    let accent = gradient.first ?? ChatListAppearance.brandAccentFallback
-    fillLayer.colors = (gradient.count >= 2 ? gradient : [accent, accent]).map(\.cgColor)
-    outlineLayer.strokeColor = accent.withAlphaComponent(0.95).cgColor
-    ringLayer.strokeColor = accent.withAlphaComponent(0.9).cgColor
+    if appearance.isDark {
+      discLayer.backgroundColor = UIColor.black.withAlphaComponent(0.62).cgColor
+      iconView.tintColor = .white
+      ringLayer.strokeColor = UIColor.white.withAlphaComponent(0.88).cgColor
+    } else {
+      discLayer.backgroundColor = UIColor.white.withAlphaComponent(0.92).cgColor
+      iconView.tintColor = UIColor.black.withAlphaComponent(0.82)
+      ringLayer.strokeColor = UIColor.black.withAlphaComponent(0.55).cgColor
+    }
   }
 
   /// progress: 0 at rest, 1 at the trigger threshold (may exceed 1 past it).
   func apply(progress: CGFloat) {
     guard !didPop else { return }
     let p = max(0.0, min(1.0, progress))
-    // The stroke is the progress bar: the outline is literally incomplete until the pull
-    // is far enough to count, so the gesture teaches its own threshold.
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    outlineLayer.strokeEnd = p
-    CATransaction.commit()
     alpha = min(1.0, p * 2.0)
     let scale = 0.72 + (0.28 * p)
     transform = CGAffineTransform(scaleX: scale, y: scale)
@@ -173,22 +147,6 @@ final class ChatSwipeReplyIconView: UIView {
     guard !didPop else { return }
     didPop = true
     alpha = 1.0
-
-    // The outline completes and the silhouette floods with the bubble gradient — the
-    // quote has been captured.
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    outlineLayer.strokeEnd = 1.0
-    CATransaction.commit()
-    let flood = CABasicAnimation(keyPath: "opacity")
-    flood.fromValue = 0.0
-    flood.toValue = 1.0
-    flood.duration = 0.18
-    flood.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    flood.fillMode = .forwards
-    flood.isRemovedOnCompletion = false
-    fillLayer.add(flood, forKey: "flood")
-    fillLayer.opacity = 1.0
 
     UIView.animate(
       withDuration: 0.5, delay: 0.0, usingSpringWithDamping: 0.46,
@@ -565,13 +523,47 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
     // Show reply banner in native input bar
     if let idx = swipeReplyIndexPath?.item, idx < rows.count {
       let row = rows[idx]
-      inputBar?.showReplyBanner(messageId: messageId, text: row.text, isMe: row.isMe)
+      inputBar?.showReplyBanner(
+        messageId: messageId,
+        text: replyBannerPreviewText(for: row),
+        isMe: row.isMe,
+        senderName: replyBannerSenderName(for: row)
+      )
     }
   }
 
   private func finishSwipeReply() {
     resetSwipeReplyTransform(animated: true)
     clearSwipeReplyState()
+  }
+
+  private func replyBannerSenderName(for row: ChatListRow) -> String {
+    if let agent = row.agentName?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !agent.isEmpty
+    {
+      return agent
+    }
+    return enginePeerDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  func replyBannerPreviewText(for row: ChatListRow, fallback: String = "") -> String {
+    switch row.visualKind {
+    case .video, .videoNote:
+      return "Video Message"
+    case .voice:
+      return "Voice Message"
+    case .media:
+      let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? "Image" : trimmed
+    case .document:
+      let name = row.fileName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !name.isEmpty { return name }
+      let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? fallback : trimmed
+    case .text, .sticker:
+      let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? fallback : trimmed
+    }
   }
 
   private func resetSwipeReplyTransform(animated: Bool) {
@@ -1197,7 +1189,12 @@ extension ChatListView: UIGestureRecognizerDelegate, ChatContextMenuOverlayDeleg
 
     if let row = rows.first(where: { $0.messageId == mid }) {
       if actionId == "reply" {
-        inputBar?.showReplyBanner(messageId: mid, text: row.text, isMe: row.isMe)
+        inputBar?.showReplyBanner(
+          messageId: mid,
+          text: replyBannerPreviewText(for: row),
+          isMe: row.isMe,
+          senderName: replyBannerSenderName(for: row)
+        )
       } else if actionId == "edit" {
         inputBar?.showEditBanner(messageId: mid, text: row.text)
       } else if actionId == "copy" {
@@ -1527,8 +1524,6 @@ extension ChatListView {
   private func deletionFragmentBudget(for row: ChatListRow) -> Int {
     switch row.visualKind {
     case .media:
-      // Photographic cells need more samples than text; otherwise each source
-      // tile remains visibly square even after the early sparkle collapse.
       return 1_600
     case .video, .videoNote:
       return 1_350
@@ -1625,8 +1620,6 @@ private final class ChatBubbleFragmentDisintegrationView: UIView {
     let width = max(capture.frame.width, 1)
     let height = max(capture.frame.height, 1)
     let area = width * height
-    // Preserve the source image for the first frame, but sample it densely enough
-    // that detailed media does not turn into a few large white rectangles.
     let desired = max(128, min(budget, Int(area / 6.5)))
     let tileSide = max(1.5, sqrt(area / CGFloat(desired)))
     let columns = max(1, Int(ceil(width / tileSide)))
@@ -1715,8 +1708,6 @@ private final class ChatBubbleFragmentDisintegrationView: UIView {
       opacity.values = [1, 0.96, 0.66, 0]
       opacity.keyTimes = [0, 0.10, 0.68, 1]
 
-      // Use area/height, not width alone: a wide one-line text bubble is still small
-      // material, while a tall voice/media card needs particles that remain readable.
       let captureAreaRoot = sqrt(max(capture.frame.width * capture.frame.height, 1.0))
       let heightFactor = max(0.0, min(1.0, (capture.frame.height - 40.0) / 180.0))
       let areaFactor = max(0.0, min(1.0, (captureAreaRoot - 70.0) / 300.0))
@@ -1724,9 +1715,6 @@ private final class ChatBubbleFragmentDisintegrationView: UIView {
       let baseSparkleSide = 0.85 + (materialSizeFactor * 2.65) + (jitterC * 0.55)
       let sourceSide = max(max(fragment.bounds.width, fragment.bounds.height), 1.0)
       let adaptiveSparkleScale = min(0.85, max(0.20, baseSparkleSide / sourceSide))
-
-      // Monotonic scale reduction: starts at 1.0, retains source scale/material past 50ms,
-      // transitions smoothly to adaptiveSparkleScale, and fades to 0 without rebound.
       let scaleMid = 1.0 - (1.0 - adaptiveSparkleScale) * 0.22
       let scaleLate = adaptiveSparkleScale
       let scaleEnd: CGFloat = 0.0

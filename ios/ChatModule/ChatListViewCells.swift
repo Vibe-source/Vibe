@@ -391,10 +391,8 @@ private func chatBlurredMicroThumbnail(_ image: UIImage) -> UIImage? {
   let size = image.size
   let longest = max(size.width, size.height)
   guard longest > 0.5 else { return nil }
-  // Upscale BEFORE blurring. Blurring at 64px and letting the image view stretch the
-  // result would leave the seams of that stretch behind; blurring after a smooth upscale
-  // removes those too. 180px carries no detail worth resolving and stays cheap.
-  let scale = max(1.0, 180.0 / longest)
+  // Upscale before blur so JPEG 8x8 blocks don't become a grate. Keep the blur light.
+  let scale = max(1.0, 240.0 / longest)
   let target = CGSize(
     width: max(1.0, (size.width * scale).rounded()),
     height: max(1.0, (size.height * scale).rounded())
@@ -413,7 +411,7 @@ private func chatBlurredMicroThumbnail(_ image: UIImage) -> UIImage? {
   // input those samples come back transparent — which fades the border and gives the
   // placeholder a washed-out frame instead of a full-bleed one.
   filter.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
-  filter.setValue(max(1.0, max(target.width, target.height) * 0.06), forKey: kCIInputRadiusKey)
+  filter.setValue(max(1.0, max(target.width, target.height) * 0.025), forKey: kCIInputRadiusKey)
   guard let output = filter.outputImage,
     let rendered = chatMicroThumbBlurContext.createCGImage(output, from: input.extent)
   else { return nil }
@@ -655,21 +653,67 @@ func chatMediaDiskCacheSave(_ data: Data, forKey cacheKey: String) {
 func chatMediaSeedRemoteCacheFromLocalFile(localURI: String, remoteURL: String, mediaKey: String?) {
   let trimmedRemote = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
   guard !trimmedRemote.isEmpty else { return }
-  chatMediaDiskCacheQueue.async {
+  let path: String
+  if let parsed = URL(string: localURI), parsed.isFileURL {
+    path = parsed.path
+  } else {
+    path = localURI
+  }
+  let exists = FileManager.default.fileExists(atPath: path)
+  let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+  let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+  guard exists, bytes > 0, bytes <= 25 * 1024 * 1024 else {
+    ChatMediaWatchdog.once(
+      key: "seed-fail:\(trimmedRemote)",
+      "seed-fail reason=local-missing exists=\(exists ? "Y" : "N") bytes=\(bytes) path=\(path) remote=\(trimmedRemote)"
+    )
+    return
+  }
+  let vault = VibeMediaVault.shared
+  let keys = [chatMediaCacheKey(trimmedRemote, mediaKey: mediaKey)]
+    + ((mediaKey?.isEmpty == false) ? [chatMediaCacheKey(trimmedRemote, mediaKey: nil)] : [])
+  var seeded = false
+  for cacheKey in keys where !vault.contains(cacheKey, kind: .image) {
+    if vault.adopt(fileAt: URL(fileURLWithPath: path), for: cacheKey, kind: .image, move: false)
+      != nil
+    {
+      seeded = true
+    }
+  }
+  ChatMediaWatchdog.once(
+    key: "seed:\(trimmedRemote)",
+    "seed-outgoing ok=\(seeded ? "Y" : "N") bytes=\(bytes) remote=\(trimmedRemote) local=\(path)"
+  )
+}
+
+/// On-disk file for this row: surviving local path, or vault copy keyed by remote URL.
+func chatOnDiskMediaFileURL(for row: ChatListRow) -> URL? {
+  if let local = row.localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !local.isEmpty
+  {
     let path: String
-    if let parsed = URL(string: localURI), parsed.isFileURL {
+    if let parsed = URL(string: local), parsed.isFileURL {
       path = parsed.path
     } else {
-      path = localURI
+      path = local
     }
-    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-    let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-    guard bytes > 0, bytes <= 25 * 1024 * 1024 else { return }
-    let cacheKey = chatMediaCacheKey(trimmedRemote, mediaKey: mediaKey)
-    let vault = VibeMediaVault.shared
-    guard !vault.contains(cacheKey, kind: .image) else { return }
-    vault.adopt(fileAt: URL(fileURLWithPath: path), for: cacheKey, kind: .image, move: false)
+    if FileManager.default.fileExists(atPath: path) {
+      return URL(fileURLWithPath: path)
+    }
   }
+  guard let remote = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+    !remote.isEmpty
+  else { return nil }
+  let vault = VibeMediaVault.shared
+  let keys = [
+    VibeMediaVault.identity(rawURL: remote, mediaKey: row.mediaKey),
+    VibeMediaVault.identity(rawURL: remote, mediaKey: nil),
+  ]
+  for key in keys {
+    if let url = vault.cachedURL(for: key, kind: .image) { return url }
+    if let url = vault.cachedURL(for: key, kind: .document) { return url }
+  }
+  return nil
 }
 
 /// Bytes for a media key, from disk only. `legacyRawKey` is the pre-vault key for the same
@@ -2154,7 +2198,9 @@ private final class ChatReactionChipView: UIView {
   let emojiLabel = UILabel()
   let countLabel = ChatRollingCounterLabel()
   var onHold: ((String, CGPoint) -> Void)?
+  var onTap: ((String) -> Void)?
   private var emoji = ""
+  private var revealFallback: DispatchWorkItem?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -2170,6 +2216,9 @@ private final class ChatReactionChipView: UIView {
     let hold = UILongPressGestureRecognizer(target: self, action: #selector(handleHold(_:)))
     hold.minimumPressDuration = 0.32
     addGestureRecognizer(hold)
+    let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+    tap.require(toFail: hold)
+    addGestureRecognizer(tap)
   }
 
   required init?(coder: NSCoder) { nil }
@@ -2182,6 +2231,19 @@ private final class ChatReactionChipView: UIView {
     emojiLabel.text = reaction.emoji
     emojiLabel.isHidden = hidesEmoji
     alpha = hidesEmoji ? 0.0 : 1.0
+    // A flight that never lands (cell recycled, window gone) must not leave the chip
+    // invisible for the rest of the session.
+    revealFallback?.cancel()
+    revealFallback = nil
+    if hidesEmoji {
+      let reveal = DispatchWorkItem { [weak self] in
+        guard let self, self.alpha < 1.0 else { return }
+        self.emojiLabel.isHidden = false
+        self.alpha = 1.0
+      }
+      revealFallback = reveal
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: reveal)
+    }
     countLabel.isHidden = !showsCount
     // Own bubbles: the pill takes the message text colour, so it tracks the theme.
     let outgoingInk = appearance.textColorMe
@@ -2202,6 +2264,11 @@ private final class ChatReactionChipView: UIView {
       ? UIColor.clear.cgColor
       : (reaction.isSelected ? appearance.accent : UIColor.white)
         .withAlphaComponent(reaction.isSelected ? 0.58 : 0.16).cgColor
+  }
+
+  @objc private func handleTap() {
+    guard !emoji.isEmpty else { return }
+    onTap?(emoji)
   }
 
   @objc private func handleHold(_ gesture: UILongPressGestureRecognizer) {
@@ -2241,6 +2308,7 @@ private final class ChatReactionStripView: UIView {
   private var animatesNextLayout = false
   private var showsCount = true
   var onHold: ((String, CGPoint) -> Void)?
+  var onTap: ((String) -> Void)?
 
   func configure(
     reactions: [ChatListRow.Reaction], appearance: ChatListAppearance, isMe: Bool,
@@ -2259,6 +2327,7 @@ private final class ChatReactionStripView: UIView {
       if chip.superview == nil { addSubview(chip) }
       chips[reaction.emoji] = chip
       chip.onHold = { [weak self] emoji, point in self?.onHold?(emoji, point) }
+      chip.onTap = { [weak self] emoji in self?.onTap?(emoji) }
       let hidesEmoji = ChatReactionTransitionCoordinator.shared.isFlying(
         chatId: chatId, messageId: messageId, emoji: reaction.emoji)
       chip.apply(
@@ -2326,6 +2395,7 @@ struct AgentTurnBubbleState: Equatable {
   // existing measure/configure threading), this applies to ANY tall bubble — user
   // text included — via the shared tall-content collapse in measureMessageBubbleLayout.
   var tallExpanded: Bool = false
+  var videoNoteExpanded: Bool = false
 }
 
 private func measuredTextWidth(_ text: String, font: UIFont) -> CGFloat {
@@ -4002,11 +4072,24 @@ private func parseBubbleMarkdown(
   -> NSAttributedString
 {
   _ = useSharedAgentRenderer
-  return ChatNativeAgentTextRenderer.makeAttributedText(
+  let rendered = ChatNativeAgentTextRenderer.makeAttributedText(
     text: text,
     font: font,
     textColor: textColor ?? .label
   )
+  guard isRTL(text) else { return rendered }
+  // The shared renderer right-aligns RTL, which outranks the label alignment. Bubbles
+  // want the block at the plate left inset, with RTL shaping kept by the base direction.
+  let aligned = NSMutableAttributedString(attributedString: rendered)
+  aligned.enumerateAttribute(
+    .paragraphStyle, in: NSRange(location: 0, length: aligned.length)
+  ) { value, range, _ in
+    guard let style = (value as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle
+    else { return }
+    style.alignment = .left
+    aligned.addAttribute(.paragraphStyle, value: style, range: range)
+  }
+  return aligned
 }
 
 private func bubbleDisplayAttributedString(
@@ -5334,8 +5417,12 @@ func measureMessageBubbleLayout(
         mediaHeight = 60.0
       }
     case .videoNote:
-      targetWidth = 200.0
-      mediaHeight = 200.0
+      let side = videoNoteRenderedSide(
+        expanded: agentTurnState.videoNoteExpanded,
+        rowWidth: rowWidth,
+        maxBubbleWidth: maxBubbleWidth)
+      targetWidth = side
+      mediaHeight = side
     case .document:
       // حباب به‌اندازهٔ نام فایل کشیده می‌شود، نه همیشه تا آخرِ عرضِ ممکن —
       // یک نامِ کوتاه داخل حبابی تمام‌عرض، همان چیزی است که «تمیز نیست» به نظر
@@ -5460,8 +5547,13 @@ func measureMessageBubbleLayout(
       } else {
         captionBlockHeight = metaTopSpacing + bubbleMetaHeight
       }
+      // Video note: time + duration ride a line UNDER the circle (Telegram), so the row
+      // reserves that line instead of pinning chrome inside the circular clip.
+      let circleMetaBlock: CGFloat =
+        row.visualKind == .videoNote ? (metaTopSpacing + bubbleMetaHeight) : 0.0
       bodyHeight =
-        (isFullBleed || isVoice) ? mediaHeight : (mediaHeight + captionBlockHeight)
+        (isFullBleed || isVoice)
+        ? (mediaHeight + circleMetaBlock) : (mediaHeight + captionBlockHeight)
       if isEdgeCaption {
         // Edge-to-edge media: the bubble is the image plus a hairline border.
         bubbleWidth = max(bubbleMinWidth, contentWidth + mediaCaptionEdgeInset * 2.0)
@@ -5615,9 +5707,16 @@ func measureMessageBubbleLayout(
   let reactionSize = reactionStripMeasuredSize(
     row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0),
     showsCount: row.isGroupOrChannel)
+  // Timestamp rides the reaction row (LTR and RTL) when there is no link preview.
+  let metaRidesReactionRow =
+    reactionSize.height > 0.0 && !showsInlineAttachment && previewHeight <= 0.0
+  let reactionRowWidth =
+    metaRidesReactionRow
+    ? reactionSize.width + bubbleMetaInlineSpacing + meta.total
+    : reactionSize.width
   let contentWidth = max(
     meta.total,
-    min(maxContentWidth, max(desiredContentWidth, reactionSize.width)))
+    min(maxContentWidth, max(desiredContentWidth, reactionRowWidth)))
   let appliedRTLTailSideReserve =
     usesRTLColumn && row.isMe
     ? min(bubbleRTLTailSideReserve, max(0.0, contentWidth - max(textWidth, meta.total, replyPreviewWidth)))
@@ -5627,6 +5726,8 @@ func measureMessageBubbleLayout(
     ? max(1.0, contentWidth - appliedRTLTailSideReserve)
     : max(1.0, contentWidth - meta.total - bubbleMetaInlineSpacing)
   // Plate height uses the (possibly capped) body; metrics.textHeight stays full.
+  let bottomMetaLine: CGFloat =
+    metaRidesReactionRow ? 0.0 : (bubbleMetaTopSpacing + bubbleMetaHeight)
   let bodyHeight =
     showsInlineAttachment
     ? replyPreviewBlockHeight + max(bubbleTextHeight, 0.0) + inlineAttachmentSpacing
@@ -5634,7 +5735,7 @@ func measureMessageBubbleLayout(
     : usesBottomMetaLayout
     ? replyPreviewBlockHeight + max(bubbleTextHeight, 0.0) + tallToggleReserve
       + (previewHeight > 0.0 ? (bubbleLinkPreviewSpacing + previewHeight) : 0.0)
-      + bubbleMetaTopSpacing + bubbleMetaHeight
+      + bottomMetaLine
     : replyPreviewBlockHeight + max(bubbleTextHeight, bubbleMetaHeight)
   let reactionHeightOffset = reactionStripHeightOffset(
     reactionSize, bottomPadding: bubbleBottomPadding)
@@ -5725,19 +5826,18 @@ private func bubbleRoundedPath(
   return path
 }
 
-/// Media upload/download ring — Settings avatar spinner style (continuous rotating arc),
-/// with stroke fill tracking real byte progress until send/download finishes.
+/// Circular water-fill transfer control. Byte progress rises from the bottom.
 final class BubbleUploadProgressView: UIView {
   private let fillLayer = CAShapeLayer()
+  private let waterHostLayer = CALayer()
+  private let waterMaskLayer = CAShapeLayer()
+  private let waterFillLayer = CALayer()
   private let trackLayer = CAShapeLayer()
-  /// Hosts the progress arc so rotation is independent of stroke-end fills / path rebuilds.
-  private let spinHostLayer = CALayer()
-  private let progressLayer = CAShapeLayer()
   private let iconView = UIImageView()
-  private let uploadProgressAnimationKey = "media.upload.progress"
-  private let uploadSpinAnimationKey = "media.upload.spin"
-  /// Progress below this is treated as "connecting" (indeterminate arc), not a stuck fill.
+  /// Progress below this is treated as connecting, not a stuck fill.
   private let realProgressThreshold: CGFloat = 0.05
+  private var displayedWater: CGFloat = 0
+  private var laidOutBowl = CGRect.zero
   private var isUploading = false
   private var needsDownload = false
   private var isDownloading = false
@@ -5752,22 +5852,18 @@ final class BubbleUploadProgressView: UIView {
     backgroundColor = .clear
 
     fillLayer.fillColor = UIColor(white: 0.0, alpha: 0.58).cgColor
+    waterFillLayer.backgroundColor = UIColor.white.withAlphaComponent(0.34).cgColor
+    waterFillLayer.anchorPoint = CGPoint(x: 0.5, y: 1.0)
+    waterHostLayer.mask = waterMaskLayer
+    waterHostLayer.addSublayer(waterFillLayer)
 
     trackLayer.fillColor = UIColor.clear.cgColor
-    trackLayer.strokeColor = UIColor(white: 1.0, alpha: 0.22).cgColor
-    trackLayer.lineWidth = 3.2
-
-    progressLayer.fillColor = UIColor.clear.cgColor
-    progressLayer.strokeColor = UIColor.white.cgColor
-    progressLayer.lineWidth = 3.2
-    progressLayer.lineCap = .round
-    progressLayer.strokeStart = 0.08
-    progressLayer.strokeEnd = 0.72
+    trackLayer.strokeColor = UIColor(white: 1.0, alpha: 0.20).cgColor
+    trackLayer.lineWidth = 1.5
 
     layer.addSublayer(fillLayer)
+    layer.addSublayer(waterHostLayer)
     layer.addSublayer(trackLayer)
-    layer.addSublayer(spinHostLayer)
-    spinHostLayer.addSublayer(progressLayer)
 
     iconView.image = UIImage(systemName: "xmark")?.withConfiguration(
       UIImage.SymbolConfiguration(pointSize: 15, weight: .bold))
@@ -5783,15 +5879,7 @@ final class BubbleUploadProgressView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    let radius = max(1.0, (min(bounds.width, bounds.height) - 4.0) * 0.5 - 1.5)
-    let center = CGPoint(x: bounds.midX, y: bounds.midY)
-    let path = UIBezierPath(
-      arcCenter: center, radius: radius, startAngle: -.pi / 2, endAngle: (.pi * 3.0) / 2.0,
-      clockwise: true)
-    trackLayer.frame = bounds
-    spinHostLayer.frame = bounds
-    progressLayer.frame = bounds
-    let fillDiameter = max(1.0, min(bounds.width, bounds.height) - 10.0)
+    let fillDiameter = max(1.0, min(bounds.width, bounds.height) - 6.0)
     let fillFrame = CGRect(
       x: floor((bounds.width - fillDiameter) * 0.5),
       y: floor((bounds.height - fillDiameter) * 0.5),
@@ -5800,18 +5888,19 @@ final class BubbleUploadProgressView: UIView {
     )
     fillLayer.frame = bounds
     fillLayer.path = UIBezierPath(ovalIn: fillFrame).cgPath
-    trackLayer.path = path.cgPath
-    progressLayer.path = path.cgPath
+    waterHostLayer.frame = bounds
+    waterMaskLayer.frame = bounds
+    waterMaskLayer.path = UIBezierPath(ovalIn: fillFrame).cgPath
+    trackLayer.frame = bounds
+    trackLayer.path = UIBezierPath(ovalIn: fillFrame.insetBy(dx: 0.75, dy: 0.75)).cgPath
     iconView.frame = CGRect(
       x: floor((bounds.width - 16.0) * 0.5),
       y: floor((bounds.height - 16.0) * 0.5),
       width: 16.0,
       height: 16.0
     )
-    // Path rebuild must not kill the continuous spin (Settings-style spinner).
-    if isUploading || (needsDownload && isDownloading) {
-      ensureSpinning()
-    }
+    laidOutBowl = fillFrame
+    layoutWaterFill(level: displayedWater)
   }
 
   /// `progress == nil` (or no real bytes yet) renders an indeterminate smooth arc
@@ -5842,8 +5931,6 @@ final class BubbleUploadProgressView: UIView {
     let progressChanged =
       abs((self.uploadProgress ?? -1) - (resolvedProgress ?? -1)) >= 0.002
     if self.isUploading == isUploading, !progressChanged {
-      // Still ensure the arc is spinning — cells reconfigure without progress deltas.
-      if isUploading { ensureSpinning() }
       return
     }
 
@@ -5882,14 +5969,12 @@ final class BubbleUploadProgressView: UIView {
 
     // Ignore idle flicker while still "needs download" during an active transfer.
     if self.isDownloading && !isDownloading && needsDownload {
-      ensureSpinning()
       return
     }
 
     let progressChanged =
       abs((self.downloadProgress ?? -1) - (resolvedProgress ?? -1)) >= 0.002
     if self.needsDownload == needsDownload, self.isDownloading == isDownloading, !progressChanged {
-      if needsDownload && isDownloading { ensureSpinning() }
       return
     }
 
@@ -5910,7 +5995,7 @@ final class BubbleUploadProgressView: UIView {
     iconView.tintColor = .white
     iconView.isHidden = false
 
-    applyRingProgress(uploadProgress)
+    applyWaterProgress(currentWaterProgress(), animated: true)
   }
 
   private func updateDownloadRingVisual() {
@@ -5920,73 +6005,66 @@ final class BubbleUploadProgressView: UIView {
     }
 
     iconView.isHidden = true
-    applyRingProgress(downloadProgress)
+    applyWaterProgress(currentWaterProgress(), animated: true)
   }
 
   private func resetRingVisual() {
-    progressLayer.removeAnimation(forKey: uploadProgressAnimationKey)
-    spinHostLayer.removeAnimation(forKey: uploadSpinAnimationKey)
+    displayedWater = 0
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    progressLayer.strokeStart = 0.08
-    progressLayer.strokeEnd = 0.72
-    spinHostLayer.transform = CATransform3DIdentity
+    layoutWaterFill(level: 0)
     CATransaction.commit()
     iconView.isHidden = true
   }
 
-  /// nil → Settings-style indeterminate arc (trim ~0.08…0.72) spinning continuously.
-  /// value → path fills toward the true fraction; host layer keeps spinning until done.
-  private func applyRingProgress(_ progress: CGFloat?) {
-    let targetStart: CGFloat
-    let targetEnd: CGFloat
-    if let progress {
-      // Determinate fill from top; leave a tiny gap so the arc still reads while spinning.
-      targetStart = 0.0
-      targetEnd = max(0.12, min(0.995, progress))
-    } else {
-      // Match EditProfileDrawingSpinner / Settings avatar upload spinner.
-      targetStart = 0.08
-      targetEnd = 0.72
-    }
-
-    let currentStart = progressLayer.presentation()?.strokeStart ?? progressLayer.strokeStart
-    let currentEnd = progressLayer.presentation()?.strokeEnd ?? progressLayer.strokeEnd
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    progressLayer.strokeStart = targetStart
-    progressLayer.strokeEnd = targetEnd
-    CATransaction.commit()
-
-    if abs(currentStart - targetStart) >= 0.002 || abs(currentEnd - targetEnd) >= 0.002 {
-      let startAnim = CABasicAnimation(keyPath: "strokeStart")
-      startAnim.fromValue = currentStart
-      startAnim.toValue = targetStart
-      let endAnim = CABasicAnimation(keyPath: "strokeEnd")
-      endAnim.fromValue = currentEnd
-      endAnim.toValue = targetEnd
-      let group = CAAnimationGroup()
-      group.animations = [startAnim, endAnim]
-      group.duration = 0.28
-      group.timingFunction = CAMediaTimingFunction(name: .easeOut)
-      group.isRemovedOnCompletion = false
-      group.fillMode = .forwards
-      progressLayer.add(group, forKey: uploadProgressAnimationKey)
-    }
-
-    ensureSpinning()
+  private func currentWaterProgress() -> CGFloat? {
+    if isUploading { return uploadProgress }
+    if needsDownload && isDownloading { return downloadProgress }
+    return nil
   }
 
-  private func ensureSpinning() {
-    guard spinHostLayer.animation(forKey: uploadSpinAnimationKey) == nil else { return }
-    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-    spin.fromValue = 0.0
-    spin.toValue = Double.pi * 2.0
-    spin.duration = 1.0
-    spin.repeatCount = .infinity
-    spin.timingFunction = CAMediaTimingFunction(name: .linear)
-    spin.isRemovedOnCompletion = false
-    spinHostLayer.add(spin, forKey: uploadSpinAnimationKey)
+  private func bowlRect() -> CGRect {
+    let fillDiameter = max(1.0, min(bounds.width, bounds.height) - 6.0)
+    return CGRect(
+      x: floor((bounds.width - fillDiameter) * 0.5),
+      y: floor((bounds.height - fillDiameter) * 0.5),
+      width: fillDiameter,
+      height: fillDiameter
+    )
+  }
+
+  private func layoutWaterFill(level: CGFloat) {
+    let bowl = bowlRect()
+    let clamped = max(0.0, min(1.0, level))
+    waterFillLayer.position = CGPoint(x: bowl.midX, y: bowl.maxY)
+    waterFillLayer.bounds = CGRect(
+      x: 0, y: 0, width: max(1.0, bowl.width), height: max(0.5, bowl.height * clamped))
+  }
+
+  private func applyWaterProgress(_ progress: CGFloat?, animated: Bool, force: Bool = false) {
+    let target: CGFloat
+    if let progress {
+      target = max(0.04, min(1.0, progress))
+    } else if isUploading || (needsDownload && isDownloading) {
+      target = 0.22
+    } else {
+      target = 0
+    }
+    guard force || abs(displayedWater - target) >= 0.008 else { return }
+    displayedWater = target
+    let apply = { self.layoutWaterFill(level: target) }
+    if animated, bounds.width > 8 {
+      CATransaction.begin()
+      CATransaction.setAnimationDuration(0.32)
+      CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+      apply()
+      CATransaction.commit()
+    } else {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      apply()
+      CATransaction.commit()
+    }
   }
 }
 
@@ -7160,6 +7238,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
   /// Latches for the two mediaserverd round trips in `configurePlaybackSession`.
   private var didConfigurePlaybackCategory = false
   private var didActivateAudioSession = false
+  private var audioSessionEpoch = 0
   private var lastNowPlayingSignature: String?
   /// Snapshot fan-out throttle — see `publishSnapshot`.
   private var lastPublishedSemanticSignature: String?
@@ -7332,6 +7411,7 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     }
     if !didActivateAudioSession {
       do {
+        audioSessionEpoch += 1
         try session.setActive(true)
         didActivateAudioSession = true
       } catch {
@@ -9240,15 +9320,16 @@ final class VoiceBubblePlaybackCoordinator: NSObject, AVAudioPlayerDelegate {
     player?.stop()
     player = nil
     cleanupStreamingPlayer()
-    // `setActive(false, .notifyOthersOnDeactivation)` is a synchronous round trip to
-    // mediaserverd and costs several hundred ms on the main thread — measured ~600ms
-    // between the tap log and the resolve log, which is the whole reason a tap felt
-    // like it did nothing before the banner appeared. It is worth paying to hand the
-    // route back on a genuine stop; it is pure waste on the way *into* a track (we
-    // reactivate immediately after) and when nothing was playing at all.
-    if deactivateSession, hadPlaybackEngine {
-      try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    audioSessionEpoch += 1
+    let deactivateEpoch = audioSessionEpoch
+    // mediaserverd XPC; off-main so audioPlayerDidFinishPlaying cannot hang the UI.
+    if deactivateSession, hadPlaybackEngine, didActivateAudioSession {
       didActivateAudioSession = false
+      DispatchQueue.global(qos: .utility).async { [weak self] in
+        guard let self, deactivateEpoch == self.audioSessionEpoch else { return }
+        try? AVAudioSession.sharedInstance().setActive(
+          false, options: [.notifyOthersOnDeactivation])
+      }
     }
     isPlaying = false
     displayLink?.invalidate()
@@ -10185,6 +10266,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// no independent existence, so the two are created together and share one backing.
   private var _mediaPlaceholderBlurView: UIVisualEffectView?
   private var _mediaPlaceholderTintView: UIView?
+  private var _viewOnceShineCover: ChatViewOnceShineCoverView?
   /// The soft material scrim over a still preview while its media transfers.
   ///
   /// Same contract as ``linkPreviewView``: hiding, resetting, zeroing a frame, reading
@@ -10220,6 +10302,42 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // Frames are assigned in `layoutSubviews`, which has not run for this view yet.
     setNeedsLayout()
     return view
+  }
+
+  private var viewOnceShineCover: ChatViewOnceShineCoverView {
+    if let existing = _viewOnceShineCover { return existing }
+    let view = ChatViewOnceShineCoverView()
+    view.isHidden = true
+    mediaContainerView.insertSubview(view, belowSubview: mediaPrimaryIconView)
+    _viewOnceShineCover = view
+    return view
+  }
+
+  private func shouldShowViewOnceShineCover(_ row: ChatListRow) -> Bool {
+    guard row.viewOnce, !isGhostHidden, row.messageType != "file" else { return false }
+    switch row.visualKind {
+    case .media, .video:
+      return true
+    case .videoNote:
+      return !agentTurnState.videoNoteExpanded
+    default:
+      return false
+    }
+  }
+
+  private func refreshViewOnceShineCover() {
+    guard let row, shouldShowViewOnceShineCover(row) else {
+      _viewOnceShineCover?.setActive(false)
+      _viewOnceShineCover?.isHidden = true
+      return
+    }
+    let cover = viewOnceShineCover
+    cover.isHidden = false
+    cover.apply(
+      image: mediaImageView.image,
+      showsFlame: row.visualKind == .videoNote,
+      circular: row.visualKind == .videoNote)
+    cover.setActive(window != nil)
   }
   /// The tint plate inside the scrim. Reaching for it builds the scrim, because it cannot
   /// exist without one.
@@ -10427,6 +10545,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var mediaVideoTimeObserver: Any?
   private var mediaVideoPlayerURLKey: String?
   private var mediaVideoPlaybackActive = false
+  private var mediaVideoHasCompletedOnce = false
+  private var mediaVideoUserPaused = false
+  private var mediaTransferChromeShown = false
   private var mediaVideoReady = false
   private var mediaVideoIsMuted = true
   private var mediaVideoHasAudio = false
@@ -10467,6 +10588,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   var onAgentErrorRetryTap: ((ChatListRow) -> Void)?
   var onAgentAction: (([String: Any]) -> Void)?
   var onReactionHold: ((ChatListRow, String, CGPoint) -> Void)?
+  var onReactionTap: ((ChatListRow, String) -> Void)?
   /// Claim a sender-declared decision action (opaque token).
   var onServiceDecisionAction: ((ChatListRow, ChatServiceAction) -> Void)?
   var onSelectionToggle: ((ChatListRow) -> Void)?
@@ -10635,6 +10757,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       guard let self, let row = self.row else { return }
       self.onReactionHold?(row, emoji, point)
     }
+    reactionStripView.onTap = { [weak self] emoji in
+      guard let self, let row = self.row else { return }
+      self.onReactionTap?(row, emoji)
+    }
     contentView.addSubview(selectionCircleView)
     selectionCircleView.addTarget(self, action: #selector(handleSelectionToggle), for: .touchUpInside)
 
@@ -10666,6 +10792,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaPrimaryIconView.clipsToBounds = true
     mediaPrimaryIconView.backgroundColor = UIColor(white: 0.0, alpha: 0.28)
     mediaPrimaryIconView.layer.cornerCurve = .circular
+    mediaPrimaryIconView.isUserInteractionEnabled = true
+    let playTap = UITapGestureRecognizer(target: self, action: #selector(handleInlineVideoPlayTap))
+    playTap.cancelsTouchesInView = true
+    mediaPrimaryIconView.addGestureRecognizer(playTap)
 
     mediaVoiceButtonView.clipsToBounds = false
     mediaVoiceButtonView.isUserInteractionEnabled = true
@@ -10933,6 +11063,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     updateStickerAnimationPlayback()
     refreshInlineVideoPlaybackIfNeeded()
     updateWallpaperBackdropLayoutIfNeeded()
+    refreshViewOnceShineCover()
   }
 
   func currentMediaImage() -> UIImage? {
@@ -10984,34 +11115,98 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     refreshInlineVideoPlaybackIfNeeded()
   }
 
-  /// Telegram-style video-note expand: the circle itself scales up; ring spins on
-  /// the rim. `mediaContainerView` is the actually-visible circle for a full-bleed
-  /// video note (bubbleView underneath is chrome-hidden) — the meta pill and the
-  /// progress ring are real children of it, so they scale for free with zero
-  /// manual offset math and can never drift out of sync.
+  func lastTouchWasOnVideoPlayControl() -> Bool {
+    guard let point = lastTouchPointInCell,
+      ProcessInfo.processInfo.systemUptime - lastTouchAt < 2.0,
+      !mediaPrimaryIconView.isHidden
+    else { return false }
+    let hit = mediaPrimaryIconView.convert(mediaPrimaryIconView.bounds, to: self)
+      .insetBy(dx: -10.0, dy: -10.0)
+    return hit.contains(point)
+  }
+
+  @objc private func handleInlineVideoPlayTap() {
+    guard let row, row.visualKind == .video || row.visualKind == .videoNote else { return }
+    guard !row.shouldShowUploadOverlay, !mediaIsDownloading else { return }
+    toggleInlineVideoPlayback()
+  }
+
+  func pauseInlineVideoForFullscreen() {
+    mediaVideoUserPaused = true
+    mediaVideoPlayer?.pause()
+    refreshInlineVideoPlayGlyph()
+  }
+
+  func toggleInlineVideoPlayback() {
+    guard row?.visualKind == .video || row?.visualKind == .videoNote else { return }
+    if isInlineVideoPlayingNow() {
+      mediaVideoUserPaused = true
+      mediaVideoPlayer?.pause()
+    } else {
+      mediaVideoUserPaused = false
+      mediaVideoHasCompletedOnce = false
+      mediaVideoPlaybackActive = true
+      if mediaVideoReady, mediaVideoPlayer != nil {
+        mediaVideoPlayer?.play()
+      } else {
+        refreshInlineVideoPlaybackIfNeeded()
+      }
+    }
+    refreshInlineVideoPlayGlyph()
+  }
+
+  private func isInlineVideoPlayingNow() -> Bool {
+    mediaVideoPlayer?.timeControlStatus == .playing
+  }
+
+  private func refreshInlineVideoPlayGlyph() {
+    guard let row, row.visualKind == .video || row.visualKind == .videoNote else { return }
+    if shouldShowViewOnceShineCover(row) {
+      mediaPrimaryIconView.isHidden = true
+      return
+    }
+    if row.shouldShowUploadOverlay || mediaIsDownloading {
+      mediaPrimaryIconView.isHidden = true
+      return
+    }
+    let playing = isInlineVideoPlayingNow() && !mediaVideoUserPaused
+    let symbol = playing ? "pause.fill" : "play.fill"
+    let point: CGFloat = row.visualKind == .videoNote ? 22 : 24
+    mediaPrimaryIconView.image = UIImage(systemName: symbol)?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: point, weight: .bold))
+    mediaPrimaryIconView.isHidden = false
+    mediaPrimaryIconView.tintColor = .white
+    mediaPrimaryIconView.backgroundColor = UIColor.black.withAlphaComponent(playing ? 0.28 : 0.42)
+    mediaPrimaryIconView.isUserInteractionEnabled = true
+    mediaContainerView.bringSubviewToFront(mediaPrimaryIconView)
+  }
+
+  var onVideoNotePlaybackEnded: (() -> Void)?
+  private var videoNoteExpandSessionAt: TimeInterval = 0
+
+  func noteVideoNoteExpandSession() {
+    videoNoteExpandSessionAt = ProcessInfo.processInfo.systemUptime
+  }
+
+  func beginVideoNoteExpandedPlayback() {
+    noteVideoNoteExpandSession()
+    mediaVideoPlaybackActive = true
+    if let player = mediaVideoPlayer {
+      player.seek(to: .zero)
+      player.play()
+    }
+    refreshInlineVideoPlaybackIfNeeded()
+    setVideoNoteExpandedPlayback(true)
+  }
+
   func setVideoNoteExpandedPlayback(_ expanded: Bool) {
     guard row?.visualKind == .videoNote else { return }
-    // Scale must not be clipped by the cell or neighbours.
-    clipsToBounds = false
-    contentView.clipsToBounds = false
-    superview?.bringSubviewToFront(self)
-    let scale: CGFloat = expanded ? 1.24 : 1.0
-    let target = CGAffineTransform(scaleX: scale, y: scale)
     UIView.animate(
-      withDuration: 0.32,
+      withDuration: 0.2,
       delay: 0,
-      usingSpringWithDamping: 0.84,
-      initialSpringVelocity: 0.22,
       options: [.beginFromCurrentState, .allowUserInteraction]
     ) {
-      self.bubbleView.transform = target
-      self.tailView.transform = target
-      self.mediaContainerView.transform = target
       self.mediaPrimaryIconView.alpha = expanded ? 0 : 1
-    } completion: { _ in
-      if !expanded {
-        self.setNeedsLayout()
-      }
     }
     if expanded {
       ensureVideoNoteProgressRing()
@@ -11019,6 +11214,48 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     } else {
       stopVideoNoteProgressRing()
     }
+  }
+
+  private var videoNoteScaleInFlight = false
+
+  func prepareVideoNoteScale(from fromSide: CGFloat, to toSide: CGFloat) {
+    guard row?.visualKind == .videoNote else { return }
+    let view = mediaContainerView
+    let s = max(0.01, fromSide / max(1.0, toSide))
+    videoNoteScaleInFlight = true
+    clipsToBounds = false
+    contentView.clipsToBounds = false
+    superview?.bringSubviewToFront(self)
+    setVideoNoteScaleAnchor(CGPoint(x: 0.5, y: 1.0), on: view)
+    view.transform = CGAffineTransform(scaleX: s, y: s)
+  }
+
+  func settleVideoNoteScale() {
+    mediaContainerView.transform = .identity
+  }
+
+  func endVideoNoteScale() {
+    let view = mediaContainerView
+    view.transform = .identity
+    setVideoNoteScaleAnchor(CGPoint(x: 0.5, y: 0.5), on: view)
+    videoNoteScaleInFlight = false
+  }
+
+  private func setVideoNoteScaleAnchor(_ point: CGPoint, on view: UIView) {
+    let bounds = view.bounds
+    var newPoint = CGPoint(x: bounds.width * point.x, y: bounds.height * point.y)
+    var oldPoint = CGPoint(
+      x: bounds.width * view.layer.anchorPoint.x,
+      y: bounds.height * view.layer.anchorPoint.y)
+    newPoint = newPoint.applying(view.transform)
+    oldPoint = oldPoint.applying(view.transform)
+    var position = view.layer.position
+    position.x -= oldPoint.x
+    position.x += newPoint.x
+    position.y -= oldPoint.y
+    position.y += newPoint.y
+    view.layer.position = position
+    view.layer.anchorPoint = point
   }
 
   private var videoNoteProgressRing: CAShapeLayer?
@@ -11029,7 +11266,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     let ring = CAShapeLayer()
     ring.fillColor = UIColor.clear.cgColor
     ring.strokeColor = UIColor.white.withAlphaComponent(0.95).cgColor
-    ring.lineWidth = 3.5
+    ring.lineWidth = 2.0
     ring.lineCap = .round
     ring.strokeEnd = 0
     // On the visible media circle (not bubbleView, which is chrome-hidden and
@@ -11609,16 +11846,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let resolveTextColor = row.isMe ? appearance.textColorMe : appearance.textColorThem
       let displayText = bubbleDisplayAttributedString(
         for: row, font: messageFont, textColor: resolveTextColor)
-      // Telegram places an RTL body at the LEADING edge of the plate with the meta row
-      // trailing beneath it — measured off the reference screenshot: the text starts near
-      // the bubble's left inset while the ✓ sits at the right. Right-aligning the body
-      // (and mirroring the meta to the left) produced the opposite of that, which read as
-      // "the order is wrong". Writing direction stays RTL; only the paragraph alignment
-      // is leading, so mixed content still shapes correctly.
-      // Absolute .left, not .natural: the label below is forced RTL, and .natural under
-      // forceRightToLeft resolves back to the right — the change would be a no-op.
+      // Keep RTL glyph shaping, but place the body at the plate's left inset.
+      // Absolute .left avoids .natural resolving right under forceRightToLeft.
       let rtlBody = isRTL(displayText.string)
-      messageLabel.textAlignment = rtlBody ? .right : .natural
+      messageLabel.textAlignment = rtlBody ? .left : .natural
       messageLabel.semanticContentAttribute = rtlBody ? .forceRightToLeft : .unspecified
       if messageLabel.isHidden {
         messageLabel.resetStreamingState()
@@ -11743,24 +11974,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         row.isMe
         ? appearance.textColorMe
         : (row.isAgentMessage ? appearance.textColorThem : appearance.textColorThem)
-      // Video-note meta now overlays the video itself (Telegram-style pill), so it
-      // must stay legible against arbitrary footage — always light, on a dark
-      // translucent capsule — rather than the bubble-adaptive color used elsewhere.
-      let metaColor =
-        row.visualKind == .videoNote
-        ? UIColor(white: 1.0, alpha: 0.92)
-        : resolvedMetaColor(for: textColor)
+      let metaColor = resolvedMetaColor(for: textColor)
       messageLabel.textColor = textColor
       editedLabel.textColor = metaColor
       pinnedLabel.textColor = metaColor
       viewIconView.tintColor = metaColor
       viewCountLabel.textColor = metaColor
       timestampLabel.textColor = metaColor
-      if row.visualKind == .videoNote {
-        metaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.38)
-      } else {
-        metaContainerView.backgroundColor = .clear
-      }
+      metaContainerView.backgroundColor = .clear
       configureMediaPresentation(
         for: row,
         textColor: textColor,
@@ -11851,6 +12072,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     onAgentErrorRetryTap = nil
     onAgentAction = nil
     onSelectionToggle = nil
+    onVideoNotePlaybackEnded = nil
     row = nil
     selectionMode = false
     isSelectionChecked = false
@@ -11874,6 +12096,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     isGhostHidden = false
     mediaProgressSpinner.stopAnimating()
     mediaProgressOverlayView.isHidden = true
+    mediaProgressOverlayView.alpha = 1
+    mediaProgressOverlayView.transform = .identity
+    mediaTransferChromeShown = false
+    mediaVideoHasCompletedOnce = false
+    mediaVideoUserPaused = false
     mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
     mediaProgressRingView.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
     mediaProgressSizeLabel.isHidden = true
@@ -11936,6 +12163,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     renderedStatusGlyph = nil
     isContextMenuExtracted = false
     isContextMenuHeld = false
+    if videoNoteScaleInFlight {
+      endVideoNoteScale()
+    }
     hasSavedExtractionState = false
     mediaImageTask?.cancel()
     mediaImageTask = nil
@@ -11948,6 +12178,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     tailView.transform = .identity
     metaContainerView.transform = .identity
     setMediaPlaceholderHidden(true)
+    _viewOnceShineCover?.setActive(false)
+    _viewOnceShineCover?.isHidden = true
     lastReactionDebugSignature = nil
     applyContextMenuExtractionIfNeeded()
     applyContextMenuHoldIfNeeded(animated: false, strategy: "scaleCell")
@@ -12106,9 +12338,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       1.0, bounds.height - inBubbleNameReserve - topAir - outerReserve)
     let isTallHeightMorphing =
       metrics.tallToggleVisible && abs(availableBubbleHeight - metrics.bubbleHeight) > 1.0
+    let isVideoNoteScaling =
+      row.visualKind == .videoNote && abs(availableBubbleHeight - metrics.bubbleHeight) > 1.0
     // Always clamp to the slot under chrome so a short cell never lets body text
     // run into the forward header or the next row.
     let bubbleHeight: CGFloat = {
+      if isVideoNoteScaling { return metrics.bubbleHeight }
       let raw = isTallHeightMorphing ? availableBubbleHeight : metrics.bubbleHeight
       return min(raw, availableBubbleHeight)
     }()
@@ -12130,7 +12365,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // never paint outside the plate. Reporting it would only add a redundant reload to
     // the row whose cell must survive in place.
     let slotGeometryIsStable =
-      !isTallHeightMorphing && !metrics.tallToggleVisible && !row.isStreamingText
+      !isTallHeightMorphing && !isVideoNoteScaling && !metrics.tallToggleVisible
+      && !row.isStreamingText
       && !isContextMenuExtracted && !isContextMenuHeld && superview != nil
     let slotIsTooShort = slotSlack < -0.5 && slotGeometryIsStable
     // Asymmetric threshold: a short slot is a hard defect at any size (text lands outside
@@ -12140,8 +12376,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if slotIsTooShort || slotIsTooTall {
       onSlotHeightMismatch?(row.key, slotSlack)
     }
+    let videoNoteExpandedCentered =
+      row.visualKind == .videoNote && agentTurnState.videoNoteExpanded
     let bubbleX: CGFloat
-    if metrics.agentTurnCentered {
+    if videoNoteExpandedCentered {
+      bubbleX = max(bubbleSideMargin, (layoutWidth - bubbleWidth) / 2.0)
+    } else if metrics.agentTurnCentered {
       // Compact "thinking" pill: center it in the row instead of pinning to the leading
       // edge, so the tiny loader reads as a centered indicator rather than a marooned
       // scrap in a full-width shell. Selection inset only shifts non-me rows.
@@ -12203,7 +12443,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // cell. Soft fade mask on the body communicates "more below" (not a hard cut).
     // Forwarded / named rows also clip so chrome↔body seams never bleed into neighbours
     // when a reopen uses a slightly-short seed height for one frame.
-    if metrics.tallToggleVisible || inBubbleNameReserve > 0.5 || slotIsTooShort {
+    if isVideoNoteScaling || videoNoteScaleInFlight {
+      clipsToBounds = false
+      contentView.clipsToBounds = false
+    } else if metrics.tallToggleVisible || inBubbleNameReserve > 0.5 || slotIsTooShort {
       clipsToBounds = true
       contentView.clipsToBounds = true
     } else {
@@ -12314,7 +12557,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       replyPreviewView.frame = .zero
       _linkPreviewView?.frame = .zero
       let mediaFrame: CGRect
-      if isFullBleed {
+      if isFullBleed, row.visualKind == .videoNote {
+        let metaBlock = metaTopSpacing + bubbleMetaHeight
+        let side = min(
+          bubbleFrame.width,
+          metrics.mediaHeight,
+          max(1.0, bubbleFrame.height - metaBlock))
+        let x = row.isMe ? bubbleFrame.maxX - side : bubbleFrame.minX
+        mediaFrame = pixelAlignedRect(
+          CGRect(x: x, y: bubbleFrame.minY, width: side, height: side))
+      } else if isFullBleed {
         mediaFrame = pixelAlignedRect(bubbleFrame.insetBy(dx: -0.6, dy: -0.6))
       } else if isTransparentSticker {
         let mediaX = row.isMe ? (bubbleFrame.maxX - metrics.contentWidth) : bubbleFrame.minX
@@ -12377,22 +12629,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       let metaX: CGFloat
       let metaY: CGFloat
       if row.visualKind == .videoNote {
-        // Telegram-authentic: time + ✓ sit as a translucent pill INSIDE the circle,
-        // bottom-right, overlapping the video. metaContainerView is a real child of
-        // mediaContainerView (the actually-visible circle) so it inherits its scale
-        // transform for free during expand-on-play — no manual offset math, so it
-        // physically cannot drift out of sync with the circle.
-        if metaContainerView.superview !== mediaContainerView {
-          mediaContainerView.addSubview(metaContainerView)
-        } else {
-          mediaContainerView.bringSubviewToFront(metaContainerView)
+        // Telegram: time + ✓ sit on the wallpaper UNDER the circle, bottom-right — the
+        // circular clip cuts anything parented inside it.
+        if metaContainerView.superview !== contentView {
+          contentView.addSubview(metaContainerView)
         }
-        // Inset along the diagonal (not the bounding-box corner) so the pill stays
-        // fully inside the circular mask instead of being clipped by it.
-        let diameter = min(mediaContainerView.bounds.width, mediaContainerView.bounds.height)
-        let cornerInset = diameter * 0.5 * (1.0 - 0.7071) + 3.0
-        metaY = mediaContainerView.bounds.height - bubbleMetaHeight - cornerInset
-        metaX = mediaContainerView.bounds.width - metrics.metaWidth - cornerInset
+        metaContainerView.layer.cornerRadius = 0
+        metaX = mediaFrame.maxX - metrics.metaWidth - 6.0
+        metaY = mediaFrame.maxY + metaTopSpacing
       } else {
         if metaContainerView.superview !== contentView {
           contentView.addSubview(metaContainerView)
@@ -12423,9 +12667,6 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           width: metrics.metaWidth,
           height: bubbleMetaHeight
         ))
-      if row.visualKind == .videoNote {
-        metaContainerView.layer.cornerRadius = metaContainerView.bounds.height * 0.5
-      }
 
       mediaProgressOverlayView.frame = mediaContainerView.bounds
       mediaImageView.frame = mediaContainerView.bounds
@@ -12669,9 +12910,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           _linkPreviewView?.frame = .zero
         }
 
-        let metaTop = metrics.hasLinkPreview
-          ? (_linkPreviewView?.frame.maxY ?? textBottom) + bubbleMetaTopSpacing
-          : textBottom + bubbleMetaTopSpacing
+        let ridesReactionRow = !row.reactions.isEmpty && !metrics.hasLinkPreview
+        let metaTop: CGFloat
+        if ridesReactionRow {
+          metaTop =
+            bubbleFrame.maxY - reactionStripBottomInset - reactionChipHeight / 2.0
+            - bubbleMetaHeight / 2.0
+        } else if metrics.hasLinkPreview {
+          metaTop = (_linkPreviewView?.frame.maxY ?? textBottom) + bubbleMetaTopSpacing
+        } else {
+          metaTop = textBottom + bubbleMetaTopSpacing
+        }
         // Meta (time / sent) is ALWAYS trailing — RTL included. Telegram keeps the ✓ at
         // the bubble's right edge and leads the body instead; mirroring the meta to the
         // left put the two rows on opposite edges and looked misordered.
@@ -12711,10 +12960,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             width: metrics.messageWidth,
             height: metrics.textHeight
           ))
+        // With a reaction strip the plate grew by its height: keep the meta on the strip
+        // row (Telegram) instead of the plate bottom, where the two collided.
+        let metaBottomY =
+          row.reactions.isEmpty
+          ? bubbleFrame.maxY - 5.0 - bubbleMetaHeight
+          : bubbleFrame.maxY - reactionStripBottomInset - reactionChipHeight / 2.0
+            - bubbleMetaHeight / 2.0
         metaContainerView.frame = pixelAlignedRect(
           CGRect(
             x: bubbleFrame.maxX - 8.0 - metrics.metaWidth,
-            y: bubbleFrame.maxY - 5.0 - bubbleMetaHeight,
+            y: metaBottomY,
             width: metrics.metaWidth,
             height: bubbleMetaHeight
           ))
@@ -12740,7 +12996,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
     }
 
-    let reactionFrame = pixelAlignedRect(reactionBadgeFrame(in: bubbleFrame))
+    let metaRidesReactionRow =
+      !row.reactions.isEmpty && !metrics.hasInlineAttachment
+      && !metrics.isMediaLayout && !metrics.hasLinkPreview
+    let reactionFrame = pixelAlignedRect(
+      reactionBadgeFrame(
+        in: bubbleFrame,
+        trailingReserve: metaRidesReactionRow
+          ? metrics.metaWidth + bubbleMetaInlineSpacing : 0.0))
     reactionStripView.frame = reactionFrame
 
     // Glyph box is 22pt (the touch target is grown separately below); it centres on the
@@ -13318,11 +13581,31 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         queue: .main
       ) { [weak self] _ in
         guard let self, let player = self.mediaVideoPlayer else { return }
-        self.inlineVideoLog("player loop url=\(playbackKey)")
-        self.mediaVideoCurrentTime = 0.0
-        self.updateInlineVideoTimeBadge()
+        if self.row?.visualKind == .videoNote, self.agentTurnState.videoNoteExpanded {
+          let elapsed = ProcessInfo.processInfo.systemUptime - self.videoNoteExpandSessionAt
+          if elapsed < 0.5 {
+            player.seek(to: .zero)
+            player.play()
+            return
+          }
+          player.pause()
+          player.seek(to: .zero)
+          self.mediaVideoCurrentTime = 0.0
+          self.mediaVideoHasCompletedOnce = true
+          self.mediaVideoUserPaused = true
+          self.updateInlineVideoTimeBadge()
+          self.refreshInlineVideoPlayGlyph()
+          self.onVideoNotePlaybackEnded?()
+          return
+        }
+        self.inlineVideoLog("player ended once url=\(playbackKey)")
+        player.pause()
         player.seek(to: .zero)
-        player.play()
+        self.mediaVideoCurrentTime = 0.0
+        self.mediaVideoHasCompletedOnce = true
+        self.mediaVideoUserPaused = true
+        self.updateInlineVideoTimeBadge()
+        self.refreshInlineVideoPlayGlyph()
       }
       mediaVideoStatusObserver = playerItem.observe(\.status, options: [.initial, .new]) {
         [weak self] item, _ in
@@ -13339,8 +13622,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             self.mediaVideoPlayer?.isMuted = self.mediaVideoIsMuted || !self.mediaVideoHasAudio
             self._mediaVideoPlayerLayer?.opacity = 1.0
             self.mediaVideoPlayerHostView.isHidden = false
-            self.mediaVideoPlayer?.play()
+            if self.mediaVideoHasCompletedOnce || self.mediaVideoUserPaused {
+              self.mediaVideoPlayer?.pause()
+            } else {
+              self.mediaVideoPlayer?.play()
+            }
             self.updateInlineVideoTimeBadge()
+            self.refreshInlineVideoPlayGlyph()
             self.inlineVideoLog(
               "player ready url=\(playbackKey) hasAudio=\(self.mediaVideoHasAudio ? "Y" : "N") muted=\(self.mediaVideoPlayer?.isMuted == true ? "Y" : "N") duration=\(CMTimeGetSeconds(item.duration))"
             )
@@ -13368,11 +13656,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if mediaVideoReady {
       mediaVideoPlayerHostView.isHidden = false
       _mediaVideoPlayerLayer?.opacity = 1.0
-      mediaVideoPlayer?.play()
+      if mediaVideoHasCompletedOnce || mediaVideoUserPaused {
+        mediaVideoPlayer?.pause()
+      } else {
+        mediaVideoPlayer?.play()
+      }
       inlineVideoLog(
         "player play url=\(playbackKey) timeControl=\(mediaVideoPlayer?.timeControlStatus.rawValue ?? -1)"
       )
     }
+    refreshInlineVideoPlayGlyph()
     updateInlineVideoAudioIcon()
     updateMediaPlaceholderVisibility()
   }
@@ -13609,9 +13902,50 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
   }
 
+  private func setMediaTransferOverlayVisible(_ visible: Bool) {
+    if visible {
+      if mediaTransferChromeShown {
+        mediaProgressOverlayView.isHidden = false
+        mediaProgressOverlayView.isUserInteractionEnabled = true
+        mediaProgressOverlayView.alpha = 1
+        return
+      }
+      mediaTransferChromeShown = true
+      mediaProgressOverlayView.isHidden = false
+      mediaProgressOverlayView.isUserInteractionEnabled = true
+      mediaProgressOverlayView.alpha = 0
+      mediaProgressOverlayView.transform = .identity
+      UIView.animate(
+        withDuration: 0.28, delay: 0,
+        options: [.curveEaseOut, .beginFromCurrentState, .allowUserInteraction]
+      ) {
+        self.mediaProgressOverlayView.alpha = 1
+      }
+    } else if mediaTransferChromeShown {
+      mediaTransferChromeShown = false
+      mediaProgressOverlayView.isUserInteractionEnabled = false
+      UIView.animate(
+        withDuration: 0.20, delay: 0, options: [.curveEaseIn, .beginFromCurrentState]
+      ) {
+        self.mediaProgressOverlayView.alpha = 0
+      } completion: { _ in
+        if !self.mediaTransferChromeShown {
+          self.mediaProgressOverlayView.isHidden = true
+          self.mediaProgressOverlayView.alpha = 1
+        }
+      }
+    } else {
+      mediaProgressOverlayView.isHidden = true
+      mediaProgressOverlayView.isUserInteractionEnabled = false
+      mediaProgressOverlayView.alpha = 1
+      mediaProgressOverlayView.transform = .identity
+    }
+  }
+
   private func updateMediaTransferChrome(for row: ChatListRow) {
     let hidesLocalGifTransfer = row.isMe && row.messageType == "gif"
     if hidesLocalGifTransfer {
+      mediaTransferChromeShown = false
       mediaProgressOverlayView.isHidden = true
       mediaProgressRingView.isHidden = true
       mediaProgressRingView.setUploadState(isUploading: false, progress: nil)
@@ -13626,9 +13960,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     let hasActiveTransfer = row.shouldShowUploadOverlay || mediaIsDownloading
     mediaProgressOverlayView.backgroundColor = .clear
-    mediaProgressOverlayView.isHidden = !hasActiveTransfer
     mediaProgressRingView.isHidden = !hasActiveTransfer
     mediaProgressSpinner.stopAnimating()
+    mediaProgressSpinner.isHidden = true
+    setMediaTransferOverlayVisible(hasActiveTransfer)
 
     if row.shouldShowUploadOverlay {
       // Only real byte progress counts — until the first upload callback the ring is an
@@ -13684,6 +14019,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressSizeLabel.isHidden = true
     }
 
+    if row.visualKind == .videoNote {
+      // Circular note: a centred spinner only, never a byte counter.
+      mediaProgressSizeLabel.isHidden = true
+      mediaProgressSizeLabel.text = nil
+    }
+
     let shouldShowPrimaryIcon: Bool = {
       switch row.visualKind {
       case .video, .videoNote:
@@ -13696,7 +14037,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         return false
       }
     }()
-    mediaPrimaryIconView.isHidden = row.shouldShowUploadOverlay || mediaIsDownloading || !shouldShowPrimaryIcon
+    if row.visualKind == .video || row.visualKind == .videoNote {
+      refreshInlineVideoPlayGlyph()
+    } else {
+      mediaPrimaryIconView.isHidden =
+        row.shouldShowUploadOverlay || mediaIsDownloading || !shouldShowPrimaryIcon
+    }
 
     if row.visualKind == .video || row.visualKind == .videoNote {
       mediaVideoInfoBadgeView.isHidden = hasActiveTransfer
@@ -14004,11 +14350,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     case .video:
       mediaImageView.isHidden = false
-      mediaPrimaryIconView.isHidden = false
-      mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 24, weight: .bold))
-      mediaPrimaryIconView.tintColor = contrastingMediaForeground(for: appearance.accent)
-      mediaPrimaryIconView.backgroundColor = appearance.accent.withAlphaComponent(0.90)
+      refreshInlineVideoPlayGlyph()
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.35)
       mediaBorderLayer.lineWidth = 1.0
       mediaBorderLayer.strokeColor =
@@ -14018,14 +14360,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     case .videoNote:
       mediaImageView.isHidden = false
       // Soft center play only when not already playing inline (Telegram circle).
-      let playingInline =
-        !mediaVideoPlayerHostView.isHidden && mediaVideoReady
-        && _mediaVideoPlayerLayer?.player != nil
-      mediaPrimaryIconView.isHidden = playingInline
-      mediaPrimaryIconView.image = UIImage(systemName: "play.fill")?.withConfiguration(
-        UIImage.SymbolConfiguration(pointSize: 22, weight: .bold))
-      mediaPrimaryIconView.tintColor = .white
-      mediaPrimaryIconView.backgroundColor = UIColor.black.withAlphaComponent(0.42)
+      refreshInlineVideoPlayGlyph()
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.4)
       mediaBorderLayer.lineWidth = 0.0
       mediaBorderLayer.strokeColor = nil
@@ -14127,6 +14462,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // network hasn't finished; thumb paints first).
     if row.visualKind == .media, chatMediaGridImageCount(row) <= 1,
       mediaPixelQuality.rawValue < ChatMediaPreviewQuality.full.rawValue,
+      chatOnDiskMediaFileURL(for: row) == nil,
       !row.agentBridgeAttachmentsEnc.isEmpty
         || !row.attachmentThumbnailsB64.isEmpty
         || (row.thumbnailBase64?.isEmpty == false)
@@ -14220,6 +14556,30 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       || row.visualKind == .video || row.visualKind == .videoNote
     if forceImageLoad {
       mediaImageView.isHidden = false
+    }
+    if forceImageLoad,
+      mediaPixelQuality.rawValue < ChatMediaPreviewQuality.full.rawValue,
+      let diskURL = chatOnDiskMediaFileURL(for: row)
+    {
+      let shouldAnimate = chatMediaShouldAnimate(
+        urlString: diskURL.absoluteString, messageType: row.messageType)
+      if let image = chatMediaLoadImageFromFile(at: diskURL.path, shouldAnimate: shouldAnimate) {
+        chatMediaImageCache.setObject(
+          image, forKey: chatMediaCacheKey(diskURL.absoluteString, mediaKey: nil) as NSString)
+        if let remote = row.mediaUrl {
+          chatMediaImageCache.setObject(
+            image, forKey: chatMediaCacheKey(remote, mediaKey: row.mediaKey) as NSString)
+        }
+        applyResolvedMediaPreviewImage(
+          image, for: row, mediaURL: row.mediaUrl ?? diskURL.absoluteString)
+        mediaPrimaryIconView.isHidden = true
+        preferredLocalMediaURL = diskURL.absoluteString
+      } else {
+        ChatMediaWatchdog.once(
+          key: "disk-unreadable:\(row.messageId ?? row.key)",
+          "disk-unreadable msgId=\(row.messageId ?? row.key) path=\(diskURL.path) remote=\(row.mediaUrl ?? "-")"
+        )
+      }
     }
     // PDF pixels come only from PDFKit's page renderer in ChatListView. Keeping this
     // branch closed is the invariant that prevents a document from reaching UIImage
@@ -14564,6 +14924,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         (row.mediaUrl?.isEmpty == false) ? "Y" : "N")
     }
     updateStickerAnimationPlayback()
+    refreshViewOnceShineCover()
   }
 
   private func reportNaturalMediaSizeIfNeeded(
@@ -14638,6 +14999,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       tailView.setImage(image)
       tailView.isHidden = isGhostHidden || !row.shape.showTail
     }
+    refreshViewOnceShineCover()
   }
 
   private func layoutMediaSubviews(for row: ChatListRow, in bounds: CGRect) {
@@ -14700,6 +15062,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if let scrim = _mediaPlaceholderBlurView {
       scrim.frame = mediaContainerView.bounds
       _mediaPlaceholderTintView?.frame = scrim.contentView.bounds
+    }
+    if let cover = _viewOnceShineCover {
+      cover.frame = mediaContainerView.bounds
+      if !cover.isHidden {
+        mediaContainerView.insertSubview(cover, belowSubview: mediaPrimaryIconView)
+      }
     }
     mediaVideoPlayerHostView.frame = mediaContainerView.bounds
     _mediaVideoPlayerLayer?.frame = mediaVideoPlayerHostView.bounds
@@ -14846,64 +15214,74 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         height: btnSize
       )
       mediaPrimaryIconView.layer.cornerRadius = btnSize * 0.5
+      mediaContainerView.bringSubviewToFront(mediaPrimaryIconView)
 
       if row.visualKind == .videoNote {
-        // Match Telegram reference:
-        //  - duration bottom-left under/inside the circle rim
-        //  - mute centered on the bottom of the circle
-        //  - time + ✓ outside to the RIGHT (meta frame)
-        let badgeHeight: CGFloat = 18.0
-        let badgeInset: CGFloat = 14.0
-        let muteSize: CGFloat = 18.0
-        let badgeText = mediaDurationBadge.text ?? ""
-        let textWidth = measuredTextWidth(badgeText, font: mediaDurationBadge.font)
-
-        // Duration alone bottom-left (white, soft shadow — no clipped pill).
-        mediaVideoInfoBadgeView.backgroundColor = .clear
-        mediaVideoInfoBadgeView.layer.cornerRadius = 0
-        mediaVideoInfoBadgeView.clipsToBounds = false
-        mediaVideoInfoBadgeView.isHidden = false
-        mediaVideoInfoBadgeView.frame = CGRect(
-          x: badgeInset,
-          y: height - badgeHeight - badgeInset,
-          width: max(28.0, textWidth + 4.0),
-          height: badgeHeight
-        )
-        mediaVideoTimeIconView.frame = .zero
-        mediaDurationBadge.textColor = .white
-        mediaDurationBadge.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        mediaDurationBadge.layer.shadowColor = UIColor.black.cgColor
-        mediaDurationBadge.layer.shadowOpacity = 0.65
-        mediaDurationBadge.layer.shadowRadius = 2.0
-        mediaDurationBadge.layer.shadowOffset = .zero
-        mediaDurationBadge.frame = mediaVideoInfoBadgeView.bounds
-        mediaDurationBadge.textAlignment = .left
-
-        // Mute disc bottom-center of the circle.
+        // Only the mute pill rides the circle; the duration capsule sits on the wallpaper
+        // under the note, level with the time, since the circular clip cuts anything else.
+        let mutePillHeight: CGFloat = 20.0
+        let mutePillWidth: CGFloat = 30.0
         if mediaVideoAudioIconView.superview !== mediaContainerView {
           mediaContainerView.addSubview(mediaVideoAudioIconView)
         }
-        mediaVideoAudioIconView.isHidden = false
-        mediaVideoAudioIconView.backgroundColor = UIColor.black.withAlphaComponent(0.40)
-        mediaVideoAudioIconView.layer.cornerRadius = muteSize * 0.5
+        mediaVideoAudioIconView.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        mediaVideoAudioIconView.layer.cornerRadius = mutePillHeight * 0.5
+        mediaVideoAudioIconView.layer.cornerCurve = .continuous
         mediaVideoAudioIconView.clipsToBounds = true
         mediaVideoAudioIconView.tintColor = .white
-        mediaVideoAudioIconView.contentMode = .scaleAspectFit
-        mediaVideoAudioIconView.frame = CGRect(
-          x: floor((width - muteSize) * 0.5),
-          y: height - muteSize - badgeInset,
-          width: muteSize,
-          height: muteSize
-        )
-        mediaContainerView.bringSubviewToFront(mediaVideoInfoBadgeView)
+        mediaVideoAudioIconView.contentMode = .center
+        mediaVideoAudioIconView.frame =
+          mediaVideoAudioIconView.isHidden
+          ? .zero
+          : CGRect(
+            x: floor((width - mutePillWidth) * 0.5),
+            y: floor(height * 0.9 - mutePillHeight * 0.5),
+            width: mutePillWidth,
+            height: mutePillHeight)
+        mediaVideoTimeIconView.frame = .zero
         mediaContainerView.bringSubviewToFront(mediaVideoAudioIconView)
+
+        if mediaVideoInfoBadgeView.superview !== contentView {
+          contentView.addSubview(mediaVideoInfoBadgeView)
+        }
+        let noteFrame = mediaContainerView.frame
+        let metaLine = metaContainerView.frame
+        let badgeHeight = metaLine.height > 1.0 ? metaLine.height : bubbleMetaHeight
+        let badgeY = metaLine.height > 1.0 ? metaLine.minY : noteFrame.maxY + 4.0
+        mediaDurationBadge.textColor = timestampLabel.textColor
+        mediaDurationBadge.font = .systemFont(ofSize: 11, weight: .semibold)
+        mediaDurationBadge.layer.shadowOpacity = 0.0
+        mediaDurationBadge.textAlignment = .left
+        let textWidth = measuredTextWidth(
+          mediaDurationBadge.text ?? "", font: mediaDurationBadge.font)
+        let badgeWidth = max(24.0, ceil(textWidth) + 2.0)
+        mediaVideoInfoBadgeView.backgroundColor = .clear
+        mediaVideoInfoBadgeView.layer.cornerRadius = 0.0
+        mediaVideoInfoBadgeView.clipsToBounds = false
+        mediaVideoInfoBadgeView.frame = CGRect(
+          x: noteFrame.minX + 4.0,
+          y: badgeY,
+          width: badgeWidth,
+          height: badgeHeight
+        )
+        mediaDurationBadge.frame = CGRect(
+          x: 0.0, y: 0.0, width: badgeWidth, height: badgeHeight)
       } else if !mediaVideoInfoBadgeView.isHidden && !mediaDurationBadge.isHidden {
         // Regular video: duration + mute share a top-leading pill.
+        if mediaVideoInfoBadgeView.superview !== mediaContainerView {
+          mediaContainerView.addSubview(mediaVideoInfoBadgeView)
+        }
         if mediaVideoAudioIconView.superview !== mediaVideoInfoBadgeView {
           mediaVideoInfoBadgeView.addSubview(mediaVideoAudioIconView)
         }
+        mediaVideoInfoBadgeView.backgroundColor = UIColor(white: 0.0, alpha: 0.56)
+        mediaVideoInfoBadgeView.layer.cornerRadius = 11.0
+        mediaVideoInfoBadgeView.clipsToBounds = true
+        mediaDurationBadge.textColor = .white
         mediaVideoAudioIconView.backgroundColor = .clear
         mediaVideoAudioIconView.layer.cornerRadius = 0
+        mediaVideoAudioIconView.clipsToBounds = false
+        mediaVideoAudioIconView.contentMode = .scaleAspectFit
         let badgeText = mediaDurationBadge.text ?? ""
         let badgeHeight: CGFloat = 22.0
         let badgeInsetX: CGFloat = 8.0
@@ -14980,72 +15358,32 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressSizeLabel.isHidden = true
       mediaProgressSizeLabel.frame = .zero
     } else if !mediaProgressOverlayView.isHidden {
-      let isUploading = row.shouldShowUploadOverlay
-
-      if isUploading {
-        let ringSize: CGFloat = 44.0
-        let overlayWidth = width
-        let overlayHeight = height
-        mediaProgressOverlayView.frame = CGRect(x: 0, y: 0, width: overlayWidth, height: overlayHeight)
-
-        let ringX = floor((width - ringSize) * 0.5)
-        let ringY = floor((height - ringSize) * 0.5)
-        mediaProgressRingView.frame = CGRect(x: ringX, y: ringY, width: ringSize, height: ringSize)
-        mediaProgressSpinner.center = CGPoint(x: width * 0.5, y: height * 0.5)
-
-        // Size/progress badge sits top-left (like the video duration badge); the
-        // spinner alone owns the center.
-        if !mediaProgressSizeLabel.isHidden {
-          let labelText = mediaProgressSizeLabel.text ?? ""
-          let labelHeight: CGFloat = 20.0
-          let labelWidth = measuredTextWidth(labelText, font: mediaProgressSizeLabel.font) + 8.0
-          mediaProgressSizeLabel.frame = CGRect(
-             x: 8.0,
-             y: 8.0,
-             width: labelWidth,
-             height: labelHeight
-          )
-        }
-      } else {
-        let badgeInsetX: CGFloat = row.visualKind == .videoNote ? 10.0 : 8.0
-        let badgeInsetY: CGFloat = row.visualKind == .videoNote ? 10.0 : 8.0
-        let ringSize: CGFloat = 18.0
-        let ringY = 0.0
-        let labelHeight: CGFloat = 20.0
-        let labelWidth: CGFloat
-        if !mediaProgressSizeLabel.isHidden {
-          let labelText = mediaProgressSizeLabel.text ?? ""
-          labelWidth = min(
-            max(0.0, width - badgeInsetX - ringSize - 12.0),
-            measuredTextWidth(labelText, font: mediaProgressSizeLabel.font) + 8.0
-          )
-        } else {
-          labelWidth = 0.0
-        }
-        let overlayHeight = max(ringSize, labelHeight)
-        let overlayWidth = ringSize + (labelWidth > 0.0 ? (6.0 + labelWidth) : 0.0)
-        mediaProgressOverlayView.frame = CGRect(
-          x: badgeInsetX,
-          y: badgeInsetY,
-          width: overlayWidth,
-          height: overlayHeight
+      let ringSize: CGFloat = row.visualKind == .videoNote ? 48.0 : 52.0
+      let labelHeight: CGFloat = mediaProgressSizeLabel.isHidden ? 0.0 : 20.0
+      let labelGap: CGFloat = mediaProgressSizeLabel.isHidden ? 0.0 : 8.0
+      mediaProgressOverlayView.frame = CGRect(x: 0, y: 0, width: width, height: height)
+      let clusterHeight = ringSize + labelGap + labelHeight
+      let clusterY = floor((height - clusterHeight) * 0.5)
+      let ringX = floor((width - ringSize) * 0.5)
+      mediaProgressRingView.frame = CGRect(
+        x: ringX, y: clusterY, width: ringSize, height: ringSize)
+      mediaProgressSpinner.isHidden = true
+      if !mediaProgressSizeLabel.isHidden {
+        let labelText = mediaProgressSizeLabel.text ?? ""
+        let labelWidth = min(
+          max(44.0, measuredTextWidth(labelText, font: mediaProgressSizeLabel.font) + 10.0),
+          max(44.0, width - 16.0)
         )
-        mediaProgressRingView.frame = CGRect(
-          x: 0.0,
-          y: floor((overlayHeight - ringSize) * 0.5),
-          width: ringSize,
-          height: ringSize
+        mediaProgressSizeLabel.frame = CGRect(
+          x: floor((width - labelWidth) * 0.5),
+          y: mediaProgressRingView.frame.maxY + labelGap,
+          width: labelWidth,
+          height: labelHeight
         )
-        mediaProgressSpinner.center = CGPoint(x: ringSize * 0.5, y: overlayHeight * 0.5)
-        if !mediaProgressSizeLabel.isHidden {
-          mediaProgressSizeLabel.frame = CGRect(
-            x: ringSize + 6.0,
-            y: floor((overlayHeight - labelHeight) * 0.5),
-            width: labelWidth,
-            height: labelHeight
-          )
-        }
       }
+    }
+    if !mediaPrimaryIconView.isHidden {
+      mediaContainerView.bringSubviewToFront(mediaPrimaryIconView)
     }
   }
 
@@ -16214,10 +16552,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return (image, contentView.convert(captureRect, to: view))
   }
 
-  private func reactionBadgeFrame(in bubbleFrame: CGRect) -> CGRect {
+  private func reactionBadgeFrame(in bubbleFrame: CGRect, trailingReserve: CGFloat = 0.0)
+    -> CGRect
+  {
     let maxBadgeWidth = max(
       20.0,
-      bubbleFrame.width - Self.reactionBadgeInsetLeft - 4.0
+      bubbleFrame.width - Self.reactionBadgeInsetLeft - 4.0 - trailingReserve
     )
     let measured = reactionStripMeasuredSize(
       row?.reactions ?? [], maxWidth: maxBadgeWidth,

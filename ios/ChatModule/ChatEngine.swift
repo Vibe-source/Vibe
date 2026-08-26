@@ -249,17 +249,43 @@ private func chatEngineEncryptHybridMessage(
   return payloadString
 }
 
+/// Identity shared by every `crypto` log line: which message, in which chat, whose.
+/// Truncated on purpose — enough to correlate a row across the seams, not enough to
+/// identify a conversation from an exported log.
+private func chatEngineCryptoMeta(chatId: String?, messageId: String?, isMine: Bool) -> [String:
+  String]
+{
+  [
+    "chat": chatId.map { String($0.prefix(12)) } ?? "-",
+    "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+    "mine": isMine ? "Y" : "N",
+  ]
+}
+
 private func chatEngineDecryptHybridMessage(
   privateKey: SecKey,
   ciphertext: String,
-  isMyMessage: Bool
+  isMyMessage: Bool,
+  chatId: String? = nil,
+  messageId: String? = nil
 ) -> String {
+  // Every exit names the stage it died at, so a failure reads as a location, not a count.
+  var meta = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMyMessage)
+  meta["env"] = "hybrid"
+  func fail(_ stage: String, _ extra: [String: String] = [:]) {
+    var line = meta
+    line["stage"] = stage
+    for (key, value) in extra { line[key] = value }
+    VibeLog.error("hybrid open failed", category: "crypto", metadata: line)
+  }
+
   let trimmed = ciphertext.trimmingCharacters(in: .whitespacesAndNewlines)
-  guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return "" }
+  guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
+    fail("envelope-empty", ["bytes": String(ciphertext.count)])
+    return ""
+  }
   guard let payload = try? JSONDecoder().decode(ChatEngineHybridPayload.self, from: data) else {
-    NSLog(
-      "[ChatEngine] Decrypt failed: Payload decode error on JSON (isMyMessage: %@)",
-      isMyMessage ? "Y" : "N")
+    fail("json-decode", ["bytes": String(trimmed.count)])
     return ""
   }
   guard
@@ -267,7 +293,12 @@ private func chatEngineDecryptHybridMessage(
     let cipherAndTag = Data(base64Encoded: payload.c),
     cipherAndTag.count >= 16
   else {
-    NSLog("[ChatEngine] Decrypt failed: Invalid iv or ciphertext structure")
+    fail(
+      "envelope-shape",
+      [
+        "ivB64": String(payload.iv.count),
+        "ctB64": String(payload.c.count),
+      ])
     return ""
   }
 
@@ -300,11 +331,23 @@ private func chatEngineDecryptHybridMessage(
       break
     }
   }
+  // Which slots the sender wrote decides what a refusal means: no `k` at all is a
+  // sender that never sealed to us, `k` present but refused is a stale public key.
+  let slots =
+    "\(payload.k != nil ? "k" : "")\(payload.s != nil ? "s" : "")\(payload.g != nil ? "g" : "")"
   guard let aesKeyData else {
-    NSLog(
-      "[ChatEngine] Decrypt failed: Could not decrypt AES key. Candidates count: %d",
-      keyCandidates.count)
+    fail(
+      "rsa-unwrap",
+      [
+        "cands": String(keyCandidates.count),
+        "slots": slots.isEmpty ? "none" : slots,
+      ])
     return ""
+  }
+  // The core refuses any content key that is not 32 bytes; this path never has, so a
+  // short key opens here and fails there — the two readers then disagree on one row.
+  if aesKeyData.count != 32 {
+    fail("aes-key-length", ["keyLen": String(aesKeyData.count), "slots": slots])
   }
 
   let ciphertextData = cipherAndTag.dropLast(16)
@@ -317,9 +360,27 @@ private func chatEngineDecryptHybridMessage(
       tag: tagData
     )
     let plaintextData = try AES.GCM.open(sealedBox, using: SymmetricKey(data: aesKeyData))
-    return String(data: plaintextData, encoding: .utf8) ?? ""
+    guard let plaintext = String(data: plaintextData, encoding: .utf8) else {
+      fail("utf8", ["plainBytes": String(plaintextData.count)])
+      return ""
+    }
+    if plaintext.isEmpty {
+      fail("opened-empty", ["slots": slots])
+      return ""
+    }
+    var okLine = meta
+    okLine["stage"] = "ok"
+    okLine["plainLen"] = String(plaintext.count)
+    VibeLog.debug("hybrid opened", category: "crypto", metadata: okLine)
+    return plaintext
   } catch {
-    NSLog("[ChatEngine] Decrypt failed (AES): %@", error.localizedDescription)
+    fail(
+      "aes-gcm",
+      [
+        "reason": String(describing: error),
+        "ctBytes": String(cipherAndTag.count),
+        "slots": slots,
+      ])
     return ""
   }
 }
@@ -450,7 +511,15 @@ final class ChatEngine {
   private var activeMediaUploadTasksByMessageId: [String: URLSessionTask] = [:]
   private var canceledOutboundMessageIds = Set<String>()
   private var nativeTypingStateByChatId: [String: Bool] = [:]
+  private var nativeTypingSentAtMsByChatId: [String: Int64] = [:]
+  /// Re-push our own "typing" at least this often, comfortably inside the peer expiry.
+  static let typingRefreshMs: Int64 = 3500
   private var peerTypingUserIdsByChatId: [String: Set<String>] = [:]
+  /// Last "typing" frame per peer. A peer emits one typing and one stop-typing, so a lost
+  /// stop (backgrounded, killed, socket dropped) would otherwise pin the header forever.
+  private var peerTypingSeenAtMsByChatId: [String: [String: Int64]] = [:]
+  private var peerTypingExpiryScheduled = false
+  static let peerTypingExpiryMs: Int64 = 6500
 
   /// Lock-guarded copy of the small state the UI polls, so those reads never
   /// queue behind engine work. Published from ``postChangeLocked``; see
@@ -2166,7 +2235,12 @@ final class ChatEngine {
       if isBridgeTextModeLocked() {
         return ["accepted": false, "reason": "typing_disabled_in_blackout", "typing": typing]
       }
-      if nativeTypingStateByChatId[chatId] == typing {
+      // A live "typing" is refreshed on a cadence: the peer expires it after
+      // peerTypingExpiryMs, so one push per composer-became-non-empty is not enough.
+      let sinceSentMs = Int64(nowMs()) - (nativeTypingSentAtMsByChatId[chatId] ?? 0)
+      if nativeTypingStateByChatId[chatId] == typing,
+        !typing || sinceSentMs < Self.typingRefreshMs
+      {
         return ["accepted": true, "transport": "native", "deduped": true, "typing": typing]
       }
       guard let client = phoenixClient else {
@@ -2183,6 +2257,7 @@ final class ChatEngine {
         return ["accepted": false, "reason": "chat_not_joined", "typing": typing]
       }
       nativeTypingStateByChatId[chatId] = typing
+      nativeTypingSentAtMsByChatId[chatId] = typing ? Int64(nowMs()) : 0
       let userId = normalizedString(getConfigValueLocked("userId")) ?? "me"
       let event = typing ? "typing" : "stop-typing"
       let ref = client.push(
@@ -4090,6 +4165,7 @@ final class ChatEngine {
     var mediaKey = normalizedString(metadataValue("mediaKey", ["media_key"]))
     let contact = metadataValue("contact", [])
     let viewOnce = metadataValue("viewOnce", ["view_once"])
+    let mediaTtlSeconds = metadataValue("mediaTtlSeconds", ["media_ttl_seconds"])
     let isVideoNote = metadataValue("isVideoNote", ["is_video_note"])
     let waveform = metadataValue("waveform", [])
     let stickerId = normalizedString(metadataValue("stickerId", []))
@@ -4220,6 +4296,7 @@ final class ChatEngine {
       if let thumbnailBase64 { decryptedFields["thumbnailBase64"] = thumbnailBase64 }
       if let mediaKey { decryptedFields["mediaKey"] = mediaKey }
       if let viewOnce { decryptedFields["viewOnce"] = viewOnce }
+      if let mediaTtlSeconds { decryptedFields["mediaTtlSeconds"] = mediaTtlSeconds }
       if let isVideoNote { decryptedFields["isVideoNote"] = isVideoNote }
       if let waveform { decryptedFields["waveform"] = waveform }
       if let stickerId { decryptedFields["stickerId"] = stickerId }
@@ -4235,7 +4312,8 @@ final class ChatEngine {
         type: type,
         timestampMs: timestampMs,
         encryptedContent: nil,
-        decryptedFields: decryptedFields
+        decryptedFields: decryptedFields,
+        forceIsMe: true
       )
       if var message = optimisticRow["message"] as? [String: Any] {
         message["status"] = "sending"
@@ -4799,8 +4877,10 @@ final class ChatEngine {
             }
           } else {
             let reason = uploadOutcome.reason ?? "upload_failed"
+            // invalid_upload_url is config not yet resolved (cold launch), same class as
+            // missing_upload_config: hold the draft rather than mark the row failed.
             let retryableReasons: Set<String> = [
-              "upload_failed", "upload_timeout", "missing_upload_config",
+              "upload_failed", "upload_timeout", "missing_upload_config", "invalid_upload_url",
             ]
             let shouldQueue = retryableReasons.contains(reason)
 
@@ -4953,6 +5033,7 @@ final class ChatEngine {
           fullPayloadBase["thumbnailBase64"] = finalThumbnailBase64
         }
         if let viewOnce { fullPayloadBase["viewOnce"] = viewOnce }
+        if let mediaTtlSeconds { fullPayloadBase["mediaTtlSeconds"] = mediaTtlSeconds }
         if let isVideoNote { fullPayloadBase["isVideoNote"] = isVideoNote }
         if let waveform { fullPayloadBase["waveform"] = waveform }
         if let stickerId { fullPayloadBase["stickerId"] = stickerId }
@@ -5026,7 +5107,7 @@ final class ChatEngine {
             // to us, and the row would render empty. See
             // `VibeSecureSessions.rememberOwnPlaintext`.
             VibeSecureSessions.shared.rememberOwnPlaintext(
-              fullPayloadString, messageId: messageId)
+              fullPayloadString, messageId: messageId, envelope: mlsSealed)
             encryptedContent = mlsSealed
           } else if isGroup || friendPublicKey == nil {
             // Server-readable, and only these three cases can get here:
@@ -5693,6 +5774,21 @@ final class ChatEngine {
       postChatDeltaLocked(
         chatId: chatId, inserted: [], updated: [messageId], deleted: [], source: "edit")
       return result
+    }
+  }
+
+  func reportMediaOpened(chatId: String, messageId: String) {
+    let chatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let messageId = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chatId.isEmpty, !messageId.isEmpty else { return }
+    queue.async { [weak self] in
+      guard let self, let client = self.phoenixClient,
+        self.nativeJoinedChatIds.contains(chatId)
+      else { return }
+      _ = client.push(
+        topic: self.chatTopic(for: chatId),
+        event: "media-opened",
+        payload: ["messageId": messageId])
     }
   }
 
@@ -6565,19 +6661,32 @@ final class ChatEngine {
   /// The original body, now only ever reached on the engine queue.
   private func homePreviewTextLocked(_ payload: [String: Any]) -> String? {
     let chatId = normalizedString(payload["chatId"] ?? payload["chat_id"]) ?? "home_preview"
+    let messageId =
+      normalizedString(payload["id"] ?? payload["messageId"] ?? payload["message_id"]) ?? ""
+    // Home draws "Encrypted message" for every nil below, so each nil says which one it was.
+    func giveUp(_ stage: String, isMine: Bool = false) -> String? {
+      if ChatEngine.cryptoLogOnce("home-preview", messageId: messageId) {
+        var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMine)
+        line["stage"] = stage
+        VibeLog.warning("home preview has no plaintext", category: "crypto", metadata: line)
+      }
+      return nil
+    }
     guard
       let row = buildHistoryRowsLocked(chatId: chatId, rawMessages: [payload]).first,
       let message = row["message"] as? [String: Any]
     else {
-      return nil
+      return giveUp("no-row")
     }
+    let isMine = (message["isMe"] as? Bool) == true
     if (message["decryptionFailed"] as? Bool) == true {
-      return nil
+      return giveUp("decrypt-failed", isMine: isMine)
     }
-    guard let text = normalizedString(message["plainContent"] ?? message["text"]),
-      !isLikelyHybridCiphertext(text)
-    else {
-      return nil
+    guard let text = normalizedString(message["plainContent"] ?? message["text"]) else {
+      return giveUp("no-text", isMine: isMine)
+    }
+    guard !isLikelyHybridCiphertext(text) else {
+      return giveUp("text-is-ciphertext", isMine: isMine)
     }
     return text
   }
@@ -6593,6 +6702,47 @@ final class ChatEngine {
       (payload["encryptedContent"] as? String) ?? (payload["encrypted_content"] as? String)
       ?? (payload["content"] as? String) ?? (payload["text"] as? String) ?? ""
     return "\(id)|\(body.count)|\(body.suffix(16))"
+  }
+
+  /// Drops peers whose last "typing" frame aged out, and republishes the chats it changed.
+  /// Reschedules itself while anyone is still marked typing.
+  private func expirePeerTypingLocked() {
+    peerTypingExpiryScheduled = false
+    let cutoff = Int64(nowMs()) - Self.peerTypingExpiryMs
+    var stillTyping = false
+    for (chatId, seenAt) in peerTypingSeenAtMsByChatId {
+      let fresh = seenAt.filter { $0.value > cutoff }
+      if fresh.count == seenAt.count {
+        stillTyping = stillTyping || !fresh.isEmpty
+        continue
+      }
+      if fresh.isEmpty {
+        peerTypingSeenAtMsByChatId.removeValue(forKey: chatId)
+        peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+      } else {
+        peerTypingSeenAtMsByChatId[chatId] = fresh
+        peerTypingUserIdsByChatId[chatId] = Set(fresh.keys)
+        stillTyping = true
+      }
+      let typingUserIds = Array(peerTypingUserIdsByChatId[chatId] ?? []).sorted()
+      postChangeLocked(
+        reason: "peerTyping",
+        userInfo: [
+          "chatId": chatId,
+          "messageId": typingUserIds.isEmpty ? "false" : "true",
+          "typingUserIds": typingUserIds,
+        ]
+      )
+    }
+    if stillTyping { schedulePeerTypingExpiryLocked() }
+  }
+
+  private func schedulePeerTypingExpiryLocked() {
+    guard !peerTypingExpiryScheduled else { return }
+    peerTypingExpiryScheduled = true
+    queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      self?.expirePeerTypingLocked()
+    }
   }
 
   func typingUserIds(chatId: String?) -> [String] {
@@ -9153,19 +9303,26 @@ final class ChatEngine {
             frame.payload["userId"] ?? frame.payload["user_id"] ?? frame.payload["id"])
           let myUserId = self.normalizedUpper(self.getConfigValueLocked("userId"))
           var typingUsers = self.peerTypingUserIdsByChatId[chatId] ?? Set<String>()
+          var typingSeenAt = self.peerTypingSeenAtMsByChatId[chatId] ?? [:]
           if let payloadUserId, payloadUserId != myUserId {
             if typing {
               typingUsers.insert(payloadUserId)
+              typingSeenAt[payloadUserId] = Int64(self.nowMs())
             } else {
               typingUsers.remove(payloadUserId)
+              typingSeenAt.removeValue(forKey: payloadUserId)
             }
             if typingUsers.isEmpty {
               self.peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+              self.peerTypingSeenAtMsByChatId.removeValue(forKey: chatId)
             } else {
               self.peerTypingUserIdsByChatId[chatId] = typingUsers
+              self.peerTypingSeenAtMsByChatId[chatId] = typingSeenAt
+              self.schedulePeerTypingExpiryLocked()
             }
           } else if !typing {
             self.peerTypingUserIdsByChatId.removeValue(forKey: chatId)
+            self.peerTypingSeenAtMsByChatId.removeValue(forKey: chatId)
             typingUsers.removeAll()
           }
           if !typing, payloadUserId?.lowercased() == Self.agentUserId {
@@ -9342,16 +9499,16 @@ final class ChatEngine {
             next["isSelected"] = self.normalizedString(bucket["emoji"]) == selectedEmoji
             return next
           }
-          if self.applyMessageEngagementLocked(
+          // Post even when nothing local changed: a message the engine has not
+          // materialised yet would otherwise leave the open chat silent until reopen.
+          self.applyMessageEngagementLocked(
             chatId: chatId, messageId: messageId, reactions: reactions, viewCount: nil)
-          {
-            self.postChangeLocked(
-              reason: "chatMessageReactionChanged",
-              userInfo: ["chatId": chatId, "messageId": messageId])
-            self.postChatDeltaLocked(
-              chatId: chatId, inserted: [], updated: [messageId], deleted: [],
-              source: "reaction")
-          }
+          self.postChangeLocked(
+            reason: "chatMessageReactionChanged",
+            userInfo: ["chatId": chatId, "messageId": messageId])
+          self.postChatDeltaLocked(
+            chatId: chatId, inserted: [], updated: [messageId], deleted: [],
+            source: "reaction")
           return
         }
         if frame.event == "message-view-counts-updated",
@@ -10078,13 +10235,19 @@ final class ChatEngine {
   private static var decryptFailureLoggedIds: Set<String> = []
 
   static func noteDecryptFailureOnce(messageId: String) -> Bool {
+    cryptoLogOnce("decrypt-failed", messageId: messageId)
+  }
+
+  /// One line per (event, message), ever — the same gate, keyed so that a failed open
+  /// and an empty row for the same message are not collapsed into one.
+  static func cryptoLogOnce(_ event: String, messageId: String) -> Bool {
     guard !messageId.isEmpty else { return false }
     decryptFailureLogLock.lock()
     defer { decryptFailureLogLock.unlock() }
     // Bounded: a device that somehow fails thousands of messages must not turn this
     // diagnostic into the memory leak.
     if decryptFailureLoggedIds.count > 512 { return false }
-    return decryptFailureLoggedIds.insert(messageId).inserted
+    return decryptFailureLoggedIds.insert("\(event)|\(messageId)").inserted
   }
 
   private func decryptPrivateKeyLocked() -> SecKey? {
@@ -10219,6 +10382,9 @@ final class ChatEngine {
     if let contact = json["contact"] { out["contact"] = contact }
     if let caption = json["caption"] { out["caption"] = caption }
     if let viewOnce = json["viewOnce"] { out["viewOnce"] = viewOnce }
+    if let mediaTtlSeconds = json["mediaTtlSeconds"] ?? json["media_ttl_seconds"] {
+      out["mediaTtlSeconds"] = mediaTtlSeconds
+    }
     if let isEdited = json["isEdited"] { out["isEdited"] = isEdited }
     if let editedAt = json["editedAt"] { out["editedAt"] = editedAt }
     if let waveform = json["waveform"] { out["waveform"] = waveform }
@@ -11489,14 +11655,16 @@ final class ChatEngine {
     timestampMs: Int64,
     encryptedContent: String?,
     decryptedFields: [String: Any],
+    forceIsMe: Bool? = nil,
     forceEdited: Bool = false,
     forceEditedAt: Any? = nil
   ) -> [String: Any] {
     let normalizedType = normalizedString(type)?.lowercased() ?? "text"
     let normalizedFrom = normalizedString(fromId)
-    let isMe =
+    let isMe = forceIsMe ?? (
       normalizedUpper(normalizedFrom) != nil
-      && normalizedUpper(normalizedFrom) == currentUserIdLocked()
+        && normalizedUpper(normalizedFrom) == currentUserIdLocked()
+    )
     let text = normalizedString(decryptedFields["text"]) ?? ""
     let mediaUrl = normalizedString(decryptedFields["mediaUrl"])
     let localMediaUrl = normalizedString(
@@ -11531,6 +11699,9 @@ final class ChatEngine {
     if let latitude { metadata["latitude"] = latitude }
     if let longitude { metadata["longitude"] = longitude }
     if let viewOnce = decryptedFields["viewOnce"] { metadata["viewOnce"] = viewOnce }
+    if let mediaTtlSeconds = decryptedFields["mediaTtlSeconds"] {
+      metadata["mediaTtlSeconds"] = mediaTtlSeconds
+    }
     if let contact = decryptedFields["contact"] { metadata["contact"] = contact }
     if let caption { metadata["caption"] = caption }
     if let mediaKey = decryptedFields["mediaKey"] { metadata["mediaKey"] = mediaKey }
@@ -11661,17 +11832,17 @@ final class ChatEngine {
     guard let messageId = normalizedString(payload["id"] ?? payload["message_id"]) else {
       return nil
     }
-    // Same rule as the history page: the core reads the frame the server sent,
-    // not Swift's interpretation of it. `.chatTopic` rather than `.historyPage`
-    // because the source drives the core's flush barrier and its dedup rules.
-    feedCoreRawFramesLocked(chatId: chatId, rawMessages: [payload], source: .chatTopic)
 
     let fromId = normalizedString(payload["fromId"] ?? payload["from_id"])
     let encryptedContent = normalizedString(
       payload["encryptedContent"] ?? payload["encrypted_content"])
     let type = normalizedString(payload["type"]) ?? "text"
     let timestampMs = parseLongValue(payload["timestamp"]) ?? Int64(nowMs())
-    let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
+    let senderIsMe =
+      normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
+    let existingMessageIsMe =
+      (findMessagePayloadLocked(chatId: chatId, messageId: messageId)?["isMe"] as? Bool) == true
+    let isMe = senderIsMe || existingMessageIsMe
     let rawMediaUrl = normalizedString(payload["mediaUrl"] ?? payload["media_url"])
     let rawFileName = normalizedString(payload["fileName"] ?? payload["file_name"])
     let rawMediaKey = normalizedString(payload["mediaKey"] ?? payload["media_key"])
@@ -11752,7 +11923,9 @@ final class ChatEngine {
         // members and refuses to process what we authored. Asking anyway is
         // how these rendered as empty bubbles; the retained plaintext is the
         // only source for them.
-        if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(messageId: messageId) {
+        if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(
+          messageId: messageId, envelope: encryptedContent)
+        {
           return mine
         }
         return VibeSecureSessions.shared.open(
@@ -11761,9 +11934,15 @@ final class ChatEngine {
       if !encryptedLooksHybrid {
         return encryptedContent
       }
-      guard let privateKey = decryptPrivateKeyLocked() else { return "" }
+      guard let privateKey = decryptPrivateKeyLocked() else {
+        VibeLog.error(
+          "no private key to open with", category: "crypto",
+          metadata: chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMe))
+        return ""
+      }
       return chatEngineDecryptHybridMessage(
-        privateKey: privateKey, ciphertext: encryptedContent, isMyMessage: isMe)
+        privateKey: privateKey, ciphertext: encryptedContent, isMyMessage: isMe,
+        chatId: chatId, messageId: messageId)
     }()
     // `encryptedIsMls` belongs here too. Without it a failed MLS open renders as
     // an empty bubble rather than the decryption-failed state, because the
@@ -11798,7 +11977,9 @@ final class ChatEngine {
           // Distinguishes "this device cannot decrypt anything right now" (locked or
           // missing private key — every hybrid open returns "" from the guard above)
           // from "this particular message was sealed to a key we do not hold".
-          "privateKey": (decryptPrivateKeyLocked() != nil) ? "present" : "MISSING",
+          // NOT named `privateKey`: the log redactor scrubs any key containing that
+          // fragment, and present/MISSING both became a 7-character placeholder.
+          "rsaKey": (decryptPrivateKeyLocked() != nil) ? "present" : "MISSING",
         ])
     }
 
@@ -11838,6 +12019,22 @@ final class ChatEngine {
     {
       decryptedFields["fileName"] = fileNameForRow
     }
+    // Opened, but nothing to draw. This is the empty bubble the transcript shows, and
+    // it is a different failure from a refused open — which is why it gets its own line.
+    if !isAgentMessage, hadEncryptedContent, !decryptionFailed,
+      normalizedString(decryptedFields["text"]) == nil,
+      normalizedString(decryptedFields["caption"]) == nil,
+      normalizedString(decryptedFields["mediaUrl"]) == nil,
+      ChatEngine.cryptoLogOnce("empty-row", messageId: messageId)
+    {
+      var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMe)
+      line["stage"] = "live-row"
+      line["env"] = encryptedIsMls ? "mls" : (encryptedLooksHybrid ? "hybrid" : "plain")
+      line["type"] = type
+      line["plainLen"] = String(decryptedText.count)
+      line["fields"] = decryptedFields.keys.sorted().prefix(8).joined(separator: ",")
+      VibeLog.warning("opened but row has nothing to render", category: "crypto", metadata: line)
+    }
     var row = buildLiveRowPayloadLocked(
       chatId: chatId,
       messageId: messageId,
@@ -11845,7 +12042,8 @@ final class ChatEngine {
       type: type,
       timestampMs: timestampMs,
       encryptedContent: encryptedContent,
-      decryptedFields: decryptedFields
+      decryptedFields: decryptedFields,
+      forceIsMe: isMe
     )
     // Inject agent-specific fields into the message payload for the UI layer
     if isAgentMessage, var message = row["message"] as? [String: Any] {
@@ -11930,6 +12128,9 @@ final class ChatEngine {
         }
       }
     }
+    let coreFrames = coreProjectedFramesLocked(
+      chatId: chatId, rawMessages: [payload], rows: [row])
+    feedCoreRawFramesLocked(chatId: chatId, rawMessages: coreFrames, source: .chatTopic)
     let inserted = upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: row)
     appendJournalLocked(
       event: "native-message-row-upsert",
@@ -12043,19 +12244,51 @@ final class ChatEngine {
         parseLongValue(existingMessage["timestampMs"] ?? existingMessage["timestamp"])
         ?? Int64(nowMs())
       let isMe = normalizedUpper(fromId) != nil && normalizedUpper(fromId) == currentUserIdLocked()
+      func noteMutationOpenFailure(_ stage: String, env: String) {
+        guard ChatEngine.cryptoLogOnce("mutation-open", messageId: messageId) else { return }
+        var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMe)
+        line["stage"] = stage
+        line["env"] = env
+        VibeLog.error("edited message failed to decrypt", category: "crypto", metadata: line)
+      }
       let decryptedFields: [String: Any] = {
         guard let encryptedContent, !encryptedContent.isEmpty else {
           return [:]
         }
+        // An edit can arrive sealed with MLS. Without this branch the envelope string is
+        // parsed as if it were the payload, so the edit lands as literal `vmls1.` text.
+        if VibeSecureSessions.isMlsEnvelope(encryptedContent) {
+          if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(
+            messageId: messageId, envelope: encryptedContent)
+          {
+            return parseDecryptedMessagePayload(mine)
+          }
+          guard
+            let opened = VibeSecureSessions.shared.open(
+              chatId: chatId, envelope: encryptedContent, isMine: isMe, messageId: messageId)
+          else {
+            noteMutationOpenFailure(isMe ? "mls-own-no-plaintext" : "mls-open", env: "mls")
+            return [:]
+          }
+          return parseDecryptedMessagePayload(opened)
+        }
         if !isLikelyHybridCiphertext(encryptedContent) {
           return parseDecryptedMessagePayload(encryptedContent)
         }
-        guard let privateKey = decryptPrivateKeyLocked() else { return [:] }
+        guard let privateKey = decryptPrivateKeyLocked() else {
+          noteMutationOpenFailure("no-rsa-key", env: "hybrid")
+          return [:]
+        }
         let decrypted = chatEngineDecryptHybridMessage(
           privateKey: privateKey,
           ciphertext: encryptedContent,
-          isMyMessage: isMe
+          isMyMessage: isMe,
+          chatId: chatId,
+          messageId: messageId
         )
+        if decrypted.isEmpty {
+          noteMutationOpenFailure("hybrid-open", env: "hybrid")
+        }
         return parseDecryptedMessagePayload(decrypted)
       }()
       var hydratedFields = decryptedFields
@@ -12595,13 +12828,16 @@ final class ChatEngine {
       var withDraft = 0
       var inReplayQueue = 0
       var orphaned: [String] = []
+      let uploading = Set(self.activeMediaUploadTasksByMessageId.keys)
       for id in pendingMessageIds {
+        if queued.contains(id) { inReplayQueue += 1 }
+        let local = self.localStatusIndex[chatId]?[id]
+        if local == "sending" || uploading.contains(id) { continue }
         if self.pendingOutboundDraftsByMessageId[id] != nil {
           withDraft += 1
         } else {
           orphaned.append(id)
         }
-        if queued.contains(id) { inReplayQueue += 1 }
       }
       NSLog(
         "[PendingAudit] chat=%@ pending=%d withDraft=%d inReplayQueue=%d orphaned=%d orphanSample=[%@]",
@@ -13574,8 +13810,13 @@ final class ChatEngine {
       return LocalMediaUploadOutcome(result: nil, reason: "invalid_local_media_uri")
     }
     let normalizedURL = fileURL.standardizedFileURL
-    guard FileManager.default.fileExists(atPath: normalizedURL.path) else {
-      return LocalMediaUploadOutcome(result: nil, reason: "media_file_missing")
+    // A just-recorded note can arrive a beat before its file lands on disk; one short
+    // re-check keeps the cell on its spinner instead of failing with zero progress.
+    if !FileManager.default.fileExists(atPath: normalizedURL.path) {
+      Thread.sleep(forTimeInterval: 0.5)
+      guard FileManager.default.fileExists(atPath: normalizedURL.path) else {
+        return LocalMediaUploadOutcome(result: nil, reason: "media_file_missing")
+      }
     }
     let fileData: Data
     do {
@@ -14093,19 +14334,8 @@ final class ChatEngine {
     historyRowsByChat[chatId] = restoredRows
     historyFullyLoadedChats.insert(chatId)
     historyRowsRestoredFromCacheChats.insert(chatId)
-    // Feed the core from the store too, not just from the network.
-    //
-    // Without this the core starves on exactly the launch that matters. A warm
-    // relaunch restores from SQLite and logs `loadChatHistory SKIP … reason=
-    // restored_fresh_ttl` — the network fetch never runs, so the network-side
-    // ingest hooks never fire and the core holds zero rows for a chat the user is
-    // looking at. Observed on device 2026-08-03: `driver ARMED` with no window
-    // behind it.
-    //
-    // The inner `message` dict is what goes over, not the row wrapper: rows are
-    // `{kind, key, message:{…}}` and `canonical.rs` reads server-frame keys. That
-    // dict keeps `encryptedContent` alongside the opened text, so the core opens
-    // the envelope itself rather than trusting Swift's copy.
+    // Store rows contain decrypted render fields alongside the original envelope.
+    // Feeding both restores readable secure rows without waiting for a network page.
     feedCoreRawFramesLocked(
       chatId: chatId,
       rawMessages: restoredRows.compactMap { $0["message"] as? [String: Any] },
@@ -15125,9 +15355,11 @@ final class ChatEngine {
         }
 
         let existingCount = self.historyRowsByChat[chatId]?.count ?? 0
-        // Same reason as the store branch above: the core pages back with the list.
+        // Keep older core pages readable when their secure envelopes were opened by Swift.
+        let coreFrames = self.coreProjectedFramesLocked(
+          chatId: chatId, rawMessages: messagesArray, rows: olderRows)
         self.feedCoreRawFramesLocked(
-          chatId: chatId, rawMessages: messagesArray, source: .historyPage)
+          chatId: chatId, rawMessages: coreFrames, source: .historyPage)
         let (rows, delta) = self.ingestHistoryRowsLocked(chatId: chatId, remoteRows: olderRows)
         self.historyRowsByChat[chatId] = rows
         _ = self.persistHistoryRowsToStoreLocked(
@@ -15380,6 +15612,81 @@ final class ChatEngine {
   /// Swift path is unaffected — during the migration the core is a second reader
   /// of the same bytes, and a core that cannot keep up must never delay a message
   /// the user is waiting for.
+  /// Adds the plaintext render projection Swift already opened to each original frame.
+  /// The encrypted envelope remains intact for core identity, ordering, and persistence.
+  private func coreProjectedFramesLocked(
+    chatId: String, rawMessages: [[String: Any]], rows: [[String: Any]]
+  ) -> [[String: Any]] {
+    var messagesById: [String: [String: Any]] = [:]
+    for row in rows {
+      guard let message = row["message"] as? [String: Any],
+        let messageId = normalizedString(message["id"] ?? message["message_id"])
+      else { continue }
+      messagesById[messageId] = message
+    }
+
+    return rawMessages.map { raw in
+      let rawIdValue =
+        chatId == "saved_messages"
+        ? raw["original_message_id"] ?? raw["originalMessageId"] ?? raw["id"]
+          ?? raw["message_id"]
+        : raw["id"] ?? raw["message_id"]
+      guard let messageId = normalizedString(rawIdValue),
+        let message = messagesById[messageId]
+      else {
+        noteCoreFrameWithoutPlaintextLocked(
+          chatId: chatId, frame: raw, messageId: normalizedString(rawIdValue),
+          projected: false, isMine: false, decryptFailed: false)
+        return raw
+      }
+
+      var frame = raw
+      for (key, value) in message where key != "encryptedContent" {
+        frame[key] = value
+      }
+      noteCoreFrameWithoutPlaintextLocked(
+        chatId: chatId, frame: frame, messageId: messageId, projected: true,
+        isMine: (message["isMe"] as? Bool) == true,
+        decryptFailed: (message["decryptionFailed"] as? Bool) == true)
+      if let metadata = message["metadata"] as? [String: Any] {
+        for key in [
+          "mediaKey", "waveform", "width", "height", "thumbnailBase64", "fileSize",
+          "viewOnce", "mediaTtlSeconds", "contact",
+        ] {
+          if let value = metadata[key] { frame[key] = value }
+        }
+      }
+      return frame
+    }
+  }
+
+  /// Names a frame the core will have to render with nothing in it.
+  ///
+  /// The core opens envelopes through its own unwrapper, so a frame carrying an
+  /// envelope and no plaintext is the render path predicting an empty bubble —
+  /// even when the Swift row beside it drew text.
+  private func noteCoreFrameWithoutPlaintextLocked(
+    chatId: String, frame: [String: Any], messageId: String?, projected: Bool, isMine: Bool,
+    decryptFailed: Bool
+  ) {
+    guard let messageId, !messageId.isEmpty else { return }
+    guard normalizedString(frame["encryptedContent"] ?? frame["encrypted_content"]) != nil,
+      normalizedString(frame["text"]) == nil,
+      normalizedString(frame["plainContent"] ?? frame["plain_content"]) == nil,
+      normalizedString(frame["caption"]) == nil,
+      normalizedString(frame["mediaUrl"] ?? frame["media_url"]) == nil,
+      ChatEngine.cryptoLogOnce("core-frame", messageId: messageId)
+    else { return }
+    var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMine)
+    line["stage"] = projected ? "core-ingest" : "core-ingest-unmatched"
+    line["env"] =
+      VibeSecureSessions.isMlsEnvelope(
+        normalizedString(frame["encryptedContent"] ?? frame["encrypted_content"]))
+      ? "mls" : "hybrid"
+    line["decryptFailed"] = decryptFailed ? "Y" : "N"
+    VibeLog.warning("core frame carries no plaintext", category: "crypto", metadata: line)
+  }
+
   private func feedCoreRawFramesLocked(
     chatId: String, rawMessages: [[String: Any]], source: VibeFfiSource
   ) {
@@ -15593,15 +15900,12 @@ final class ChatEngine {
       return
     }
 
-    // Hand the page to the Rust core **before** Swift canonicalizes it. These are
-    // the bytes as the server sent them, which is what `VibeCoreEventV1::RawFrames`
-    // is specified to carry — the core does its own alias resolution, envelope
-    // open, media fold and dedup from the original frame. Feeding it Swift's
-    // already-normalized output instead would make the core a re-parser of a parse
-    // and leave the divergence it exists to remove.
-    feedCoreRawFramesLocked(chatId: chatId, rawMessages: messagesArray, source: .historyPage)
-
     let remoteRows = buildHistoryRowsLocked(chatId: chatId, rawMessages: messagesArray)
+    // Core keeps the original envelope but receives the render projection Swift already opened.
+    // This prevents an opaque secure frame from replacing readable engine text with an empty body.
+    let coreFrames = coreProjectedFramesLocked(
+      chatId: chatId, rawMessages: messagesArray, rows: remoteRows)
+    feedCoreRawFramesLocked(chatId: chatId, rawMessages: coreFrames, source: .historyPage)
     if let response = object as? [String: Any] {
       applyHistoryPaginationMetadataLocked(
         chatId: chatId, response: response, remoteRows: remoteRows)
@@ -15839,6 +16143,9 @@ final class ChatEngine {
         ?? encryptedContent
       let hadEncryptedContent = encryptedContent != nil && !encryptedContent!.isEmpty
       var historyDecryptionFailed = false
+      // Where the open died. A count cannot tell a missing key from a session that
+      // disagrees, and this path used to report neither.
+      var historyDecryptStage = "-"
       let decryptedFields: [String: Any] = {
         if historyIsAgent {
           if let agentPlainContent, !agentPlainContent.isEmpty {
@@ -15856,7 +16163,9 @@ final class ChatEngine {
             // Our own messages have no decryptable form — MLS encrypts to the
             // other members. Scrolling back through our own history would go
             // blank without the retained plaintext.
-            if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(messageId: messageId) {
+            if isMe, let mine = VibeSecureSessions.shared.ownPlaintext(
+              messageId: messageId, envelope: encryptedContent)
+            {
               return parseDecryptedMessagePayload(mine)
             }
             guard
@@ -15864,11 +16173,13 @@ final class ChatEngine {
                 chatId: chatId, envelope: encryptedContent, isMine: isMe, messageId: messageId)
             else {
               historyDecryptionFailed = true
+              historyDecryptStage = isMe ? "mls-own-no-plaintext" : "mls-open"
               return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
             }
             let parsed = parseDecryptedMessagePayload(opened)
             if !parsed.isEmpty { return parsed }
             historyDecryptionFailed = true
+            historyDecryptStage = "mls-payload-empty"
             return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
           }
           if !encryptedLooksHybrid {
@@ -15876,23 +16187,42 @@ final class ChatEngine {
           }
           guard let privateKey = decryptPrivateKeyLocked() else {
             historyDecryptionFailed = true
+            historyDecryptStage = "no-rsa-key"
             return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
           }
           let decrypted = chatEngineDecryptHybridMessage(
             privateKey: privateKey,
             ciphertext: encryptedContent,
-            isMyMessage: isMe
+            isMyMessage: isMe,
+            chatId: chatId,
+            messageId: messageId
           )
           if decrypted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             historyDecryptionFailed = true
+            historyDecryptStage = "hybrid-open"
             return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
           }
           let parsed = parseDecryptedMessagePayload(decrypted)
           if !parsed.isEmpty { return parsed }
           historyDecryptionFailed = true
+          historyDecryptStage = "hybrid-payload-empty"
         }
         return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
       }()
+      // The history builder used to fail SILENTLY: only the live path logged, so a row
+      // that opened on arrival and refused on reopen looked identical to one that never
+      // arrived. Same gate as the live path, so a reparse cannot flood the log.
+      if historyDecryptionFailed, ChatEngine.cryptoLogOnce("history-open", messageId: messageId) {
+        var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMe)
+        line["stage"] = historyDecryptStage
+        line["env"] =
+          VibeSecureSessions.isMlsEnvelope(encryptedContent)
+          ? "mls" : (encryptedLooksHybrid ? "hybrid" : "plain")
+        line["type"] = type
+        line["fallback"] = plaintextFallback.isEmpty ? "none" : String(plaintextFallback.count)
+        line["wireMediaUrl"] = (rawMediaUrl?.isEmpty == false) ? "Y" : "N"
+        VibeLog.error("history row failed to decrypt", category: "crypto", metadata: line)
+      }
       var enrichedFields = decryptedFields
       if let rawMetadata, enrichedFields["metadata"] == nil {
         enrichedFields["metadata"] = rawMetadata
@@ -16027,9 +16357,28 @@ final class ChatEngine {
         if let reactionEmoji = normalizedString(raw["reactionEmoji"] ?? raw["reaction_emoji"]) {
           message["reactionEmoji"] = reactionEmoji
         }
-        if !historyIsAgent && hadEncryptedContent && encryptedLooksHybrid && historyDecryptionFailed
+        // MLS belongs here as much as hybrid: without it a failed ratchet open leaves the
+        // row unflagged, so Home prints a preview for a message the transcript draws blank.
+        if !historyIsAgent, hadEncryptedContent, historyDecryptionFailed,
+          encryptedLooksHybrid || VibeSecureSessions.isMlsEnvelope(encryptedContent)
         {
           message["decryptionFailed"] = true
+        }
+        // Opened, but the row has nothing to draw — the empty bubble, from the reopen side.
+        if !historyIsAgent, hadEncryptedContent, !historyDecryptionFailed,
+          normalizedString(message["text"]) == nil,
+          normalizedString(message["caption"]) == nil,
+          normalizedString(message["mediaUrl"]) == nil,
+          ChatEngine.cryptoLogOnce("history-empty-row", messageId: messageId)
+        {
+          var line = chatEngineCryptoMeta(chatId: chatId, messageId: messageId, isMine: isMe)
+          line["stage"] = "history-row"
+          line["env"] =
+            VibeSecureSessions.isMlsEnvelope(encryptedContent)
+            ? "mls" : (encryptedLooksHybrid ? "hybrid" : "plain")
+          line["type"] = type
+          line["fields"] = message.keys.sorted().prefix(8).joined(separator: ",")
+          VibeLog.warning("opened but row has nothing to render", category: "crypto", metadata: line)
         }
         row["message"] = message
       }

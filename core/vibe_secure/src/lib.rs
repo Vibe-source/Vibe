@@ -80,7 +80,7 @@ pub use error::VibeSecureError;
 pub use identity::{VibeDeviceIdentity, VibeKeyPackageBundle};
 pub use padding::{VibePaddingError, VIBE_PAD_BUCKETS};
 pub use provider::VibeSecureProvider;
-pub use session::{VibeCommitOutput, VibeSecureSession};
+pub use session::{VibeCommitOutput, VibeMlsEnvelopeHeader, VibeSecureSession};
 pub use trust::{
     inspect_key_package, vibe_safety_number, VibeKeyPackageIdentity, VIBE_SAFETY_NUMBER_DIGITS,
 };

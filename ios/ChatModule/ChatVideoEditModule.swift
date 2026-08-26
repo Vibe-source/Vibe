@@ -32,16 +32,25 @@ enum ChatVideoEditModule {
     asset: AVAsset,
     initialCaption: String?,
     headerTitle: String? = nil,
+    messageId: String? = nil,
+    zoomSourceProvider: ChatMediaZoomSourceProviding? = nil,
     onReply: (() -> Void)? = nil
   ) {
     let controller = ChatVideoEditViewController(
       asset: asset,
       initialCaption: initialCaption,
       headerTitle: headerTitle,
-      previewOnly: true
+      previewOnly: true,
+      messageId: messageId
     )
     controller.modalPresentationStyle = .overFullScreen
     controller.onReply = onReply
+    if let zoomSourceProvider {
+      let transition = ChatMediaZoomTransition()
+      transition.sourceProvider = zoomSourceProvider
+      controller.zoomTransition = transition
+      controller.transitioningDelegate = transition
+    }
     presenter.present(controller, animated: true)
   }
 }

@@ -17,6 +17,10 @@ struct ChatImageEditActionPayload {
   let mediaURL: String
   let caption: String?
   let editedImageURL: URL?
+  var extraImageURLs: [URL] = []
+  var viewOnce: Bool = false
+  var mediaTtlSeconds: Int? = nil
+  var isHighQuality: Bool = false
 }
 
 /// One page in the native image open sheet (single image or multi-image set).
@@ -28,14 +32,23 @@ struct ChatImageEditGalleryPage {
   let messageId: String?
   /// Second header line (the message date, as in the reference).
   let subtitle: String?
+  let viewOnce: Bool
+  let mediaTtlSeconds: Int?
 
   init(
-    mediaURL: String, image: UIImage?, messageId: String? = nil, subtitle: String? = nil
+    mediaURL: String,
+    image: UIImage?,
+    messageId: String? = nil,
+    subtitle: String? = nil,
+    viewOnce: Bool = false,
+    mediaTtlSeconds: Int? = nil
   ) {
     self.mediaURL = mediaURL
     self.image = image
     self.messageId = messageId
     self.subtitle = subtitle
+    self.viewOnce = viewOnce
+    self.mediaTtlSeconds = mediaTtlSeconds
   }
 }
 

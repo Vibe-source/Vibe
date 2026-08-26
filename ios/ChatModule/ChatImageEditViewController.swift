@@ -1,5 +1,6 @@
 import Combine
 import PencilKit
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -82,6 +83,17 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     title: headerTitleText,
     subtitle: headerSubtitleText,
     hasMessage: currentMessageId != nil)
+  private lazy var composerModel = ChatAttachComposerModel(
+    recipientName: headerTitleText == "Photo" ? "" : headerTitleText,
+    pickCount: 1,
+    pageIndex: 0,
+    caption: "")
+  private lazy var composerHost = ChatAttachComposerChromeHost(
+    model: composerModel,
+    sendColor: UIColor(red: 0.20, green: 0.55, blue: 0.98, alpha: 1))
+  private var isAttachComposer: Bool { dismissPresenterOnSend && messageId == nil }
+  private var cropOverlay: ChatAttachCropOverlay?
+  private var composerOriginalImage: UIImage?
 
   // MARK: Bottom
 
@@ -96,6 +108,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private let viewerBarHost = ChatImageViewerBottomBarHost()
   private let strokeSizeControl = ChatImageStrokeSizeControl()
   private var markupCancellable: AnyCancellable?
+  private var composerCancellable: AnyCancellable?
 
   /// Sticker/GIF library (reuse chat GIF panel — not a custom emoji tray).
   private var gifPanel: ChatGifPanelView?
@@ -300,6 +313,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     refreshHeaderForCurrentPage()
     applyToolFromModel()
 
+    composerCancellable = composerModel.objectWillChange.sink { [weak self] _ in
+      DispatchQueue.main.async { self?.applyComposerAdjustmentsPreview() }
+    }
     markupCancellable = markupModel.objectWillChange.sink { [weak self] _ in
       DispatchQueue.main.async {
         guard let self else { return }
@@ -348,6 +364,16 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     } else {
       setMarkupActive(false, animated: false)
     }
+
+    if isAttachComposer {
+      headerHost.isHidden = true
+      viewerBarHost.isHidden = true
+      filmstrip.isHidden = true
+      composerHost.isHidden = false
+      composerModel.pickCount = max(1, galleryPages.count)
+      composerModel.pageIndex = galleryIndex
+      composerModel.recipientName = headerTitleText == "Photo" ? "" : headerTitleText
+    }
   }
 
   @objc private func handleImageHold(_ gr: UILongPressGestureRecognizer) {
@@ -377,6 +403,30 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     headerHost.onReply = { [weak self] in self?.emitAfterDismiss(.reply) }
     headerHost.onDelete = { [weak self] in self?.handleDeleteRequested() }
     view.addSubview(headerHost)
+
+    composerHost.onClose = { [weak self] in self?.handleClose() }
+    composerHost.onPick = { [weak self] in self?.handleComposerPickMore() }
+    composerHost.onCrop = { [weak self] in self?.handleComposerCrop() }
+    composerHost.onDraw = { [weak self] in
+      self?.markupModel.mode = .draw
+      self?.setMarkupActive(true, animated: true)
+    }
+    composerHost.onToggleAdjust = { [weak self] in
+      guard let self else { return }
+      self.composerModel.showAdjustments.toggle()
+      if !self.composerModel.showAdjustments {
+        self.applyComposerAdjustmentsPreview()
+      }
+      self.view.setNeedsLayout()
+    }
+    composerHost.onToggleHD = { [weak self] in
+      guard let self else { return }
+      self.isHighQuality.toggle()
+      self.composerModel.isHighQuality = self.isHighQuality
+    }
+    composerHost.onSend = { [weak self] in self?.handleSend() }
+    composerHost.isHidden = true
+    view.addSubview(composerHost)
 
     applyThemeToChrome()
   }
@@ -590,6 +640,15 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     setChromeFrame(
       headerHost,
       CGRect(x: 0, y: safe.top, width: w, height: max(44, topH - safe.top)))
+    if isAttachComposer {
+      let composerBottomLift = keyboardHeight > 0 ? keyboardHeight : 0
+      setChromeFrame(composerHost, view.bounds.inset(by: UIEdgeInsets(
+        top: safe.top, left: 0, bottom: composerBottomLift, right: 0)))
+      composerHost.isHidden = isMarkupActive
+      headerHost.isHidden = !isMarkupActive
+      viewerBarHost.isHidden = true
+      view.bringSubviewToFront(composerHost)
+    }
     refreshUndoRedoState()
 
     let markupH: CGFloat =
@@ -668,7 +727,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     let mainSlideOffset =
       viewerBarHost.preferredHeight + viewerFilmH + safe.bottom + 44
     let markupSlideOffset = markupNaturalH + safe.bottom + 12
-    let showsViewer = !isMarkupActive && !isGifPanelVisible
+    let showsViewer = !isMarkupActive && !isGifPanelVisible && !isAttachComposer
     setBottomControlVisible(
       bottomScrimHost, showsViewer, hiddenOffset: mainSlideOffset)
     setBottomControlVisible(
@@ -721,6 +780,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     view.bringSubviewToFront(bottomContainer)
     if isGifPanelVisible { view.bringSubviewToFront(gifPanelContainer) }
     view.bringSubviewToFront(headerHost)
+    if isAttachComposer && !isMarkupActive {
+      view.bringSubviewToFront(composerHost)
+    }
 
     if let image = imageView.image, image.size.width > 1, image.size.height > 1 {
       let rect = fittingRect(container: stageView.bounds, mediaSize: image.size)
@@ -924,16 +986,20 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   /// Moves the editing surface onto another photo. Any markup on the page being
   /// left is dropped rather than silently carried across — strokes belong to the
   /// picture they were drawn on.
-  private func selectPage(at index: Int) {
+  private func selectPage(at index: Int, animated: Bool = false) {
     guard index >= 0, index < galleryPages.count else { return }
     galleryIndex = index
     let page = galleryPages[index]
     mediaURL = page.mediaURL
+    composerOriginalImage = nil
+    composerModel.pageIndex = index
+    composerModel.pickCount = galleryPages.count
     canvasView.drawing = PKDrawing()
     overlayContainer.subviews.forEach { $0.removeFromSuperview() }
     aiUndoStack.removeAll()
     markupModel.aiCanUndo = false
     aiSelectionView.clearSelection()
+    _ = animated
 
     if let image = page.image {
       applyImage(image)
@@ -1154,6 +1220,10 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   }
 
   private func handleSaveImage() {
+    if galleryPages[safeIndex: galleryIndex]?.viewOnce == true {
+      presentToast("This photo can't be saved")
+      return
+    }
     guard let image = snapshotEditedImage() ?? imageView.image else { return }
     UIImageWriteToSavedPhotosAlbum(
       image, self,
@@ -1520,6 +1590,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   }
 
   private func applyImage(_ image: UIImage) {
+    if composerOriginalImage == nil || !composerModel.hasAdjustments {
+      composerOriginalImage = image
+    }
     originalImage = image
     imageView.image = image
     // Keep the page cache in step so swiping away and back shows what the user
@@ -1530,7 +1603,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
         mediaURL: page.mediaURL,
         image: image,
         messageId: page.messageId,
-        subtitle: page.subtitle)
+        subtitle: page.subtitle,
+        viewOnce: page.viewOnce,
+        mediaTtlSeconds: page.mediaTtlSeconds)
       if galleryIndex < pageImageViews.count {
         pageImageViews[galleryIndex].image = image
       }
@@ -1561,10 +1636,20 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     // behind, so it has to count here or confirm would silently discard it.
     !canvasView.drawing.strokes.isEmpty || !overlayContainer.subviews.isEmpty
       || !aiUndoStack.isEmpty
+      || (isAttachComposer && composerModel.hasAdjustments)
   }
 
   private func snapshotEditedImage() -> UIImage? {
-    guard let base = imageView.image else { return nil }
+    guard let displayed = imageView.image else { return nil }
+    let base: UIImage = {
+      guard isAttachComposer, composerModel.hasAdjustments else { return displayed }
+      let source = composerOriginalImage ?? displayed
+      return ChatAttachImageAdjust.apply(
+        source,
+        brightness: composerModel.brightness,
+        contrast: composerModel.contrast,
+        saturation: composerModel.saturation)
+    }()
     // Flatten image + PencilKit drawing + overlays into one image at base pixel size.
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = base.scale
@@ -1607,14 +1692,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     guard let data = resized.jpegData(compressionQuality: isHighQuality ? 0.88 : 0.78) else {
       return nil
     }
-    let url = URL(fileURLWithPath: NSTemporaryDirectory())
-      .appendingPathComponent("chat-edit-\(UUID().uuidString).jpg")
-    do {
-      try data.write(to: url, options: .atomic)
-      return url
-    } catch {
-      return nil
-    }
+    return VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: "jpg")
   }
 
   private func emit(_ eventType: ChatImageEditEventType) {
@@ -1646,13 +1724,31 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       return nil
     }()
 
+    let extraURLs: [URL] = {
+      guard isAttachComposer, galleryPages.count > 1 else { return [] }
+      return galleryPages.enumerated().compactMap { index, page in
+        if index == galleryIndex { return nil }
+        if let image = page.image { return writeJPEGToTemp(image) }
+        if page.mediaURL.hasPrefix("file"), let url = URL(string: page.mediaURL) { return url }
+        return nil
+      }
+    }()
+    if isAttachComposer {
+      ChatAttachSendContext.pending = ChatAttachmentSendOptions.from(
+        composerModel.keepPolicy, highQuality: isHighQuality)
+      captionText = composerModel.caption.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     onAction?(
       ChatImageEditActionPayload(
         eventType: eventType,
         messageId: currentMessageId,
         mediaURL: mediaURL,
         caption: captionText.isEmpty ? nil : captionText,
-        editedImageURL: finalEdited
+        editedImageURL: finalEdited,
+        extraImageURLs: extraURLs,
+        viewOnce: isAttachComposer ? composerModel.keepPolicy.viewOnce : false,
+        mediaTtlSeconds: isAttachComposer ? composerModel.keepPolicy.mediaTtlSeconds : nil,
+        isHighQuality: isHighQuality
       ))
 
     let shouldDismissPresenter = dismissPresenterOnSend && eventType == .sendNew
@@ -1946,15 +2042,76 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   }
 
   @objc private func handleSend() {
-    let edited = hasVisualEdits()
+    if isAttachComposer { commitComposerCropIfNeeded() }
+    let edited = hasVisualEdits() || (isAttachComposer && composerModel.hasAdjustments)
     let captionChanged =
       !(captionField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || (isAttachComposer
+        && !composerModel.caption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     let eventType: ChatImageEditEventType = {
       if currentMessageId == nil { return .sendNew }
       if edited || captionChanged { return .edit }
       return .resend
     }()
     emit(eventType)
+  }
+
+  private func handleComposerPickMore() {
+    var config = PHPickerConfiguration(photoLibrary: .shared())
+    config.selectionLimit = max(1, 6 - galleryPages.count)
+    config.filter = .images
+    config.preferredAssetRepresentationMode = .current
+    let picker = PHPickerViewController(configuration: config)
+    picker.delegate = self
+    present(picker, animated: true)
+  }
+
+  private func handleComposerCrop() {
+    if composerModel.isCropping {
+      commitComposerCropIfNeeded()
+      return
+    }
+    composerModel.isCropping = true
+    let overlay = ChatAttachCropOverlay(frame: stageView.bounds)
+    overlay.install(over: renderSurfaceView.frame)
+    stageView.addSubview(overlay)
+    cropOverlay = overlay
+  }
+
+  private func commitComposerCropIfNeeded() {
+    guard composerModel.isCropping, let overlay = cropOverlay, let image = imageView.image else {
+      composerModel.isCropping = false
+      cropOverlay?.removeFromSuperview()
+      cropOverlay = nil
+      return
+    }
+    if let cropped = overlay.croppedImage(from: image, drawnIn: renderSurfaceView.frame) {
+      applyImage(cropped)
+    }
+    overlay.removeFromSuperview()
+    cropOverlay = nil
+    composerModel.isCropping = false
+  }
+
+  private func applyComposerAdjustmentsPreview() {
+    guard isAttachComposer, composerModel.showAdjustments || composerModel.hasAdjustments else {
+      return
+    }
+    let source = composerOriginalImage ?? imageView.image
+    guard let source else { return }
+    imageView.image = ChatAttachImageAdjust.apply(
+      source,
+      brightness: composerModel.brightness,
+      contrast: composerModel.contrast,
+      saturation: composerModel.saturation)
+  }
+
+  private func appendComposerPages(_ pages: [ChatImageEditGalleryPage]) {
+    guard !pages.isEmpty else { return }
+    galleryPages.append(contentsOf: pages)
+    composerModel.pickCount = galleryPages.count
+    rebuildPages()
+    selectPage(at: galleryPages.count - 1, animated: true)
   }
 
 
@@ -2224,6 +2381,34 @@ extension ChatImageEditViewController: ChatMediaZoomTransitionTarget {
     view.insertSubview(flightView, belowSubview: topContainer)
     flightView.frame = view.convert(frameInWindow, from: nil)
     return view
+  }
+}
+
+extension ChatImageEditViewController: PHPickerViewControllerDelegate {
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    guard !results.isEmpty else { return }
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var pagesByIndex: [Int: ChatImageEditGalleryPage] = [:]
+    for (index, result) in results.enumerated() {
+      guard result.itemProvider.canLoadObject(ofClass: UIImage.self) else { continue }
+      group.enter()
+      result.itemProvider.loadObject(ofClass: UIImage.self) { object, _ in
+        defer { group.leave() }
+        guard let image = object as? UIImage,
+          let data = image.jpegData(compressionQuality: 0.9),
+          let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: "jpg")
+        else { return }
+        lock.lock()
+        pagesByIndex[index] = ChatImageEditGalleryPage(mediaURL: url.absoluteString, image: image)
+        lock.unlock()
+      }
+    }
+    group.notify(queue: .main) { [weak self] in
+      let pages = pagesByIndex.keys.sorted().compactMap { pagesByIndex[$0] }
+      self?.appendComposerPages(pages)
+    }
   }
 }
 

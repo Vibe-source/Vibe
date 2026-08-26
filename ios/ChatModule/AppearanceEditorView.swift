@@ -1003,7 +1003,7 @@ struct ChatAppearanceColorEditor: View {
     case .background:
       return Array(draft.wallpaperGradient.prefix(4))
     case .accent:
-      return [draft.accent, "#8B7CFF", "#08C6B4", "#5C5CC5"]
+      return [draft.accent, "#3B8AE8", "#2C9A68", "#C85A28"]
     case .messages:
       return draft.bubbleMeGradient + draft.bubbleThemGradient.prefix(2)
     }
@@ -1059,7 +1059,7 @@ struct ChatAppearanceColorEditor: View {
       return draft.wallpaperScrollGradient.indices.contains(i)
         ? draft.wallpaperScrollGradient[i] : "#05050B"
     case .bubbleMe(let i):
-      return draft.bubbleMeGradient.indices.contains(i) ? draft.bubbleMeGradient[i] : "#8B7CFF"
+      return draft.bubbleMeGradient.indices.contains(i) ? draft.bubbleMeGradient[i] : "#3B8AE8"
     case .bubbleThem(let i):
       return draft.bubbleThemGradient.indices.contains(i) ? draft.bubbleThemGradient[i] : "#252936"
     case .accent:
@@ -1096,7 +1096,7 @@ struct ChatAppearanceColorEditor: View {
       ensureCount(&draft.wallpaperScrollGradient, min: i + 1, fill: "#05050B")
       draft.wallpaperScrollGradient[i] = hex
     case .bubbleMe(let i):
-      ensureCount(&draft.bubbleMeGradient, min: max(2, i + 1), fill: "#8B7CFF")
+      ensureCount(&draft.bubbleMeGradient, min: max(2, i + 1), fill: "#3B8AE8")
       draft.bubbleMeGradient[i] = hex
     case .bubbleThem(let i):
       ensureCount(&draft.bubbleThemGradient, min: max(2, i + 1), fill: "#252936")

@@ -608,6 +608,8 @@ struct ChatListRow {
   let duration: Double?
   let waveform: [CGFloat]?
   let isVideoNote: Bool
+  let viewOnce: Bool
+  let mediaTtlSeconds: Int?
   let uploadProgress: Double?
   let fileSize: Int64?
   let mediaWidth: Double?
@@ -884,6 +886,8 @@ struct ChatListRow {
       duration = nil
       waveform = nil
       isVideoNote = false
+      viewOnce = false
+      mediaTtlSeconds = nil
       uploadProgress = nil
       fileSize = nil
       mediaWidth = nil
@@ -1148,6 +1152,13 @@ struct ChatListRow {
       (message["isVideoNote"] as? Bool)
       ?? (metadata?["isVideoNote"] as? Bool)
       ?? false
+    viewOnce =
+      parseBool(message["viewOnce"] ?? message["view_once"])
+      ?? parseBool(metadata?["viewOnce"] ?? metadata?["view_once"])
+      ?? false
+    mediaTtlSeconds =
+      parseLong(message["mediaTtlSeconds"] ?? message["media_ttl_seconds"]).map(Int.init)
+      ?? parseLong(metadata?["mediaTtlSeconds"] ?? metadata?["media_ttl_seconds"]).map(Int.init)
     uploadProgress =
       parseDouble(message["uploadProgress"])
       ?? parseDouble(message["upload_progress"])
@@ -1687,6 +1698,7 @@ func chatListRowContentEqual(_ lhs: ChatListRow, _ rhs: ChatListRow) -> Bool {
     && lhs.forwardedFromAvatar == rhs.forwardedFromAvatar
     && lhs.forwardedFromUserId == rhs.forwardedFromUserId
     && optionalDoubleEqual(lhs.duration, rhs.duration) && lhs.isVideoNote == rhs.isVideoNote
+    && lhs.viewOnce == rhs.viewOnce && lhs.mediaTtlSeconds == rhs.mediaTtlSeconds
     && optionalWaveformEqual(lhs.waveform, rhs.waveform)
     && optionalDoubleEqual(lhs.uploadProgress, rhs.uploadProgress)
     && lhs.fileSize == rhs.fileSize
@@ -1819,6 +1831,9 @@ func chatListRowSignatureFields(_ row: ChatListRow) -> [(name: String, value: St
     ("eventInboxRole", String(describing: row.eventInboxRole)),
     ("hiddenFromTranscript", String(row.hiddenFromTranscript)),
     ("isDeliveryFailed", String(row.isDeliveryFailed)), ("isAgentError", String(row.isAgentError)),
+    // Appended LAST — the flipped-field diff is positional against persisted arrays.
+    // Emoji + count only: those set the strip width and its wrap; isSelected is a tint.
+    ("reactions", row.reactions.map { "\($0.emoji)x\($0.count)" }.joined(separator: ",")),
   ]
 }
 

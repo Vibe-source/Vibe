@@ -350,23 +350,6 @@ public final class ChatMainView: UIView,
   }()
 
 
-  private static let lastSeenDateFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .short
-    formatter.timeStyle = .none
-    return formatter
-  }()
-  private static let lastSeenTimeFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .none
-    formatter.timeStyle = .short
-    return formatter
-  }()
-  private static let lastSeenWeekdayFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.dateFormat = "EEEE"
-    return formatter
-  }()
   private static let profileListDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
@@ -5168,7 +5151,7 @@ public final class ChatMainView: UIView,
     guard shouldShowDirectPresence() else { return nil }
     if isOnline { return "online" }
     guard let lastSeen = engineLastSeenTimestampMs else { return "last seen recently" }
-    return formatLastSeenSubtitle(lastSeen)
+    return Self.formatLastSeenSubtitle(lastSeen)
   }
 
   private enum ConnectionHeaderPhase {
@@ -5230,34 +5213,20 @@ public final class ChatMainView: UIView,
 
 
 
-  private func formatLastSeenSubtitle(_ timestampMs: Int64) -> String {
+  /// Relative last-seen for the chat header. Clock time lives on messages, not here.
+  static func formatLastSeenSubtitle(_ timestampMs: Int64) -> String {
+    guard timestampMs > 0 else { return "last seen recently" }
     let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
-    let calendar = Calendar.current
     let now = Date()
-    let timePart = Self.lastSeenTimeFormatter.string(from: date)
-    if calendar.isDateInToday(date) {
-      return "last seen at \(timePart)"
+    if now.timeIntervalSince(date) < 60 {
+      return "last seen just now"
     }
-    if calendar.isDateInYesterday(date) {
-      return "last seen yesterday at \(timePart)"
-    }
-
-    let startOfLastSeenDay = calendar.startOfDay(for: date)
-    let startOfToday = calendar.startOfDay(for: now)
-    let daysAgo =
-      calendar.dateComponents([.day], from: startOfLastSeenDay, to: startOfToday).day
-      ?? Int.max
-
-    if daysAgo < 7 {
-      let weekday = Self.lastSeenWeekdayFormatter.string(from: date).lowercased()
-      return "last seen \(weekday) at \(timePart)"
-    }
-    if daysAgo < 14 {
-      return "last seen last week"
-    }
-
-    let dayPart = Self.lastSeenDateFormatter.string(from: date)
-    return "last seen \(dayPart) at \(timePart)"
+    let formatter = RelativeDateTimeFormatter()
+    formatter.unitsStyle = .short
+    let relative = formatter.localizedString(for: date, relativeTo: now)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !relative.isEmpty else { return "last seen recently" }
+    return "last seen \(relative)"
   }
 
   private func updateAvatarViews() {

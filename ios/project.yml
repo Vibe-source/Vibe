@@ -110,6 +110,8 @@ targets:
         DEVELOPMENT_TEAM: BXY4DH6H7D
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: App/Vibe.entitlements
+        # iPhone-only: the store rejects a portrait-only universal build.
+        TARGETED_DEVICE_FAMILY: "1"
       configs:
         Debug:
           APS_ENVIRONMENT: development

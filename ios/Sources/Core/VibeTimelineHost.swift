@@ -779,13 +779,32 @@ final class VibeTimelineHost {
     let failedFlag: UInt32 = 1 << 8  // VibeMessageFlags::DECRYPTION_FAILED
     var failed = 0
     var empty = 0
+    var unreadableIds: [String] = []
     for message in window.messages {
-      if message.flags & failedFlag != 0 { failed += 1 }
-      if message.text.isEmpty && !message.hasMedia { empty += 1 }
+      let refused = message.flags & failedFlag != 0
+      let blank = message.text.isEmpty && !message.hasMedia
+      if refused { failed += 1 }
+      if blank { empty += 1 }
+      if refused || blank, unreadableIds.count < 3 {
+        unreadableIds.append(String(message.messageId.suffix(12)) + (refused ? "!" : ""))
+      }
     }
     NSLog(
       "[VibeCore] window chat=%@ rows=%d decryptFailed=%d emptyNoMedia=%d",
       String(chatId.prefix(12)), window.messages.count, failed, empty)
+    // The count alone cannot be traced back to a row, and NSLog never reaches the
+    // in-app export. A trailing ! marks a row the core itself refused to open.
+    if failed > 0 || empty > 0 {
+      VibeLog.warning(
+        "core window has unreadable rows", category: "crypto",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "rows": String(window.messages.count),
+          "decryptFailed": String(failed),
+          "emptyNoMedia": String(empty),
+          "ids": unreadableIds.joined(separator: ","),
+        ])
+    }
 
     // Everything from here to `applied = items` is main-thread work inside a navigation
     // push, so it is measured and reported rather than assumed. The device export that

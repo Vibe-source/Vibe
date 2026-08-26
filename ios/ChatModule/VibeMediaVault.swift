@@ -381,6 +381,30 @@ final class VibeMediaVault {
     return destination
   }
 
+  /// Durable file for a just-picked photo/video. Never tmp — iOS deletes tmp between chat opens.
+  func persistOutgoingPick(data: Data, fileExtension: String) -> URL? {
+    let ext = Self.sanitizedExtension(fileExtension)
+    let isVideo = ["mp4", "mov", "m4v", "webm"].contains(ext)
+    return store(
+      data,
+      for: "outgoing:\(UUID().uuidString)",
+      kind: isVideo ? .document : .image,
+      fileExtension: ext.isEmpty ? "jpg" : ext,
+      displayName: isVideo ? "video" : "photo")
+  }
+
+  /// Moves a temp export into the vault so the sender's file survives tmp eviction.
+  func persistOutgoingPick(fileAt source: URL, move: Bool) -> URL? {
+    let ext = source.pathExtension.lowercased()
+    let isVideo = ["mp4", "mov", "m4v", "webm"].contains(ext)
+    return adopt(
+      fileAt: source,
+      for: "outgoing:\(UUID().uuidString)",
+      kind: isVideo ? .document : .image,
+      displayName: source.lastPathComponent,
+      move: move)
+  }
+
   /// Drops a file the app can prove is unusable (truncated, or an error page saved as media).
   /// This is the ONLY automatic removal in the vault, and it exists so a poisoned byte range
   /// cannot wedge a row forever. A fetch that merely failed must not come here.
@@ -535,5 +559,19 @@ final class VibeMediaVault {
       of: "[^A-Za-z0-9._-]+", with: "-", options: .regularExpression)
     let trimmed = String(cleaned.prefix(80)).trimmingCharacters(in: CharacterSet(charactersIn: "-."))
     return trimmed.isEmpty ? fallback : trimmed
+  }
+}
+
+/// Once-per-key media loss/reload logs so a later tmp-evict or vault miss is visible.
+enum ChatMediaWatchdog {
+  private static let lock = NSLock()
+  private static var logged = Set<String>()
+
+  static func once(key: String, _ message: String) {
+    lock.lock()
+    let inserted = logged.insert(key).inserted
+    lock.unlock()
+    guard inserted else { return }
+    NSLog("[MediaWatchdog] %@", message)
   }
 }

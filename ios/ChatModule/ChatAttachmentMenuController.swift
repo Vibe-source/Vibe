@@ -4,6 +4,7 @@ import Photos
 import PhotosUI
 import UIKit
 import UniformTypeIdentifiers
+import VisionKit
 
 // MARK: - ChatAttachmentMenuController
 
@@ -13,6 +14,8 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   var onSelectImages: (([String], String?, ChatAttachmentTransitionCapture?) -> Void)?
   var onSelectFile: ((String, String) -> Void)?
   var onSelectLocation: ((Double, Double) -> Void)?
+  var onSelectText: ((String) -> Void)?
+  var recipientName: String = ""
 
   var sourceButtonFrameInWindow: CGRect?
   weak var sourceButtonView: UIView?
@@ -33,8 +36,22 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private weak var zoomAnchorCellImageView: UIImageView?
   private let fileView = UIView()
   private let fileActionButton = UIButton(type: .system)
+  private let fileScrollView = UIScrollView()
+  private let fileStack = UIStackView()
+  private let recentsTable = UITableView(frame: .zero, style: .plain)
+  private var recentEntries: [ChatRecentSentFilesStore.Entry] = []
+  private var recentsHeightConstraint: NSLayoutConstraint?
   private let locationView = UIView()
   private let locationActionButton = UIButton(type: .system)
+  private let articleView = UIView()
+  private let articleField = UITextField()
+  private let articleSendButton = UIButton(type: .system)
+  private let checklistView = UIView()
+  private let checklistField = UITextField()
+  private var checklistItems: [String] = []
+  private let checklistList = UIStackView()
+  private let audioView = UIView()
+  private let audioActionButton = UIButton(type: .system)
 
   // ── Soft edge masks (gradient fade at header and bottom) ──
   private let topMaskView = UIView()
@@ -86,19 +103,25 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   private let selectionFeedback = UISelectionFeedbackGenerator()
 
   private enum MenuSection: Int, CaseIterable {
-    case gallery, file, location
+    case gallery, article, file, location, checklist, audio
     var title: String {
       switch self {
       case .gallery: return "Gallery"
+      case .article: return "Article"
       case .file: return "File"
       case .location: return "Location"
+      case .checklist: return "Checklist"
+      case .audio: return "Audio"
       }
     }
     var symbolName: String {
       switch self {
-      case .gallery: return "photo.stack"
-      case .file: return "doc"
-      case .location: return "location.circle"
+      case .gallery: return "photo.on.rectangle"
+      case .article: return "doc.richtext"
+      case .file: return "doc.fill"
+      case .location: return "location"
+      case .checklist: return "checkmark.square"
+      case .audio: return "play.circle"
       }
     }
   }
@@ -287,44 +310,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     contentView.addSubview(galleryEmptyLabel)
     contentView.addSubview(galleryPermissionButton)
 
-    // File Rows
-    let fileStack = UIStackView()
-    fileStack.translatesAutoresizingMaskIntoConstraints = false
-    fileStack.axis = .vertical
-    fileStack.spacing = 0
-    fileView.addSubview(fileStack)
-
-    let isDark = appearance.isDark
-
-    let galleryRow = AttachmentRowView(
-      title: "Choose from Gallery",
-      symbol: "photo.on.rectangle",
-      color: .systemBlue,
-      isDark: isDark,
-      showDivider: true
-    ) { [weak self] in
-      self?.openFullGalleryPicker()
-    }
-
-    let docRow = AttachmentRowView(
-      title: "Choose from Files",
-      symbol: "folder",
-      color: .systemOrange,
-      isDark: isDark,
-      showDivider: false
-    ) { [weak self] in
-      self?.openFilePicker()
-    }
-
-    fileStack.addArrangedSubview(galleryRow)
-    fileStack.addArrangedSubview(docRow)
-
-    NSLayoutConstraint.activate([
-      fileStack.leadingAnchor.constraint(equalTo: fileView.leadingAnchor),
-      fileStack.trailingAnchor.constraint(equalTo: fileView.trailingAnchor),
-      fileStack.centerYAnchor.constraint(equalTo: fileView.centerYAnchor, constant: -20),
-    ])
-
+    installFileSheet()
     contentView.addSubview(fileView)
 
     setupCenterAction(
@@ -333,6 +319,179 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     )
     locationActionButton.addTarget(self, action: #selector(openLocation), for: .touchUpInside)
     contentView.addSubview(locationView)
+
+    setupArticleHost()
+    setupChecklistHost()
+    setupCenterAction(
+      audioView, title: "Audio", subtitle: "Send a music or audio file",
+      button: audioActionButton, buttonTitle: "Choose Audio", symbol: "play.circle")
+    audioActionButton.addTarget(self, action: #selector(openAudioPicker), for: .touchUpInside)
+    contentView.addSubview(articleView)
+    contentView.addSubview(checklistView)
+    contentView.addSubview(audioView)
+    articleView.isHidden = true
+    checklistView.isHidden = true
+    audioView.isHidden = true
+  }
+
+  private func installFileSheet() {
+    let isDark = appearance.isDark
+    let rowColor = accentColor
+
+    fileScrollView.translatesAutoresizingMaskIntoConstraints = false
+    fileScrollView.alwaysBounceVertical = true
+    fileScrollView.showsVerticalScrollIndicator = false
+    fileView.addSubview(fileScrollView)
+
+    fileStack.translatesAutoresizingMaskIntoConstraints = false
+    fileStack.axis = .vertical
+    fileStack.spacing = 18
+    fileScrollView.addSubview(fileStack)
+
+    let card = UIView()
+    card.backgroundColor = primaryTextColor.withAlphaComponent(isDark ? 0.08 : 0.06)
+    card.layer.cornerRadius = 16
+    card.layer.cornerCurve = .continuous
+    let cardStack = UIStackView()
+    cardStack.translatesAutoresizingMaskIntoConstraints = false
+    cardStack.axis = .vertical
+    cardStack.spacing = 0
+    card.addSubview(cardStack)
+
+    let galleryRow = AttachmentRowView(
+      title: "Select from Gallery",
+      symbol: "photo",
+      color: rowColor,
+      isDark: isDark,
+      showDivider: true,
+      showChevron: false
+    ) { [weak self] in
+      self?.openFullGalleryPicker()
+    }
+    let docRow = AttachmentRowView(
+      title: "Select from Files",
+      symbol: "icloud",
+      color: rowColor,
+      isDark: isDark,
+      showDivider: true,
+      showChevron: false
+    ) { [weak self] in
+      self?.openFilePicker()
+    }
+    let scanRow = AttachmentRowView(
+      title: "Scan Document",
+      symbol: "doc.viewfinder",
+      color: rowColor,
+      isDark: isDark,
+      showDivider: false,
+      showChevron: false
+    ) { [weak self] in
+      self?.openDocumentScanner()
+    }
+    cardStack.addArrangedSubview(galleryRow)
+    cardStack.addArrangedSubview(docRow)
+    cardStack.addArrangedSubview(scanRow)
+
+    let recentsLabel = UILabel()
+    recentsLabel.text = "RECENTLY SENT FILES"
+    recentsLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+    recentsLabel.textColor = secondaryTextColor
+
+    recentsTable.translatesAutoresizingMaskIntoConstraints = false
+    recentsTable.backgroundColor = .clear
+    recentsTable.separatorStyle = .none
+    recentsTable.isScrollEnabled = false
+    recentsTable.dataSource = self
+    recentsTable.delegate = self
+    recentsTable.register(UITableViewCell.self, forCellReuseIdentifier: "recent-file")
+    recentsTable.rowHeight = 58
+
+    fileStack.addArrangedSubview(card)
+    fileStack.addArrangedSubview(recentsLabel)
+    fileStack.addArrangedSubview(recentsTable)
+
+    NSLayoutConstraint.activate([
+      fileScrollView.leadingAnchor.constraint(equalTo: fileView.leadingAnchor),
+      fileScrollView.trailingAnchor.constraint(equalTo: fileView.trailingAnchor),
+      fileScrollView.topAnchor.constraint(equalTo: fileView.topAnchor),
+      fileScrollView.bottomAnchor.constraint(equalTo: fileView.bottomAnchor),
+      fileStack.leadingAnchor.constraint(equalTo: fileScrollView.contentLayoutGuide.leadingAnchor, constant: 16),
+      fileStack.trailingAnchor.constraint(equalTo: fileScrollView.contentLayoutGuide.trailingAnchor, constant: -16),
+      fileStack.topAnchor.constraint(equalTo: fileScrollView.contentLayoutGuide.topAnchor, constant: 8),
+      fileStack.bottomAnchor.constraint(equalTo: fileScrollView.contentLayoutGuide.bottomAnchor, constant: -20),
+      fileStack.widthAnchor.constraint(equalTo: fileScrollView.frameLayoutGuide.widthAnchor, constant: -32),
+      cardStack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+      cardStack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+      cardStack.topAnchor.constraint(equalTo: card.topAnchor),
+      cardStack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+    ])
+    let recentsH = recentsTable.heightAnchor.constraint(equalToConstant: 8)
+    recentsH.isActive = true
+    recentsHeightConstraint = recentsH
+    reloadRecentFiles()
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(reloadRecentFiles),
+      name: ChatRecentSentFilesStore.didChange, object: nil)
+  }
+
+  @objc private func reloadRecentFiles() {
+    recentEntries = ChatRecentSentFilesStore.shared.entries
+    recentsTable.reloadData()
+    recentsTable.layoutIfNeeded()
+    recentsHeightConstraint?.constant = max(8, recentsTable.contentSize.height)
+  }
+
+  private func setupArticleHost() {
+    articleView.backgroundColor = .clear
+    let title = UILabel()
+    title.text = "Article"
+    title.font = .systemFont(ofSize: 22, weight: .semibold)
+    title.textColor = primaryTextColor
+    title.textAlignment = .center
+    articleView.addSubview(title)
+    title.tag = 11
+    articleField.placeholder = "Paste a link or title"
+    articleField.font = .systemFont(ofSize: 16)
+    articleField.textColor = primaryTextColor
+    articleField.borderStyle = .roundedRect
+    articleField.returnKeyType = .send
+    articleField.delegate = self
+    articleView.addSubview(articleField)
+    articleField.tag = 12
+    articleSendButton.setTitle("Send Article", for: .normal)
+    articleSendButton.setTitleColor(accentColor, for: .normal)
+    articleSendButton.addTarget(self, action: #selector(sendArticle), for: .touchUpInside)
+    articleView.addSubview(articleSendButton)
+    articleSendButton.tag = 13
+  }
+
+  private func setupChecklistHost() {
+    checklistView.backgroundColor = .clear
+    let title = UILabel()
+    title.text = "Checklist"
+    title.font = .systemFont(ofSize: 22, weight: .semibold)
+    title.textColor = primaryTextColor
+    title.textAlignment = .center
+    checklistView.addSubview(title)
+    title.tag = 21
+    checklistField.placeholder = "Add an item"
+    checklistField.font = .systemFont(ofSize: 16)
+    checklistField.textColor = primaryTextColor
+    checklistField.borderStyle = .roundedRect
+    checklistField.returnKeyType = .done
+    checklistField.delegate = self
+    checklistView.addSubview(checklistField)
+    checklistField.tag = 22
+    checklistList.axis = .vertical
+    checklistList.spacing = 8
+    checklistView.addSubview(checklistList)
+    checklistList.tag = 23
+    let send = UIButton(type: .system)
+    send.setTitle("Send Checklist", for: .normal)
+    send.setTitleColor(accentColor, for: .normal)
+    send.addTarget(self, action: #selector(sendChecklist), for: .touchUpInside)
+    checklistView.addSubview(send)
+    send.tag = 24
   }
 
   // MARK: - Tab Bar + Caption (exact ChatNativeTabBarModule subview copy)
@@ -365,8 +524,8 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     captionIconView.contentMode = .scaleAspectFit
     captionIconView.isUserInteractionEnabled = false
     captionIconView.image = UIImage(
-      systemName: "arrow.up",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)
+      systemName: "paperplane.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
     )
     captionIconView.tintColor = .white
     captionIconView.alpha = 1.0
@@ -420,13 +579,10 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       captionChromeView.topAnchor.constraint(equalTo: tabBar.topAnchor),
       wC, hC,
 
-      // Icon inside caption
-      captionIconView.centerXAnchor.constraint(
-        equalTo: captionChromeView.contentView.centerXAnchor),
-      captionIconView.centerYAnchor.constraint(
-        equalTo: captionChromeView.contentView.centerYAnchor),
-      captionIconView.widthAnchor.constraint(equalToConstant: 24),
-      captionIconView.heightAnchor.constraint(equalToConstant: 24),
+      captionIconView.centerXAnchor.constraint(equalTo: captionSendButton.centerXAnchor),
+      captionIconView.centerYAnchor.constraint(equalTo: captionSendButton.centerYAnchor),
+      captionIconView.widthAnchor.constraint(equalToConstant: 20),
+      captionIconView.heightAnchor.constraint(equalToConstant: 20),
 
       // Text field
       captionField.leadingAnchor.constraint(
@@ -509,18 +665,19 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
   @objc private func captionTextDidChange() {
     guard isCaptionMode else { return }
-    let hasText = !(captionField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    UIView.animate(withDuration: 0.2) {
-      self.captionSendButton.backgroundColor =
-        hasText
-        ? self.accentColor
-        : (self.appearance.isDark
-          ? UIColor.white.withAlphaComponent(0.12) : UIColor.black.withAlphaComponent(0.06))
-      self.captionIconView.tintColor =
-        hasText
-        ? .white
-        : (self.appearance.isDark
-          ? UIColor.white.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4))
+    updateCaptionSendAppearance(animated: true)
+  }
+
+  /// Selected media is already sendable; caption text is optional.
+  private func updateCaptionSendAppearance(animated: Bool) {
+    let apply = {
+      self.captionSendButton.backgroundColor = self.accentColor
+      self.captionIconView.tintColor = .white
+    }
+    if animated {
+      UIView.animate(withDuration: 0.2, animations: apply)
+    } else {
+      apply()
     }
   }
 
@@ -597,14 +754,30 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       x: 0, y: topInset, width: w, height: max(1, h - topInset - tabBarOverlap))
     fileView.frame = fileLocFrame
     locationView.frame = fileLocFrame
+    articleView.frame = fileLocFrame
+    checklistView.frame = fileLocFrame
+    audioView.frame = fileLocFrame
     layoutCenterViews()
+    layoutComposerHosts()
     updateCameraPreviewFrame()
+  }
+
+  private func layoutComposerHosts() {
+    let bounds = articleView.bounds
+    articleView.viewWithTag(11)?.frame = CGRect(x: 16, y: 24, width: bounds.width - 32, height: 28)
+    articleField.frame = CGRect(x: 16, y: 68, width: bounds.width - 32, height: 44)
+    articleSendButton.frame = CGRect(x: 16, y: 124, width: bounds.width - 32, height: 44)
+    checklistView.viewWithTag(21)?.frame = CGRect(x: 16, y: 24, width: bounds.width - 32, height: 28)
+    checklistField.frame = CGRect(x: 16, y: 68, width: bounds.width - 32, height: 44)
+    let send = checklistView.viewWithTag(24)
+    send?.frame = CGRect(x: 16, y: bounds.height - 56, width: bounds.width - 32, height: 44)
+    checklistList.frame = CGRect(x: 16, y: 124, width: bounds.width - 32, height: max(40, bounds.height - 190))
   }
 
   private func layoutCenterViews() {
     let insetBounds = contentView.bounds.insetBy(dx: 12, dy: 12)
     // Only location uses the classic center layout now
-    for host in [locationView] {
+    for host in [locationView, audioView] {
       guard host.subviews.count >= 3 else { continue }
       let title = host.subviews[0]
       let subtitle = host.subviews[1]
@@ -641,7 +814,8 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     let from = hostView(for: previous)
 
     // Hide all first, then just show target and from
-    [galleryCollectionView, galleryEmptyLabel, galleryPermissionButton, fileView, locationView]
+    [galleryCollectionView, galleryEmptyLabel, galleryPermissionButton, fileView, locationView,
+      articleView, checklistView, audioView]
       .forEach {
         $0.isHidden = true
       }
@@ -691,6 +865,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     galleryPermissionButton.isHidden = section != .gallery || !galleryNeedsPermissionAction
     fileView.isHidden = section != .file
     locationView.isHidden = section != .location
+    articleView.isHidden = section != .article
+    checklistView.isHidden = section != .checklist
+    audioView.isHidden = section != .audio
   }
 
   /// Limited access can add more, denied access can be changed in Settings; full
@@ -707,6 +884,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     case .gallery: return galleryCollectionView
     case .file: return fileView
     case .location: return locationView
+    case .article: return articleView
+    case .checklist: return checklistView
+    case .audio: return audioView
     }
   }
 
@@ -802,42 +982,36 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     guard !isCaptionMode else { return }
     isCaptionMode = true
     captionChromeView.isHidden = false
+    let tabFrame = tabBar.bounds
+    if captionWidthConstraint?.constant == 0 {
+      captionWidthConstraint?.constant = max(64, tabFrame.width)
+      captionHeightConstraint?.constant = max(44, tabFrame.height)
+      captionChromeView.layer.cornerRadius = 22
+      tabBarContainer.layoutIfNeeded()
+    }
+
+    captionChromeView.contentView.bringSubviewToFront(captionSendButton)
+    captionChromeView.contentView.bringSubviewToFront(captionIconView)
 
     UIView.animate(
-      withDuration: 0.4, delay: 0, usingSpringWithDamping: 0.8, initialSpringVelocity: 0.2,
-      options: .curveEaseInOut
+      withDuration: 0.42, delay: 0, usingSpringWithDamping: 0.92, initialSpringVelocity: 0.12,
+      options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]
     ) {
       let fullWidth = self.tabBarContainer.bounds.width
       self.captionWidthConstraint?.constant = fullWidth
       self.captionHeightConstraint?.constant = 50
       self.captionChromeView.layer.cornerRadius = 25
-
       self.tabBar.alpha = 0
-      self.tabBar.transform = CGAffineTransform(translationX: -40, y: 0)
-
-      self.captionChromeView.contentView.bringSubviewToFront(self.captionSendButton)
-      self.captionChromeView.contentView.bringSubviewToFront(self.captionIconView)
-
-      // Move icon to the send position (matching vibeExpand)
-      let translationX = (fullWidth / 2.0) - 25.0
-      self.captionIconView.transform = CGAffineTransform(translationX: translationX, y: 0)
-        .scaledBy(x: 0.85, y: 0.85)
-
+      self.tabBar.transform = .identity
+      self.captionIconView.transform = .identity
       self.captionSendButton.layer.cornerRadius = 19
-      self.captionSendButton.backgroundColor =
-        self.appearance.isDark
-        ? UIColor.white.withAlphaComponent(0.12) : UIColor.black.withAlphaComponent(0.06)
-
-      self.captionIconView.alpha = 1.0
-      self.captionIconView.tintColor =
-        self.appearance.isDark
-        ? UIColor.white.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
-      self.captionField.alpha = 1.0
-      self.captionSendButton.alpha = 1.0
-
+      self.captionSendButton.backgroundColor = self.accentColor
+      self.captionIconView.alpha = 1
+      self.captionIconView.tintColor = .white
+      self.captionField.alpha = 1
+      self.captionSendButton.alpha = 1
       self.tabBarContainer.layoutIfNeeded()
     }
-    // NO auto-focus on caption field — user can tap it if they want to type
   }
 
   private func exitCaptionMode() {
@@ -863,7 +1037,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
       self.captionIconView.transform = .identity
       self.captionIconView.alpha = 1.0
-      self.captionIconView.tintColor = .white
+      self.captionIconView.tintColor = self.primaryTextColor.withAlphaComponent(0.7)
 
       self.captionField.alpha = 0
       self.captionSendButton.alpha = 0
@@ -878,11 +1052,7 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   @objc private func sendSelectedItem() {
     let indices = selectedAssetIndices.filter { $0 < galleryAssets.count }
     guard !indices.isEmpty else { return }
-    if indices.count == 1 {
-      sendSelectedAsset(galleryAssets[indices[0]], skipEditor: true)
-      return
-    }
-    sendSelectedImages(indices.map { galleryAssets[$0] }.filter { $0.mediaType == .image })
+    presentComposer(for: indices.map { galleryAssets[$0] }, startIndex: 0)
   }
 
   /// Export every selected image to a temp file, then hand ALL uris (selection order)
@@ -909,15 +1079,11 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
           if let uti, let type = UTType(uti) { return type.preferredFilenameExtension ?? "jpg" }
           return "jpg"
         }()
-        let url = FileManager.default.temporaryDirectory
-          .appendingPathComponent("gallery-\(UUID().uuidString)")
-          .appendingPathExtension(ext)
-        do {
-          try data.write(to: url, options: .atomic)
-          lock.lock()
-          urisByIndex[index] = url.absoluteString
-          lock.unlock()
-        } catch {}
+        guard let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: ext)
+        else { return }
+        lock.lock()
+        urisByIndex[index] = url.absoluteString
+        lock.unlock()
       }
     }
     group.notify(queue: .main) { [weak self] in
@@ -936,6 +1102,23 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+    if textField === articleField {
+      sendArticle()
+      return true
+    }
+    if textField === checklistField {
+      let item = checklistField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !item.isEmpty {
+        checklistItems.append(item)
+        checklistField.text = ""
+        let row = UILabel()
+        row.text = "☐ \(item)"
+        row.font = .systemFont(ofSize: 16)
+        row.textColor = primaryTextColor
+        checklistList.addArrangedSubview(row)
+      }
+      return true
+    }
     if isCaptionMode { sendSelectedItem() }
     return true
   }
@@ -1046,48 +1229,115 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
         if let uti, let type = UTType(uti) { return type.preferredFilenameExtension ?? "jpg" }
         return "jpg"
       }()
-      let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("gallery-\(UUID().uuidString)")
-        .appendingPathExtension(ext)
-      do {
-        try data.write(to: url, options: .atomic)
-        DispatchQueue.main.async {
-          self.isSelectingAsset = false
-          if skipEditor {
-            self.finishAndDismiss {
-              self.onSelectImage?(url.absoluteString, self.currentCaption(), nil)
-            }
-          } else {
-            self.presentEditor(for: url, initialImage: UIImage(data: data))
-          }
-        }
-      } catch {
+      guard let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: ext)
+      else {
         DispatchQueue.main.async { self.isSelectingAsset = false }
+        return
+      }
+      DispatchQueue.main.async {
+        self.isSelectingAsset = false
+        if skipEditor {
+          self.finishAndDismiss {
+            self.onSelectImage?(url.absoluteString, self.currentCaption(), nil)
+          }
+        } else {
+          self.presentEditor(for: url, initialImage: UIImage(data: data))
+        }
       }
     }
   }
 
   private func presentEditor(for url: URL, initialImage: UIImage?) {
+    presentComposerPages(
+      [ChatImageEditGalleryPage(mediaURL: url.absoluteString, image: initialImage)],
+      startIndex: 0,
+      fallbackURL: url)
+  }
+
+  private func presentComposer(for assets: [PHAsset], startIndex: Int) {
+    guard !assets.isEmpty, !isSelectingAsset else { return }
+    if assets.count == 1, assets[0].mediaType == .video {
+      isSelectingAsset = true
+      sendVideo(assets[0], skipEditor: false)
+      return
+    }
+    let images = assets.filter { $0.mediaType == .image }
+    guard !images.isEmpty else { return }
+    isSelectingAsset = true
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var pagesByIndex: [Int: ChatImageEditGalleryPage] = [:]
+    for (index, asset) in images.enumerated() {
+      group.enter()
+      let options = PHImageRequestOptions()
+      options.isNetworkAccessAllowed = true
+      options.deliveryMode = .highQualityFormat
+      options.version = .current
+      PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) {
+        data, uti, _, _ in
+        defer { group.leave() }
+        guard let data else { return }
+        let ext: String = {
+          if let uti, let type = UTType(uti) { return type.preferredFilenameExtension ?? "jpg" }
+          return "jpg"
+        }()
+        guard let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: ext)
+        else { return }
+        lock.lock()
+        pagesByIndex[index] = ChatImageEditGalleryPage(
+          mediaURL: url.absoluteString, image: UIImage(data: data))
+        lock.unlock()
+      }
+    }
+    group.notify(queue: .main) { [weak self] in
+      guard let self else { return }
+      self.isSelectingAsset = false
+      let pages = pagesByIndex.keys.sorted().compactMap { pagesByIndex[$0] }
+      guard let first = pages.first, let url = URL(string: first.mediaURL) else { return }
+      self.presentComposerPages(pages, startIndex: min(startIndex, pages.count - 1), fallbackURL: url)
+    }
+  }
+
+  private func presentComposerPages(
+    _ pages: [ChatImageEditGalleryPage], startIndex: Int, fallbackURL: URL
+  ) {
     let onSelectImage = self.onSelectImage
+    let onSelectImages = self.onSelectImages
     ChatImageEditModule.presentEditor(
-      from: self, messageId: nil, mediaURL: url.absoluteString,
-      initialImage: initialImage,
+      from: self,
+      messageId: nil,
+      mediaURL: (startIndex >= 0 && startIndex < pages.count)
+        ? pages[startIndex].mediaURL : fallbackURL.absoluteString,
+      initialImage: (startIndex >= 0 && startIndex < pages.count)
+        ? pages[startIndex].image : pages.first?.image,
       initialCaption: currentCaption(),
+      headerTitle: recipientName,
       dismissPresenterOnSend: true,
-      // Same shared-element open as the chat: the picture grows out of the
-      // thumbnail that was tapped instead of arriving from nowhere.
+      galleryPages: pages,
+      startIndex: startIndex,
+      allowsFilmstrip: false,
       zoomSourceProvider: self
     ) { [weak self] payload in
-      if payload.eventType == .sendNew {
-        let finalURL = payload.editedImageURL ?? url
-        let caption = payload.caption ?? self?.currentCaption()
-        if let self = self {
-          self.finishAndDismiss {
-            onSelectImage?(finalURL.absoluteString, caption, nil)
-          }
+      guard payload.eventType == .sendNew else { return }
+      let primary = payload.editedImageURL ?? fallbackURL
+      var uris = [primary.absoluteString]
+      uris.append(contentsOf: payload.extraImageURLs.map(\.absoluteString))
+      let caption = payload.caption ?? self?.currentCaption()
+      ChatAttachSendContext.pending = ChatAttachmentSendOptions(
+        viewOnce: payload.viewOnce,
+        mediaTtlSeconds: payload.mediaTtlSeconds,
+        isHighQuality: payload.isHighQuality)
+      let send: () -> Void = {
+        if uris.count == 1 {
+          onSelectImage?(uris[0], caption, nil)
         } else {
-          onSelectImage?(finalURL.absoluteString, caption, nil)
+          onSelectImages?(uris, caption, nil)
         }
+      }
+      if let self {
+        self.finishAndDismiss(send)
+      } else {
+        send()
       }
     }
   }
@@ -1179,9 +1429,12 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
             if exportSession.status == .completed,
               self.isUsableExportedVideo(outputURL, logContext: "gallery_export")
             {
+              let durable =
+                VibeMediaVault.shared.persistOutgoingPick(fileAt: outputURL, move: true)
+                ?? outputURL
               self.isSelectingAsset = false
               self.finishAndDismiss {
-                self.onSelectImage?(outputURL.absoluteString, self.currentCaption(), nil)
+                self.onSelectImage?(durable.absoluteString, self.currentCaption(), nil)
               }
               return
             }
@@ -1276,6 +1529,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
   }
 
   private func copyVideoToTemporaryURL(from sourceURL: URL) throws -> URL {
+    if let durable = VibeMediaVault.shared.persistOutgoingPick(fileAt: sourceURL, move: false) {
+      return durable
+    }
     let ext = sourceURL.pathExtension.isEmpty ? "mov" : sourceURL.pathExtension
     let destinationURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("gallery-video-\(UUID().uuidString)")
@@ -1433,7 +1689,107 @@ extension ChatAttachmentMenuController: UIDocumentPickerDelegate {
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL])
   {
     guard let url = urls.first else { return }
+    let accessed = url.startAccessingSecurityScopedResource()
+    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+    ChatRecentSentFilesStore.shared.record(
+      sourceURL: url, displayName: url.lastPathComponent, byteSize: size)
     finishAndDismiss { self.onSelectFile?(url.absoluteString, url.lastPathComponent) }
+  }
+}
+
+extension ChatAttachmentMenuController: UITableViewDataSource, UITableViewDelegate {
+  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    recentEntries.count
+  }
+
+  func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: "recent-file", for: indexPath)
+    let entry = recentEntries[indexPath.row]
+    var content = cell.defaultContentConfiguration()
+    content.text = entry.fileName
+    content.secondaryText = Self.recentFileSubtitle(entry)
+    content.image = UIImage(systemName: "doc.fill")
+    content.imageProperties.tintColor = .systemBlue
+    content.textProperties.color = primaryTextColor
+    content.secondaryTextProperties.color = secondaryTextColor
+    cell.contentConfiguration = content
+    cell.backgroundColor = .clear
+    cell.selectionStyle = .default
+    return cell
+  }
+
+  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: true)
+    let entry = recentEntries[indexPath.row]
+    let url = ChatRecentSentFilesStore.shared.fileURL(for: entry)
+    finishAndDismiss { self.onSelectFile?(url.absoluteString, entry.fileName) }
+  }
+
+  private static func recentFileSubtitle(_ entry: ChatRecentSentFilesStore.Entry) -> String {
+    let size = ByteCountFormatter.string(fromByteCount: entry.byteSize, countStyle: .file)
+    let formatter = DateFormatter()
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    return "\(size) · \(formatter.string(from: entry.sentAt))"
+  }
+}
+
+extension ChatAttachmentMenuController: VNDocumentCameraViewControllerDelegate {
+  @objc private func openDocumentScanner() {
+    guard VNDocumentCameraViewController.isSupported else {
+      openFilePicker()
+      return
+    }
+    let scanner = VNDocumentCameraViewController()
+    scanner.delegate = self
+    present(scanner, animated: true)
+  }
+
+  func documentCameraViewControllerDidCancel(_ controller: VNDocumentCameraViewController) {
+    controller.dismiss(animated: true)
+  }
+
+  func documentCameraViewController(
+    _ controller: VNDocumentCameraViewController, didFailWithError error: Error
+  ) {
+    controller.dismiss(animated: true)
+  }
+
+  func documentCameraViewController(
+    _ controller: VNDocumentCameraViewController,
+    didFinishWith scan: VNDocumentCameraScan
+  ) {
+    controller.dismiss(animated: true)
+    guard scan.pageCount > 0 else { return }
+    let image = scan.imageOfPage(at: 0)
+    guard let data = image.jpegData(compressionQuality: 0.88),
+      let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: "jpg")
+    else { return }
+    presentEditor(for: url, initialImage: image)
+  }
+
+  @objc private func openAudioPicker() {
+    view.endEditing(true)
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.audio, .mp3, .mpeg4Audio])
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    present(picker, animated: true)
+  }
+
+  @objc private func sendArticle() {
+    let text = articleField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !text.isEmpty else { return }
+    finishAndDismiss { self.onSelectText?(text) }
+  }
+
+  @objc private func sendChecklist() {
+    let pending = checklistField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    var items = checklistItems
+    if !pending.isEmpty { items.append(pending) }
+    guard !items.isEmpty else { return }
+    let body = items.map { "☐ \($0)" }.joined(separator: "\n")
+    finishAndDismiss { self.onSelectText?(body) }
   }
 }
 
@@ -1533,8 +1889,11 @@ extension ChatAttachmentMenuController:
     // Remember the thumbnail so the editor can grow out of it. Held weakly: the
     // grid can recycle the cell while the asset's full-size data is still loading.
     zoomAnchorCellImageView = (cv.cellForItem(at: indexPath) as? ChatAttachmentAssetCell)?.imageView
-    // Direct tap = open editor
-    sendSelectedAsset(galleryAssets[assetIdx])
+    var indices = selectedAssetIndices.filter { $0 < galleryAssets.count }
+    if !indices.contains(assetIdx) { indices.insert(assetIdx, at: 0) }
+    if indices.isEmpty { indices = [assetIdx] }
+    let start = indices.firstIndex(of: assetIdx) ?? 0
+    presentComposer(for: indices.map { galleryAssets[$0] }, startIndex: start)
   }
 
   // This goes through the generic FlowLayout delegate method, but
@@ -1569,11 +1928,10 @@ extension ChatAttachmentMenuController: UIImagePickerControllerDelegate,
   ) {
     picker.dismiss(animated: true) { [weak self] in
       if let image = info[.originalImage] as? UIImage {
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(
-          "camera-\(UUID().uuidString).jpg")
-        if let data = image.jpegData(compressionQuality: 0.9) {
-          try? data.write(to: tempURL)
-          self?.finishAndDismiss { self?.onSelectImage?(tempURL.absoluteString, nil, nil) }
+        if let data = image.jpegData(compressionQuality: 0.9),
+          let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: "jpg")
+        {
+          self?.finishAndDismiss { self?.onSelectImage?(url.absoluteString, nil, nil) }
         }
       } else if let videoURL = info[.mediaURL] as? URL, let self {
         let stableURL = (try? self.copyVideoToTemporaryURL(from: videoURL)) ?? videoURL
@@ -1621,8 +1979,9 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
   var representedAssetId = ""
   var onSelectToggle: (() -> Void)?
 
-  // Selection toggle button at top-right
-  private let toggleButton = UIButton(type: .system)
+  // Selection toggle: `.normal` = inactive circle, `.selected` = active check.
+  private let toggleButton = UIButton(type: .custom)
+  private let selectedScrim = UIView()
   private let videoBadgeView = UIView()
   private let videoBadgeIconView = UIImageView()
   private let videoBadgeLabel = UILabel()
@@ -1633,6 +1992,8 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
     clipsToBounds = true
     layer.cornerCurve = .continuous
     layer.cornerRadius = 8
+    isAccessibilityElement = true
+    accessibilityLabel = "Select photo"
 
     imageView.frame = bounds
     imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -1640,16 +2001,23 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
     imageView.backgroundColor = UIColor.white.withAlphaComponent(0.08)
     contentView.addSubview(imageView)
 
-    // 2-state toggle: circle (unchecked) / checkmark.circle.fill (checked)
-    toggleButton.setImage(
-      UIImage(
-        systemName: "circle",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .medium)),
-      for: .normal
-    )
-    toggleButton.tintColor = UIColor.white.withAlphaComponent(0.8)
+    selectedScrim.frame = bounds
+    selectedScrim.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    selectedScrim.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+    selectedScrim.isUserInteractionEnabled = false
+    selectedScrim.alpha = 0
+    contentView.addSubview(selectedScrim)
+
+    let symbol = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
+    let inactive = UIImage(systemName: "circle", withConfiguration: symbol)
+    let active = UIImage(systemName: "checkmark.circle.fill", withConfiguration: symbol)
+    toggleButton.setImage(inactive, for: .normal)
+    toggleButton.setImage(inactive, for: .highlighted)
+    toggleButton.setImage(active, for: .selected)
+    toggleButton.setImage(active, for: [.selected, .highlighted])
+    toggleButton.adjustsImageWhenHighlighted = false
+    toggleButton.tintColor = UIColor.white.withAlphaComponent(0.85)
     toggleButton.addTarget(self, action: #selector(toggleTapped), for: .touchUpInside)
-    // Large hit area
     toggleButton.contentEdgeInsets = UIEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
     contentView.addSubview(toggleButton)
 
@@ -1716,21 +2084,21 @@ private final class ChatAttachmentAssetCell: UICollectionViewCell {
 
   func setChecked(_ checked: Bool, animated: Bool) {
     isChecked = checked
-    let symbol = checked ? "checkmark.circle.fill" : "circle"
-    let tint: UIColor = checked ? UIColor.systemBlue : UIColor.white.withAlphaComponent(0.8)
-    let image = UIImage(
-      systemName: symbol,
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .medium)
-    )
-
-    if animated {
-      UIView.transition(with: toggleButton, duration: 0.18, options: .transitionCrossDissolve) {
-        self.toggleButton.setImage(image, for: .normal)
-        self.toggleButton.tintColor = tint
+    let apply = {
+      self.toggleButton.isSelected = checked
+      self.toggleButton.tintColor =
+        checked ? UIColor.systemBlue : UIColor.white.withAlphaComponent(0.85)
+      self.selectedScrim.alpha = checked ? 1 : 0
+      if checked {
+        self.accessibilityTraits.insert(.selected)
+      } else {
+        self.accessibilityTraits.remove(.selected)
       }
+    }
+    if animated {
+      UIView.animate(withDuration: 0.18, delay: 0, options: .curveEaseInOut, animations: apply)
     } else {
-      toggleButton.setImage(image, for: .normal)
-      toggleButton.tintColor = tint
+      apply()
     }
   }
 
@@ -1877,9 +2245,8 @@ extension ChatAttachmentMenuController: PHPickerViewControllerDelegate {
       itemProvider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
         guard let image = object as? UIImage, let data = image.jpegData(compressionQuality: 0.9)
         else { return }
-        let url = FileManager.default.temporaryDirectory
-          .appendingPathComponent("gallery-\(UUID().uuidString).jpg")
-        try? data.write(to: url)
+        guard let url = VibeMediaVault.shared.persistOutgoingPick(data: data, fileExtension: "jpg")
+        else { return }
         DispatchQueue.main.async {
           self?.finishAndDismiss { self?.onSelectImage?(url.absoluteString, nil, nil) }
         }
@@ -1900,6 +2267,7 @@ private final class AttachmentRowView: UIControl {
 
   init(
     title: String, symbol: String, color: UIColor, isDark: Bool, showDivider: Bool,
+    showChevron: Bool = true,
     onPress: @escaping () -> Void
   ) {
     self.onPress = onPress
@@ -1933,6 +2301,7 @@ private final class AttachmentRowView: UIControl {
       withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold))
     chevronView.tintColor = (isDark ? UIColor.white : UIColor.black).withAlphaComponent(
       isDark ? 0.5 : 0.32)
+    chevronView.isHidden = !showChevron
     addSubview(chevronView)
 
     divider.translatesAutoresizingMaskIntoConstraints = false

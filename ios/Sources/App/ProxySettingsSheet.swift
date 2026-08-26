@@ -188,14 +188,14 @@ private struct ProxyRow: View {
     .lineLimit(1)
   }
 
-  /// Ping alone; green already says connected, so the word would be redundant.
+  /// Active tunnel says connected. Ping is only for idle probe rows.
   private var detail: String {
     switch state {
     case .probing: return "checking…"
     case let .reachable(ms): return "ping \(ms) ms"
     case .unreachable: return "unavailable"
     case .connecting: return "connecting…"
-    case let .connected(ms): return ms.map { "ping \($0) ms" } ?? "connected"
+    case .connected: return "connected"
     case let .failed(message): return message
     case let .invalid(message): return message
     }

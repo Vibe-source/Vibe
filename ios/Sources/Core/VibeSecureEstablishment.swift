@@ -700,6 +700,17 @@ enum VibeSecureEstablishment {
         guard let object else { return }
         let pending = (object["pending"] as? Int) ?? 0
         let delivered = (object["delivered"] as? Int) ?? 0
+        let incomingPending = (object["incomingPending"] as? Int) ?? 0
+        let incomingDelivered = (object["incomingDelivered"] as? Int) ?? 0
+        // A joiner never posts a Welcome, so sent pending/delivered stay 0.
+        // incoming* is how we tell that apart from an initiator whose POST never landed.
+        if incomingDelivered > 0 {
+          VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
+          return
+        }
+        if incomingPending > 0 {
+          return
+        }
         // Confirmed only when something was actually applied and nothing is
         // still outstanding. `delivered > 0` alone is not enough for a group:
         // one member joining does not mean the rest can read.
@@ -708,35 +719,19 @@ enum VibeSecureEstablishment {
           return
         }
 
-        // `pending == 0 && delivered == 0` is not "still waiting" — it means the
-        // server holds no Welcome row for this chat at all, while we sit on a
-        // group. The peer was never told this group exists and never will be.
-        //
-        // Two ways in, both real: a kill between `createSession` and `POST
-        // /welcomes`, and a peer that retired its signing key (which deletes the
-        // Welcomes addressed to it) after we had already posted one. Either way
-        // `hasSession` keeps answering yes, so `establishDirectMessage`
-        // short-circuits and the chat never reaches MLS again — the state this
-        // file has been describing as "not self-healing yet".
-        //
-        // Discarding is free, and only here: an unconfirmed group has never
-        // sealed a message, because the send path requires `isPeerConfirmed`
-        // first. So there is nothing to lose and nothing to downgrade — the next
-        // attempt starts clean and re-establishes.
-        //
-        // Gated on age, because a group mid-establishment looks exactly like an
-        // abandoned one from here: `createSession` stores the group id before
-        // `POST /welcomes` is even sent, so a status query racing that window
-        // reads pending=0 delivered=0 for a group that is seconds from working.
-        // Discarding that would break establishment rather than repair it. The
-        // grace period is far longer than any round-trip and costs only a delay
-        // on a genuinely dead group.
+        // True initiator orphan: we created a group and the server has no Welcome
+        // we sent or received. Joiners must not enter this arm.
         if delivered == 0, pending == 0 {
           let age = VibeSecureSessions.shared.groupAge(chatId: chatId) ?? 0
           guard age > orphanGraceSeconds else { return }
           VibeLog.notice(
-            "[VibeSecure] \(chatId) holds a group the server never had a Welcome for"
-              + " — discarding it so establishment can start over")
+            "discarding initiator mls group with no server welcome",
+            category: "crypto",
+            metadata: [
+              "chat": String(chatId.prefix(12)),
+              "stage": "orphan-discard",
+              "age": "\(Int(age))",
+            ])
           VibeSecureSessions.shared.discard(chatId: chatId)
           return
         }

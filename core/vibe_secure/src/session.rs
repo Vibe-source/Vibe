@@ -97,6 +97,14 @@ pub struct VibeCommitOutput {
     pub welcome: Vec<u8>,
 }
 
+/// Cleartext MLS header from a `vmls1.` envelope. Not an open — no AEAD, no secrets.
+pub struct VibeMlsEnvelopeHeader {
+    pub group_id: Vec<u8>,
+    pub epoch: u64,
+    /// `app`, `commit`, or `proposal`.
+    pub content: &'static str,
+}
+
 impl VibeSecureSession {
     /// Creates a brand-new group with `identity` as its only member.
     pub fn create(
@@ -145,6 +153,34 @@ impl VibeSecureSession {
         }
     }
 
+    /// Reads the MLS group id from a `vmls1.` header without opening the message.
+    /// The id is in the clear on every PrivateMessage; used to rebind a dropped chat mapping.
+    pub fn group_id_from_envelope(envelope: &str) -> Result<Vec<u8>, VibeSecureError> {
+        Ok(Self::envelope_header(envelope)?.group_id)
+    }
+
+    /// Group id, epoch, and content type from a `vmls1.` header. Does not open the AEAD.
+    pub fn envelope_header(envelope: &str) -> Result<VibeMlsEnvelopeHeader, VibeSecureError> {
+        catch_untrusted(VibeSecureError::MalformedEnvelope, || {
+            let bytes = envelope::unwrap(envelope)?;
+            let message_in = MlsMessageIn::tls_deserialize_exact_bytes(&bytes)
+                .map_err(|_| VibeSecureError::MalformedEnvelope)?;
+            let protocol_message = message_in
+                .try_into_protocol_message()
+                .map_err(|_| VibeSecureError::MalformedEnvelope)?;
+            let content = match protocol_message.content_type() {
+                ContentType::Application => "app",
+                ContentType::Proposal => "proposal",
+                ContentType::Commit => "commit",
+            };
+            Ok::<VibeMlsEnvelopeHeader, VibeSecureError>(VibeMlsEnvelopeHeader {
+                group_id: protocol_message.group_id().as_slice().to_vec(),
+                epoch: protocol_message.epoch().as_u64(),
+                content,
+            })
+        })?
+    }
+
     /// The group's id, which is how it is addressed in storage.
     ///
     /// The platform persists its own `chat id -> group id` mapping; this crate
@@ -152,6 +188,14 @@ impl VibeSecureSession {
     /// this crate has no opinion about them.
     pub fn group_id(&self) -> Vec<u8> {
         self.group.group_id().as_slice().to_vec()
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.group.epoch().as_u64()
+    }
+
+    pub fn has_pending_commit(&self) -> bool {
+        self.group.pending_commit().is_some()
     }
 
     /// Joins a group from a Welcome message, as produced by
@@ -308,6 +352,16 @@ impl VibeSecureSession {
         let protocol_message = message_in
             .try_into_protocol_message()
             .map_err(|_| VibeSecureError::Open)?;
+
+        // A crash between `add_members` and `merge_pending_commit` leaves the
+        // committer PendingCommit at epoch N while the joiner already lives at N+1.
+        if self.group.pending_commit().is_some() {
+            self.with_group(|group| {
+                group
+                    .merge_pending_commit(provider)
+                    .map_err(|_| VibeSecureError::Open)
+            })?;
+        }
 
         let processed = self.with_group(|group| {
             group

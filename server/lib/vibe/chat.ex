@@ -1034,6 +1034,77 @@ defmodule Vibe.Chat do
       end
   end
 
+  def consume_view_once_media(chat_id, message_id, user_id) do
+    with {:ok, uuid} <- Ecto.UUID.cast(message_id),
+         true <- is_participant?(chat_id, user_id),
+         %Message{} = message <-
+           RepoRLS.with_user(user_id, fn ->
+             Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id))
+           end) do
+      meta = message.metadata || %{}
+      view_once = meta["viewOnce"] == true or meta["view_once"] == true
+      ttl = media_ttl_seconds(meta)
+
+      cond do
+        not view_once and is_nil(ttl) ->
+          {:error, :not_view_once}
+
+        ttl in [nil, 0] ->
+          delete_view_once_and_broadcast(chat_id, message_id, message.from_id, user_id)
+
+        is_integer(ttl) and ttl > 0 ->
+          Task.start(fn ->
+            Process.sleep(ttl * 1000)
+            _ = delete_view_once_and_broadcast(chat_id, message_id, message.from_id, user_id)
+          end)
+
+          {:ok, :scheduled}
+
+        true ->
+          {:error, :not_view_once}
+      end
+    else
+      false -> {:error, :forbidden}
+      :error -> {:error, :invalid_id}
+      nil -> {:error, :not_found}
+      other -> other
+    end
+  end
+
+  defp delete_view_once_and_broadcast(chat_id, message_id, author_id, actor_id) do
+    case delete_message(chat_id, message_id, author_id, true) do
+      {:ok, message} ->
+        payload = %{
+          chatId: chat_id,
+          messageId: message_id,
+          deletedBy: actor_id,
+          forEveryone: true,
+          reason: "view_once"
+        }
+
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-deleted", payload)
+        broadcast_user_chat_event(chat_id, "message-deleted", payload, nil)
+        {:ok, message}
+
+      other ->
+        other
+    end
+  end
+
+  defp media_ttl_seconds(meta) when is_map(meta) do
+    value = meta["mediaTtlSeconds"] || meta["media_ttl_seconds"]
+
+    cond do
+      is_integer(value) and value >= 0 -> value
+      is_binary(value) ->
+        case Integer.parse(value) do
+          {n, _} when n >= 0 -> n
+          _ -> nil
+        end
+      true -> nil
+    end
+  end
+
   def delete_message(chat_id, message_id, user_id, for_everyone \\ true) do
     result =
       RepoRLS.with_user(user_id, fn ->

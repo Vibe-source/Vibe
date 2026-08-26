@@ -53,13 +53,6 @@ defmodule VibeWeb.Endpoint do
     only: VibeWeb.static_paths()
   )
 
-  # Serve uploaded files
-  plug(Plug.Static,
-    at: "/uploads",
-    from: "/app/uploads",
-    gzip: false
-  )
-
   plug(Plug.RequestId)
   plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
 

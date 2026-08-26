@@ -3279,6 +3279,7 @@ final class ContactDirectoryViewModel: ObservableObject {
       let chats = try await ChatHomeService.fetchChats(config: config)
       rows = chats.filter { row in
         !row.isSavedMessages && !row.isGroup && row.peerUserId != nil
+          && row.hasVisibleActivity
       }
       hasLoaded = true
     } catch {
@@ -3358,6 +3359,7 @@ private struct ChatHomeScreen: View {
   @State private var isShowingGroupCreation = false
   @State private var pendingCreatedRoomRoute: ChatRoute?
   @State private var pendingSavedContact: ContactSearchUser?
+  @State private var queuedSavedContact: ContactSearchUser?
   @State private var isShowingProxy = false
   @State private var proxyBadge = HomeProxyBadge()
   @State private var homeSearchQuery = ""
@@ -3391,7 +3393,19 @@ private struct ChatHomeScreen: View {
   }
 
   private var visibleHomeRows: [ChatHomeListRow] {
-    Self.sortedForHome(model.rows.filter { !locallyHiddenChatIDs.contains($0.chatId) })
+    Self.sortedForHome(
+      model.rows.filter { row in
+        !locallyHiddenChatIDs.contains(row.chatId) && Self.shouldAppearOnHome(row)
+      })
+  }
+
+  /// Empty 1:1 DMs stay off Home; rooms, saved messages, and agent surfaces stay.
+  private static func shouldAppearOnHome(_ row: ChatHomeListRow) -> Bool {
+    if row.isSavedMessages || row.isArchiveEntry || row.isGroup { return true }
+    if row.isAgentFriend || row.isBuiltInAgentSurface || row.isBridgeAgentSurface {
+      return true
+    }
+    return row.hasVisibleActivity
   }
 
   /// Home ordering: pinned chats (Saved Messages included), then every other chat by
@@ -3892,7 +3906,7 @@ private struct ChatHomeScreen: View {
       )
       openHomeSearch()
     }
-    .sheet(isPresented: $isShowingSearch) {
+    .sheet(isPresented: $isShowingSearch, onDismiss: presentQueuedSavedContact) {
       if let config = AppSessionConfig.current {
         NavigationStack {
           ContactSearchView(config: config, homeRows: visibleHomeRows) { payload in
@@ -3902,13 +3916,22 @@ private struct ChatHomeScreen: View {
       }
     }
     .sheet(item: $pendingSavedContact) { user in
-      ContactActionSheet(user: user) {
-        pendingSavedContact = nil
-        Task { @MainActor in
-          try? await Task.sleep(nanoseconds: 180_000_000)
-          _ = await openChat(for: user)
+      ContactActionSheet(
+        user: user,
+        onChat: {
+          pendingSavedContact = nil
+          Task { _ = await openChat(for: user) }
+        },
+        onCall: {
+          pendingSavedContact = nil
+          Task {
+            let route = await openChat(for: user)
+            if let route {
+              NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
+            }
+          }
         }
-      }
+      )
     }
     .sheet(isPresented: $isShowingProxy) {
       NavigationStack {
@@ -4374,17 +4397,13 @@ private struct ChatHomeScreen: View {
     }
 
     if action == "saveContact" {
-      Task { @MainActor in
-        guard await saveContact(for: user) else { return }
-        isShowingSearch = false
-        pendingSavedContact = user
-      }
+      queuedSavedContact = user
+      isShowingSearch = false
       return
     }
 
     isShowingSearch = false
     Task {
-      // No artificial 300ms delay — open as soon as DM create returns.
       let route = await openChat(for: user)
       if action == "call", let route {
         NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
@@ -4392,23 +4411,10 @@ private struct ChatHomeScreen: View {
     }
   }
 
-
-  @MainActor
-  private func saveContact(for user: ContactSearchUser) async -> Bool {
-    guard let config = AppSessionConfig.current else {
-      errorMessage = "The current session is unavailable."
-      return false
-    }
-
-    do {
-      _ = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
-      await model.refresh()
-      AppToastController.shared.show("Contact saved.")
-      return true
-    } catch {
-      errorMessage = error.localizedDescription
-      return false
-    }
+  private func presentQueuedSavedContact() {
+    guard let user = queuedSavedContact else { return }
+    queuedSavedContact = nil
+    pendingSavedContact = user
   }
 
   @MainActor
@@ -7963,6 +7969,7 @@ final class ChatHomeNativeListController: UIViewController, UITableViewDataSourc
           isDark: self.isDark,
           avatarBackgroundColor: nil,
           avatarGradientColors: self.resolvedAvatarGradientColors(for: row),
+          unreadBadgeColor: AppThemePalette.resolve(for: self.isDark ? .dark : .light).accentUIColor,
           isEditing: self.isEditingMode,
           isEditSelected: self.selectedChatIDs.contains(row.chatId),
           showsRightCheckmark: self.showsRightCheckmark,
@@ -8401,6 +8408,7 @@ final class ChatHomeNativeListController: UIViewController, UITableViewDataSourc
       isDark: isDark,
       avatarBackgroundColor: nil,
       avatarGradientColors: resolvedAvatarGradientColors(for: row),
+      unreadBadgeColor: AppThemePalette.resolve(for: isDark ? .dark : .light).accentUIColor,
       isEditing: isEditingMode,
       isEditSelected: selectedChatIDs.contains(row.chatId),
       showsRightCheckmark: showsRightCheckmark,
@@ -9915,6 +9923,7 @@ private struct ContactsPageView: View {
   @State private var isShowingGroupCreation = false
   @State private var pendingCreatedRoomRoute: ChatRoute?
   @State private var pendingSavedContact: ContactSearchUser?
+  @State private var queuedSavedContact: ContactSearchUser?
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
@@ -10017,7 +10026,7 @@ private struct ContactsPageView: View {
     .refreshable {
       await model.refresh()
     }
-    .sheet(isPresented: $isShowingSearch) {
+    .sheet(isPresented: $isShowingSearch, onDismiss: presentQueuedSavedContact) {
       if let config = AppSessionConfig.current {
         Group {
           ContactSearchView(config: config, homeRows: model.rows) { payload in
@@ -10027,13 +10036,22 @@ private struct ContactsPageView: View {
       }
     }
     .sheet(item: $pendingSavedContact) { user in
-      ContactActionSheet(user: user) {
-        pendingSavedContact = nil
-        Task { @MainActor in
-          try? await Task.sleep(nanoseconds: 180_000_000)
-          _ = await openChat(for: user)
+      ContactActionSheet(
+        user: user,
+        onChat: {
+          pendingSavedContact = nil
+          Task { _ = await openChat(for: user) }
+        },
+        onCall: {
+          pendingSavedContact = nil
+          Task {
+            let route = await openChat(for: user)
+            if let route {
+              NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
+            }
+          }
         }
-      }
+      )
     }
     .sheet(isPresented: $isShowingGroupCreation, onDismiss: openPendingCreatedRoom) {
       if let config = AppSessionConfig.current {
@@ -10106,11 +10124,8 @@ private struct ContactsPageView: View {
     }
 
     if action == "saveContact" {
-      Task { @MainActor in
-        guard await saveContact(for: user) else { return }
-        isShowingSearch = false
-        pendingSavedContact = user
-      }
+      queuedSavedContact = user
+      isShowingSearch = false
       return
     }
 
@@ -10123,23 +10138,10 @@ private struct ContactsPageView: View {
     }
   }
 
-
-  @MainActor
-  private func saveContact(for user: ContactSearchUser) async -> Bool {
-    guard let config = AppSessionConfig.current else {
-      errorMessage = "The current session is unavailable."
-      return false
-    }
-
-    do {
-      _ = try await ChatDirectMessageService.startChat(config: config, friendID: user.userID)
-      await model.refresh()
-      AppToastController.shared.show("Contact saved.")
-      return true
-    } catch {
-      errorMessage = error.localizedDescription
-      return false
-    }
+  private func presentQueuedSavedContact() {
+    guard let user = queuedSavedContact else { return }
+    queuedSavedContact = nil
+    pendingSavedContact = user
   }
 
   @MainActor
@@ -11776,7 +11778,7 @@ final class ChatConversationController: UIViewController {
         "ChatConversationController postPresentationActivation chatId=\(chatId) reason=\(reason)")
       self.configureEngineBindingIfNeeded(
         reason: "\(reason)-postTransition",
-        enableStatusAuthority: false
+        enableStatusAuthority: !self.route.skipsServerChannel && self.route.bridgeProvider == nil
       )
       self.completeDeferredEngineStateRefreshIfNeeded(chatId: chatId)
       self.openChatChannelIfNeeded(reason: "\(reason)-postTransition")
@@ -12200,7 +12202,10 @@ final class ChatConversationController: UIViewController {
     deferredEngineRowsReadyChatId = nil
     appShellRouteLog(
       "ChatConversationController completeDeferredEngineState chatId=\(chatId)")
-    configureEngineBindingIfNeeded(reason: "completeDeferredEngineState", enableStatusAuthority: false)
+    configureEngineBindingIfNeeded(
+      reason: "completeDeferredEngineState",
+      enableStatusAuthority: !route.skipsServerChannel && route.bridgeProvider == nil
+    )
     mainView.setDefersEngineStateRefreshes(false)
     mainView.refreshEngineStateAfterDeferredRouteOpen()
     refreshHeaderState()
@@ -13446,13 +13451,7 @@ final class ChatConversationController: UIViewController {
 
   private static func lastSeenLabel(from timestampMs: Int64) -> String? {
     guard timestampMs > 0 else { return nil }
-    let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
-    let formatter = RelativeDateTimeFormatter()
-    formatter.unitsStyle = .short
-    let relative = formatter.localizedString(for: date, relativeTo: Date())
-    let trimmed = relative.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return nil }
-    return "last seen \(trimmed)"
+    return ChatMainView.formatLastSeenSubtitle(timestampMs)
   }
 
   private static func normalizedString(_ value: Any?) -> String? {
@@ -14137,9 +14136,7 @@ private struct ContactSearchView: View {
       .sheet(isPresented: $isShowingNewContact) {
         NavigationStack {
           NewContactSearchView(config: config) { payload in
-            if (payload["action"] as? String) != "saveContact" {
-              isShowingNewContact = false
-            }
+            isShowingNewContact = false
             onResult(payload)
           }
         }
@@ -14602,133 +14599,119 @@ private struct ContactActionSheet: View {
 
   let user: ContactSearchUser
   let onChat: () -> Void
+  let onCall: () -> Void
 
   private var palette: AppThemePalette {
     AppThemePalette.resolve(for: colorScheme)
   }
 
   var body: some View {
-    VStack(spacing: 0) {
-      HStack {
-        Spacer()
-        Button { dismiss() } label: {
-          Image(systemName: "xmark")
-            .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(palette.secondaryText)
-            .frame(width: 32, height: 32)
-            .background(palette.card, in: Circle())
+    NavigationStack {
+      List {
+        Section {
+          VStack(spacing: 10) {
+            HomeListStyleAvatar(
+              title: user.username,
+              peerUserId: user.userID,
+              chatId: nil,
+              avatarURI: ChatAvatarURLResolver.resolve(
+                rawAvatar: user.profileImage,
+                peerUserId: user.userID,
+                chatId: nil,
+                preferPushAvatar: false,
+                isAgent: user.isAgent || user.bridgeProvider != nil,
+                agentId: user.agentId ?? user.bridgeAgentRouteId,
+                displayName: user.handle ?? user.username
+              ),
+              fallback: String(user.username.prefix(2)),
+              isDark: colorScheme == .dark,
+              palette: palette,
+              size: 88
+            )
+
+            Text(user.username)
+              .font(.system(size: 22, weight: .semibold))
+              .foregroundStyle(palette.text)
+              .lineLimit(1)
+
+            Text(user.subtitle)
+              .font(.system(size: 14, weight: .regular))
+              .foregroundStyle(palette.secondaryText)
+              .lineLimit(1)
+          }
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 12)
+          .listRowBackground(Color.clear)
+          .listRowSeparator(.hidden)
         }
-        .accessibilityLabel("Close")
+
+        Section {
+          HStack(spacing: 12) {
+            ContactActionButton(title: "Chat", systemImage: "message.fill") {
+              dismiss()
+              onChat()
+            }
+            ContactActionButton(title: "Call", systemImage: "phone.fill") {
+              dismiss()
+              onCall()
+            }
+          }
+          .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+          .listRowBackground(Color.clear)
+          .listRowSeparator(.hidden)
+        }
       }
-
-      HomeListStyleAvatar(
-        title: user.username,
-        peerUserId: user.userID,
-        chatId: nil,
-        avatarURI: ChatAvatarURLResolver.resolve(
-          rawAvatar: user.profileImage,
-          peerUserId: user.userID,
-          chatId: nil,
-          preferPushAvatar: false,
-          isAgent: user.isAgent || user.bridgeProvider != nil,
-          agentId: user.agentId ?? user.bridgeAgentRouteId,
-          displayName: user.handle ?? user.username
-        ),
-        fallback: String(user.username.prefix(2)),
-        isDark: colorScheme == .dark,
-        palette: palette,
-        size: 88
-      )
-      .padding(.top, 2)
-
-      Text(user.username)
-        .font(.system(size: 21, weight: .semibold))
-        .foregroundStyle(palette.text)
-        .lineLimit(1)
-        .padding(.top, 12)
-
-      Text(user.subtitle)
-        .font(.system(size: 14, weight: .regular))
-        .foregroundStyle(palette.secondaryText)
-        .lineLimit(1)
-        .padding(.top, 4)
-
-      HStack(spacing: 12) {
-        ContactActionButton(
-          title: "Chat",
-          subtitle: "Open chat",
-          systemImage: "message.fill",
-          palette: palette,
-          isEnabled: true,
-          action: onChat
-        )
-
-        ContactActionButton(
-          title: "Call",
-          subtitle: "Unavailable",
-          systemImage: "phone.fill",
-          palette: palette,
-          isEnabled: false,
-          action: {}
-        )
+      .listStyle(.insetGrouped)
+      .scrollContentBackground(.hidden)
+      .background(palette.background.ignoresSafeArea())
+      .navigationTitle("Contact")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button {
+            dismiss()
+          } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 13, weight: .semibold))
+          }
+          .accessibilityLabel("Close")
+        }
       }
-      .padding(.top, 24)
-
-      Label("Calls are unavailable until secure call-key exchange is enabled.", systemImage: "info.circle")
-        .font(.system(size: 12, weight: .regular))
-        .foregroundStyle(palette.secondaryText)
-        .multilineTextAlignment(.center)
-        .padding(.horizontal, 28)
-        .padding(.top, 18)
     }
-    .padding(.horizontal, 20)
-    .padding(.top, 10)
-    .padding(.bottom, 28)
-    .frame(maxWidth: .infinity)
-    .background(palette.background.ignoresSafeArea())
-    .presentationDetents([.medium])
+    .presentationDetents([.medium, .large])
     .presentationDragIndicator(.visible)
   }
 }
 
 private struct ContactActionButton: View {
   let title: String
-  let subtitle: String
   let systemImage: String
-  let palette: AppThemePalette
-  let isEnabled: Bool
   let action: () -> Void
+  @Environment(\.colorScheme) private var colorScheme
 
   var body: some View {
     Button(action: action) {
-      VStack(spacing: 8) {
+      VStack(spacing: 6) {
         Image(systemName: systemImage)
-          .font(.system(size: 19, weight: .semibold))
-          .foregroundStyle(isEnabled ? palette.accent : palette.secondaryText.opacity(0.55))
-          .frame(width: 46, height: 46)
-          .background(
-            (isEnabled ? palette.accent : palette.secondaryText).opacity(0.12),
-            in: Circle()
-          )
-
+          .font(.system(size: 18, weight: .semibold))
         Text(title)
-          .font(.system(size: 15, weight: .semibold))
-          .foregroundStyle(isEnabled ? palette.text : palette.secondaryText.opacity(0.7))
-
-        Text(subtitle)
-          .font(.system(size: 11, weight: .regular))
-          .foregroundStyle(palette.secondaryText)
+          .font(.system(size: 13, weight: .semibold))
       }
+      .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
       .frame(maxWidth: .infinity)
-      .padding(.vertical, 12)
-      .background(palette.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-      .overlay(
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-          .stroke(palette.border.opacity(0.6), lineWidth: 1)
-      )
+      .padding(.vertical, 14)
+      .background {
+        if #available(iOS 26.0, *) {
+          Capsule(style: .continuous)
+            .fill(.clear)
+            .glassEffect(.regular.interactive(true), in: .capsule)
+        } else {
+          Capsule(style: .continuous)
+            .fill(.regularMaterial)
+        }
+      }
     }
     .buttonStyle(.plain)
-    .disabled(!isEnabled)
   }
 }
 
@@ -14769,14 +14752,16 @@ private struct NewContactSearchView: View {
   @FocusState private var focusedField: Field?
 
   private enum Field {
-    case name
+    case firstName
+    case lastName
     case query
   }
 
   let config: AppSessionConfig
   let onResult: ([String: Any]) -> Void
 
-  @State private var contactName = ""
+  @State private var firstName = ""
+  @State private var lastName = ""
   @State private var query = ""
   @State private var results: [ContactSearchUser] = []
   @State private var selectedUser: ContactSearchUser?
@@ -14790,63 +14775,78 @@ private struct NewContactSearchView: View {
   }
 
   var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 16) {
-        contactFields
+    List {
+      Section {
+        HStack(spacing: 12) {
+          TextField("First Name", text: $firstName)
+            .focused($focusedField, equals: .firstName)
+            .textInputAutocapitalization(.words)
+            .autocorrectionDisabled()
+          Divider()
+            .frame(height: 22)
+          TextField("Last Name", text: $lastName)
+            .focused($focusedField, equals: .lastName)
+            .textInputAutocapitalization(.words)
+            .autocorrectionDisabled()
+        }
+        .font(.system(size: 16, weight: .regular))
 
-        if results.isEmpty {
-          ContactSearchStatusView(
-            isLoading: isLoading,
-            hasSearched: hasSearched,
-            message: statusText,
-            palette: palette
-          )
-          .frame(maxWidth: .infinity)
-          .padding(.top, 16)
-        } else {
-          Text("People")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(palette.secondaryText)
-            .textCase(.uppercase)
-            .padding(.horizontal, 4)
+        HStack(spacing: 10) {
+          TextField("Username", text: $query)
+            .focused($focusedField, equals: .query)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.default)
+          if isLoading {
+            ProgressView()
+              .controlSize(.small)
+          }
+        }
+        .font(.system(size: 16, weight: .regular))
+      }
 
-          LazyVStack(spacing: 0) {
-            ForEach(results) { user in
-              let isSelected = selectedUser?.userID == user.userID
-              ContactSearchResultRow(
-                user: user,
-                isSaved: isSelected,
-                palette: palette,
-                avatarSize: 46,
-                rowHorizontalPadding: 12,
-                rowVerticalPadding: 7,
-                rowMinHeight: 62,
-                showsSeparator: true
-              )
-              .background(
-                isSelected
-                  ? palette.accent.opacity(0.1)
-                  : Color.clear
-              )
-              .contentShape(Rectangle())
-              .onTapGesture {
-                selectedUser = user
-                focusedField = nil
-              }
+      if results.isEmpty {
+        if isLoading || hasSearched || !statusText.isEmpty {
+          Section {
+            ContactSearchStatusView(
+              isLoading: isLoading,
+              hasSearched: hasSearched,
+              message: statusText,
+              palette: palette
+            )
+            .frame(maxWidth: .infinity)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+          }
+        }
+      } else {
+        Section("People") {
+          ForEach(results) { user in
+            let isSelected = selectedUser?.userID == user.userID
+            ContactSearchResultRow(
+              user: user,
+              isSaved: isSelected,
+              palette: palette,
+              avatarSize: 46,
+              rowHorizontalPadding: 4,
+              rowVerticalPadding: 6,
+              rowMinHeight: 56,
+              showsSeparator: false
+            )
+            .listRowBackground(
+              isSelected ? palette.accent.opacity(0.12) : nil
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+              selectedUser = user
+              focusedField = nil
             }
           }
-          .background(palette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-          .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-              .stroke(palette.border.opacity(0.65), lineWidth: 1)
-          )
         }
       }
-      .padding(.horizontal, 16)
-      .padding(.top, 12)
-      .padding(.bottom, 28)
     }
-    .scrollIndicators(.hidden)
+    .listStyle(.insetGrouped)
+    .scrollContentBackground(.hidden)
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("New Contact")
     .navigationBarTitleDisplayMode(.inline)
@@ -14856,7 +14856,7 @@ private struct NewContactSearchView: View {
     .onDisappear { searchTask?.cancel() }
     .task {
       focusedField = .query
-      statusText = "Search by username or phone number."
+      statusText = "Search by username."
     }
     .toolbar {
       ToolbarItem(placement: .topBarLeading) {
@@ -14881,56 +14881,6 @@ private struct NewContactSearchView: View {
     }
   }
 
-  private var contactFields: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 12) {
-        Image(systemName: "person")
-          .font(.system(size: 17, weight: .medium))
-          .foregroundStyle(palette.secondaryText)
-          .frame(width: 22)
-
-        TextField("Name (optional)", text: $contactName)
-          .focused($focusedField, equals: .name)
-          .textInputAutocapitalization(.words)
-          .autocorrectionDisabled()
-          .font(.system(size: 16, weight: .regular))
-      }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 14)
-
-      Divider()
-        .overlay(palette.border.opacity(0.75))
-        .padding(.leading, 50)
-
-      HStack(spacing: 12) {
-        Image(systemName: "magnifyingglass")
-          .font(.system(size: 17, weight: .medium))
-          .foregroundStyle(palette.accent)
-          .frame(width: 22)
-
-        TextField("Username or phone number", text: $query)
-          .focused($focusedField, equals: .query)
-          .textInputAutocapitalization(.never)
-          .autocorrectionDisabled()
-          .keyboardType(.default)
-          .font(.system(size: 16, weight: .regular))
-
-        if isLoading {
-          ProgressView()
-            .controlSize(.small)
-            .tint(palette.accent)
-        }
-      }
-      .padding(.horizontal, 16)
-      .padding(.vertical, 14)
-    }
-    .background(palette.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-    .overlay(
-      RoundedRectangle(cornerRadius: 18, style: .continuous)
-        .stroke(palette.border.opacity(0.65), lineWidth: 1)
-    )
-  }
-
   private func scheduleSearch(query rawQuery: String) {
     searchTask?.cancel()
     let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -14953,6 +14903,15 @@ private struct NewContactSearchView: View {
         results = found
         isLoading = false
         hasSearched = true
+        if found.count == 1 {
+          selectedUser = found[0]
+        } else if let current = selectedUser,
+          found.contains(where: { $0.userID == current.userID })
+        {
+          selectedUser = current
+        } else {
+          selectedUser = nil
+        }
         statusText = found.isEmpty ? "No user found for “\(query)”." : ""
       } catch {
         guard !Task.isCancelled else { return }
@@ -14966,10 +14925,15 @@ private struct NewContactSearchView: View {
 
   private func save(_ user: ContactSearchUser) {
     var payload = user.payload
-    let trimmedName = contactName.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !trimmedName.isEmpty {
-      payload["contactName"] = trimmedName
+    let fullName = [firstName, lastName]
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+    if !fullName.isEmpty {
+      payload["contactName"] = fullName
+      payload["displayName"] = fullName
     }
+    dismiss()
     onResult(["action": "saveContact", "user": payload])
   }
 }

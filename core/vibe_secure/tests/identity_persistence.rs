@@ -218,3 +218,42 @@ fn a_stored_key_that_is_not_in_the_store_falls_back_to_generating() {
     .expect("the replacement identity reloads");
     assert_eq!(reloaded.signature_key(), identity.signature_key());
 }
+
+/// Drop the chat→group mapping and recover it from the `vmls1.` header.
+#[test]
+fn an_envelope_rebinding_loads_the_sqlite_group_and_opens() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alice_path = dir.path().join("alice.sqlite3");
+    let bob_path = dir.path().join("bob.sqlite3");
+
+    let alice_provider =
+        VibeSecureProvider::open(alice_path.to_str().expect("utf8 path")).expect("alice opens");
+    let bob_provider =
+        VibeSecureProvider::open(bob_path.to_str().expect("utf8 path")).expect("bob opens");
+
+    let alice_identity =
+        VibeDeviceIdentity::generate("alice-device-1", &alice_provider).expect("alice identity");
+    let bob_identity =
+        VibeDeviceIdentity::generate("bob-device-1", &bob_provider).expect("bob identity");
+
+    let (mut alice_session, _bob_live) = established_pair(
+        &alice_provider,
+        &bob_provider,
+        &alice_identity,
+        &bob_identity,
+    );
+    let sealed = alice_session
+        .seal(&alice_identity, b"after mapping dropped", &alice_provider)
+        .expect("alice seals");
+
+    let peeked = VibeSecureSession::group_id_from_envelope(&sealed).expect("peek");
+    let mut bob_rebound = VibeSecureSession::load(&peeked, &bob_provider)
+        .expect("load does not error")
+        .expect("sqlite still holds the group after the mapping is gone");
+    assert_eq!(
+        bob_rebound
+            .open(&sealed, &bob_provider)
+            .expect("bob opens after rebind"),
+        b"after mapping dropped"
+    );
+}

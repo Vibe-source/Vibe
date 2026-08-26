@@ -58,6 +58,58 @@ defmodule Vibe.Accounts do
     update_user(user, updates)
   end
 
+  @privacy_gate_fields [
+    :privacy_phone_number,
+    :privacy_profile_photos,
+    :privacy_bio,
+    :privacy_birthday,
+    :privacy_gifts,
+    :privacy_saved_music
+  ]
+
+  # Self always sees. contacts = existing DM and neither side blocked.
+  def viewer_can_see?(%User{} = owner, viewer, field) when field in @privacy_gate_fields do
+    cond do
+      match?(%{id: id} when id == owner.id, viewer) ->
+        true
+
+      true ->
+        case Map.get(owner, field) || "everybody" do
+          "everybody" -> true
+          "nobody" -> false
+          "contacts" -> dm_contact?(owner, viewer)
+          _ -> false
+        end
+    end
+  end
+
+  def viewer_can_see?(_owner, _viewer, _field), do: false
+
+  defp dm_contact?(_owner, nil), do: false
+
+  defp dm_contact?(%User{id: owner_id}, %{id: viewer_id})
+       when is_binary(viewer_id) and viewer_id != owner_id do
+    not blocked?(owner_id, viewer_id) and not blocked?(viewer_id, owner_id) and
+      dm_exists?(owner_id, viewer_id)
+  end
+
+  defp dm_contact?(_owner, _viewer), do: false
+
+  defp dm_exists?(owner_id, viewer_id) do
+    query =
+      from(r in Vibe.Chat.Room,
+        join: p1 in Vibe.Chat.Participant,
+        on: p1.chat_id == r.id,
+        join: p2 in Vibe.Chat.Participant,
+        on: p2.chat_id == r.id,
+        where: r.type == "dm" and p1.user_id == ^owner_id and p2.user_id == ^viewer_id,
+        select: 1,
+        limit: 1
+      )
+
+    Repo.exists?(query)
+  end
+
   # Authenticating a request is the one query that repeats identically on every
   # call of a session, and the DB is ~350ms away — so it was the floor under every
   # authenticated endpoint. Serve it from a short-TTL cache; see

@@ -607,6 +607,26 @@ defmodule VibeWeb.ChatChannel do
     do: {:reply, {:error, %{reason: "invalid_payload"}}, socket}
 
   @impl true
+  def handle_in("media-opened", %{"messageId" => msg_id}, socket) do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+
+    case Chat.consume_view_once_media(chat_id, msg_id, user_id) do
+      {:ok, _message} ->
+        {:reply, {:ok, %{deleted: true}}, socket}
+
+      {:ok, :scheduled} ->
+        {:reply, {:ok, %{scheduled: true}}, socket}
+
+      {:error, :not_view_once} ->
+        {:reply, {:ok, %{ignored: true}}, socket}
+
+      {:error, reason} ->
+        {:reply, {:error, %{reason: inspect(reason)}}, socket}
+    end
+  end
+
+  @impl true
   def handle_in("delete-message", %{"messageId" => msg_id} = payload, socket) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id

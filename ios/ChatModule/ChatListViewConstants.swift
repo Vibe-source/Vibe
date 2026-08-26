@@ -14,6 +14,16 @@ let bubbleBottomPadding: CGFloat = 6.0
 let bubbleMetaTopSpacing: CGFloat = 1.0
 let bubbleMetaHeight: CGFloat = 14.0
 let bubbleMinWidth: CGFloat = 26.0
+let videoNoteDefaultSide: CGFloat = 200.0
+let videoNoteExpandedSide: CGFloat = 360.0
+/// Minimum air on EACH side of an expanded video note (centred).
+let videoNoteExpandedSideMargin: CGFloat = 20.0
+
+func videoNoteRenderedSide(expanded: Bool, rowWidth: CGFloat, maxBubbleWidth: CGFloat) -> CGFloat {
+  let available = max(videoNoteDefaultSide, rowWidth - videoNoteExpandedSideMargin * 2.0)
+  if expanded { return min(videoNoteExpandedSide, available) }
+  return min(videoNoteDefaultSide, maxBubbleWidth)
+}
 let bubbleMaxWidthFactor: CGFloat = 0.85
 // Agent-turn bubbles carry long structured prose (headings, nested lists, code). WhatsApp
 // Meta AI style needs a bit more air than a one-line Telegram chat bubble: 14pt horizontal

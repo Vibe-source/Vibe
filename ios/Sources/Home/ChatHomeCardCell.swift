@@ -181,6 +181,7 @@ final class ChatHomeCardCell: UITableViewCell {
     isDark: Bool,
     avatarBackgroundColor: UIColor?,
     avatarGradientColors: (UIColor, UIColor)?,
+    unreadBadgeColor: UIColor? = nil,
     isEditing: Bool,
     isEditSelected: Bool,
     showsRightCheckmark: Bool = false,
@@ -198,9 +199,10 @@ final class ChatHomeCardCell: UITableViewCell {
       ? UIColor(red: 138 / 255, green: 202 / 255, blue: 255 / 255, alpha: 1)
       : UIColor(red: 43 / 255, green: 135 / 255, blue: 210 / 255, alpha: 1)
     let badgeBackground =
-      isDark
-      ? UIColor(red: 157 / 255, green: 216 / 255, blue: 255 / 255, alpha: 1)
-      : UIColor(red: 23 / 255, green: 132 / 255, blue: 209 / 255, alpha: 1)
+      unreadBadgeColor
+      ?? (isDark
+        ? UIColor(red: 157 / 255, green: 216 / 255, blue: 255 / 255, alpha: 1)
+        : UIColor(red: 23 / 255, green: 132 / 255, blue: 209 / 255, alpha: 1))
     let pressedColor =
       isDark
       ? UIColor.white.withAlphaComponent(0.08)
@@ -342,9 +344,11 @@ final class ChatHomeCardCell: UITableViewCell {
     }
     renderedReceiptStatus = receiptGlyphStatus
 
-    unreadBadge.isHidden = showsRightCheckmark || compactForwardStyle || !(row.unreadCount > 0 || row.markedUnread)
-    unreadLabel.text = row.unreadCount > 0 ? "\(row.unreadCount)" : ""
-    unreadLabel.textColor = isDark ? UIColor.black : UIColor.white
+    let unreadVisible =
+      !showsRightCheckmark && !compactForwardStyle && (row.unreadCount > 0 || row.markedUnread)
+    unreadBadge.isHidden = !unreadVisible
+    unreadLabel.text = unreadVisible ? "\(max(1, row.unreadCount))" : ""
+    unreadLabel.textColor = .white
     unreadBadge.backgroundColor = badgeBackground
 
     muteIconView.isHidden = showsRightCheckmark || compactForwardStyle || !row.muted

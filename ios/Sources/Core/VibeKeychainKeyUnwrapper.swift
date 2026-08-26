@@ -110,9 +110,9 @@ final class VibeKeychainKeyUnwrapper: VibeFfiKeyUnwrapper {
       // another device" from the render side and has a completely different fix. Both
       // arrive as `decryptFailed=N` in `[VibeCore] window` with nothing to tell them
       // apart — that number has been unactionable for exactly this reason.
-      NSLog(
-        "[CoreCrypto] unwrap batch=%ld REFUSED ALL — no private key (locked Keychain "
-          + "or signed-out session)", requests.count)
+      VibeLog.error(
+        "core unwrap refused every key — no private key (locked Keychain or signed out)",
+        category: "crypto", metadata: ["batch": String(requests.count)])
       return Array(repeating: nil, count: requests.count)
     }
 
@@ -153,10 +153,14 @@ final class VibeKeychainKeyUnwrapper: VibeFfiKeyUnwrapper {
     // type is explicit that revealing which slot succeeded leaks send-vs-receive to
     // anything watching the boundary.
     if refusedCount > 0 {
-      NSLog(
-        "[CoreCrypto] unwrap batch=%ld opened=%ld refused=%ld — refused means no candidate "
-          + "unwrapped (message sealed to a key this device does not hold)",
-        requests.count, openedCount, refusedCount)
+      VibeLog.warning(
+        "core unwrap refused a key — sealed to a key this device does not hold",
+        category: "crypto",
+        metadata: [
+          "batch": String(requests.count),
+          "opened": String(openedCount),
+          "refused": String(refusedCount),
+        ])
     }
     // Invariant the core depends on. Cheap to assert, catastrophic to violate.
     assert(results.count == requests.count, "unwrapper must answer positionally")

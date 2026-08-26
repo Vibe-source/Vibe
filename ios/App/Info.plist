@@ -33,7 +33,6 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<!-- Giphy GIF panel (overridable via process env GIPHY_API_KEY) -->
 	<key>GIPHY_API_KEY</key>
 	<string>sXpGFDGZs0Dv1mmNFvYaGUvYwKX0PWIh</string>
 	<key>LSRequiresIPhoneOS</key>

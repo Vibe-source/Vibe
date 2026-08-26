@@ -540,7 +540,7 @@ final class VibeSecureSessions {
 
   /// Joins `chatId`'s group from a Welcome produced by another member.
   func joinSession(chatId: String, welcome: Data, ratchetTree: Data?) -> VibeSecureSessionHandle? {
-    queue.sync {
+    let session: VibeSecureSessionHandle? = queue.sync {
       guard let identity = identityHandleLocked() else { return nil }
       do {
         let session = try VibeSecureSessionHandle.joinFromWelcome(
@@ -553,6 +553,12 @@ final class VibeSecureSessions {
         return nil
       }
     }
+    // A joiner never posts a Welcome, so sender-only welcome-status stays 0/0.
+    // Confirm here or refreshPeerConfirmation will discard this group as an orphan.
+    if session != nil {
+      markPeerConfirmed(chatId: chatId)
+    }
+    return session
   }
 
   // ── Own-message plaintext ───────────────────────────────────────────────
@@ -583,28 +589,46 @@ final class VibeSecureSessions {
   private static let ownPlaintextKey = "vibe.mls.ownPlaintext"
   private static let ownPlaintextOrderKey = "vibe.mls.ownPlaintext.order"
 
-  /// Retains our own plaintext for `messageId`.
-  func rememberOwnPlaintext(_ plaintext: String, messageId: String) {
-    queue.sync {
-      var store = UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
-      var order = UserDefaults.standard.stringArray(forKey: Self.ownPlaintextOrderKey) ?? []
-      if store[messageId] == nil { order.append(messageId) }
-      store[messageId] = plaintext
-      while order.count > Self.ownPlaintextLimit {
-        let evicted = order.removeFirst()
-        store.removeValue(forKey: evicted)
-      }
-      UserDefaults.standard.set(store, forKey: Self.ownPlaintextKey)
-      UserDefaults.standard.set(order, forKey: Self.ownPlaintextOrderKey)
+  /// Retains our own plaintext for `messageId`, and for the envelope if we have it.
+  func rememberOwnPlaintext(_ plaintext: String, messageId: String, envelope: String? = nil) {
+    queue.sync { retainPlaintextLocked(plaintext, messageId: messageId, envelope: envelope) }
+  }
+
+  /// Retains one opened plaintext. Must not touch `queue`: callers hold it.
+  private func retainPlaintextLocked(_ plaintext: String, messageId: String?, envelope: String?) {
+    var store =
+      UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
+    var order = UserDefaults.standard.stringArray(forKey: Self.ownPlaintextOrderKey) ?? []
+    func put(_ key: String) {
+      if store[key] == nil { order.append(key) }
+      store[key] = plaintext
     }
+    if let messageId { put(messageId) }
+    if let envelope { put(Self.envelopePlaintextKey(envelope)) }
+    while order.count > Self.ownPlaintextLimit {
+      let evicted = order.removeFirst()
+      store.removeValue(forKey: evicted)
+    }
+    UserDefaults.standard.set(store, forKey: Self.ownPlaintextKey)
+    UserDefaults.standard.set(order, forKey: Self.ownPlaintextOrderKey)
   }
 
   /// The plaintext we retained for one of our own messages, if we still have it.
-  func ownPlaintext(messageId: String) -> String? {
-    queue.sync {
-      (UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String])?[
-        messageId]
-    }
+  func ownPlaintext(messageId: String, envelope: String? = nil) -> String? {
+    queue.sync { retainedPlaintextLocked(messageId: messageId, envelope: envelope) }
+  }
+
+  /// The plaintext retained for a message, if we still have it. Callers hold `queue`.
+  private func retainedPlaintextLocked(messageId: String?, envelope: String?) -> String? {
+    let store =
+      UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
+    if let messageId, let text = store[messageId] { return text }
+    if let envelope { return store[Self.envelopePlaintextKey(envelope)] }
+    return nil
+  }
+
+  private static func envelopePlaintextKey(_ envelope: String) -> String {
+    "e:" + String(envelope.suffix(24))
   }
 
   /// Seals a payload for `chatId`, or `nil` if this chat has no MLS session.
@@ -644,29 +668,108 @@ final class VibeSecureSessions {
   {
     queue.sync {
       let who = isMine ? "own" : "peer"
-      let mid = messageId.map { String($0.prefix(8)) } ?? "?"
-      guard let session = sessionLocked(chatId: chatId) else {
-        VibeLog.info(
-          "[VibeSecure] vmls1 for \(chatId) mid=\(mid) from=\(who) — NO SESSION"
-            + " (group=\(groupIdHexLocked(chatId: chatId) ?? "none"))")
+      // MLS opens are one-shot: `process_message` drops the ratchet key, so a second
+      // open of the same envelope fails and the row blanks on the next reload.
+      if let retained = retainedPlaintextLocked(messageId: messageId, envelope: envelope) {
+        return retained
+      }
+      let session =
+        sessionLocked(chatId: chatId)
+        ?? recoverSessionLocked(chatId: chatId, envelope: envelope, messageId: messageId)
+      guard let session else {
+        VibeLog.error(
+          "mls open has no session",
+          category: "crypto",
+          metadata: [
+            "chat": String(chatId.prefix(12)),
+            "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+            "mine": isMine ? "Y" : "N",
+            "stage": "no-session",
+            "group": groupIdHexLocked(chatId: chatId) ?? "none",
+            "from": who,
+          ])
         return nil
       }
+      let header = try? vibeMlsEnvelopeHeader(envelope: envelope)
       do {
-        return String(decoding: try session.open(envelope: envelope), as: UTF8.self)
+        let plaintext = String(decoding: try session.open(envelope: envelope), as: UTF8.self)
+        retainPlaintextLocked(plaintext, messageId: messageId, envelope: envelope)
+        return plaintext
       } catch {
-        // Split by author, because the two mean completely different things.
+        var meta: [String: String] = [
+          "chat": String(chatId.prefix(12)),
+          "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+          "group": groupIdHexLocked(chatId: chatId) ?? "none",
+          "envEpoch": header.map { String($0.epoch) } ?? "-",
+          "groupEpoch": (try? session.epoch()).map(String.init) ?? "-",
+          "pending": ((try? session.hasPendingCommit()) ?? false) ? "Y" : "N",
+          "content": header?.content ?? "-",
+          "err": String((error as NSError).localizedDescription.prefix(80)),
+        ]
         if isMine {
-          VibeLog.info(
-            "[VibeSecure] own message \(mid) in \(chatId) is not self-openable (expected);"
-              + " retained plaintext missing")
+          meta["stage"] = "mls-own-expected"
+          VibeLog.info("own mls message is not self-openable", category: "crypto", metadata: meta)
         } else {
-          VibeLog.error(
-            "[VibeSecure] PEER open failed chat=\(chatId) mid=\(mid)"
-              + " group=\(groupIdHexLocked(chatId: chatId) ?? "none") — session disagrees: \(error)"
-          )
+          meta["stage"] = "mls-open"
+          VibeLog.error("mls peer open failed", category: "crypto", metadata: meta)
         }
         return nil
       }
+    }
+  }
+
+  /// Reloads a persisted group whose chat mapping was dropped, using the envelope header.
+  private func recoverSessionLocked(chatId: String, envelope: String, messageId: String?)
+    -> VibeSecureSessionHandle?
+  {
+    guard let identity = identityHandleLocked() else { return nil }
+    let groupId: Data
+    do {
+      groupId = try vibeMlsGroupIdFromEnvelope(envelope: envelope)
+    } catch {
+      VibeLog.error(
+        "mls envelope header unreadable",
+        category: "crypto",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+          "stage": "envelope-group-id",
+        ])
+      return nil
+    }
+    do {
+      guard let restored = try identity.loadSession(groupId: groupId) else {
+        VibeLog.error(
+          "mls sqlite has no group for envelope",
+          category: "crypto",
+          metadata: [
+            "chat": String(chatId.prefix(12)),
+            "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+            "stage": "sqlite-miss",
+          ])
+        return nil
+      }
+      sessions[chatId] = restored
+      Self.storeGroupId(groupId, chatId: chatId)
+      VibeLog.notice(
+        "rebound mls group from envelope",
+        category: "crypto",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+          "stage": "rebound",
+        ])
+      return restored
+    } catch {
+      VibeLog.error(
+        "mls session reload failed",
+        category: "crypto",
+        metadata: [
+          "chat": String(chatId.prefix(12)),
+          "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+          "stage": "sqlite-load",
+        ])
+      return nil
     }
   }
 

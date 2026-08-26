@@ -72,6 +72,40 @@ fn two_member_group_seals_and_opens_through_the_vmls1_envelope() {
     assert_eq!(opened, b"hello bob");
 }
 
+#[test]
+fn group_id_from_envelope_matches_the_session_without_opening() {
+    let alice_provider = provider();
+    let bob_provider = provider();
+    let alice_identity = identity("alice-device-1", &alice_provider);
+    let bob_identity = identity("bob-device-1", &bob_provider);
+
+    let (mut alice_session, bob_session) = paired_dm(
+        &alice_identity,
+        &alice_provider,
+        &bob_identity,
+        &bob_provider,
+    );
+
+    let sealed = alice_session
+        .seal(&alice_identity, b"hello bob", &alice_provider)
+        .expect("alice seals");
+    let peeked = VibeSecureSession::group_id_from_envelope(&sealed).expect("peek");
+    assert_eq!(peeked, alice_session.group_id());
+    assert_eq!(peeked, bob_session.group_id());
+    let header = VibeSecureSession::envelope_header(&sealed).expect("header");
+    assert_eq!(header.group_id, alice_session.group_id());
+    assert_eq!(header.epoch, alice_session.epoch());
+    assert_eq!(header.epoch, bob_session.epoch());
+    assert_eq!(header.content, "app");
+}
+
+#[test]
+fn group_id_from_envelope_rejects_malformed_input() {
+    assert!(VibeSecureSession::group_id_from_envelope("not-mls").is_err());
+    assert!(VibeSecureSession::group_id_from_envelope("vmls1.").is_err());
+    assert!(VibeSecureSession::group_id_from_envelope("vmls1.###").is_err());
+}
+
 // 2. A third member added later opens messages sent after the add.
 #[test]
 fn a_third_member_added_later_opens_messages_sent_after_the_add() {
@@ -311,5 +345,35 @@ fn a_sender_cannot_open_its_own_message_so_platforms_must_keep_the_plaintext() {
     assert_eq!(
         bob_session.open(&sealed, &bob_provider).expect("bob opens"),
         b"hello"
+    );
+}
+
+/// 11. A message opens exactly once: `process_message` ratchets the sender's
+/// secret tree and drops that key, so re-parsing the same envelope fails.
+#[test]
+fn the_same_message_cannot_be_opened_twice() {
+    let alice_provider = provider();
+    let bob_provider = provider();
+    let alice_identity = identity("alice-device-1", &alice_provider);
+    let bob_identity = identity("bob-device-1", &bob_provider);
+
+    let (mut alice_session, mut bob_session) = paired_dm(
+        &alice_identity,
+        &alice_provider,
+        &bob_identity,
+        &bob_provider,
+    );
+
+    let sealed = alice_session
+        .seal(&alice_identity, b"read me once", &alice_provider)
+        .expect("alice seals");
+
+    assert_eq!(
+        bob_session.open(&sealed, &bob_provider).expect("bob opens"),
+        b"read me once"
+    );
+    assert!(
+        bob_session.open(&sealed, &bob_provider).is_err(),
+        "a second open must fail, or the receiver would not need a plaintext cache"
     );
 }

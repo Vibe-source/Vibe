@@ -758,6 +758,14 @@ struct ChatHomeListRow {
     Self.bridgeProvider(peerUserId: peerUserId, name: title, isAgent: isAgentFriend, agentId: peerAgentId) != nil
   }
 
+  /// Human 1:1 rows with no preview/messages stay off Home until someone sends.
+  var hasVisibleActivity: Bool {
+    if isTyping || unreadCount > 0 { return true }
+    if !preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+    if !initialMessages.isEmpty || !previewRows.isEmpty { return true }
+    return false
+  }
+
   var isGoldTier: Bool {
     peerTier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "gold"
   }

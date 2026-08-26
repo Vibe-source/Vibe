@@ -21,9 +21,18 @@ defmodule VibeWeb.UserController do
   end
 
   def show_by_phone(conn, %{"phone" => phone}) do
+    viewer = conn.assigns.current_user
+
     case Accounts.get_user_by_phone(phone) do
-      nil -> conn |> put_status(404) |> json(%{error: "User not found"})
-      user -> render_user(conn, user, conn.assigns.current_user)
+      nil ->
+        conn |> put_status(404) |> json(%{error: "User not found"})
+
+      user ->
+        if Accounts.viewer_can_see?(user, viewer, :privacy_phone_number) do
+          render_user(conn, user, viewer)
+        else
+          conn |> put_status(404) |> json(%{error: "User not found"})
+        end
     end
   end
 
@@ -355,16 +364,8 @@ defmodule VibeWeb.UserController do
   end
 
   defp render_user(conn, user, viewer) do
-    is_self = viewer && viewer.id == user.id
     is_online = user.show_online_status and user_online?(user.id)
     agent_id = if user.is_agent, do: Agents.agent_id_for_user(user.id), else: nil
-
-    phone_number =
-      cond do
-        is_self -> user.phone_number
-        user.privacy_phone_number == "everybody" -> user.phone_number
-        true -> nil
-      end
 
     json(conn, %{
       userId: user.id,
@@ -377,15 +378,23 @@ defmodule VibeWeb.UserController do
       acceptsIncomingChat:
         if(user.is_agent && agent_id, do: agent_accepts_incoming_chat(agent_id, viewer), else: nil),
       name: user.name,
-      phoneNumber: phone_number,
+      phoneNumber:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_phone_number),
+          do: user.phone_number,
+          else: nil
+        ),
       publicKey: user.public_key,
       identityKey: user.identity_key,
-      profileImage: user.profile_image,
+      profileImage:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_profile_photos),
+          do: user.profile_image,
+          else: nil
+        ),
       online: if(user.show_online_status, do: is_online, else: false),
       lastSeen: if(user.show_last_seen, do: user.last_seen, else: nil),
       showLastSeen: user.show_last_seen,
       showOnlineStatus: user.show_online_status,
-      bio: user.bio,
+      bio: if(Accounts.viewer_can_see?(user, viewer, :privacy_bio), do: user.bio, else: nil),
       autoDeleteTimer: user.auto_delete_timer,
       privacyForward: user.privacy_forward,
       privacyCalls: user.privacy_calls,
@@ -395,7 +404,11 @@ defmodule VibeWeb.UserController do
       privacyGifts: user.privacy_gifts,
       privacyBirthday: user.privacy_birthday,
       privacySavedMusic: user.privacy_saved_music,
-      dateOfBirth: user.date_of_birth
+      dateOfBirth:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_birthday),
+          do: user.date_of_birth,
+          else: nil
+        )
     })
   end
 
@@ -416,10 +429,18 @@ defmodule VibeWeb.UserController do
       acceptsIncomingChat:
         if(user.is_agent && agent_id, do: agent_accepts_incoming_chat(agent_id, viewer), else: nil),
       name: user.name,
-      phoneNumber: if(user.privacy_phone_number == "everybody", do: user.phone_number, else: nil),
+      phoneNumber:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_phone_number),
+          do: user.phone_number,
+          else: nil
+        ),
       publicKey: user.public_key,
       identityKey: user.identity_key,
-      profileImage: user.profile_image
+      profileImage:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_profile_photos),
+          do: user.profile_image,
+          else: nil
+        )
     }
   end
 

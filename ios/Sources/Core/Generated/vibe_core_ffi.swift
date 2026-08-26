@@ -2188,6 +2188,8 @@ public protocol VibeSecureSessionHandleProtocol : AnyObject {
      */
     func addMembers(keyPackages: [Data]) throws  -> VibeFfiCommitOutput
     
+    func epoch() throws  -> UInt64
+    
     /**
      * The group's ratchet tree, which a joiner needs alongside a Welcome.
      */
@@ -2197,6 +2199,8 @@ public protocol VibeSecureSessionHandleProtocol : AnyObject {
      * The group's id — the handle the platform stores against its chat id.
      */
     func groupId() throws  -> Data
+    
+    func hasPendingCommit() throws  -> Bool
     
     /**
      * Opens a `vmls1.` envelope.
@@ -2309,6 +2313,13 @@ open func addMembers(keyPackages: [Data])throws  -> VibeFfiCommitOutput {
 })
 }
     
+open func epoch()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_epoch(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
     /**
      * The group's ratchet tree, which a joiner needs alongside a Welcome.
      */
@@ -2325,6 +2336,13 @@ open func exportRatchetTree()throws  -> Data {
 open func groupId()throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_group_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func hasPendingCommit()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_has_pending_commit(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -4230,8 +4248,8 @@ public struct FfiConverterTypeVibeFfiMessage: FfiConverterRustBuffer {
                 reply: FfiConverterOptionTypeVibeFfiReply.read(from: &buf), 
                 agent: FfiConverterOptionTypeVibeFfiAgent.read(from: &buf), 
                 service: FfiConverterOptionTypeVibeFfiService.read(from: &buf), 
-                editedAtMs: FfiConverterOptionInt64.read(from: &buf),
-                reactions: FfiConverterSequenceTypeVibeFfiReaction.read(from: &buf),
+                editedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                reactions: FfiConverterSequenceTypeVibeFfiReaction.read(from: &buf), 
                 viewCount: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
@@ -4283,6 +4301,80 @@ public func FfiConverterTypeVibeFfiMessage_lower(_ value: VibeFfiMessage) -> Rus
 }
 
 
+public struct VibeFfiMlsEnvelopeHeader {
+    public var groupId: Data
+    public var epoch: UInt64
+    public var content: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: Data, epoch: UInt64, content: String) {
+        self.groupId = groupId
+        self.epoch = epoch
+        self.content = content
+    }
+}
+
+
+
+extension VibeFfiMlsEnvelopeHeader: Equatable, Hashable {
+    public static func ==(lhs: VibeFfiMlsEnvelopeHeader, rhs: VibeFfiMlsEnvelopeHeader) -> Bool {
+        if lhs.groupId != rhs.groupId {
+            return false
+        }
+        if lhs.epoch != rhs.epoch {
+            return false
+        }
+        if lhs.content != rhs.content {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(groupId)
+        hasher.combine(epoch)
+        hasher.combine(content)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVibeFfiMlsEnvelopeHeader: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiMlsEnvelopeHeader {
+        return
+            try VibeFfiMlsEnvelopeHeader(
+                groupId: FfiConverterData.read(from: &buf), 
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VibeFfiMlsEnvelopeHeader, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.groupId, into: &buf)
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMlsEnvelopeHeader_lift(_ buf: RustBuffer) throws -> VibeFfiMlsEnvelopeHeader {
+    return try FfiConverterTypeVibeFfiMlsEnvelopeHeader.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVibeFfiMlsEnvelopeHeader_lower(_ value: VibeFfiMlsEnvelopeHeader) -> RustBuffer {
+    return FfiConverterTypeVibeFfiMlsEnvelopeHeader.lower(value)
+}
+
+
 public struct VibeFfiReaction {
     public var emoji: String
     public var count: UInt64
@@ -4328,8 +4420,8 @@ public struct FfiConverterTypeVibeFfiReaction: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VibeFfiReaction {
         return
             try VibeFfiReaction(
-                emoji: FfiConverterString.read(from: &buf),
-                count: FfiConverterUInt64.read(from: &buf),
+                emoji: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt64.read(from: &buf), 
                 isSelected: FfiConverterBool.read(from: &buf)
         )
     }
@@ -6647,6 +6739,26 @@ public func vibeGroupMintEpochKey()throws  -> Data {
 })
 }
 /**
+ * Cleartext `vmls1.` header: group id, epoch, content type. Does not open the message.
+ */
+public func vibeMlsEnvelopeHeader(envelope: String)throws  -> VibeFfiMlsEnvelopeHeader {
+    return try  FfiConverterTypeVibeFfiMlsEnvelopeHeader.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_func_vibe_mls_envelope_header(
+        FfiConverterString.lower(envelope),$0
+    )
+})
+}
+/**
+ * Group id from a `vmls1.` header, without opening the ciphertext.
+ */
+public func vibeMlsGroupIdFromEnvelope(envelope: String)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_func_vibe_mls_group_id_from_envelope(
+        FfiConverterString.lower(envelope),$0
+    )
+})
+}
+/**
  * The safety number two people compare out of band to prove nobody is in the
  * middle.
  *
@@ -6689,6 +6801,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_func_vibe_group_mint_epoch_key() != 62093) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_mls_envelope_header() != 1546) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_mls_group_id_from_envelope() != 33383) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_func_vibe_safety_number() != 16482) {
@@ -6790,10 +6908,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_add_members() != 56357) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_epoch() != 19311) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_export_ratchet_tree() != 24404) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_group_id() != 9124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_has_pending_commit() != 31204) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_open() != 64976) {

@@ -245,6 +245,31 @@ pub fn vibe_safety_number(key_a: Vec<u8>, key_b: Vec<u8>) -> String {
     vibe_secure::vibe_safety_number(&key_a, &key_b)
 }
 
+/// Group id from a `vmls1.` header, without opening the ciphertext.
+#[uniffi::export]
+pub fn vibe_mls_group_id_from_envelope(envelope: String) -> Result<Vec<u8>, VibeFfiError> {
+    VibeSecureSession::group_id_from_envelope(&envelope).map_err(|e| map_err(&e))
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct VibeFfiMlsEnvelopeHeader {
+    pub group_id: Vec<u8>,
+    pub epoch: u64,
+    pub content: String,
+}
+
+/// Cleartext `vmls1.` header: group id, epoch, content type. Does not open the message.
+#[uniffi::export]
+pub fn vibe_mls_envelope_header(envelope: String) -> Result<VibeFfiMlsEnvelopeHeader, VibeFfiError> {
+    let header =
+        VibeSecureSession::envelope_header(&envelope).map_err(|e| map_err(&e))?;
+    Ok(VibeFfiMlsEnvelopeHeader {
+        group_id: header.group_id,
+        epoch: header.epoch,
+        content: header.content.to_string(),
+    })
+}
+
 /// The two messages an `add_members` commit produces.
 ///
 /// `commit` goes to existing members; `welcome` goes to the joiner, who also
@@ -311,6 +336,20 @@ impl VibeSecureSessionHandle {
             detail: "secure: session lock poisoned".to_owned(),
         })?;
         Ok(guard.group_id())
+    }
+
+    pub fn epoch(&self) -> Result<u64, VibeFfiError> {
+        let guard = self.inner.lock().map_err(|_| VibeFfiError::Internal {
+            detail: "secure: session lock poisoned".to_owned(),
+        })?;
+        Ok(guard.epoch())
+    }
+
+    pub fn has_pending_commit(&self) -> Result<bool, VibeFfiError> {
+        let guard = self.inner.lock().map_err(|_| VibeFfiError::Internal {
+            detail: "secure: session lock poisoned".to_owned(),
+        })?;
+        Ok(guard.has_pending_commit())
     }
 
     /// Joins a group from a Welcome produced by another member's `add_members`.

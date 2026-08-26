@@ -521,18 +521,28 @@ struct ChatAppearanceDraft: Equatable, Codable {
         migrated.messageCornerRadius = 6.0 / 11.0
       }
     }
-    guard migrated.version < 3 else { return migrated }
-    migrated.version = 3
-    // Drafts written before colours resolved live carry a baked palette, which pinned the
-    // chat to whatever appearance was active when the draft was first seeded. Where it
-    // still matches a plate it was seeded rather than chosen — clear it so the theme wins.
-    guard chatAppearanceDraftPaletteIsSeeded(migrated) else { return migrated }
-    migrated.wallpaperGradient = []
-    migrated.bubbleMeGradient = []
-    migrated.bubbleThemGradient = []
-    migrated.wallpaperPatternMaskKey = nil
-    migrated.wallpaperPatternOpacity = -1.0
-    migrated.accent = ""
+    if migrated.version < 3 {
+      migrated.version = 3
+      // Drafts written before colours resolved live carry a baked palette, which pinned the
+      // chat to whatever appearance was active when the draft was first seeded.
+      if chatAppearanceDraftPaletteIsSeeded(migrated) {
+        migrated.wallpaperGradient = []
+        migrated.bubbleMeGradient = []
+        migrated.bubbleThemGradient = []
+        migrated.wallpaperPatternMaskKey = nil
+        migrated.wallpaperPatternOpacity = -1.0
+        migrated.accent = ""
+      }
+    }
+    guard migrated.version < 4 else { return migrated }
+    migrated.version = 4
+    // Re-seed factory outgoing tints so Telegram-deeper plates replace the old neon pairs.
+    if chatAppearanceDraftPaletteIsSeeded(migrated)
+      || isLegacyFactoryOutgoingPalette(migrated.bubbleMeGradient)
+    {
+      migrated.bubbleMeGradient = []
+      migrated.accent = ""
+    }
     return migrated
   }
 
@@ -1552,8 +1562,14 @@ private func nativePresetAppearance(
   let patternGradient = parseGradient(
     (raw["wallpaperPatternGradient"] as? [String]) ?? variant.patternGradientColors,
     fallback: [])
+  let rawMeStops = raw["bubbleMeGradient"] as? [String]
+  let meStops: [String] = {
+    guard let rawMeStops, rawMeStops.count >= 2 else { return variant.bubbleMeGradient }
+    if isLegacyFactoryOutgoingPalette(rawMeStops) { return variant.bubbleMeGradient }
+    return rawMeStops
+  }()
   let bubbleMeGradient = parseGradient(
-    (raw["bubbleMeGradient"] as? [String]) ?? variant.bubbleMeGradient,
+    meStops,
     fallback: fallback.bubbleMeGradient)
   let rawBubbleThemColor =
     parseColor(raw["bubbleThemColor"] as? String)
@@ -1574,6 +1590,7 @@ private func nativePresetAppearance(
   let accent =
     parseColor(raw["accent"] as? String)
     ?? parseColor(raw["accentColor"] as? String)
+    ?? parseColor(variant.bubbleMe)
     ?? fallback.accent
   let messageCornerRadius = parseMessageCornerRadiusPoints(
     raw["messageCornerRadius"],
@@ -1629,8 +1646,21 @@ private func nativePresetAppearance(
   )
 }
 
-/// True when the draft's colours are exactly some plate variant's — i.e. they were seeded
-/// by the old `seededDefault`, not picked by the user. Used once, by the v3 migration.
+/// Old neon/complement outgoing pairs from before the Telegram-deeper plates.
+private func isLegacyFactoryOutgoingPalette(_ stops: [String]) -> Bool {
+  let key = stops.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+  let legacy: [[String]] = [
+    ["#6E5BFF", "#14C8B8"], ["#8B7CFF", "#08C6B4"],
+    ["#9C62F0", "#4B9BFF"], ["#7F5AF0", "#1E90FF"],
+    ["#38C7A5", "#73C74B"], ["#08C6B4", "#28B463"],
+    ["#5A6B8C", "#4A78C2"], ["#475569", "#3B82F6"],
+    ["#F051B5", "#A851F0"], ["#D946EF", "#7F5AF0"],
+    ["#F0830C", "#F0413A"], ["#FF8C00", "#E82A2A"],
+    ["#5DB82E", "#2EB8A3"], ["#28B463", "#1DB8A6"],
+  ]
+  return legacy.contains { $0.map { $0.uppercased() } == key }
+}
+
 private func chatAppearanceDraftPaletteIsSeeded(_ draft: ChatAppearanceDraft) -> Bool {
   func same(_ lhs: [String], _ rhs: [String]) -> Bool {
     lhs.map { $0.uppercased() } == rhs.map { $0.uppercased() }
@@ -1657,8 +1687,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#F7FAFF", "#EEF7F8"],
-        bubbleMe: "#3F6EF5",
-        bubbleMeGradient: ["#6E5BFF", "#14C8B8"],
+        bubbleMe: "#3B8AE8",
+        bubbleMeGradient: ["#4C9AF5", "#2D7AD4"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#A88FF5", "#5AD4C7", "#E89A89"],
@@ -1669,8 +1699,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#05050B", "#05050B"],
-        bubbleMe: "#12B8A7",
-        bubbleMeGradient: ["#8B7CFF", "#08C6B4"],
+        bubbleMe: "#3B8AE8",
+        bubbleMeGradient: ["#4A96E8", "#2E78CC"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#7F5AF0", "#1DB8A6", "#D16F58"],
@@ -1686,9 +1716,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#F4F8FA", "#E9F0F5"],
-        bubbleMe: "#1976D2",
-        // Mist: purple at top, blue at bottom (shared diagonal start→end).
-        bubbleMeGradient: ["#9C62F0", "#4B9BFF"],
+        bubbleMe: "#2F7FE0",
+        bubbleMeGradient: ["#3D8EEC", "#1E6EC8"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#7EB6FF", "#B084F5", "#FF8DA1"],
@@ -1700,8 +1729,7 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       dark: NativeThemeVariant(
         backgroundGradient: ["#03070C", "#03070C"],
         bubbleMe: "#2F80ED",
-        // Mist: purple at top, blue at bottom (shared diagonal start→end).
-        bubbleMeGradient: ["#7F5AF0", "#1E90FF"],
+        bubbleMeGradient: ["#3D8EE8", "#226EC8"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#2F80ED", "#8B4CF5", "#F0516A"],
@@ -1717,8 +1745,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#EAF8D8", "#EAF8D8"],
-        bubbleMe: "#38C7A5",
-        bubbleMeGradient: ["#38C7A5", "#73C74B"],
+        bubbleMe: "#2E9B6E",
+        bubbleMeGradient: ["#36B07C", "#248A5E"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#75D4C3", "#95D475", "#F5DD6A"],
@@ -1729,8 +1757,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#020806", "#020806"],
-        bubbleMe: "#2EB872",
-        bubbleMeGradient: ["#08C6B4", "#28B463"],
+        bubbleMe: "#2C9A68",
+        bubbleMeGradient: ["#32A872", "#24885A"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#1DB8A6", "#2EB872", "#F0DB35"],
@@ -1746,8 +1774,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#F6F6F4", "#ECEEF1"],
-        bubbleMe: "#4A78C2",
-        bubbleMeGradient: ["#5A6B8C", "#4A78C2"],
+        bubbleMe: "#4A6FA0",
+        bubbleMeGradient: ["#5A7FB0", "#3D5F90"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#B8C0D0", "#D0B8E6", "#A3C2F0"],
@@ -1758,8 +1786,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#030304", "#050607"],
-        bubbleMe: "#4287F5",
-        bubbleMeGradient: ["#475569", "#3B82F6"],
+        bubbleMe: "#3D6EA8",
+        bubbleMeGradient: ["#4A7EBA", "#325E94"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#64748B", "#A64DFF", "#4287F5"],
@@ -1775,8 +1803,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "music",
       light: NativeThemeVariant(
         backgroundGradient: ["#FFF5FA", "#FFF0F1"],
-        bubbleMe: "#D63D8C",
-        bubbleMeGradient: ["#F051B5", "#A851F0"],
+        bubbleMe: "#C43B88",
+        bubbleMeGradient: ["#D44A96", "#A83074"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#F59AE0", "#D09AF5", "#8EE3F5"],
@@ -1787,8 +1815,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#070306", "#070306"],
-        bubbleMe: "#E84AA8",
-        bubbleMeGradient: ["#D946EF", "#7F5AF0"],
+        bubbleMe: "#C43B88",
+        bubbleMeGradient: ["#D24A96", "#A83074"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#E84AA8", "#8B4CF5", "#1DB8A6"],
@@ -1804,8 +1832,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#FFF7F0", "#F5ECE5"],
-        bubbleMe: "#D9632D",
-        bubbleMeGradient: ["#F0830C", "#F0413A"],
+        bubbleMe: "#C85A28",
+        bubbleMeGradient: ["#D86A32", "#B44A1E"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#F5B97A", "#F5877A", "#F57AC0"],
@@ -1816,8 +1844,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#060302", "#060302"],
-        bubbleMe: "#E86D32",
-        bubbleMeGradient: ["#FF8C00", "#E82A2A"],
+        bubbleMe: "#C85A28",
+        bubbleMeGradient: ["#D86A32", "#B04A20"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#FF9A3D", "#E82A2A", "#D946EF"],
@@ -1833,8 +1861,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       maskedImage: "doodles",
       light: NativeThemeVariant(
         backgroundGradient: ["#EAF7CD", "#C8E8C5"],
-        bubbleMe: "#5DB82E",
-        bubbleMeGradient: ["#5DB82E", "#2EB8A3"],
+        bubbleMe: "#3D9B40",
+        bubbleMeGradient: ["#4CAF50", "#338A3A"],
         bubbleThem: "#FFFFFF",
         bubbleThemGradient: ["#FFFFFF", "#F6F8FC"],
         patternGradientColors: ["#A9D67A", "#7AE6D2", "#7AA3F5"],
@@ -1845,8 +1873,8 @@ private func nativePreset(for id: String) -> NativeThemePreset? {
       ),
       dark: NativeThemeVariant(
         backgroundGradient: ["#030704", "#030704"],
-        bubbleMe: "#28B463",
-        bubbleMeGradient: ["#28B463", "#1DB8A6"],
+        bubbleMe: "#3A9B4A",
+        bubbleMeGradient: ["#3FAF55", "#2E8A42"],
         bubbleThem: "#252936",
         bubbleThemGradient: ["#252936", "#1A202C"],
         patternGradientColors: ["#28B463", "#1DB8A6", "#2F80ED"],

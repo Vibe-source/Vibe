@@ -217,6 +217,9 @@ struct Prepared {
     client_message_id: Option<String>,
     ts_ms: i64,
     envelope: Option<envelope::VibeHybridEnvelopeV1>,
+    /// An envelope this crate recognises but cannot open: MLS, legacy RSA-direct,
+    /// agent-sealed. The host opens those and projects the plaintext into the frame.
+    sealed_elsewhere: bool,
     key_candidates: Option<Vec<Vec<u8>>>,
     request_index: Option<usize>,
     plain_payload: Option<Map<String, Value>>,
@@ -251,6 +254,7 @@ fn prepare(
     let mut envelope_parsed = None;
     let mut key_candidates = None;
     let mut plain_payload = None;
+    let mut sealed_elsewhere = false;
 
     if let Some(raw_content) = pick_str(&raw, &["encryptedContent", "encrypted_content"]) {
         match envelope::classify(&raw_content) {
@@ -283,7 +287,9 @@ fn prepare(
             VibeEnvelopeFormat::LegacyRsaDirect
             | VibeEnvelopeFormat::AgentSealedArte1
             | VibeEnvelopeFormat::MlsV2
-            | VibeEnvelopeFormat::Unrecognized => {}
+            | VibeEnvelopeFormat::Unrecognized => {
+                sealed_elsewhere = true;
+            }
         }
     }
 
@@ -293,6 +299,7 @@ fn prepare(
         client_message_id,
         ts_ms,
         envelope: envelope_parsed,
+        sealed_elsewhere,
         key_candidates,
         request_index: None,
         plain_payload,
@@ -368,6 +375,18 @@ fn build_snapshot(
     let (media, mut media_thumbs) = build_media(payload, raw, &p.message_id);
     thumbs.append(&mut media_thumbs);
 
+    // An envelope this crate cannot open (MLS, legacy RSA, agent-sealed) is not a failure
+    // by itself: the host opens those and projects the plaintext into the frame. It is a
+    // failure only when nothing came with it — otherwise the row renders blank with no
+    // flag, which is indistinguishable from a message that was genuinely empty.
+    if p.sealed_elsewhere
+        && text.is_empty()
+        && caption.as_deref().unwrap_or("").is_empty()
+        && media.is_none()
+    {
+        flags.insert(VibeMessageFlags::DECRYPTION_FAILED);
+    }
+
     let agent = build_agent(raw);
     let service = build_service(raw);
     let reply = build_reply(payload, raw);
@@ -386,7 +405,9 @@ fn build_snapshot(
     {
         flags.insert(VibeMessageFlags::FORWARDED);
     }
-    if pick_bool(raw, &["viewOnce", "view_once"]).unwrap_or(false) {
+    if pick_bool(raw, &["viewOnce", "view_once"]).unwrap_or(false)
+        || pick_i64(raw, &["mediaTtlSeconds", "media_ttl_seconds"]).is_some()
+    {
         flags.insert(VibeMessageFlags::VIEW_ONCE);
     }
     if pick_bool(raw, &["eventNotification", "event_notification"]).unwrap_or(false) {
@@ -1168,6 +1189,33 @@ mod tests {
         let m = &out.messages[0];
         assert!(m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
         assert!(m.body.text.is_empty());
+    }
+
+    /// This crate cannot open MLS and never will (`vibe_secure` owns the ratchet), so
+    /// the arm that recognises the format used to leave the row blank AND unflagged —
+    /// a delivered message that reads as an empty bubble with nothing to explain it.
+    #[test]
+    fn an_mls_envelope_with_no_host_plaintext_is_flagged_not_silently_blank() {
+        let aead = VibeDenyAllAead;
+        let unwrap = VibeDenyAllKeyUnwrapper;
+        let frame = r#"{"id":"mls-1","chat_id":"chat-1","sender_id":"peer","timestamp":5,"encrypted_content":"vmls1.AAAA"}"#;
+        let out = canonicalize_frame(frame.as_bytes(), &ctx(&aead, &unwrap, false)).unwrap();
+        let m = &out.messages[0];
+        assert!(m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
+        assert!(m.body.text.is_empty());
+    }
+
+    /// The host opens MLS and projects the plaintext into the frame. That row is
+    /// readable, so flagging it would inflate `decryptFailed` with working messages.
+    #[test]
+    fn an_mls_envelope_opened_by_the_host_is_not_flagged() {
+        let aead = VibeDenyAllAead;
+        let unwrap = VibeDenyAllKeyUnwrapper;
+        let frame = r#"{"id":"mls-2","chat_id":"chat-1","sender_id":"peer","timestamp":6,"encrypted_content":"vmls1.AAAA","text":"hello"}"#;
+        let out = canonicalize_frame(frame.as_bytes(), &ctx(&aead, &unwrap, false)).unwrap();
+        let m = &out.messages[0];
+        assert!(!m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
+        assert_eq!(m.body.text, "hello");
     }
 
     #[test]
