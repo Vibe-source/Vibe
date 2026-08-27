@@ -1042,23 +1042,20 @@ defmodule Vibe.Chat do
              Repo.one(from(m in Message, where: m.id == ^uuid and m.chat_id == ^chat_id))
            end) do
       meta = message.metadata || %{}
-      view_once = meta["viewOnce"] == true or meta["view_once"] == true
       ttl = media_ttl_seconds(meta)
 
       cond do
-        not view_once and is_nil(ttl) ->
+        meta["mediaExpired"] == true or meta["media_expired"] == true ->
+          {:ok, :viewed}
+
+        not view_once_media?(meta) and is_nil(ttl) ->
           {:error, :not_view_once}
 
         ttl in [nil, 0] ->
-          delete_view_once_and_broadcast(chat_id, message_id, message.from_id, user_id)
+          expire_view_once_and_broadcast(message, user_id, "viewed")
 
         is_integer(ttl) and ttl > 0 ->
-          Task.start(fn ->
-            Process.sleep(ttl * 1000)
-            _ = delete_view_once_and_broadcast(chat_id, message_id, message.from_id, user_id)
-          end)
-
-          {:ok, :scheduled}
+          schedule_view_once_expiry(message, user_id, ttl)
 
         true ->
           {:error, :not_view_once}
@@ -1071,24 +1068,194 @@ defmodule Vibe.Chat do
     end
   end
 
-  defp delete_view_once_and_broadcast(chat_id, message_id, author_id, actor_id) do
-    case delete_message(chat_id, message_id, author_id, true) do
-      {:ok, message} ->
-        payload = %{
-          chatId: chat_id,
-          messageId: message_id,
-          deletedBy: actor_id,
-          forEveryone: true,
-          reason: "view_once"
-        }
+  defp view_once_media?(meta) when is_map(meta) do
+    meta["viewOnce"] == true or meta["view_once"] == true
+  end
 
-        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message-deleted", payload)
-        broadcast_user_chat_event(chat_id, "message-deleted", payload, nil)
-        {:ok, message}
+  defp view_once_media?(_), do: false
 
-      other ->
-        other
+  defp schedule_view_once_expiry(%Message{} = message, user_id, ttl) when is_integer(ttl) and ttl > 0 do
+    meta = message.metadata || %{}
+    now = System.system_time(:millisecond)
+    expires_at =
+      case meta["mediaExpiresAt"] || meta["media_expires_at"] do
+        n when is_integer(n) -> n
+        _ -> now + ttl * 1000
+      end
+
+    if expires_at <= now do
+      expire_view_once_and_broadcast(message, user_id, "expired")
+    else
+      unless is_integer(meta["mediaOpenedAt"] || meta["media_opened_at"]) do
+        new_meta =
+          Map.merge(meta, %{
+            "mediaOpenedAt" => now,
+            "mediaExpiresAt" => expires_at
+          })
+
+        _ =
+          RepoRLS.with_user(user_id, fn ->
+            message
+            |> Message.changeset(%{metadata: new_meta})
+            |> Repo.update()
+          end)
+      end
+
+      remaining = max(expires_at - now, 0)
+
+      Task.start(fn ->
+        Process.sleep(remaining)
+        _ = expire_view_once_and_broadcast(message, user_id, "expired")
+      end)
+
+      {:ok, :scheduled}
     end
+  end
+
+  defp expire_view_once_and_broadcast(%Message{} = message, user_id, reason) do
+    RepoRLS.with_user(user_id, fn ->
+      fresh =
+        Repo.one(from(m in Message, where: m.id == ^message.id and m.chat_id == ^message.chat_id)) ||
+          message
+
+      meta = fresh.metadata || %{}
+
+      if meta["mediaExpired"] == true or meta["media_expired"] == true do
+        {:ok, :viewed}
+      else
+        tombstone_reason = if reason == "expired", do: "expired", else: "viewed"
+        label = view_once_tombstone_label(fresh, tombstone_reason)
+        metadata = view_once_tombstone_metadata(fresh, tombstone_reason, label)
+        edited_at = System.system_time(:millisecond)
+
+        case fresh
+             |> Ecto.Changeset.change(%{
+               type: "system",
+               media_url: nil,
+               encrypted_content: " ",
+               metadata: metadata,
+               edited_at: edited_at
+             })
+             |> Repo.update() do
+          {:ok, updated} ->
+            broadcast_view_once_tombstone(updated, user_id)
+            {:ok, if(tombstone_reason == "expired", do: :expired, else: :viewed)}
+
+          other ->
+            other
+        end
+      end
+    end)
+  end
+
+  defp view_once_tombstone_label(%Message{} = message, reason) do
+    noun =
+      case message.type do
+        "video" -> "Video"
+        _ -> "Photo"
+      end
+
+    if reason == "expired", do: "#{noun} expired", else: "#{noun} viewed"
+  end
+
+  defp view_once_tombstone_metadata(%Message{} = message, reason, label) do
+    dropped = [
+      "mediaUrl",
+      "media_url",
+      "localMediaUrl",
+      "local_media_url",
+      "mediaKey",
+      "media_key",
+      "thumbnailBase64",
+      "thumbnail_base64",
+      "attachmentThumbnailsB64",
+      "attachmentUrls",
+      "attachmentMediaKeys",
+      "width",
+      "height",
+      "duration",
+      "fileName",
+      "file_name",
+      "mimeType",
+      "mime_type",
+      "waveform",
+      "isVideoNote"
+    ]
+
+    (message.metadata || %{})
+    |> Map.drop(dropped)
+    |> Map.merge(%{
+      "mediaExpired" => true,
+      "mediaExpiryReason" => reason,
+      "text" => label,
+      "service" => %{
+        "kind" => "view_once_expired",
+        "status" => "expired",
+        "text" => label
+      }
+    })
+  end
+
+  defp broadcast_view_once_tombstone(%Message{} = updated, actor_id) do
+    metadata = updated.metadata || %{}
+    client = client_message_payload(updated) |> mirrored_message_payload()
+
+    payload = %{
+      chatId: updated.chat_id,
+      messageId: updated.id,
+      encryptedContent: "",
+      editedAt: updated.edited_at,
+      editedBy: actor_id,
+      plainContent: metadata["text"],
+      plaintext: metadata["text"],
+      metadata: metadata,
+      type: updated.type,
+      message: client
+    }
+
+    VibeWeb.Endpoint.broadcast!("chat:#{updated.chat_id}", "message-edited", payload)
+    broadcast_user_chat_event(updated.chat_id, "message-edited", payload)
+    :ok
+  end
+
+  defp persist_expired_timed_media(%Message{} = message) do
+    meta = message.metadata || %{}
+
+    cond do
+      meta["mediaExpired"] == true or meta["media_expired"] == true ->
+        message
+
+      timed_media_deadline_passed?(meta) ->
+        case expire_view_once_and_broadcast(message, message.from_id, "expired") do
+          {:ok, _} -> Repo.get(Message, message.id) || in_memory_view_once_tombstone(message)
+          _ -> in_memory_view_once_tombstone(message)
+        end
+
+      true ->
+        message
+    end
+  end
+
+  defp persist_expired_timed_media(other), do: other
+
+  defp timed_media_deadline_passed?(meta) when is_map(meta) do
+    case meta["mediaExpiresAt"] || meta["media_expires_at"] do
+      n when is_integer(n) -> n <= System.system_time(:millisecond)
+      _ -> false
+    end
+  end
+
+  defp timed_media_deadline_passed?(_), do: false
+
+  defp in_memory_view_once_tombstone(%Message{} = message) do
+    label = view_once_tombstone_label(message, "expired")
+    %{
+      message
+      | type: "system",
+        media_url: nil,
+        encrypted_content: " ",
+        metadata: view_once_tombstone_metadata(message, "expired", label)
+    }
   end
 
   defp media_ttl_seconds(meta) when is_map(meta) do
@@ -3888,6 +4055,8 @@ defmodule Vibe.Chat do
   defp to_client_message(nil), do: nil
 
   defp to_client_message(%Message{} = message) do
+    message = persist_expired_timed_media(message)
+
     case agent_message_meta(message) do
       nil ->
         base_message_map(message)
@@ -4013,6 +4182,9 @@ defmodule Vibe.Chat do
   end
 
   defp base_message_map(%Message{} = message) do
+    meta = message.metadata || %{}
+    expired = meta["mediaExpired"] == true or meta["media_expired"] == true
+
     %{
       id: message.id,
       chat_id: message.chat_id,
@@ -4021,8 +4193,8 @@ defmodule Vibe.Chat do
       type: message.type,
       encrypted_content: message.encrypted_content,
       status: message.status,
-      media_url: rewrite_media_url(message.media_url),
-      metadata: message.metadata || %{},
+      media_url: if(expired, do: nil, else: rewrite_media_url(message.media_url)),
+      metadata: meta,
       reply_to_id: message.reply_to_id,
       editedAt: message.edited_at
     }

@@ -34,6 +34,7 @@ struct ChatImageEditGalleryPage {
   let subtitle: String?
   let viewOnce: Bool
   let mediaTtlSeconds: Int?
+  let mediaKey: String?
 
   init(
     mediaURL: String,
@@ -41,7 +42,8 @@ struct ChatImageEditGalleryPage {
     messageId: String? = nil,
     subtitle: String? = nil,
     viewOnce: Bool = false,
-    mediaTtlSeconds: Int? = nil
+    mediaTtlSeconds: Int? = nil,
+    mediaKey: String? = nil
   ) {
     self.mediaURL = mediaURL
     self.image = image
@@ -49,6 +51,7 @@ struct ChatImageEditGalleryPage {
     self.subtitle = subtitle
     self.viewOnce = viewOnce
     self.mediaTtlSeconds = mediaTtlSeconds
+    self.mediaKey = mediaKey
   }
 }
 
@@ -73,6 +76,8 @@ enum ChatImageEditModule {
     /// Supplies the cell the photo should grow out of and shrink back into. Held
     /// weakly by the transition, so the chat owning it is enough to keep it alive.
     zoomSourceProvider: ChatMediaZoomSourceProviding? = nil,
+    onProtectedMediaDisplayed: ((String?, Int?) -> Void)? = nil,
+    onProtectedMediaExpired: ((String?) -> Void)? = nil,
     onAction: @escaping (ChatImageEditActionPayload) -> Void
   ) {
     let pages: [ChatImageEditGalleryPage] = {
@@ -99,6 +104,8 @@ enum ChatImageEditModule {
     transition.sourceProvider = zoomSourceProvider
     controller.zoomTransition = transition
     controller.transitioningDelegate = transition
+    controller.onProtectedMediaDisplayed = onProtectedMediaDisplayed
+    controller.onProtectedMediaExpired = onProtectedMediaExpired
     controller.onAction = onAction
     presenter.present(controller, animated: true)
   }

@@ -1503,6 +1503,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// same task while live and history paths overlap.
   private var liveAgentTurnHighWaterByKey: [String: ChatListRow] = [:]
   private var nativeDeletedMessageIds = Set<String>()
+  /// Survives chat close/reopen so a consumed view-once cannot return from engine cache.
+  private static var consumedViewOnceIdsByChat: [String: Set<String>] = [:]
+  private static let consumedViewOnceLock = NSLock()
   private var isInternalScrollAdjustment = false
   private var isUpdatingBottomInset = false
   // Coalescing for agent-stream-tick driven setRows (see scheduleStreamCoalescedSetRows).
@@ -2383,9 +2386,15 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       self?.toggleReactionFromChip(emoji, on: tappedRow)
     }
     cell.onVideoNotePlaybackEnded = { [weak self, weak cell] in
-      guard let self, let endedId = cell?.row?.messageId else { return }
+      guard let self, let endedCell = cell, let endedRow = endedCell.row,
+        let endedId = endedRow.messageId
+      else { return }
       guard self.expandedVideoNoteMessageId == endedId else { return }
       if self.isTallMorphInFlight { return }
+      if endedRow.viewOnce, !endedRow.isMe {
+        self.consumeViewOnceMediaIfNeeded(endedRow)
+        return
+      }
       self.setExpandedVideoNoteMessageId(nil, animated: true)
     }
     cell.configure(
@@ -17202,7 +17211,57 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return retained + payload
   }
 
+  private func replacingConsumedViewOnceRows(_ rows: [[String: Any]]) -> [[String: Any]] {
+    let chatId = engineChatId
+    guard !chatId.isEmpty else { return rows }
+    return rows.map { row in
+      guard let id = messageId(fromRawRow: row),
+        Self.isConsumedViewOnce(chatId: chatId, messageId: id)
+      else { return row }
+      return viewOnceTombstoneRow(from: row)
+    }
+  }
+
+  private func viewOnceTombstoneRow(from row: [String: Any]) -> [String: Any] {
+    guard var message = row["message"] as? [String: Any] else { return row }
+    let oldMetadata = (message["metadata"] as? [String: Any]) ?? [:]
+    let ttlValue = message["mediaTtlSeconds"] ?? message["media_ttl_seconds"]
+      ?? oldMetadata["mediaTtlSeconds"] ?? oldMetadata["media_ttl_seconds"]
+    let ttl = (ttlValue as? Int) ?? (ttlValue as? NSNumber)?.intValue ?? 0
+    let type = ((message["type"] as? String) ?? "").lowercased()
+    let isVideo =
+      type == "video" || (message["isVideoNote"] as? Bool) == true
+      || (oldMetadata["isVideoNote"] as? Bool) == true
+    let noun = isVideo ? "Video" : "Photo"
+    let label = ttl > 0 ? "\(noun) expired" : "\(noun) viewed"
+    let preservedChatId = message["chatId"] ?? message["chat_id"]
+    let removedKeys = [
+      "mediaUrl", "media_url", "localMediaUrl", "local_media_url", "mediaKey", "media_key",
+      "thumbnailBase64", "thumbnail_base64", "attachmentThumbnailsB64", "attachmentUrls",
+      "attachmentMediaKeys", "width", "height", "duration", "fileName", "file_name",
+      "mimeType", "mime_type", "waveform", "isVideoNote",
+    ]
+    for key in removedKeys { message.removeValue(forKey: key) }
+    message["text"] = ""
+    message["type"] = "system"
+    message["metadata"] = [
+      "viewOnce": true,
+      "mediaExpired": true,
+      "mediaExpiryReason": ttl > 0 ? "expired" : "viewed",
+      "service": [
+        "kind": "view_once_expired",
+        "status": "expired",
+        "text": label,
+      ],
+    ]
+    if let preservedChatId { message["chatId"] = preservedChatId }
+    var result = row
+    result["message"] = message
+    return result
+  }
+
   private func mergedRowsPayload(from baseRows: [[String: Any]]) -> [[String: Any]] {
+    let baseRows = replacingConsumedViewOnceRows(baseRows)
     let basePayloadRows: [[String: Any]] = {
       guard statusAuthorityEnabled, !engineChatId.isEmpty else { return baseRows }
       // Delta-driven applies (stage B1) already fetched a fresh engine read off-main;
@@ -17269,7 +17328,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
 
     // Protect the strictly-older displayed rows a volatile Vibe AI DM payload doesn't
     // cover (media/older turns from the cold-open seed). No-op elsewhere.
-    let effectiveBaseRows = retainingOlderVolatileAgentPrefix(basePayloadRows)
+    let effectiveBaseRows = replacingConsumedViewOnceRows(retainingOlderVolatileAgentPrefix(basePayloadRows))
 
     var engineMergedRows = effectiveBaseRows
     if !nativeEngineRowsById.isEmpty || !nativeDeletedMessageIds.isEmpty {
@@ -17477,6 +17536,91 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return mergedRow
   }
 
+  /// Snapshot view-once cells and run the existing fragment delete shader before rows refresh.
+  private func animateIncomingViewOnceDeletes(_ ids: [String]) {
+    for id in ids {
+      guard let row = rows.first(where: { $0.messageId == id }), row.viewOnce else { continue }
+      animateVisibleMessageDisintegration(messageId: id, row: row)
+    }
+  }
+
+  private func consumeViewOnceMediaIfNeeded(_ row: ChatListRow) {
+    noteProtectedMediaOpened(row, ttl: row.mediaTtlSeconds, tombstoneNow: true)
+  }
+
+  private func noteProtectedMediaOpened(_ row: ChatListRow, ttl: Int?, tombstoneNow: Bool) {
+    guard !row.isMe, let messageId = row.messageId, !messageId.isEmpty else { return }
+    let seconds = ttl ?? row.mediaTtlSeconds ?? 0
+    guard row.viewOnce || seconds > 0 else { return }
+    if Self.rememberReportedProtectedMedia(chatId: engineChatId, messageId: messageId) {
+      ChatEngine.shared.reportMediaOpened(chatId: engineChatId, messageId: messageId)
+    }
+    if tombstoneNow || (row.viewOnce && seconds <= 0) {
+      applyViewOnceTombstoneIfNeeded(row)
+    }
+  }
+
+  private func applyViewOnceTombstoneIfNeeded(_ row: ChatListRow) {
+    guard let messageId = row.messageId, !messageId.isEmpty else { return }
+    guard Self.rememberConsumedViewOnce(chatId: engineChatId, messageId: messageId) else { return }
+    chatViewOnceEvictCached(key: messageId)
+    if let url = row.mediaUrl, !url.isEmpty { chatViewOnceEvictCached(key: url) }
+    Self.invalidateBottomReopenSnapshots(chatId: engineChatId, reason: "view-once-consume")
+    setRows(sourceRowsPayload)
+  }
+
+  private static func rememberConsumedViewOnce(chatId: String, messageId: String) -> Bool {
+    let chat = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let id = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chat.isEmpty, !id.isEmpty else { return false }
+    consumedViewOnceLock.lock()
+    defer { consumedViewOnceLock.unlock() }
+    hydrateConsumedViewOnceIdsLocked()
+    let inserted = consumedViewOnceIdsByChat[chat, default: []].insert(id).inserted
+    if inserted { persistConsumedViewOnceIdsLocked() }
+    return inserted
+  }
+
+  private static func isConsumedViewOnce(chatId: String, messageId: String) -> Bool {
+    let chat = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let id = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chat.isEmpty, !id.isEmpty else { return false }
+    consumedViewOnceLock.lock()
+    defer { consumedViewOnceLock.unlock() }
+    hydrateConsumedViewOnceIdsLocked()
+    return consumedViewOnceIdsByChat[chat]?.contains(id) == true
+  }
+
+  private static var reportedProtectedMediaIdsByChat: [String: Set<String>] = [:]
+  private static let consumedViewOnceDefaultsKey = "vibe.consumedViewOnceIdsByChat"
+  private static var consumedViewOnceHydrated = false
+
+  private static func rememberReportedProtectedMedia(chatId: String, messageId: String) -> Bool {
+    let chat = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let id = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !chat.isEmpty, !id.isEmpty else { return false }
+    consumedViewOnceLock.lock()
+    defer { consumedViewOnceLock.unlock() }
+    return reportedProtectedMediaIdsByChat[chat, default: []].insert(id).inserted
+  }
+
+  private static func hydrateConsumedViewOnceIdsLocked() {
+    guard !consumedViewOnceHydrated else { return }
+    consumedViewOnceHydrated = true
+    guard
+      let stored = UserDefaults.standard.dictionary(forKey: consumedViewOnceDefaultsKey)
+        as? [String: [String]]
+    else { return }
+    for (chat, ids) in stored {
+      consumedViewOnceIdsByChat[chat, default: []].formUnion(ids)
+    }
+  }
+
+  private static func persistConsumedViewOnceIdsLocked() {
+    let payload = consumedViewOnceIdsByChat.mapValues { Array($0) }
+    UserDefaults.standard.set(payload, forKey: consumedViewOnceDefaultsKey)
+  }
+
   /// Pipeline-v2 stage B1: apply an engine `chatDelta`. The engine is authoritative
   /// for every id in the delta, so stale overlay copies are dropped (the overlay
   /// drains as deltas flow and remains only for statusAuthority-OFF surfaces), and
@@ -17495,6 +17639,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       nativeDeletedMessageIds.insert(id)
     }
     if !deleted.isEmpty {
+      animateIncomingViewOnceDeletes(deleted)
       retireBottomReopenSnapshotForStructuralDelete()
     }
     let source = (userInfo?["source"] as? String) ?? ""
@@ -17798,6 +17943,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     thumbnailBase64: String? = nil,
     waveform: [Double]? = nil,
     isVideoNote: Bool = false,
+    viewOnce: Bool = false,
+    mediaTtlSeconds: Int? = nil,
     replyToId: String? = nil
   ) {
     let isPreviousMe: Bool = {
@@ -17830,6 +17977,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Drives MessageVisualKind.videoNote — without it the round note renders as a
     // plain rectangular video bubble.
     if isVideoNote { metadata["isVideoNote"] = true }
+    if viewOnce { metadata["viewOnce"] = true }
+    if let mediaTtlSeconds { metadata["mediaTtlSeconds"] = mediaTtlSeconds }
 
     var message: [String: Any] = [
       "id": messageId,
@@ -20956,6 +21105,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let mediaSize = isVideo ? localVideoNaturalSize(for: uri) : localImagePixelSize(for: uri)
     let thumbnailBase64 = isVideo ? localVideoThumbnailBase64(for: uri) : nil
     let effectiveText = caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let sendOptions = ChatAttachSendContext.take()
 
     inputBar?.dismissReplyBanner(animated: false)
     // Photos/videos insert as list cells. A composer overlay stays put while older
@@ -20996,6 +21146,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       duration: duration,
       mediaSize: mediaSize,
       thumbnailBase64: optimisticThumb,
+      viewOnce: sendOptions?.viewOnce == true,
+      mediaTtlSeconds: sendOptions?.mediaTtlSeconds,
       replyToId: replyToMessageId
     )
 
@@ -21029,9 +21181,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if !effectiveText.isEmpty {
       metadata["caption"] = effectiveText
     }
-    if let opts = ChatAttachSendContext.take() {
-      if opts.viewOnce { metadata["viewOnce"] = true }
-      if let ttl = opts.mediaTtlSeconds { metadata["mediaTtlSeconds"] = ttl }
+    if let sendOptions {
+      if sendOptions.viewOnce { metadata["viewOnce"] = true }
+      if let ttl = sendOptions.mediaTtlSeconds { metadata["mediaTtlSeconds"] = ttl }
     }
 
     // Bridge-agent DM / multi-agent group: a plain media message never reaches the agent —
@@ -22358,39 +22510,25 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard FileManager.default.fileExists(atPath: url.path) else { return false }
     let byteSize = localFileSize(at: url)
     guard byteSize > 0 else { return false }
-    let asset = AVURLAsset(url: url)
-    if asset.isPlayable || !asset.tracks(withMediaType: .video).isEmpty {
-      return true
-    }
-    if hasRecognizableLocalVideoContainerHeader(url: url) {
+    if hasRecognizableLocalVideoContainerHeader(url: url) { return true }
+    if byteSize > 1024 {
       chatListDebugLog(
         chatListMediaVerboseDebugLogs,
-        "[ChatMediaVideo] local accepted by header context=%@ path=%@ bytes=%lld playable=%@ header=%@",
+        "[ChatMediaVideo] local accepted by size context=%@ path=%@ bytes=%lld",
         logContext,
         url.path,
-        byteSize,
-        asset.isPlayable ? "Y" : "N",
-        localVideoHeaderSummary(url: url)
+        byteSize
       )
       return true
     }
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    generator.maximumSize = CGSize(width: 640.0, height: 640.0)
-    do {
-      _ = try generator.copyCGImage(at: .zero, actualTime: nil)
-      return true
-    } catch {
-      NSLog(
-        "[ChatMediaVideo] local unusable context=%@ path=%@ bytes=%lld error=%@ header=%@",
-        logContext,
-        url.path,
-        byteSize,
-        error.localizedDescription,
-        localVideoHeaderSummary(url: url)
-      )
-      return false
-    }
+    NSLog(
+      "[ChatMediaVideo] local unusable context=%@ path=%@ bytes=%lld header=%@",
+      logContext,
+      url.path,
+      byteSize,
+      localVideoHeaderSummary(url: url)
+    )
+    return false
   }
 
   private func usableLocalMediaURL(
@@ -22886,6 +23024,31 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let cell = collectionView.visibleCells.compactMap { $0 as? ChatListCell }
       .first { $0.row?.messageId == row.messageId || $0.row?.key == row.key }
 
+    if row.viewOnce {
+      let seed = cell?.currentMediaImage()
+      let url = resolvedPreferredMediaURL(for: row) ?? row.mediaUrl ?? ""
+      guard !url.isEmpty || seed != nil else { return }
+      presentImageEditView(
+        for: row,
+        mediaURL: url,
+        seedImage: seed,
+        sourceView: sourceView,
+        galleryPages: [
+          ChatImageEditGalleryPage(
+            mediaURL: url,
+            image: seed,
+            messageId: row.messageId,
+            subtitle: mediaHeaderDateText(for: row),
+            viewOnce: true,
+            mediaTtlSeconds: row.mediaTtlSeconds,
+            mediaKey: row.mediaKey)
+        ],
+        startIndex: 0,
+        allowsFilmstrip: false
+      )
+      return
+    }
+
     let messagePages = buildNativeImagePages(for: row, cell: cell)
 
     // A multi-image message pages within itself and keeps its filmstrip. A
@@ -22950,7 +23113,8 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     let visibleCells = collectionView.visibleCells.compactMap { $0 as? ChatListCell }
 
     return rows.compactMap { row -> ChatImageEditGalleryPage? in
-      guard row.kind == .message, row.visualKind == .media, let messageId = row.messageId
+      guard row.kind == .message, row.visualKind == .media, let messageId = row.messageId,
+        !row.viewOnce
       else { return nil }
       // Multi-image messages page inside themselves; folding their tiles into a
       // flat chat-wide list would lose which tile the user actually tapped.
@@ -22970,7 +23134,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         mediaURL: url,
         image: seed,
         messageId: messageId,
-        subtitle: mediaHeaderDateText(for: row)
+        subtitle: mediaHeaderDateText(for: row),
+        viewOnce: row.viewOnce,
+        mediaTtlSeconds: row.mediaTtlSeconds
       )
     }
   }
@@ -23034,7 +23200,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
             mediaURL: url,
             image: seed,
             messageId: row.messageId,
-            subtitle: mediaHeaderDateText(for: row)))
+            subtitle: mediaHeaderDateText(for: row),
+            viewOnce: row.viewOnce,
+            mediaTtlSeconds: row.mediaTtlSeconds))
       }
       return pages
     }
@@ -23051,7 +23219,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         mediaURL: url,
         image: seed,
         messageId: row.messageId,
-        subtitle: mediaHeaderDateText(for: row))
+        subtitle: mediaHeaderDateText(for: row),
+        viewOnce: row.viewOnce,
+        mediaTtlSeconds: row.mediaTtlSeconds)
     ]
   }
 
@@ -23075,12 +23245,10 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
           image: seedImage,
           messageId: row.messageId,
           viewOnce: row.viewOnce,
-          mediaTtlSeconds: row.mediaTtlSeconds)
+          mediaTtlSeconds: row.mediaTtlSeconds,
+          mediaKey: row.mediaKey)
       ]
     }()
-    if row.viewOnce, !row.isMe, let messageId = row.messageId {
-      ChatEngine.shared.reportMediaOpened(chatId: engineChatId, messageId: messageId)
-    }
     ChatImageEditModule.presentEditor(
       from: presenter,
       sourceView: sourceView,
@@ -23093,7 +23261,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       galleryPages: pagesWithTTL,
       startIndex: startIndex,
       allowsFilmstrip: allowsFilmstrip,
-      zoomSourceProvider: self
+      zoomSourceProvider: self,
+      onProtectedMediaDisplayed: { [weak self] messageId, ttl in
+        guard let self else { return }
+        let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+        let seconds = ttl ?? protectedRow.mediaTtlSeconds ?? 0
+        self.noteProtectedMediaOpened(
+          protectedRow, ttl: seconds, tombstoneNow: protectedRow.viewOnce && seconds <= 0)
+      },
+      onProtectedMediaExpired: { [weak self] messageId in
+        guard let self else { return }
+        let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+        self.applyViewOnceTombstoneIfNeeded(protectedRow)
+      }
     ) { [weak self] payload in
       guard let self else { return }
       // The viewer swipes across messages, so these act on the photo that was on
@@ -23565,7 +23745,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
         initialCaption: row.text,
         headerTitle: resolvedMediaPreviewHeaderTitle(for: row),
         messageId: row.messageId,
+        viewOnce: row.viewOnce,
+        mediaTtlSeconds: row.mediaTtlSeconds,
         zoomSourceProvider: self,
+        onProtectedMediaDisplayed: { [weak self] messageId, ttl in
+          guard let self else { return }
+          let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+          let seconds = ttl ?? protectedRow.mediaTtlSeconds ?? 0
+          self.noteProtectedMediaOpened(
+            protectedRow, ttl: seconds, tombstoneNow: protectedRow.viewOnce && seconds <= 0)
+        },
+        onProtectedMediaExpired: { [weak self] messageId in
+          guard let self else { return }
+          let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+          self.applyViewOnceTombstoneIfNeeded(protectedRow)
+        },
         onReply: { [weak self] in
           self?.showReplyBanner(for: row, fallbackText: "Video")
         }
@@ -23715,7 +23909,21 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       initialCaption: row?.text,
       headerTitle: resolvedMediaPreviewHeaderTitle(for: row),
       messageId: row?.messageId,
+      viewOnce: row?.viewOnce ?? false,
+      mediaTtlSeconds: row?.mediaTtlSeconds,
       zoomSourceProvider: self,
+      onProtectedMediaDisplayed: { [weak self] messageId, ttl in
+        guard let self, let row else { return }
+        let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+        let seconds = ttl ?? protectedRow.mediaTtlSeconds ?? 0
+        self.noteProtectedMediaOpened(
+          protectedRow, ttl: seconds, tombstoneNow: protectedRow.viewOnce && seconds <= 0)
+      },
+      onProtectedMediaExpired: { [weak self] messageId in
+        guard let self, let row else { return }
+        let protectedRow = messageId.flatMap { id in self.rows.first { $0.messageId == id } } ?? row
+        self.applyViewOnceTombstoneIfNeeded(protectedRow)
+      },
       onReply: { [weak self] in
         guard let self, let row else { return }
         self.showReplyBanner(for: row, fallbackText: "Video")

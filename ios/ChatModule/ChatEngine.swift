@@ -4509,8 +4509,8 @@ final class ChatEngine {
           }
         } else if let mlsPeerUserId = normalizedString(peerUserId) {
           VibeSecureEstablishment.establishDirectMessage(
-            chatId: chatId, peerUserId: mlsPeerUserId, apiBase: mlsApiBase, token: token,
-            completion: onSettled)
+            chatId: chatId, peerUserId: mlsPeerUserId, myUserId: userId, apiBase: mlsApiBase,
+            token: token, completion: onSettled)
         }
         return [
           "accepted": true, "queued": true, "reason": "mls_establishing",
@@ -12239,7 +12239,15 @@ final class ChatEngine {
       }
       let existingMetadata = existingMessage["metadata"] as? [String: Any]
       let fromId = normalizedString(existingMessage["fromId"] ?? existingMessage["from_id"])
-      let type = normalizedString(existingMessage["type"]) ?? "text"
+      let wireMetadataEarly = payload["metadata"] as? [String: Any]
+      let isViewOnceTombstone =
+        (wireMetadataEarly?["mediaExpired"] as? Bool) == true
+        || ((wireMetadataEarly?["service"] as? [String: Any])?["kind"] as? String)
+          == "view_once_expired"
+      let type =
+        isViewOnceTombstone
+        ? (normalizedString(payload["type"]) ?? "system")
+        : (normalizedString(existingMessage["type"]) ?? "text")
       let timestampMs =
         parseLongValue(existingMessage["timestampMs"] ?? existingMessage["timestamp"])
         ?? Int64(nowMs())
@@ -12292,45 +12300,56 @@ final class ChatEngine {
         return parseDecryptedMessagePayload(decrypted)
       }()
       var hydratedFields = decryptedFields
-      if normalizedString(hydratedFields["mediaUrl"]) == nil {
-        hydratedFields["mediaUrl"] =
-          existingMessage["mediaUrl"] ?? existingMessage["media_url"]
-          ?? existingMetadata?["mediaUrl"] ?? existingMetadata?["media_url"]
-      }
-      if normalizedString(hydratedFields["fileName"]) == nil {
-        hydratedFields["fileName"] =
-          existingMessage["fileName"] ?? existingMessage["file_name"]
-          ?? existingMetadata?["fileName"] ?? existingMetadata?["file_name"]
-      }
-      if normalizedString(hydratedFields["mediaKey"]) == nil {
-        hydratedFields["mediaKey"] =
-          existingMessage["mediaKey"] ?? existingMessage["media_key"]
-          ?? existingMetadata?["mediaKey"] ?? existingMetadata?["media_key"]
-      }
-      if hydratedFields["thumbnailBase64"] == nil {
-        hydratedFields["thumbnailBase64"] =
-          existingMessage["thumbnailBase64"] ?? existingMessage["thumbnail_base64"]
-          ?? existingMetadata?["thumbnailBase64"] ?? existingMetadata?["thumbnail_base64"]
-      }
-      // Carry the existing metadata under the edited payload's fields so an edit
-      // (e.g. adding a caption to a sent image) can't wipe row-only state like the
-      // sealed attachment blobs (server never echoes those back) or media size.
-      // Also accept top-level `metadata` on the wire event (decision settlement
-      // rewrites `service` there without re-wrapping ciphertext as hybrid JSON).
-      let wireMetadata = payload["metadata"] as? [String: Any]
-      if let existingMetadata, !existingMetadata.isEmpty {
-        var mergedMetadata = existingMetadata
-        if let editedMetadata = hydratedFields["metadata"] as? [String: Any] {
-          mergedMetadata.merge(editedMetadata) { _, new in new }
+      let wireMetadata = payload["metadata"] as? [String: Any] ?? wireMetadataEarly
+      if isViewOnceTombstone {
+        hydratedFields["mediaUrl"] = nil
+        hydratedFields["localMediaUrl"] = nil
+        hydratedFields["fileName"] = nil
+        hydratedFields["mediaKey"] = nil
+        hydratedFields["thumbnailBase64"] = nil
+        if let wireMetadata, !wireMetadata.isEmpty {
+          hydratedFields["metadata"] = wireMetadata
         }
-        if let wireMetadata {
+      } else {
+        if normalizedString(hydratedFields["mediaUrl"]) == nil {
+          hydratedFields["mediaUrl"] =
+            existingMessage["mediaUrl"] ?? existingMessage["media_url"]
+            ?? existingMetadata?["mediaUrl"] ?? existingMetadata?["media_url"]
+        }
+        if normalizedString(hydratedFields["fileName"]) == nil {
+          hydratedFields["fileName"] =
+            existingMessage["fileName"] ?? existingMessage["file_name"]
+            ?? existingMetadata?["fileName"] ?? existingMetadata?["file_name"]
+        }
+        if normalizedString(hydratedFields["mediaKey"]) == nil {
+          hydratedFields["mediaKey"] =
+            existingMessage["mediaKey"] ?? existingMessage["media_key"]
+            ?? existingMetadata?["mediaKey"] ?? existingMetadata?["media_key"]
+        }
+        if hydratedFields["thumbnailBase64"] == nil {
+          hydratedFields["thumbnailBase64"] =
+            existingMessage["thumbnailBase64"] ?? existingMessage["thumbnail_base64"]
+            ?? existingMetadata?["thumbnailBase64"] ?? existingMetadata?["thumbnail_base64"]
+        }
+        // Carry the existing metadata under the edited payload's fields so an edit
+        // (e.g. adding a caption to a sent image) can't wipe row-only state like the
+        // sealed attachment blobs (server never echoes those back) or media size.
+        // Also accept top-level `metadata` on the wire event (decision settlement
+        // rewrites `service` there without re-wrapping ciphertext as hybrid JSON).
+        if let existingMetadata, !existingMetadata.isEmpty {
+          var mergedMetadata = existingMetadata
+          if let editedMetadata = hydratedFields["metadata"] as? [String: Any] {
+            mergedMetadata.merge(editedMetadata) { _, new in new }
+          }
+          if let wireMetadata {
+            mergedMetadata.merge(wireMetadata) { _, new in new }
+          }
+          hydratedFields["metadata"] = mergedMetadata
+        } else if let wireMetadata, !wireMetadata.isEmpty {
+          var mergedMetadata = (hydratedFields["metadata"] as? [String: Any]) ?? [:]
           mergedMetadata.merge(wireMetadata) { _, new in new }
+          hydratedFields["metadata"] = mergedMetadata
         }
-        hydratedFields["metadata"] = mergedMetadata
-      } else if let wireMetadata, !wireMetadata.isEmpty {
-        var mergedMetadata = (hydratedFields["metadata"] as? [String: Any]) ?? [:]
-        mergedMetadata.merge(wireMetadata) { _, new in new }
-        hydratedFields["metadata"] = mergedMetadata
       }
       if let plain = normalizedString(payload["plainContent"] ?? payload["plaintext"]),
         !plain.isEmpty
@@ -12367,6 +12386,51 @@ final class ChatEngine {
       state["updatedAt"] = nowMs()
       return (messageId, "edited")
     case "message-deleted":
+      if normalizedString(payload["reason"]) == "view_once",
+        let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId)
+      {
+        let existingType = normalizedString(existingMessage["type"]) ?? "image"
+        let noun = existingType == "video" ? "Video" : "Photo"
+        let label = "\(noun) viewed"
+        let fromId = normalizedString(existingMessage["fromId"] ?? existingMessage["from_id"])
+        let timestampMs =
+          parseLongValue(existingMessage["timestampMs"] ?? existingMessage["timestamp"])
+          ?? Int64(nowMs())
+        let tombstoneFields: [String: Any] = [
+          "text": "",
+          "plainContent": label,
+          "metadata": [
+            "mediaExpired": true,
+            "mediaExpiryReason": "viewed",
+            "text": label,
+            "service": [
+              "kind": "view_once_expired",
+              "status": "expired",
+              "text": label,
+            ],
+          ],
+        ]
+        let row = buildLiveRowPayloadLocked(
+          chatId: chatId,
+          messageId: messageId,
+          fromId: fromId,
+          type: "system",
+          timestampMs: timestampMs,
+          encryptedContent: nil,
+          decryptedFields: tombstoneFields,
+          forceEdited: true
+        )
+        upsertLiveMessageRowLocked(chatId: chatId, messageId: messageId, row: row)
+        appendJournalLocked(
+          event: "native-message-edited",
+          payload: [
+            "chatId": chatId,
+            "messageId": messageId,
+            "reason": "view_once",
+          ])
+        state["updatedAt"] = nowMs()
+        return (messageId, "edited")
+      }
       removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
       markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
       applyPinnedUpdateLocked(

@@ -24,6 +24,8 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private var galleryIndex: Int
 
   var onAction: ((ChatImageEditActionPayload) -> Void)?
+  var onProtectedMediaDisplayed: ((String?, Int?) -> Void)?
+  var onProtectedMediaExpired: ((String?) -> Void)?
 
   // MARK: Canvas
 
@@ -82,7 +84,8 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   private lazy var headerHost = ChatImageEditorHeaderHost(
     title: headerTitleText,
     subtitle: headerSubtitleText,
-    hasMessage: currentMessageId != nil)
+    hasMessage: currentMessageId != nil,
+    allowsActions: !isProtectedMediaPage)
   private lazy var composerModel = ChatAttachComposerModel(
     recipientName: headerTitleText == "Photo" ? "" : headerTitleText,
     pickCount: 1,
@@ -172,7 +175,21 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   /// Last mode the layout was animated for, so only a real tab change springs.
   private var lastAppliedMarkupMode: ChatImageMarkupMode?
   private var undoManagerProxy = UndoManager()
+  private let protectedTimerHost = UIView()
+  private let protectedTimerTrack = UIView()
+  private let protectedTimerFill = UIView()
+  private let protectedTimerIcon = UIImageView(image: UIImage(systemName: "flame.fill"))
+  private let protectedTimerLabel = UILabel()
+  private var protectedTimer: Timer?
+  private var protectedTimerDeadline: CFTimeInterval?
+  private var protectedTimerDuration: TimeInterval = 0
+  private var displayedProtectedMediaIds = Set<String>()
+  private var isProtectedExpiryCommitted = false
 
+  private var currentPage: ChatImageEditGalleryPage? { galleryPages[safeIndex: galleryIndex] }
+  private var isProtectedMediaPage: Bool {
+    currentPage?.viewOnce == true || (currentPage?.mediaTtlSeconds ?? 0) > 0
+  }
   private var showsFilmstrip: Bool { allowsFilmstrip && galleryPages.count > 1 }
   private var showsPaging: Bool { galleryPages.count > 1 }
 
@@ -222,6 +239,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
 
   deinit {
     remoteImageTask?.cancel()
+    protectedTimer?.invalidate()
     NotificationCenter.default.removeObserver(self)
   }
 
@@ -308,6 +326,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
 
     setupTopBar()
     setupBottomBar()
+    setupProtectedMediaUI()
     rebuildPages()
     loadImage()
     refreshHeaderForCurrentPage()
@@ -359,7 +378,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     renderSurfaceView.addGestureRecognizer(hold)
     renderSurfaceView.isUserInteractionEnabled = true
 
-    if startInEditMode {
+    if startInEditMode, !isProtectedMediaPage {
       setMarkupActive(true, animated: false)
     } else {
       setMarkupActive(false, animated: false)
@@ -373,11 +392,108 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       composerModel.pickCount = max(1, galleryPages.count)
       composerModel.pageIndex = galleryIndex
       composerModel.recipientName = headerTitleText == "Photo" ? "" : headerTitleText
+      composerHost.reloadChrome()
+    }
+  }
+
+  private func setupProtectedMediaUI() {
+    guard isProtectedMediaPage else {
+      protectedTimerHost.isHidden = true
+      return
+    }
+    protectedTimerHost.backgroundColor = UIColor.black.withAlphaComponent(0.48)
+    protectedTimerHost.layer.cornerRadius = 15
+    protectedTimerHost.isUserInteractionEnabled = false
+    protectedTimerHost.isHidden = true
+    protectedTimerTrack.backgroundColor = UIColor.white.withAlphaComponent(0.20)
+    protectedTimerTrack.layer.cornerRadius = 1.5
+    protectedTimerFill.backgroundColor = .systemOrange
+    protectedTimerFill.layer.cornerRadius = 1.5
+    protectedTimerIcon.tintColor = .systemOrange
+    protectedTimerIcon.contentMode = .scaleAspectFit
+    protectedTimerLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+    protectedTimerLabel.textColor = .white
+    protectedTimerLabel.textAlignment = .right
+    protectedTimerHost.addSubview(protectedTimerIcon)
+    protectedTimerHost.addSubview(protectedTimerLabel)
+    protectedTimerHost.addSubview(protectedTimerTrack)
+    protectedTimerTrack.addSubview(protectedTimerFill)
+    view.addSubview(protectedTimerHost)
+    bottomContainer.isHidden = true
+    viewerBarHost.isHidden = true
+    filmstrip.isHidden = true
+    markupHost.isHidden = true
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    beginProtectedMediaIfReady()
+  }
+
+  private func beginProtectedMediaIfReady() {
+    guard isProtectedMediaPage, imageView.image != nil, let page = currentPage else { return }
+    let identity = page.messageId ?? "url:\(page.mediaURL)"
+    if displayedProtectedMediaIds.insert(identity).inserted {
+      onProtectedMediaDisplayed?(page.messageId, page.mediaTtlSeconds)
+    }
+    guard protectedTimer == nil, let seconds = page.mediaTtlSeconds, seconds > 0 else { return }
+    protectedTimerDuration = TimeInterval(seconds)
+    protectedTimerDeadline = CACurrentMediaTime() + protectedTimerDuration
+    protectedTimerHost.isHidden = false
+    let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+      self?.tickProtectedMediaTimer()
+    }
+    protectedTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+    tickProtectedMediaTimer()
+  }
+
+  private func tickProtectedMediaTimer() {
+    guard let deadline = protectedTimerDeadline, protectedTimerDuration > 0 else { return }
+    let remaining = max(0, deadline - CACurrentMediaTime())
+    let fraction = CGFloat(min(1, remaining / protectedTimerDuration))
+    protectedTimerLabel.text = "\(max(0, Int(ceil(remaining))))s"
+    protectedTimerFill.frame = CGRect(
+      x: 0, y: 0, width: protectedTimerTrack.bounds.width * fraction,
+      height: protectedTimerTrack.bounds.height)
+    if remaining <= 0 { expireProtectedMedia() }
+  }
+
+  private func expireProtectedMedia() {
+    guard !isProtectedExpiryCommitted else { return }
+    isProtectedExpiryCommitted = true
+    protectedTimer?.invalidate()
+    protectedTimer = nil
+    protectedTimerDeadline = nil
+    remoteImageTask?.cancel()
+    remoteImageTask = nil
+    imageView.image = nil
+    originalImage = nil
+    composerOriginalImage = nil
+    let expiredMessageId = currentPage?.messageId ?? messageId
+    if galleryIndex >= 0, galleryIndex < galleryPages.count {
+      let page = galleryPages[galleryIndex]
+      galleryPages[galleryIndex] = ChatImageEditGalleryPage(
+        mediaURL: page.mediaURL,
+        image: nil,
+        messageId: page.messageId,
+        subtitle: page.subtitle,
+        viewOnce: page.viewOnce,
+        mediaTtlSeconds: page.mediaTtlSeconds,
+        mediaKey: page.mediaKey)
+      pageImageViews[safeIndex: galleryIndex]?.image = nil
+    }
+    protectedTimerHost.isHidden = true
+    onProtectedMediaExpired?(expiredMessageId)
+    UIView.animate(withDuration: 0.16, animations: {
+      self.renderSurfaceView.alpha = 0
+    }) { _ in
+      self.dismiss(animated: false)
     }
   }
 
   @objc private func handleImageHold(_ gr: UILongPressGestureRecognizer) {
-    guard gr.state == .began, !isMarkupActive else { return }
+    guard gr.state == .began, !isMarkupActive, !isProtectedMediaPage else { return }
     setMarkupActive(true, animated: true)
   }
 
@@ -640,6 +756,21 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     setChromeFrame(
       headerHost,
       CGRect(x: 0, y: safe.top, width: w, height: max(44, topH - safe.top)))
+    if isProtectedMediaPage {
+      let timerWidth = min(168, max(120, w - 40))
+      protectedTimerHost.frame = CGRect(
+        x: floor((w - timerWidth) * 0.5), y: topH + 5, width: timerWidth, height: 30)
+      protectedTimerIcon.frame = CGRect(x: 10, y: 5, width: 18, height: 16)
+      protectedTimerLabel.frame = CGRect(x: timerWidth - 50, y: 3, width: 40, height: 18)
+      protectedTimerTrack.frame = CGRect(x: 10, y: 24, width: timerWidth - 20, height: 3)
+      if let deadline = protectedTimerDeadline, protectedTimerDuration > 0 {
+        let remaining = max(0, deadline - CACurrentMediaTime())
+        let fraction = CGFloat(min(1, remaining / protectedTimerDuration))
+        protectedTimerFill.frame = CGRect(
+          x: 0, y: 0, width: protectedTimerTrack.bounds.width * fraction,
+          height: protectedTimerTrack.bounds.height)
+      }
+    }
     if isAttachComposer {
       let composerBottomLift = keyboardHeight > 0 ? keyboardHeight : 0
       setChromeFrame(composerHost, view.bounds.inset(by: UIEdgeInsets(
@@ -727,7 +858,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     let mainSlideOffset =
       viewerBarHost.preferredHeight + viewerFilmH + safe.bottom + 44
     let markupSlideOffset = markupNaturalH + safe.bottom + 12
-    let showsViewer = !isMarkupActive && !isGifPanelVisible && !isAttachComposer
+    let showsViewer = !isMarkupActive && !isGifPanelVisible && !isAttachComposer && !isProtectedMediaPage
     setBottomControlVisible(
       bottomScrimHost, showsViewer, hiddenOffset: mainSlideOffset)
     setBottomControlVisible(
@@ -780,6 +911,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     view.bringSubviewToFront(bottomContainer)
     if isGifPanelVisible { view.bringSubviewToFront(gifPanelContainer) }
     view.bringSubviewToFront(headerHost)
+    if !protectedTimerHost.isHidden { view.bringSubviewToFront(protectedTimerHost) }
     if isAttachComposer && !isMarkupActive {
       view.bringSubviewToFront(composerHost)
     }
@@ -1554,7 +1686,10 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
   // MARK: Image load
 
   private func loadImage() {
-    if let pageImage = galleryPages[safeIndex: galleryIndex]?.image {
+    let page = galleryPages[safeIndex: galleryIndex]
+    let isProtectedMedia = page?.viewOnce == true
+    let mediaKey = page?.mediaKey
+    if let pageImage = page?.image {
       applyImage(pageImage)
       return
     }
@@ -1573,16 +1708,24 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       applyImage(image)
       return
     }
-    if let diskData = chatMediaDiskCacheLoad(trimmed), let diskImage = UIImage(data: diskData) {
+    if !isProtectedMedia, let diskData = chatMediaDiskCacheLoad(trimmed),
+      let diskImage = UIImage(data: diskData)
+    {
       applyImage(diskImage)
       return
     }
     guard let remoteURL = URL(string: trimmed) else { return }
     remoteImageTask?.cancel()
+    let requestedMessageId = page?.messageId
     remoteImageTask = VibeHTTP.shared.dataTask(with: remoteURL) { [weak self] data, _, _ in
-      guard let self, let data, let image = UIImage(data: data) else { return }
-      chatMediaDiskCacheSave(data, forKey: trimmed)
+      guard let self, let data,
+        let clearData = ChatEngine.shared.decryptMediaDataIfNeeded(data, mediaKey: mediaKey),
+        let image = UIImage(data: clearData)
+      else { return }
+      if !isProtectedMedia { chatMediaDiskCacheSave(clearData, forKey: trimmed) }
       DispatchQueue.main.async {
+        let currentPage = self.galleryPages[safeIndex: self.galleryIndex]
+        guard currentPage?.messageId == requestedMessageId, self.mediaURL == trimmed else { return }
         self.applyImage(image)
       }
     }
@@ -1605,12 +1748,14 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
         messageId: page.messageId,
         subtitle: page.subtitle,
         viewOnce: page.viewOnce,
-        mediaTtlSeconds: page.mediaTtlSeconds)
+        mediaTtlSeconds: page.mediaTtlSeconds,
+        mediaKey: page.mediaKey)
       if galleryIndex < pageImageViews.count {
         pageImageViews[galleryIndex].image = image
       }
     }
     view.setNeedsLayout()
+    if view.window != nil { beginProtectedMediaIfReady() }
   }
 
   /// Message the *current page* came from. Swiping moves between messages, so
@@ -1627,6 +1772,7 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
       title: headerTitleText,
       subtitle: subtitle,
       hasMessage: currentMessageId != nil)
+    headerHost.model.allowsActions = !isProtectedMediaPage
   }
 
   // MARK: Snapshot + send
@@ -2111,7 +2257,9 @@ final class ChatImageEditViewController: UIViewController, UITextFieldDelegate,
     galleryPages.append(contentsOf: pages)
     composerModel.pickCount = galleryPages.count
     rebuildPages()
-    selectPage(at: galleryPages.count - 1, animated: true)
+    composerModel.pageIndex = galleryIndex
+    composerHost.reloadChrome()
+    view.setNeedsLayout()
   }
 
 

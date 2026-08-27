@@ -473,19 +473,37 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   private var suppressNextPreviewToggleTap = false
 
   var onReply: (() -> Void)?
+  var onProtectedMediaDisplayed: ((String?, Int?) -> Void)?
+  var onProtectedMediaExpired: ((String?) -> Void)?
   var zoomTransition: ChatMediaZoomTransition?
   private let zoomMessageId: String?
+  private let isProtectedMedia: Bool
+  private let protectedTtlSeconds: Int?
+  private var didNotifyProtectedDisplay = false
+  private var isProtectedExpiryCommitted = false
+  private let protectedTimerHost = UIView()
+  private let protectedTimerTrack = UIView()
+  private let protectedTimerFill = UIView()
+  private let protectedTimerIcon = UIImageView(image: UIImage(systemName: "flame.fill"))
+  private let protectedTimerLabel = UILabel()
+  private var protectedTimer: Timer?
+  private var protectedTimerDeadline: CFTimeInterval?
+  private var protectedTimerDuration: TimeInterval = 0
 
   init(
     asset: AVAsset,
     initialCaption: String?,
     headerTitle: String?,
     previewOnly: Bool,
-    messageId: String? = nil
+    messageId: String? = nil,
+    viewOnce: Bool = false,
+    mediaTtlSeconds: Int? = nil
   ) {
     self.asset = asset
     self.previewOnly = previewOnly
     self.zoomMessageId = messageId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.protectedTtlSeconds = mediaTtlSeconds
+    self.isProtectedMedia = viewOnce || (mediaTtlSeconds ?? 0) > 0
     let normalizedCaption = initialCaption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.captionText = normalizedCaption
     let normalizedHeaderTitle = headerTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -513,6 +531,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
     }
+    protectedTimer?.invalidate()
     itemStatusObserver = nil
     loadedTimeRangesObserver = nil
     timeControlObserver = nil
@@ -762,6 +781,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     updateMuteButton()
     updatePreviewPlaybackControls()
     applyPresentationMode()
+    setupProtectedMediaUI()
     configurePlayer()
     loadAssetMetadata()
 
@@ -776,6 +796,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
     seekPlayer(to: selectedTrimStartSeconds(), playAfterSeek: true)
+    beginProtectedMediaIfReady()
   }
 
   override func viewWillDisappear(_ animated: Bool) {
@@ -815,6 +836,24 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       height: headerSide
     )
     menuButton.frame = menuGlassView.bounds
+    if isProtectedMedia {
+      let timerWidth = min(168, max(120, view.bounds.width - 40))
+      protectedTimerHost.frame = CGRect(
+        x: floor((view.bounds.width - timerWidth) * 0.5),
+        y: topContainer.frame.maxY + 10,
+        width: timerWidth,
+        height: 30)
+      protectedTimerIcon.frame = CGRect(x: 10, y: 5, width: 18, height: 16)
+      protectedTimerLabel.frame = CGRect(x: timerWidth - 50, y: 3, width: 40, height: 18)
+      protectedTimerTrack.frame = CGRect(x: 10, y: 24, width: timerWidth - 20, height: 3)
+      if let deadline = protectedTimerDeadline, protectedTimerDuration > 0 {
+        let remaining = max(0, deadline - CACurrentMediaTime())
+        let fraction = CGFloat(min(1, remaining / protectedTimerDuration))
+        protectedTimerFill.frame = CGRect(
+          x: 0, y: 0, width: protectedTimerTrack.bounds.width * fraction,
+          height: protectedTimerTrack.bounds.height)
+      }
+    }
 
     let titleWidth = min(
       max(108.0, titleLabel.intrinsicContentSize.width + 28.0),
@@ -1186,6 +1225,74 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
     updateChromeAppearance()
   }
 
+  private func setupProtectedMediaUI() {
+    guard isProtectedMedia else {
+      protectedTimerHost.isHidden = true
+      return
+    }
+    protectedTimerHost.backgroundColor = UIColor.black.withAlphaComponent(0.48)
+    protectedTimerHost.layer.cornerRadius = 15
+    protectedTimerHost.isUserInteractionEnabled = false
+    protectedTimerHost.isHidden = true
+    protectedTimerTrack.backgroundColor = UIColor.white.withAlphaComponent(0.20)
+    protectedTimerTrack.layer.cornerRadius = 1.5
+    protectedTimerFill.backgroundColor = .systemOrange
+    protectedTimerFill.layer.cornerRadius = 1.5
+    protectedTimerIcon.tintColor = .systemOrange
+    protectedTimerIcon.contentMode = .scaleAspectFit
+    protectedTimerLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+    protectedTimerLabel.textColor = .white
+    protectedTimerLabel.textAlignment = .right
+    protectedTimerHost.addSubview(protectedTimerIcon)
+    protectedTimerHost.addSubview(protectedTimerLabel)
+    protectedTimerHost.addSubview(protectedTimerTrack)
+    protectedTimerTrack.addSubview(protectedTimerFill)
+    view.addSubview(protectedTimerHost)
+  }
+
+  private func beginProtectedMediaIfReady() {
+    guard isProtectedMedia, view.window != nil, player.currentItem?.status == .readyToPlay else {
+      return
+    }
+    if !didNotifyProtectedDisplay {
+      didNotifyProtectedDisplay = true
+      onProtectedMediaDisplayed?(zoomMessageId, protectedTtlSeconds)
+    }
+    guard protectedTimer == nil, let seconds = protectedTtlSeconds, seconds > 0 else { return }
+    protectedTimerDuration = TimeInterval(seconds)
+    protectedTimerDeadline = CACurrentMediaTime() + protectedTimerDuration
+    protectedTimerHost.isHidden = false
+    let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+      self?.tickProtectedMediaTimer()
+    }
+    protectedTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+    tickProtectedMediaTimer()
+  }
+
+  private func tickProtectedMediaTimer() {
+    guard let deadline = protectedTimerDeadline, protectedTimerDuration > 0 else { return }
+    let remaining = max(0, deadline - CACurrentMediaTime())
+    let fraction = CGFloat(min(1, remaining / protectedTimerDuration))
+    protectedTimerLabel.text = "\(max(0, Int(ceil(remaining))))s"
+    protectedTimerFill.frame = CGRect(
+      x: 0, y: 0, width: protectedTimerTrack.bounds.width * fraction,
+      height: protectedTimerTrack.bounds.height)
+    if remaining <= 0 { expireProtectedMedia() }
+  }
+
+  private func expireProtectedMedia() {
+    guard !isProtectedExpiryCommitted else { return }
+    isProtectedExpiryCommitted = true
+    protectedTimer?.invalidate()
+    protectedTimer = nil
+    protectedTimerDeadline = nil
+    protectedTimerHost.isHidden = true
+    player.pause()
+    onProtectedMediaExpired?(zoomMessageId)
+    dismiss(animated: false)
+  }
+
   private func applyPresentationMode() {
     if previewOnly {
       timelineView.isHidden = true
@@ -1193,7 +1300,7 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       playerProgressContainer.isHidden = false
       downloadProgressGlassView.isHidden = true
       downloadProgressContainer.isHidden = true
-      replyGlassView.isHidden = onReply == nil
+      replyGlassView.isHidden = isProtectedMedia || onReply == nil
       textGlassView.isHidden = true
       drawGlassView.isHidden = true
       aiGlassView.isHidden = true
@@ -1203,6 +1310,8 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       playbackOverlayContainer.isHidden = false
       captionPlaceholderLabel.isHidden = true
       captionTextView.keyboardAppearance = .dark
+      menuGlassView.isHidden = isProtectedMedia
+      menuButton.isHidden = isProtectedMedia
     } else {
       timelineView.isHidden = false
       playerProgressGlassView.isHidden = true
@@ -1308,6 +1417,9 @@ final class ChatVideoEditViewController: UIViewController, UITextViewDelegate,
       )
       self.updateBufferedProgress()
       self.view.setNeedsLayout()
+      if item.status == .readyToPlay {
+        self.beginProtectedMediaIfReady()
+      }
     }
     loadedTimeRangesObserver = item.observe(\.loadedTimeRanges, options: [.initial, .new]) {
       [weak self] _, _ in

@@ -33,7 +33,11 @@ enum ChatVideoEditModule {
     initialCaption: String?,
     headerTitle: String? = nil,
     messageId: String? = nil,
+    viewOnce: Bool = false,
+    mediaTtlSeconds: Int? = nil,
     zoomSourceProvider: ChatMediaZoomSourceProviding? = nil,
+    onProtectedMediaDisplayed: ((String?, Int?) -> Void)? = nil,
+    onProtectedMediaExpired: ((String?) -> Void)? = nil,
     onReply: (() -> Void)? = nil
   ) {
     let controller = ChatVideoEditViewController(
@@ -41,9 +45,13 @@ enum ChatVideoEditModule {
       initialCaption: initialCaption,
       headerTitle: headerTitle,
       previewOnly: true,
-      messageId: messageId
+      messageId: messageId,
+      viewOnce: viewOnce,
+      mediaTtlSeconds: mediaTtlSeconds
     )
     controller.modalPresentationStyle = .overFullScreen
+    controller.onProtectedMediaDisplayed = onProtectedMediaDisplayed
+    controller.onProtectedMediaExpired = onProtectedMediaExpired
     controller.onReply = onReply
     if let zoomSourceProvider {
       let transition = ChatMediaZoomTransition()

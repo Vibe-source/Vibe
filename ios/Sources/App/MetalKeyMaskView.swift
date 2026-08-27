@@ -26,6 +26,8 @@ struct MetalKeyMaskView: UIViewRepresentable {
     enum Appearance {
       case standard
       case softSpoiler
+      /// Independent 2D wander; fills a media frame instead of streaming left-to-right.
+      case freeFloat
     }
 
     let device: MTLDevice?
@@ -36,6 +38,7 @@ struct MetalKeyMaskView: UIViewRepresentable {
     private let particleBuffer: MTLBuffer?
     private let particleCount: Int
     private let baseRadius: Float
+    private let motionMode: Float
     private var startTime = CACurrentMediaTime()
     private var revealProgress: Float = 0
     private var revealTarget: Float = 0
@@ -54,7 +57,17 @@ struct MetalKeyMaskView: UIViewRepresentable {
       ]
       let particles = Self.makeParticles(appearance: appearance)
       particleCount = particles.count
-      baseRadius = appearance == .softSpoiler ? 0.58 : 1.2
+      switch appearance {
+      case .standard:
+        baseRadius = 1.2
+        motionMode = 0
+      case .softSpoiler:
+        baseRadius = 0.58
+        motionMode = 0
+      case .freeFloat:
+        baseRadius = 0.38
+        motionMode = 1
+      }
       quadBuffer = device?.makeBuffer(
         bytes: quadVertices,
         length: MemoryLayout<SIMD2<Float>>.stride * quadVertices.count
@@ -88,6 +101,7 @@ struct MetalKeyMaskView: UIViewRepresentable {
           float time;
           float baseRadius;
           float revealProgress;
+          float motionMode;
       };
 
       struct VertexOut {
@@ -112,44 +126,77 @@ struct MetalKeyMaskView: UIViewRepresentable {
           float halfWidth = width * 0.5;
           float halfHeight = height * 0.5;
 
-          float rawX = particle.basePosition.x + (uniforms.time * particle.speed) + particle.timeOffset;
-          float wrappedX = fmod(rawX + halfWidth, width);
-          if (wrappedX < 0.0) {
-              wrappedX += width;
+          float2 center;
+          float radius;
+          float flight = 0.0;
+          if (uniforms.motionMode > 0.5) {
+              float2 origin = particle.basePosition * float2(halfWidth, halfHeight);
+              float t = uniforms.time;
+              float group = floor(fract(particle.timeOffset * 0.017) * 7.0);
+              float groupPhase = group * 1.37;
+              float2 sharedFlow = float2(
+                  sin(t * 0.10) * width * 0.026,
+                  cos(t * 0.08) * height * 0.022);
+              float groupClock = t * particle.speed * 0.48 + groupPhase;
+              float2 groupFlow = float2(
+                  sin(groupClock),
+                  cos(groupClock * 0.83 + groupPhase * 0.21)) * particle.wobble * 0.85;
+              float2 localFloat = float2(
+                  sin(t * 0.14 + particle.timeOffset * 0.035),
+                  cos(t * 0.12 + particle.timeOffset * 0.05)) * 0.22;
+              float2 floated = origin + sharedFlow + groupFlow + localFloat;
+              float wx = fmod(floated.x + halfWidth, width);
+              if (wx < 0.0) { wx += width; }
+              wx -= halfWidth;
+              float wy = fmod(floated.y + halfHeight, height);
+              if (wy < 0.0) { wy += height; }
+              wy -= halfHeight;
+              center = float2(wx, wy);
+              float spatialPhase = dot(particle.basePosition, float2(2.4, -1.8));
+              float pulse = 0.5 + 0.5 * sin(t * 0.38 + spatialPhase + groupPhase * 0.16);
+              radius = uniforms.baseRadius * particle.size * (0.94 + 0.08 * pulse);
+          } else {
+              float rawX = particle.basePosition.x + (uniforms.time * particle.speed) + particle.timeOffset;
+              float wrappedX = fmod(rawX + halfWidth, width);
+              if (wrappedX < 0.0) {
+                  wrappedX += width;
+              }
+              wrappedX -= halfWidth;
+              float randomA = fract(particle.timeOffset * 0.017);
+              float randomB = fract(particle.timeOffset * 0.131);
+              float stagger = randomA * 0.28;
+              flight = clamp((uniforms.revealProgress - stagger) / (1.0 - stagger), 0.0, 1.0);
+              float acceleration = flight * flight;
+              float flyX = (flight * 0.12 + acceleration * 0.88) * width * (0.72 + randomA * 0.58);
+              float fanDirection = randomB * 2.0 - 1.0;
+              float flyY = acceleration * fanDirection * height * (0.12 + randomA * 0.18);
+              float waveY = sin((uniforms.time * 2.0) + particle.timeOffset) * particle.wobble;
+              center = float2(wrappedX + flyX, particle.basePosition.y + waveY + flyY);
+              radius = uniforms.baseRadius * particle.size * (1.0 + flight * 0.32);
           }
-          wrappedX -= halfWidth;
-
-          // Reveal particles independently instead of translating the rectangular
-          // drawable. Each particle gets a small stagger, then accelerates out to
-          // the right with a little vertical lift, like Telegram's spoiler dissolve.
-          float randomA = fract(particle.timeOffset * 0.017);
-          float randomB = fract(particle.timeOffset * 0.131);
-          float stagger = randomA * 0.28;
-          float flight = clamp((uniforms.revealProgress - stagger) / (1.0 - stagger), 0.0, 1.0);
-          float acceleration = flight * flight;
-          float flyX = (flight * 0.12 + acceleration * 0.88) * width * (0.72 + randomA * 0.58);
-          float fanDirection = randomB * 2.0 - 1.0;
-          float flyY = acceleration * fanDirection * height * (0.12 + randomA * 0.18);
-
-          float waveY = sin((uniforms.time * 2.0) + particle.timeOffset) * particle.wobble;
-          float2 center = float2(
-              wrappedX + flyX,
-              particle.basePosition.y + waveY + flyY
-          );
-          float radius = uniforms.baseRadius * particle.size * (1.0 + flight * 0.32);
           float2 point = center + quad * radius;
-
-          float2 ndc = float2(point.x / halfWidth, point.y / halfHeight);
+          float2 ndc = float2(point.x / max(halfWidth, 1.0), point.y / max(halfHeight, 1.0));
 
           VertexOut out;
           out.position = float4(ndc.x, ndc.y, 0.0, 1.0);
           out.localPoint = quad;
-          out.color = particle.color;
 
-          float edgeDist = abs(center.x) / halfWidth;
-          float edgeAlpha = 1.0 - smoothstep(0.96, 1.16, edgeDist);
+          float edgeX = 1.0 - smoothstep(0.94, 1.14, abs(center.x) / max(halfWidth, 1.0));
+          float edgeY = 1.0 - smoothstep(0.94, 1.14, abs(center.y) / max(halfHeight, 1.0));
           float flightAlpha = 1.0 - smoothstep(0.68, 0.98, flight);
-          out.alpha = edgeAlpha * flightAlpha;
+          float contrast = 1.0;
+          if (uniforms.motionMode > 0.5) {
+              float group = floor(fract(particle.timeOffset * 0.017) * 7.0);
+              float spatialPhase = dot(particle.basePosition, float2(2.1, -1.6));
+              float waveA = 0.5 + 0.5 * sin(uniforms.time * 0.42 + spatialPhase + group * 0.19);
+              float waveB = 0.5 + 0.5 * cos(uniforms.time * 0.29 - spatialPhase * 0.61);
+              contrast = smoothstep(0.22, 0.86, waveA * 0.58 + waveB * 0.42);
+              out.color = float4(particle.color.rgb * mix(0.78, 1.16, contrast), particle.color.a);
+              out.alpha = edgeX * edgeY * mix(0.40, 0.82, contrast);
+          } else {
+              out.color = particle.color;
+              out.alpha = edgeX * flightAlpha;
+          }
           return out;
       }
 
@@ -204,7 +251,8 @@ struct MetalKeyMaskView: UIViewRepresentable {
         viewportSize: SIMD2(Float(view.bounds.width), Float(view.bounds.height)),
         time: Float(now - startTime),
         baseRadius: baseRadius,
-        revealProgress: resolvedRevealProgress
+        revealProgress: motionMode > 0.5 ? 0 : resolvedRevealProgress,
+        motionMode: motionMode
       )
 
       let commandBuffer = commandQueue.makeCommandBuffer()
@@ -255,6 +303,20 @@ struct MetalKeyMaskView: UIViewRepresentable {
     }
 
     private static func makeParticles(appearance: Appearance) -> [Particle] {
+      if appearance == .freeFloat {
+        return (0..<1600).map { _ in
+          let hot = Float.random(in: 0...1) > 0.84
+          let lightness: Float = hot ? Float.random(in: 0.90...1.0) : Float.random(in: 0.58...0.78)
+          return Particle(
+            basePosition: SIMD2(Float.random(in: -1...1), Float.random(in: -1...1)),
+            speed: Float.random(in: 0.04...0.08),
+            wobble: Float.random(in: 0.4...0.9),
+            size: Float.random(in: 0.20...0.42),
+            timeOffset: Float.random(in: 0...1000),
+            color: SIMD4(lightness, lightness, lightness, hot ? Float.random(in: 0.26...0.40) : Float.random(in: 0.10...0.20))
+          )
+        }
+      }
       let isSoft = appearance == .softSpoiler
       return (0..<(isSoft ? 1_250 : 800)).map { _ in
         let rand = Float.random(in: 0...1)
@@ -294,12 +356,14 @@ private struct Uniforms {
   let time: Float
   let baseRadius: Float
   let revealProgress: Float
+  let motionMode: Float
 }
 
 final class SecureParticleMaskView: MTKView {
   private let highlightLayer = CAGradientLayer()
   private var surfaceComponents = SIMD4<Double>(0, 0, 0, 0)
   private var revealProgress: CGFloat = 0
+  private var particlesOnlyOverlay = false
 
   override init(frame: CGRect, device: MTLDevice?) {
     super.init(frame: frame, device: device)
@@ -355,7 +419,25 @@ final class SecureParticleMaskView: MTKView {
     applySurfaceOpacity()
   }
 
+  /// Transparent clear so particles sit on a sibling blurred still, not a card fill.
+  func prepareAsMediaOverlay() {
+    particlesOnlyOverlay = true
+    backgroundColor = .clear
+    clearColor = MTLClearColorMake(0, 0, 0, 0)
+    isOpaque = false
+    highlightLayer.isHidden = true
+    highlightLayer.opacity = 0
+    layer.borderWidth = 0
+    layer.cornerRadius = 0
+    layer.masksToBounds = true
+  }
+
   private func applySurfaceOpacity() {
+    if particlesOnlyOverlay {
+      clearColor = MTLClearColorMake(0, 0, 0, 0)
+      highlightLayer.opacity = 0
+      return
+    }
     let surfaceAlpha = 1 - revealProgress * revealProgress * (3 - 2 * revealProgress)
     clearColor = MTLClearColor(
       red: surfaceComponents.x,

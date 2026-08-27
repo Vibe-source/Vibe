@@ -612,11 +612,17 @@ defmodule VibeWeb.ChatChannel do
     user_id = socket.assigns.user_id
 
     case Chat.consume_view_once_media(chat_id, msg_id, user_id) do
-      {:ok, _message} ->
-        {:reply, {:ok, %{deleted: true}}, socket}
+      {:ok, :viewed} ->
+        {:reply, {:ok, %{viewed: true}}, socket}
+
+      {:ok, :expired} ->
+        {:reply, {:ok, %{expired: true}}, socket}
 
       {:ok, :scheduled} ->
         {:reply, {:ok, %{scheduled: true}}, socket}
+
+      {:ok, _message} ->
+        {:reply, {:ok, %{viewed: true}}, socket}
 
       {:error, :not_view_once} ->
         {:reply, {:ok, %{ignored: true}}, socket}
