@@ -54,15 +54,20 @@ enum AppAppearanceController {
 
   static func setOption(_ option: AppAppearanceOption) {
     UserDefaults.standard.set(option.rawValue, forKey: storageKey)
-    // The chat draft carries its own light/dark mode. Without this it kept whatever was
-    // current the first time it was seeded, so switching to Light left the chat dark.
+    applyStoredPreference()
     var draft = ChatAppearanceDraftStore.current
     if draft.mode != option.rawValue {
       draft.mode = option.rawValue
+      if let themeId = draft.themeId {
+        draft = draft.applying(themeId: themeId)
+      }
       ChatAppearanceDraftStore.save(draft)
     }
     ChatListAppearance.invalidateBootstrap()
-    applyStoredPreference()
+    NotificationCenter.default.post(
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
   }
 
   static func applyStoredPreference(to window: UIWindow? = nil) {
@@ -350,22 +355,43 @@ struct AppThemePalette {
 
 @MainActor
 final class AppToastController: ObservableObject {
+  enum Category: Equatable {
+    case info
+    case success
+    case error
+    case progress
+  }
+
+  struct Presentation: Identifiable, Equatable {
+    let id = UUID()
+    let message: String
+    let category: Category
+  }
+
   static let shared = AppToastController()
 
-  @Published private(set) var message: String?
+  @Published private(set) var presentation: Presentation?
+  var message: String? { presentation?.message }
   private var hideTask: Task<Void, Never>?
 
   private init() {}
 
-  func show(_ message: String, duration: TimeInterval = 2.6) {
+  func show(
+    _ message: String,
+    category: Category? = nil,
+    duration: TimeInterval = 2.6
+  ) {
     hideTask?.cancel()
-    self.message = message
+    presentation = Presentation(
+      message: message,
+      category: category ?? Self.inferredCategory(for: message)
+    )
     hideTask = Task { [weak self] in
       guard duration > 0 else { return }
       try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
       guard !Task.isCancelled else { return }
       await MainActor.run {
-        self?.message = nil
+        self?.presentation = nil
       }
     }
   }
@@ -373,7 +399,20 @@ final class AppToastController: ObservableObject {
   func clear() {
     hideTask?.cancel()
     hideTask = nil
-    message = nil
+    presentation = nil
+  }
+
+  private static func inferredCategory(for message: String) -> Category {
+    let value = message.lowercased()
+    let errorWords = ["error", "fail", "couldn", "unavailable", "required", "missing", "not found", "denied"]
+    if errorWords.contains(where: value.contains) { return .error }
+
+    let progressWords = ["sending", "loading", "connecting", "updating", "preparing"]
+    if progressWords.contains(where: value.contains) { return .progress }
+
+    let successWords = ["copied", "saved", "updated", "sent", "deleted", "removed", "complete", "success", "thanks"]
+    if successWords.contains(where: value.contains) { return .success }
+    return .info
   }
 }
 

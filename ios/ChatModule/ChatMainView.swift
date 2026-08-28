@@ -787,11 +787,7 @@ public final class ChatMainView: UIView,
 
   private func reapplyNativeThemeForCurrentInterfaceStyle() {
     let isDark = ChatListAppearance.resolvedSystemStyle() == .dark
-    var rawAppearance = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
-    if let last = lastRawAppearance, last["nativeThemeId"] != nil {
-      rawAppearance = last
-    }
-    rawAppearance["nativeThemeIsDark"] = isDark
+    let rawAppearance = ChatAppearanceDraftStore.chatRawAppearance(isDark: isDark)
     setAppearance(rawAppearance)
   }
 
@@ -893,6 +889,21 @@ public final class ChatMainView: UIView,
       applyPageState(animated: true, emitEvent: true)
     }
     setHeaderSearchExpanded(true, animated: true)
+  }
+
+  func openProfileContent(_ payload: [String: Any]) {
+    let messageId =
+      (payload["messageId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+      ?? ""
+    let tab = (payload["tab"] as? String)?.lowercased() ?? ""
+    let url = (payload["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let sourceView = payload["sourceView"] as? UIView
+    chatListView.openProfileContent(
+      messageId: messageId,
+      tab: tab,
+      urlString: url,
+      sourceView: sourceView
+    )
   }
 
   func startSendTransition(_ payload: [String: Any]) {
@@ -2002,6 +2013,23 @@ public final class ChatMainView: UIView,
       name: ChatEngine.didChangeNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceDraftDidChange),
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
+  }
+
+  @objc private func handleAppearanceDraftDidChange() {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleAppearanceDraftDidChange()
+      }
+      return
+    }
+    ChatListAppearance.invalidateBootstrap()
+    reapplyNativeThemeForCurrentInterfaceStyle()
   }
 
   @objc private func handleChatEngineDidChange(_ notification: Notification) {
@@ -3718,7 +3746,7 @@ public final class ChatMainView: UIView,
       backButton.frame = backGlassView.bounds
       titleButton.frame = titleGlassView.bounds
       avatarButton.frame = avatarGlassView.bounds
-      if headerMode == .savedMessages {
+      if headerMode == .savedMessages || savedSearchExpanded {
         menuButton.frame = savedSearchExpanded
           ? CGRect(x: 10.0, y: 0.0, width: 20.0, height: 44.0)
           : CGRect(x: 0.0, y: 0.0, width: 44.0, height: 44.0)
@@ -3921,12 +3949,14 @@ public final class ChatMainView: UIView,
       savedSearchExpanded = false
       savedSearchField.resignFirstResponder()
       savedSearchField.text = nil
+      chatListView.setSearchModeActive(false)
       chatListView.setSearchQuery("")
       return
     }
 
     let applyUpdates = {
       self.savedSearchExpanded = expanded
+      self.chatListView.setSearchModeActive(expanded)
       self.updateChatModeHeaderControls()
       self.layoutChrome()
     }
@@ -4305,10 +4335,10 @@ public final class ChatMainView: UIView,
     applyPresenceTheme()
     profileBioLabel.textColor = secondary
 
-    profileMuteButton.applyTheme(foreground: text, background: actionBg)
-    profileSearchButton.applyTheme(foreground: text, background: actionBg)
-    profileAudioCallButton.applyTheme(foreground: text, background: actionBg)
-    profileVideoCallButton.applyTheme(foreground: text, background: actionBg)
+    profileMuteButton.applyTheme(foreground: text, background: actionBg, isDark: isDarkTheme)
+    profileSearchButton.applyTheme(foreground: text, background: actionBg, isDark: isDarkTheme)
+    profileAudioCallButton.applyTheme(foreground: text, background: actionBg, isDark: isDarkTheme)
+    profileVideoCallButton.applyTheme(foreground: text, background: actionBg, isDark: isDarkTheme)
 
     profileIdentityCard.backgroundColor = profileCardBg
     profileUsernameRow.applyTheme(

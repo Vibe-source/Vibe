@@ -37,6 +37,8 @@ import Security
 /// Groups are not established yet, so `seal` still returns `nil` for them and
 /// they continue on their existing path. That is a known gap, tracked in
 /// docs/secure-core-architecture.md §4 — not a property of this type.
+import CryptoKit
+
 final class VibeSecureSessions {
 
   static let shared = VibeSecureSessions()
@@ -596,21 +598,182 @@ final class VibeSecureSessions {
 
   /// Retains one opened plaintext. Must not touch `queue`: callers hold it.
   private func retainPlaintextLocked(_ plaintext: String, messageId: String?, envelope: String?) {
-    var store =
-      UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
-    var order = UserDefaults.standard.stringArray(forKey: Self.ownPlaintextOrderKey) ?? []
-    func put(_ key: String) {
-      if store[key] == nil { order.append(key) }
-      store[key] = plaintext
+    var blob = retentionLocked()
+    var changed = false
+    let primary = messageId ?? envelope.map(Self.envelopePlaintextKey) ?? ""
+    guard !primary.isEmpty else { return }
+    if blob.store[primary] == nil { blob.order.append(primary) }
+    if blob.store[primary] != plaintext {
+      blob.store[primary] = plaintext
+      changed = true
     }
-    if let messageId { put(messageId) }
-    if let envelope { put(Self.envelopePlaintextKey(envelope)) }
-    while order.count > Self.ownPlaintextLimit {
-      let evicted = order.removeFirst()
-      store.removeValue(forKey: evicted)
+    if let envelope, messageId != nil {
+      let aliasKey = Self.envelopePlaintextKey(envelope)
+      if blob.alias[aliasKey] != primary {
+        blob.alias[aliasKey] = primary
+        changed = true
+      }
     }
-    UserDefaults.standard.set(store, forKey: Self.ownPlaintextKey)
-    UserDefaults.standard.set(order, forKey: Self.ownPlaintextOrderKey)
+    while blob.order.count > Self.ownPlaintextLimit {
+      let evicted = blob.order.removeFirst()
+      blob.store.removeValue(forKey: evicted)
+      changed = true
+    }
+    if let messageId, blob.unrecoverable.remove(messageId) != nil { changed = true }
+    if changed { persistRetentionLocked(blob) }
+  }
+
+  // ── Sealed retention file ──────────────────────────────────────────────
+  // Plaintext used to sit in UserDefaults: unsealed, backed up, rewritten per open.
+  // Now one AES-GCM blob under the store key, never backed up, cached in memory.
+
+  private struct RetentionBlob: Codable {
+    var store: [String: String] = [:]
+    var alias: [String: String] = [:]
+    var order: [String] = []
+    var unrecoverable: Set<String> = []
+  }
+
+  private var retentionCache: RetentionBlob?
+  private var retentionKeyCache: SymmetricKey?
+  private var loggedTombstones = Set<String>()
+  private static let unrecoverableLimit = 4000
+
+  private static var retentionFileURL: URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    return base.appendingPathComponent("vibe-secure", isDirectory: true)
+      .appendingPathComponent("retained.v1")
+  }
+
+  private func retentionKeyLocked() -> SymmetricKey? {
+    if let cached = retentionKeyCache { return cached }
+    guard let data = VibeCoreStoreKey.loadOrCreate() else { return nil }
+    let key = SymmetricKey(data: data)
+    retentionKeyCache = key
+    return key
+  }
+
+  /// Loads the blob once per process; the first run also adopts the legacy UserDefaults entries.
+  private func retentionLocked() -> RetentionBlob {
+    if let cached = retentionCache { return cached }
+    var blob = RetentionBlob()
+    if let key = retentionKeyLocked(),
+      let sealed = try? Data(contentsOf: Self.retentionFileURL),
+      let box = try? AES.GCM.SealedBox(combined: sealed),
+      let plain = try? AES.GCM.open(box, using: key),
+      let decoded = try? JSONDecoder().decode(RetentionBlob.self, from: plain)
+    {
+      blob = decoded
+    }
+    let defaults = UserDefaults.standard
+    if let legacy = defaults.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] {
+      let legacyOrder = defaults.stringArray(forKey: Self.ownPlaintextOrderKey) ?? Array(legacy.keys)
+      for key in legacyOrder where blob.store[key] == nil {
+        guard let text = legacy[key] else { continue }
+        blob.store[key] = text
+        blob.order.append(key)
+      }
+      if persistRetentionLocked(blob) {
+        defaults.removeObject(forKey: Self.ownPlaintextKey)
+        defaults.removeObject(forKey: Self.ownPlaintextOrderKey)
+        VibeLog.notice(
+          "mls retention migrated off UserDefaults", category: "crypto",
+          metadata: ["entries": String(blob.store.count)])
+      }
+      return blob
+    }
+    retentionCache = blob
+    return blob
+  }
+
+  @discardableResult
+  private func persistRetentionLocked(_ blob: RetentionBlob) -> Bool {
+    retentionCache = blob
+    guard let key = retentionKeyLocked(), let plain = try? JSONEncoder().encode(blob),
+      let sealed = try? AES.GCM.seal(plain, using: key).combined
+    else {
+      VibeLog.error("mls retention seal failed", category: "crypto")
+      return false
+    }
+    let url = Self.retentionFileURL
+    do {
+      try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try sealed.write(
+        to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+      var values = URLResourceValues()
+      values.isExcludedFromBackup = true
+      var marked = url
+      try? marked.setResourceValues(values)
+      return true
+    } catch {
+      VibeLog.error(
+        "mls retention write failed", category: "crypto",
+        metadata: ["err": String("\(error)".prefix(80))])
+      return false
+    }
+  }
+
+  private func isUnrecoverableLocked(messageId: String?) -> Bool {
+    guard let messageId else { return false }
+    return retentionLocked().unrecoverable.contains(messageId)
+  }
+
+  private func markUnrecoverableLocked(messageId: String?) {
+    guard let messageId else { return }
+    var blob = retentionLocked()
+    guard blob.unrecoverable.insert(messageId).inserted else { return }
+    if blob.unrecoverable.count > Self.unrecoverableLimit {
+      blob.unrecoverable.remove(blob.unrecoverable.first!)
+    }
+    persistRetentionLocked(blob)
+  }
+
+  /// True when this device can never open the row; the engine renders a tombstone instead of retrying.
+  func isUnrecoverable(messageId: String) -> Bool {
+    queue.sync { isUnrecoverableLocked(messageId: messageId) }
+  }
+
+  /// Drops every retained trace of one message. Retention must not outlive the row it
+  /// belongs to, so deletes and consumed view-once messages call this.
+  func forget(messageId: String) {
+    guard !messageId.isEmpty else { return }
+    queue.sync {
+      var blob = retentionLocked()
+      var changed = blob.store.removeValue(forKey: messageId) != nil
+      if let index = blob.order.firstIndex(of: messageId) {
+        blob.order.remove(at: index)
+        changed = true
+      }
+      for (alias, primary) in blob.alias where primary == messageId {
+        blob.alias.removeValue(forKey: alias)
+        changed = true
+      }
+      if blob.unrecoverable.remove(messageId) != nil { changed = true }
+      if changed { persistRetentionLocked(blob) }
+    }
+  }
+
+  /// Bulk form of `forget(messageId:)` — one seal + write for a whole delete batch.
+  func forget(messageIds: [String]) {
+    let ids = Set(messageIds.filter { !$0.isEmpty })
+    guard !ids.isEmpty else { return }
+    queue.sync {
+      var blob = retentionLocked()
+      var changed = false
+      for id in ids where blob.store.removeValue(forKey: id) != nil { changed = true }
+      let keptOrder = blob.order.filter { !ids.contains($0) }
+      if keptOrder.count != blob.order.count {
+        blob.order = keptOrder
+        changed = true
+      }
+      for (alias, primary) in blob.alias where ids.contains(primary) {
+        blob.alias.removeValue(forKey: alias)
+        changed = true
+      }
+      for id in ids where blob.unrecoverable.remove(id) != nil { changed = true }
+      if changed { persistRetentionLocked(blob) }
+    }
   }
 
   /// The plaintext we retained for one of our own messages, if we still have it.
@@ -620,10 +783,12 @@ final class VibeSecureSessions {
 
   /// The plaintext retained for a message, if we still have it. Callers hold `queue`.
   private func retainedPlaintextLocked(messageId: String?, envelope: String?) -> String? {
-    let store =
-      UserDefaults.standard.dictionary(forKey: Self.ownPlaintextKey) as? [String: String] ?? [:]
-    if let messageId, let text = store[messageId] { return text }
-    if let envelope { return store[Self.envelopePlaintextKey(envelope)] }
+    let blob = retentionLocked()
+    if let messageId, let text = blob.store[messageId] { return text }
+    guard let envelope else { return nil }
+    let key = Self.envelopePlaintextKey(envelope)
+    if let text = blob.store[key] { return text }
+    if let id = blob.alias[key] { return blob.store[id] }
     return nil
   }
 
@@ -666,16 +831,26 @@ final class VibeSecureSessions {
   func open(chatId: String, envelope: String, isMine: Bool = false, messageId: String? = nil)
     -> String?
   {
-    queue.sync {
+    queue.sync { () -> String? in
       let who = isMine ? "own" : "peer"
       // MLS opens are one-shot: `process_message` drops the ratchet key, so a second
       // open of the same envelope fails and the row blanks on the next reload.
       if let retained = retainedPlaintextLocked(messageId: messageId, envelope: envelope) {
         return retained
       }
-      let session =
-        sessionLocked(chatId: chatId)
-        ?? recoverSessionLocked(chatId: chatId, envelope: envelope, messageId: messageId)
+      if isUnrecoverableLocked(messageId: messageId) {
+        if let messageId, loggedTombstones.insert(messageId).inserted {
+          VibeLog.info(
+            "mls row tombstoned; not retried", category: "crypto",
+            metadata: [
+              "chat": String(chatId.prefix(12)), "msg": String(messageId.suffix(12)),
+              "stage": "mls-tombstone",
+            ])
+        }
+        return nil
+      }
+      let session = sessionForEnvelopeLocked(
+        chatId: chatId, envelope: envelope, messageId: messageId)
       guard let session else {
         VibeLog.error(
           "mls open has no session",
@@ -708,14 +883,62 @@ final class VibeSecureSessions {
         ]
         if isMine {
           meta["stage"] = "mls-own-expected"
-          VibeLog.info("own mls message is not self-openable", category: "crypto", metadata: meta)
+          if loggedTombstones.insert("own:" + (messageId ?? String(envelope.suffix(24)))).inserted {
+            VibeLog.info("own mls message is not self-openable", category: "crypto", metadata: meta)
+          }
         } else {
           meta["stage"] = "mls-open"
+          if let envGid = try? vibeMlsGroupIdFromEnvelope(envelope: envelope) {
+            meta["envGroup"] = envGid.prefix(8).map { String(format: "%02x", $0) }.joined()
+          }
+          if let bound = try? session.groupId() {
+            meta["boundGroup"] = bound.prefix(8).map { String(format: "%02x", $0) }.joined()
+          }
+          // Same epoch or older with nothing pending: the ratchet key is spent, so every later
+          // open fails the same way. Tombstone it; the engine renders a resend hint instead.
+          if let header, let groupEpoch = try? session.epoch(), header.epoch <= groupEpoch,
+            ((try? session.hasPendingCommit()) ?? true) == false
+          {
+            markUnrecoverableLocked(messageId: messageId)
+            meta["tombstone"] = "Y"
+          }
           VibeLog.error("mls peer open failed", category: "crypto", metadata: meta)
         }
         return nil
       }
     }
+  }
+
+  /// Group named on the envelope, not whatever `chatId` last bound.
+  /// Both sides used to mint a DM group; chatId then pointed at ours while the peer sealed to theirs.
+  private func sessionForEnvelopeLocked(chatId: String, envelope: String, messageId: String?)
+    -> VibeSecureSessionHandle?
+  {
+    let bound = sessionLocked(chatId: chatId)
+    let envelopeGroupId = try? vibeMlsGroupIdFromEnvelope(envelope: envelope)
+    if let envelopeGroupId {
+      let boundId = try? bound?.groupId()
+      if boundId != envelopeGroupId {
+        if let identity = identityHandleLocked(),
+          let restored = try? identity.loadSession(groupId: envelopeGroupId)
+        {
+          sessions[chatId] = restored
+          Self.storeGroupId(envelopeGroupId, chatId: chatId)
+          VibeLog.notice(
+            "rebound mls group from envelope",
+            category: "crypto",
+            metadata: [
+              "chat": String(chatId.prefix(12)),
+              "msg": messageId.map { String($0.suffix(12)) } ?? "-",
+              "stage": "envelope-rebind",
+            ])
+          return restored
+        }
+        return recoverSessionLocked(chatId: chatId, envelope: envelope, messageId: messageId)
+      }
+    }
+    return bound
+      ?? recoverSessionLocked(chatId: chatId, envelope: envelope, messageId: messageId)
   }
 
   /// Reloads a persisted group whose chat mapping was dropped, using the envelope header.

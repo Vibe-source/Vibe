@@ -2371,7 +2371,7 @@ final class SettingsNativeMainView: UIView, UIScrollViewDelegate, UIImagePickerC
       guard let config = AppSessionConfig.current else { return }
       do {
         let url = try await ChatRoomCreateService.uploadAvatar(imageData: data, config: config)
-        ChatAvatarImageStore.cacheHero(image, for: url)
+        ChatAvatarImageStore.replaceHero(image, for: url)
         _ = try await AppProfileController.shared.updateFields(["profileImage": url])
         avatarView.setImageURI(url, force: true)
         AppToastController.shared.show("Photo updated")

@@ -81,7 +81,7 @@ protocol ChatMediaZoomTransitionTarget: UIViewController {
 /// Photo-only zoom. Unlike UIKit's whole-controller zoom, this keeps the
 /// presenting chat at scale 1.0 for the full transition.
 final class ChatMediaZoomTransition: NSObject, UIViewControllerTransitioningDelegate {
-  weak var sourceProvider: ChatMediaZoomSourceProviding?
+  var sourceProvider: ChatMediaZoomSourceProviding?
 
   func animationController(
     forPresented presented: UIViewController,

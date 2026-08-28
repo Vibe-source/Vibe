@@ -62,6 +62,16 @@ final class ChatAvatarNodeView: UIView {
         addSubview(imageView)
         
         clipsToBounds = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAvatarImageReplaced(_:)),
+            name: ChatAvatarImageStore.didReplaceNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
     
     override func layoutSubviews() {
@@ -257,6 +267,18 @@ final class ChatAvatarNodeView: UIView {
         }
     }
     
+    @objc private func handleAvatarImageReplaced(_ notification: Notification) {
+        guard let key = notification.object as? String,
+              currentImageKey == "url_\(key)",
+              let image = ChatAvatarImageStore.cached(for: key) else { return }
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        imageView.image = image
+        imageView.isHidden = false
+        initialsLabel.isHidden = true
+    }
+
     func prepareForReuse() {
         loadGeneration &+= 1
         loadTask?.cancel()

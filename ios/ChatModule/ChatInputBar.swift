@@ -1234,6 +1234,47 @@ private func chatGifStickerGlyphImage(size: CGSize) -> UIImage {
   return image.withRenderingMode(.alwaysTemplate)
 }
 
+/// Video-note mark: inner circle + open rounded frame, from the 24pt SVG viewBox.
+private func chatVideoNoteGlyphImage(size: CGSize) -> UIImage {
+  let format = UIGraphicsImageRendererFormat()
+  format.opaque = false
+  format.scale = UIScreen.main.scale
+  let renderer = UIGraphicsImageRenderer(size: size, format: format)
+  let image = renderer.image { _ in
+    let scale = min(size.width, size.height) / 24.0
+    let origin = CGPoint(
+      x: (size.width - 24.0 * scale) / 2.0,
+      y: (size.height - 24.0 * scale) / 2.0)
+    let p: (CGFloat, CGFloat) -> CGPoint = { x, y in
+      CGPoint(x: origin.x + x * scale, y: origin.y + y * scale)
+    }
+    UIColor.black.setStroke()
+    let frame = UIBezierPath()
+    frame.move(to: p(22, 12))
+    frame.addCurve(to: p(20.5355, 20.5355), controlPoint1: p(22, 16.714), controlPoint2: p(22, 19.0711))
+    frame.addCurve(to: p(12, 22), controlPoint1: p(19.0711, 22), controlPoint2: p(16.714, 22))
+    frame.addCurve(to: p(3.46447, 20.5355), controlPoint1: p(7.28595, 22), controlPoint2: p(4.92893, 22))
+    frame.addCurve(to: p(2, 12), controlPoint1: p(2, 19.0711), controlPoint2: p(2, 16.714))
+    frame.addCurve(to: p(3.46447, 3.46447), controlPoint1: p(2, 7.28595), controlPoint2: p(2, 4.92893))
+    frame.addCurve(to: p(12, 2), controlPoint1: p(4.92893, 2), controlPoint2: p(7.28595, 2))
+    frame.addCurve(to: p(20.5355, 3.46447), controlPoint1: p(16.714, 2), controlPoint2: p(19.0711, 2))
+    frame.addCurve(to: p(21.9449, 8), controlPoint1: p(21.5093, 4.43821), controlPoint2: p(21.8356, 5.80655))
+    frame.lineWidth = 1.5 * scale
+    frame.lineCapStyle = .round
+    frame.lineJoinStyle = .round
+    frame.stroke()
+    let dot = UIBezierPath(
+      ovalIn: CGRect(
+        x: origin.x + (12 - 4) * scale,
+        y: origin.y + (12 - 4) * scale,
+        width: 8 * scale,
+        height: 8 * scale))
+    dot.lineWidth = 1.5 * scale
+    dot.stroke()
+  }
+  return image.withRenderingMode(.alwaysTemplate)
+}
+
 final class ChatInputBar: UIView {
 
   weak var delegate: ChatInputBarDelegate?
@@ -1457,14 +1498,14 @@ final class ChatInputBar: UIView {
   // MARK: Layout constants
   private let sideSize: CGFloat = 36
   private let sideGap: CGFloat = 6
-  private let topVPad: CGFloat = 6
+  private let topVPad: CGFloat = 2
   private let bottomVPad: CGFloat = 5
   private let composerSafeBottomReduction: CGFloat = 6
   private let backgroundMaskTopOverlap: CGFloat = 0
   private let minPillH: CGFloat = 40
   private let maxPillH: CGFloat = 120
   private let textInsetH: CGFloat = 12
-  private let textInsetV: CGFloat = 10
+  private let textInsetV: CGFloat = 6
 
   // MARK: Public state
   var keyboardProgress: CGFloat = 0 {
@@ -2136,6 +2177,9 @@ final class ChatInputBar: UIView {
 
     // GIF button (inside pill, trailing side before Send)
     gifButton.setImage(chatGifStickerGlyphImage(size: CGSize(width: 24, height: 24)), for: .normal)
+    gifButton.contentVerticalAlignment = .center
+    gifButton.contentHorizontalAlignment = .center
+    gifButton.imageEdgeInsets = .zero
     gifButton.addTarget(self, action: #selector(gifTapped), for: .touchUpInside)
     pillContainer.addSubview(gifButton)
 
@@ -2279,10 +2323,11 @@ final class ChatInputBar: UIView {
       contentRow.addSubview($0)
     }
     
+    selectionDeleteGlass.clipsToBounds = false
     selectionDeleteButton.clipsToBounds = false
     selectionDeleteButton.backgroundColor = .clear
     selectionDeleteButton.isHidden = true
-    contentRow.addSubview(selectionDeleteButton)
+    selectionDeleteGlass.contentView.addSubview(selectionDeleteButton)
     applyControlGlyph(
       button: selectionDeleteButton, symbolName: "trash",
       symbolConfig: selectionCfg, tintColor: UIColor(white: 0.85, alpha: 1.0)
@@ -2410,14 +2455,7 @@ final class ChatInputBar: UIView {
 
     refreshGlass()
     refreshAgentControlModeAppearance()
-    let micCfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-    let micSymbol = composerRecordSymbolName()
-    applyControlGlyph(
-      button: micButton,
-      symbolName: micSymbol,
-      symbolConfig: micCfg,
-      tintColor: controlTint
-    )
+    applyComposerRecordGlyph(to: micButton, tintColor: controlTint)
     CATransaction.commit()
   }
 
@@ -3065,7 +3103,7 @@ final class ChatInputBar: UIView {
     let pillRight = w - dynamicHPad - (sideSize * micVisibility) - (sideGap * micVisibility)
     let sendW: CGFloat = 44
     let sendH: CGFloat = 32
-    let gifButtonSize: CGFloat = 40
+    let gifButtonSize: CGFloat = 28
     let gifTextReserve: CGFloat =
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
@@ -3259,7 +3297,11 @@ final class ChatInputBar: UIView {
       actualPillW - textInsetH * 2 - inlineAttachReserve - sendActionReserve - gifTextReserve
     )
     let tfY = bannerExtra + (clampedTextH + textInsetV * 2 - clampedTextH) / 2
-    textView.frame = CGRect(x: tfX, y: tfY, width: tfW, height: clampedTextH)
+    let minimumTextContentH = ceil(textView.font?.lineHeight ?? 0)
+    let fittedTextH = min(clampedTextH, max(minimumTextContentH, textH))
+    let textCenterOffsetY = max(0, (clampedTextH - fittedTextH) / 2)
+    textView.frame = CGRect(
+      x: tfX, y: tfY + textCenterOffsetY, width: tfW, height: fittedTextH)
     placeholderLabel.frame = CGRect(x: tfX + 2, y: tfY, width: tfW - 4, height: clampedTextH)
     let inlineButtonY = textRowBottom - 36.0 - max(2.0, (minPillH - 36.0) * 0.5)
     inlineAttachButton.frame = CGRect(
@@ -3277,10 +3319,11 @@ final class ChatInputBar: UIView {
       gifTrailingInsetCollapsed
       - ((gifTrailingInsetCollapsed - gifTrailingInsetExpanded) * clampedSendProgress)
     let gifX = actualPillW - gifTrailingInset - sendActionReserve - gifButtonSize
-    let gifBottomInset = max(3.0, (minPillH - gifButtonSize) * 0.5)
+    let textRowTop = bannerExtra
+    let gifY = textRowTop + (textRowH - gifButtonSize) * 0.5
     gifButton.frame = CGRect(
       x: gifX,
-      y: textRowBottom - gifButtonSize - gifBottomInset,
+      y: gifY,
       width: gifButtonSize,
       height: gifButtonSize
     )
@@ -3411,8 +3454,7 @@ final class ChatInputBar: UIView {
     
     selectionDeleteGlass.bounds = selectionBounds
     selectionDeleteGlass.center = CGPoint(x: dynamicHPad + (selectionSideSize / 2), y: btnCenterY + selectionYOffset)
-    selectionDeleteButton.bounds = selectionBounds
-    selectionDeleteButton.center = selectionDeleteGlass.center
+    selectionDeleteButton.frame = selectionDeleteGlass.contentView.bounds
     
     selectionShareOutsideGlass.bounds = selectionBounds
     selectionShareOutsideGlass.center = CGPoint(x: w / 2, y: btnCenterY + selectionYOffset)
@@ -3471,6 +3513,9 @@ final class ChatInputBar: UIView {
     if let gifImage = gifButton.imageView { gifButton.bringSubviewToFront(gifImage) }
     if let micImage = micButton.imageView { micButton.bringSubviewToFront(micImage) }
     if let sendImage = sendButton.imageView { sendButton.bringSubviewToFront(sendImage) }
+    if let cancelImage = cancelOverlayButton.imageView {
+      cancelOverlayButton.bringSubviewToFront(cancelImage)
+    }
     CATransaction.commit()
 
     if abs(prevH - barHeight) > 0.5 {
@@ -3506,7 +3551,7 @@ final class ChatInputBar: UIView {
       contentRow.bringSubviewToFront(selectionDeleteGlass)
       contentRow.bringSubviewToFront(selectionShareOutsideGlass)
       contentRow.bringSubviewToFront(selectionShareInsideGlass)
-      contentRow.bringSubviewToFront(selectionDeleteButton)
+      selectionDeleteGlass.contentView.bringSubviewToFront(selectionDeleteButton)
       if let deleteImage = selectionDeleteButton.imageView {
         selectionDeleteButton.bringSubviewToFront(deleteImage)
       }
@@ -3575,8 +3620,18 @@ final class ChatInputBar: UIView {
     UIColor(white: active ? 0.72 : 0.58, alpha: 0.92)
   }
 
-  private func composerRecordSymbolName() -> String {
-    isVideoMode ? "camera.circle.fill" : "mic"
+  private func applyComposerRecordGlyph(to button: UIButton, tintColor: UIColor) {
+    if isVideoMode {
+      let image = chatVideoNoteGlyphImage(size: CGSize(width: 22, height: 22))
+      button.setImage(image, for: .normal)
+      button.tintColor = tintColor
+    } else {
+      applyControlGlyph(
+        button: button,
+        symbolName: "mic",
+        symbolConfig: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium),
+        tintColor: tintColor)
+    }
   }
 
   private func setVideoNotePauseGlyph(paused: Bool) {
@@ -3585,12 +3640,11 @@ final class ChatInputBar: UIView {
     videoNotePauseButton.setImage(UIImage(systemName: name, withConfiguration: cfg), for: .normal)
   }
 
-  private func morphComposerRecordIcon(to symbolName: String) {
-    let cfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+  private func morphComposerRecordIcon() {
     let tint = appearance.textColorThem.withAlphaComponent(0.9)
     let incoming = micButton.imageView
     let outgoing = incoming?.snapshotView(afterScreenUpdates: false)
-    applyControlGlyph(button: micButton, symbolName: symbolName, symbolConfig: cfg, tintColor: tint)
+    applyComposerRecordGlyph(to: micButton, tintColor: tint)
     incoming?.transform = CGAffineTransform(translationX: 0, y: 9).scaledBy(x: 0.72, y: 0.72)
     if let outgoing, let incoming {
       outgoing.frame = incoming.frame
@@ -4091,7 +4145,7 @@ final class ChatInputBar: UIView {
     }
 
     isVideoMode.toggle()
-    morphComposerRecordIcon(to: composerRecordSymbolName())
+    morphComposerRecordIcon()
   }
 
   @objc private func handleSelectionDelete() {
@@ -5360,13 +5414,14 @@ final class ChatInputBar: UIView {
     }
     glassTarget.frame = trashContainer.bounds
     glassTarget.isUserInteractionEnabled = false
+    glassTarget.clipsToBounds = false
     trashContainer.addSubview(glassTarget)
     trashContainer.clipsToBounds = false
 
     let trashGlyph = TrashCanGlyphView(frame: CGRect(x: 0, y: 0, width: 22, height: 22))
-    trashGlyph.center = CGPoint(x: sideSize / 2, y: attachHeight / 2)
-    trashContainer.addSubview(trashGlyph)
-    trashContainer.bringSubviewToFront(trashGlyph)
+    trashGlyph.center = CGPoint(x: glassTarget.bounds.midX, y: glassTarget.bounds.midY)
+    glassTarget.contentView.addSubview(trashGlyph)
+    glassTarget.contentView.bringSubviewToFront(trashGlyph)
     bringSubviewToFront(trashContainer)
     bringSubviewToFront(animatedDot)
 
@@ -5517,14 +5572,9 @@ final class ChatInputBar: UIView {
       self.micVADView.transform = .identity
       self.micGlass.alpha = 1
 
-      let micCfg = UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-      let iconName = self.composerRecordSymbolName()
-      self.applyControlGlyph(
-        button: self.micButton,
-        symbolName: iconName,
-        symbolConfig: micCfg,
-        tintColor: self.appearance.textColorThem.withAlphaComponent(0.9)
-      )
+      self.applyComposerRecordGlyph(
+        to: self.micButton,
+        tintColor: self.appearance.textColorThem.withAlphaComponent(0.9))
 
       self.cancelOverlayButton.isHidden = true
 

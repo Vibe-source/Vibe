@@ -132,6 +132,8 @@ enum ChatAvatarURLResolver {
 /// - On URL change for the same entity: keep the previous image until the new one
 ///   arrives, then soft-crossfade (see `VibeAvatarDisplay.apply`).
 enum ChatAvatarImageStore {
+  static let didReplaceNotification = Notification.Name("ChatAvatarImageStore.didReplace")
+
   /// Downsampled avatar edge for list cells (fast cold open / memory).
   private static let diskPixelMax: CGFloat = 384
   /// Higher cap for profile/settings hero (full-width banner needs more than 384).
@@ -199,6 +201,12 @@ enum ChatAvatarImageStore {
   /// Prefer for profile/settings hero uploads (sharper than list 384px).
   static func cacheHero(_ image: UIImage, for rawValue: String?) {
     cache(image, for: rawValue, maxPixel: heroPixelMax)
+  }
+
+  static func replaceHero(_ image: UIImage, for rawValue: String?) {
+    guard let key = cacheKey(rawValue) else { return }
+    cache(image, for: key, maxPixel: heroPixelMax)
+    NotificationCenter.default.post(name: didReplaceNotification, object: key)
   }
 
   static func cache(_ image: UIImage, for rawValue: String?, maxPixel: CGFloat) {

@@ -203,8 +203,10 @@ struct ChannelSettingsPage: View {
   var onNameChanged: ((String) -> Void)? = nil
   var onAvatarChanged: ((String) -> Void)? = nil
   let onSettingsChanged: (ChannelProfileService.Settings) -> Void
+  var onDismiss: (() -> Void)? = nil
 
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.dismiss) private var dismiss
   @State private var isBusy = false
   @State private var errorMessage: String?
   @State private var showTypePicker = false
@@ -216,6 +218,10 @@ struct ChannelSettingsPage: View {
   @State private var isUploadingPhoto = false
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+
+  private func closePage() {
+    if let onDismiss { onDismiss() } else { dismiss() }
+  }
 
   private var resolvedAvatarUri: String? {
     let local = localAvatarUri?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -472,8 +478,25 @@ struct ChannelSettingsPage: View {
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
     .background(Color.clear.ignoresSafeArea())
-    .navigationTitle("Channel settings")
+    .navigationTitle("")
     .navigationBarTitleDisplayMode(.inline)
+    .navigationBarBackButtonHidden(true)
+    .toolbar {
+      ToolbarItem(placement: .topBarLeading) {
+        Button("Cancel") { closePage() }
+          .font(.system(size: 17, weight: .semibold))
+      }
+      ToolbarItem(placement: .topBarTrailing) {
+        Button("Done") {
+          Task {
+            await persistIdentity()
+            if errorMessage == nil { closePage() }
+          }
+        }
+        .font(.system(size: 17, weight: .semibold))
+        .disabled(isBusy || isUploadingPhoto || nameLocal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+      }
+    }
     .toolbarBackground(.hidden, for: .navigationBar)
     .onAppear {
       if !identitySeeded {
@@ -787,9 +810,13 @@ struct RoomEditPage: View {
   let initialName: String
   let initialDescription: String
   let initialAvatarUri: String?
+  let memberCount: Int
+  let onOpenMembers: (() -> Void)?
+  let onDismiss: (() -> Void)?
   let onSaved: (_ name: String, _ description: String, _ avatarUrl: String?) -> Void
 
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.dismiss) private var dismiss
   @State private var name: String
   @State private var descriptionText: String
   @State private var avatarItem: PhotosPickerItem?
@@ -805,6 +832,9 @@ struct RoomEditPage: View {
     initialName: String,
     initialDescription: String,
     initialAvatarUri: String?,
+    memberCount: Int = 0,
+    onOpenMembers: (() -> Void)? = nil,
+    onDismiss: (() -> Void)? = nil,
     onSaved: @escaping (String, String, String?) -> Void
   ) {
     self.config = config
@@ -813,6 +843,9 @@ struct RoomEditPage: View {
     self.initialName = initialName
     self.initialDescription = initialDescription
     self.initialAvatarUri = initialAvatarUri
+    self.memberCount = memberCount
+    self.onOpenMembers = onOpenMembers
+    self.onDismiss = onDismiss
     self.onSaved = onSaved
     _name = State(initialValue: initialName)
     _descriptionText = State(initialValue: initialDescription)
@@ -820,63 +853,117 @@ struct RoomEditPage: View {
 
   private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
 
+  private func closePage() {
+    if let onDismiss { onDismiss() } else { dismiss() }
+  }
+
   var body: some View {
     ScrollView {
-      VStack(alignment: .leading, spacing: 20) {
-        HStack(spacing: 16) {
-          PhotosPicker(selection: $avatarItem, matching: .images) {
+      VStack(spacing: 24) {
+        PhotosPicker(selection: $avatarItem, matching: .images) {
+          VStack(spacing: 10) {
             if let avatarImage {
               avatarImage
                 .resizable()
                 .scaledToFill()
-                .frame(width: 72, height: 72)
+                .frame(width: 104, height: 104)
                 .clipShape(Circle())
             } else {
-              Image(systemName: "camera.fill")
-                .font(.title2)
-                .foregroundStyle(palette.accent)
-                .frame(width: 72, height: 72)
-                .background(palette.accent.opacity(0.12))
-                .clipShape(Circle())
+              ChannelSettingsAvatarNode(
+                title: name,
+                avatarUri: initialAvatarUri,
+                chatId: chatId,
+                isDark: colorScheme == .dark,
+                size: 104
+              )
+              .frame(width: 104, height: 104)
+              .clipShape(Circle())
             }
+
+            Text("Set Photo")
+              .font(.system(size: 17, weight: .regular))
+              .foregroundStyle(palette.accent)
+          }
+          .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.plain)
+
+        VStack(spacing: 0) {
+          TextField(isChannel ? "Channel name" : "Group name", text: $name)
+            .font(.system(size: 17, weight: .regular))
+            .textInputAutocapitalization(.words)
+            .padding(.horizontal, 18)
+            .frame(minHeight: 54)
+
+          Rectangle()
+            .fill(palette.divider)
+            .frame(height: 1 / UIScreen.main.scale)
+            .padding(.horizontal, 18)
+
+          TextField("Description", text: $descriptionText, axis: .vertical)
+            .font(.system(size: 17, weight: .regular))
+            .lineLimit(1...4)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .frame(minHeight: 54, alignment: .top)
+        }
+        .background(palette.card)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+
+        if let onOpenMembers {
+          Button {
+            onOpenMembers()
+          } label: {
+            HStack(spacing: 14) {
+              Image(systemName: "person.3.fill")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(palette.accent, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+              Text(isChannel ? "Subscribers and Administrators" : "Members and Administrators")
+                .font(.system(size: 17, weight: .regular))
+                .foregroundStyle(palette.text)
+              Spacer(minLength: 8)
+              if memberCount > 0 {
+                Text("\(memberCount)")
+                  .foregroundStyle(palette.secondaryText)
+              }
+              Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(palette.tertiaryText)
+            }
+            .padding(.horizontal, 18)
+            .frame(minHeight: 62)
           }
           .buttonStyle(.plain)
-
-          TextField(isChannel ? "Channel name" : "Group name", text: $name)
-            .font(.body)
-        }
-        .padding()
-        .background(palette.card)
-        .cornerRadius(12)
-
-        VStack(alignment: .leading, spacing: 6) {
-          Text("Description")
-            .font(.headline)
-          TextField(
-            isChannel ? "What's this channel about?" : "What's this group about?",
-            text: $descriptionText,
-            axis: .vertical
-          )
-          .lineLimit(3...8)
-          .padding()
           .background(palette.card)
-          .cornerRadius(12)
+          .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         }
 
         if let errorMessage {
           Text(errorMessage)
             .font(.footnote)
             .foregroundStyle(.red)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
       }
-      .padding()
+      .padding(.horizontal, 16)
+      .padding(.top, 18)
+      .padding(.bottom, 44)
     }
+    .scrollIndicators(.hidden)
     .background(palette.background.ignoresSafeArea())
-    .navigationTitle(isChannel ? "Edit channel" : "Edit group")
+    .navigationTitle("")
     .navigationBarTitleDisplayMode(.inline)
+    .navigationBarBackButtonHidden(true)
     .toolbar {
+      ToolbarItem(placement: .topBarLeading) {
+        Button("Cancel") { closePage() }
+          .font(.system(size: 17, weight: .semibold))
+      }
       ToolbarItem(placement: .topBarTrailing) {
-        Button("Save") { Task { await save() } }
+        Button("Done") { Task { await save() } }
+          .font(.system(size: 17, weight: .semibold))
           .disabled(isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
       }
     }

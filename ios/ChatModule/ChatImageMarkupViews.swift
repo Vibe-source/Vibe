@@ -143,13 +143,15 @@ final class ChatImageEditorHeaderModel: ObservableObject {
   @Published var title: String
   @Published var subtitle: String
   @Published var hasMessage: Bool
+  @Published var allowsActions: Bool
   @Published var canUndo = false
   @Published var canRedo = false
 
-  init(title: String, subtitle: String, hasMessage: Bool) {
+  init(title: String, subtitle: String, hasMessage: Bool, allowsActions: Bool = true) {
     self.title = title
     self.subtitle = subtitle
     self.hasMessage = hasMessage
+    self.allowsActions = allowsActions
   }
 }
 
@@ -202,7 +204,11 @@ struct ChatImageEditorHeader: View {
           accessibilityLabel: "Close",
           action: onClose)
         Spacer()
-        viewerMenu
+        if model.allowsActions {
+          viewerMenu
+        } else {
+          Color.clear.frame(width: 44, height: 44)
+        }
       }
 
       VStack(spacing: 0) {
@@ -1007,11 +1013,12 @@ final class ChatImageEditorHeaderHost: UIView {
   var onReply: (() -> Void)?
   var onDelete: (() -> Void)?
 
-  init(title: String, subtitle: String, hasMessage: Bool) {
+  init(title: String, subtitle: String, hasMessage: Bool, allowsActions: Bool = true) {
     model = ChatImageEditorHeaderModel(
       title: title,
       subtitle: subtitle,
-      hasMessage: hasMessage)
+      hasMessage: hasMessage,
+      allowsActions: allowsActions)
     super.init(frame: .zero)
     backgroundColor = .clear
     isOpaque = false

@@ -284,6 +284,10 @@ final class ChatMainProfileMediaCellNode: UIControl {
   private let videoBadge = UIView()
   private let videoBadgeLabel = UILabel()
 
+  var mediaTransitionSourceView: UIView {
+    imageView.isHidden ? self : imageView
+  }
+
   private var imageLoadTask: URLSessionDataTask?
   private var imageURLString: String?
 

@@ -1381,6 +1381,30 @@ extension ChatListView {
       deleteForEveryone: deleteForEveryone)
   }
 
+  /// Visual-only disintegration for a row the engine already removed (view-once consume).
+  func animateVisibleMessageDisintegration(messageId: String, row: ChatListRow) {
+    let cell = rows.firstIndex(where: { $0.messageId == messageId })
+      .flatMap { collectionView.cellForItem(at: IndexPath(item: $0, section: 0)) }
+      as? ChatListCell
+    guard let cell, cell.contentView.alpha > 0.05,
+      let rendered = cell.bubbleSnapshotImage(in: self)
+    else { return }
+    let capture = ChatBubbleFragmentCapture(
+      image: rendered.image,
+      frame: rendered.frame,
+      isMe: row.isMe,
+      messageId: messageId)
+    let fragments = ChatBubbleFragmentDisintegrationView(
+      frame: bounds,
+      captures: [capture],
+      perCaptureBudget: deletionFragmentBudget(for: row))
+    fragments.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    addSubview(fragments)
+    bringSubviewToFront(fragments)
+    cell.contentView.alpha = 0
+    fragments.animateAndRemove()
+  }
+
   private func executeMessageDeletion(
     messageId: String,
     row: ChatListRow,
@@ -1524,11 +1548,11 @@ extension ChatListView {
   private func deletionFragmentBudget(for row: ChatListRow) -> Int {
     switch row.visualKind {
     case .media:
-      return 1_600
+      return 3_200
     case .video, .videoNote:
-      return 1_350
+      return 2_800
     case .sticker:
-      return 1_150
+      return 2_200
     case .text, .voice, .document:
       return 900
     }
@@ -1712,9 +1736,9 @@ private final class ChatBubbleFragmentDisintegrationView: UIView {
       let heightFactor = max(0.0, min(1.0, (capture.frame.height - 40.0) / 180.0))
       let areaFactor = max(0.0, min(1.0, (captureAreaRoot - 70.0) / 300.0))
       let materialSizeFactor = max(heightFactor, areaFactor)
-      let baseSparkleSide = 0.85 + (materialSizeFactor * 2.65) + (jitterC * 0.55)
+      let baseSparkleSide = 0.55 + (materialSizeFactor * 1.35) + (jitterC * 0.35)
       let sourceSide = max(max(fragment.bounds.width, fragment.bounds.height), 1.0)
-      let adaptiveSparkleScale = min(0.85, max(0.20, baseSparkleSide / sourceSide))
+      let adaptiveSparkleScale = min(0.72, max(0.12, baseSparkleSide / sourceSide))
       let scaleMid = 1.0 - (1.0 - adaptiveSparkleScale) * 0.22
       let scaleLate = adaptiveSparkleScale
       let scaleEnd: CGFloat = 0.0

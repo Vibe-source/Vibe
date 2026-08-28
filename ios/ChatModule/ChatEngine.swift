@@ -868,6 +868,10 @@ final class ChatEngine {
     }
   }
 
+  func peerUserId(chatId: String) -> String? {
+    syncOnQueue { chatPeerUserIdsByChatId[chatId] }
+  }
+
   private func currentOutboundUserIdLocked() -> String? {
     normalizedString(store.getConfig()["userId"])
   }
@@ -2778,7 +2782,30 @@ final class ChatEngine {
     guard let chatId, !chatId.isEmpty else { return ["accepted": false, "reason": "invalid_chat"] }
     guard let provider, !provider.isEmpty else { return ["accepted": false, "reason": "invalid_provider"] }
 
+    // Main must never wait on the engine queue for a fire-and-forget push: during launch
+    // ingest this blocked the UI for up to 1.3s. Accept optimistically and push async.
+    if Thread.isMainThread {
+      queue.async { [weak self] in
+        guard let self else { return }
+        let result = self.requestAgentBridgeUsageLocked(
+          chatId: chatId, provider: provider, requestId: requestId)
+        if (result["accepted"] as? Bool) != true {
+          self.appendJournalLocked(
+            event: "native-agent-bridge-usage-deferred",
+            payload: ["chatId": chatId, "provider": provider, "reason": result["reason"] ?? "-"])
+        }
+      }
+      return ["accepted": true, "transport": "native-async", "requestId": requestId]
+    }
     return syncOnQueue {
+      requestAgentBridgeUsageLocked(chatId: chatId, provider: provider, requestId: requestId)
+    }
+  }
+
+  private func requestAgentBridgeUsageLocked(chatId: String, provider: String, requestId: String)
+    -> [String: Any]
+  {
+    do {
       guard let client = phoenixClient else {
         DispatchQueue.global(qos: .utility).async { [weak self] in
           self?.ensureNativeTransport(trigger: "bridge_usage_no_socket")
@@ -4369,6 +4396,9 @@ final class ChatEngine {
       // ── Now resolve friend public key (may do synchronous HTTP — no longer blocks UI) ──
       let keyResolveStartMs = nowMs()
       let isSavedMessagesChat = chatId == "saved_messages"
+      // TOFU on the legacy hybrid RSA key: a server that answers "no KeyPackage" could
+      // otherwise substitute its own and read the DM. Only the hybrid branch consults it.
+      var hybridPeerKeyChanged = false
       let friendPublicKey: String?
       if isGroup || isSavedMessagesChat {
         friendPublicKey = nil
@@ -4421,6 +4451,11 @@ final class ChatEngine {
           ]
         }
         friendPublicKey = key
+        if let peer = normalizedString(peerUserId),
+          case .changed = VibeSecureTrust.evaluateTransport(publicKeyPem: key, userId: peer)
+        {
+          hybridPeerKeyChanged = true
+        }
       }
       NSLog(
         "[ChatEngine] sendMessage keyResolved in %dms chatId=%@ messageId=%@ hasKey=%@",
@@ -5123,6 +5158,15 @@ final class ChatEngine {
             // bug in the gate above.
             encryptedContent = fullPayloadString
           } else {
+            guard !hybridPeerKeyChanged else {
+              throw NSError(
+                domain: "VibeSecure", code: 2,
+                userInfo: [
+                  NSLocalizedDescriptionKey:
+                    "peer_key_changed — this contact's encryption key differs from the one "
+                    + "this device pinned; verify it before sending"
+                ])
+            }
             encryptedContent = try chatEngineEncryptHybridMessage(
               recipientPublicKeyPem: friendPublicKey!,
               message: fullPayloadString,
@@ -5449,6 +5493,10 @@ final class ChatEngine {
         chatId, messageId, forEveryone ? "true" : "false", ref)
       removeMessageIndicesLocked(chatId: chatId, messageId: messageId)
       markLiveMessageDeletedLocked(chatId: chatId, messageId: messageId)
+      // Retained plaintext must not outlive the row it belongs to.
+      DispatchQueue.global(qos: .utility).async {
+        VibeSecureSessions.shared.forget(messageId: messageId)
+      }
       applyPinnedUpdateLocked(
         chatId: chatId,
         messageId: messageId,
@@ -5670,6 +5718,12 @@ final class ChatEngine {
           return ["accepted": false, "reason": "missing_friend_key"]
         }
         friendPublicKey = key
+        // Same TOFU pin as the send path: a changed hybrid key blocks until verified.
+        if let peer = peerUserIdHint,
+          case .changed = VibeSecureTrust.evaluateTransport(publicKeyPem: key, userId: peer)
+        {
+          return ["accepted": false, "reason": "peer_key_changed"]
+        }
       }
 
       let editedAt = Int64(nowMs())
@@ -6954,6 +7008,15 @@ final class ChatEngine {
 
     if normalizedRaw == "read" { return "read" }
 
+    // Main thread reads the mirror: the engine queue can be mid-ingest for over a second.
+    if Thread.isMainThread, let chatId, let messageId,
+      let mirrored = uiMirror.displayStatusInputs(
+        chatId: chatId, messageId: messageId, peerUserId: normalizedUpper(peerUserId))
+    {
+      return Self.resolveDisplayStatus(
+        normalizedRaw: normalizedRaw, receiptStatus: mirrored.receipt,
+        localStatus: mirrored.local, peerOnline: mirrored.peerOnline)
+    }
     return syncOnQueue {
       var receiptStatus: String?
       var localStatus: String?
@@ -6961,6 +7024,16 @@ final class ChatEngine {
         receiptStatus = receiptIndex[chatId]?[messageId]
         localStatus = localStatusIndex[chatId]?[messageId]
       }
+      let peerOnline = normalizedUpper(peerUserId).map { onlineUsers.contains($0) } ?? false
+      return Self.resolveDisplayStatus(
+        normalizedRaw: normalizedRaw, receiptStatus: receiptStatus, localStatus: localStatus,
+        peerOnline: peerOnline)
+    }
+  }
+
+  private static func resolveDisplayStatus(
+    normalizedRaw: String?, receiptStatus: String?, localStatus: String?, peerOnline: Bool
+  ) -> String? {
       if receiptStatus == "read" { return "read" }
       if receiptStatus == "delivered" { return "delivered" }
       if normalizedRaw == "delivered" { return "delivered" }
@@ -6978,10 +7051,7 @@ final class ChatEngine {
         case "error":
           return "error"
         case "sent":
-          if let peer = normalizedUpper(peerUserId), onlineUsers.contains(peer) {
-            return "delivered"
-          }
-          return "sent"
+          return peerOnline ? "delivered" : "sent"
         case "pending", "sending":
           if normalizedRaw == nil || normalizedRaw == "sending" || normalizedRaw == "pending" {
             return localStatus
@@ -6991,14 +7061,8 @@ final class ChatEngine {
         }
       }
 
-      if normalizedRaw == "sent",
-        let peer = normalizedUpper(peerUserId),
-        onlineUsers.contains(peer)
-      {
-        return "delivered"
-      }
+      if normalizedRaw == "sent", peerOnline { return "delivered" }
       return normalizedRaw
-    }
   }
 
   private func sendReceipt(
@@ -12386,6 +12450,10 @@ final class ChatEngine {
       state["updatedAt"] = nowMs()
       return (messageId, "edited")
     case "message-deleted":
+      // Both branches below end the row, so the retained plaintext goes with it.
+      DispatchQueue.global(qos: .utility).async {
+        VibeSecureSessions.shared.forget(messageId: messageId)
+      }
       if normalizedString(payload["reason"]) == "view_once",
         let existingMessage = findMessagePayloadLocked(chatId: chatId, messageId: messageId)
       {
@@ -16238,7 +16306,16 @@ final class ChatEngine {
             else {
               historyDecryptionFailed = true
               historyDecryptStage = isMe ? "mls-own-no-plaintext" : "mls-open"
-              return plaintextFallback.isEmpty ? [:] : ["text": plaintextFallback]
+              if !plaintextFallback.isEmpty { return ["text": plaintextFallback] }
+              // Permanent (own plaintext gone, or peer ratchet key spent): a visible tombstone
+              // beats an empty bubble that re-fails on every open.
+              let permanent =
+                isMe || VibeSecureSessions.shared.isUnrecoverable(messageId: messageId)
+              guard permanent else { return [:] }
+              return [
+                "text": "This message can't be shown on this device. Ask the sender to resend it.",
+                "decryptFailed": true,
+              ]
             }
             let parsed = parseDecryptedMessagePayload(opened)
             if !parsed.isEmpty { return parsed }
@@ -16561,7 +16638,9 @@ final class ChatEngine {
       lastSeenByUserId: lastSeenByUserId,
       pendingAskByChatId: pendingAsk,
       agentTurnRunningAtMsByChatId: agentTurnRunningAtMsByChatId,
-      agentAskChatIds: askChatIds
+      agentAskChatIds: askChatIds,
+      receiptIndex: receiptIndex,
+      localStatusIndex: localStatusIndex
     )
     // Sampled, so the export can answer "is the UI still queueing?" without a
     // profiler. `fallback` climbing after launch means the mirror stopped being

@@ -5,6 +5,8 @@ import OSLog
 import Darwin
 import Combine
 
+import ContactsUI
+
 enum VibeDebugLog {
   static let verboseEnabled: Bool = {
     #if DEBUG
@@ -10281,12 +10283,15 @@ private enum ChatConversationPage: String {
   case agent
 }
 
-final class ChatProfileRootController: UIViewController {
+final class ChatProfileRootController: UIViewController, CNContactViewControllerDelegate {
   private let profileView = ChatProfileMainView()
   private var route: ChatRoute
   private var isDark: Bool
   private var onClose: (() -> Void)?
   private var onProfileAppearanceUpdated: (() -> Void)?
+  private var onSearchRequested: (() -> Void)?
+  private var onContentRequested: (([String: Any]) -> Void)?
+  private var isChatMuted = false
   private var rowsRefreshGeneration: UInt = 0
 
   var chatId: String { route.chatId }
@@ -10295,12 +10300,16 @@ final class ChatProfileRootController: UIViewController {
     route: ChatRoute,
     isDark: Bool,
     onClose: (() -> Void)?,
-    onProfileAppearanceUpdated: (() -> Void)? = nil
+    onProfileAppearanceUpdated: (() -> Void)? = nil,
+    onSearchRequested: (() -> Void)? = nil,
+    onContentRequested: (([String: Any]) -> Void)? = nil
   ) {
     self.route = route
     self.isDark = isDark
     self.onClose = onClose
     self.onProfileAppearanceUpdated = onProfileAppearanceUpdated
+    self.onSearchRequested = onSearchRequested
+    self.onContentRequested = onContentRequested
     super.init(nibName: nil, bundle: nil)
     appShellRouteLog("ChatProfileRootController init chatId=\(route.chatId) title=\(route.title)")
   }
@@ -10315,11 +10324,10 @@ final class ChatProfileRootController: UIViewController {
 
   override func viewDidLoad() {
     super.viewDidLoad()
-    // Black first paint — matches the profile hero soft-black gradient so the
-    // push transition never flashes a light/grouped background.
-    view.backgroundColor = .black
+    let background = Self.backgroundColor(isDark: isDark)
+    view.backgroundColor = background
     profileView.translatesAutoresizingMaskIntoConstraints = false
-    profileView.backgroundColor = .black
+    profileView.backgroundColor = background
     view.addSubview(profileView)
     NSLayoutConstraint.activate([
       profileView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -10348,7 +10356,13 @@ final class ChatProfileRootController: UIViewController {
 
   /// Repaint on wallpaper/theme edits instead of waiting for the next push.
   @objc private func handleAppearanceDraftChanged(_ notification: Notification) {
-    profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+    ChatListAppearance.invalidateBootstrap()
+    let nextIsDark = ChatListAppearance.resolvedSystemStyle() == .dark
+    isDark = nextIsDark
+    let background = Self.backgroundColor(isDark: nextIsDark)
+    view.backgroundColor = background
+    profileView.backgroundColor = background
+    profileView.setAppearance(Self.resolvedAppearance(isDark: nextIsDark))
   }
 
   deinit {
@@ -10359,7 +10373,9 @@ final class ChatProfileRootController: UIViewController {
     route: ChatRoute,
     isDark: Bool,
     onClose: (() -> Void)?,
-    onProfileAppearanceUpdated: (() -> Void)? = nil
+    onProfileAppearanceUpdated: (() -> Void)? = nil,
+    onSearchRequested: (() -> Void)? = nil,
+    onContentRequested: (([String: Any]) -> Void)? = nil
   ) {
     let routeChanged = self.route != route
     let themeChanged = self.isDark != isDark
@@ -10367,6 +10383,8 @@ final class ChatProfileRootController: UIViewController {
     self.isDark = isDark
     self.onClose = onClose
     self.onProfileAppearanceUpdated = onProfileAppearanceUpdated
+    self.onSearchRequested = onSearchRequested
+    self.onContentRequested = onContentRequested
 
     if themeChanged {
       setNeedsStatusBarAppearanceUpdate()
@@ -10393,6 +10411,12 @@ final class ChatProfileRootController: UIViewController {
         profileView.setEngineMyUserId(myUserId)
       }
       profileView.setAppearance(Self.resolvedAppearance(isDark: isDark))
+      if let config = AppSessionConfig.current {
+        isChatMuted =
+          ChatHomeService.cachedRows(config: config).first(where: { $0.chatId == route.chatId })?.muted
+          ?? isChatMuted
+      }
+      profileView.setIsChatMuted(isChatMuted)
       profileView.setHeaderTitle(route.title)
       profileView.setHeaderSubtitle(Self.routeOnlyHeaderSubtitle(for: route))
       profileView.setProfileName(route.title)
@@ -10492,12 +10516,22 @@ final class ChatProfileRootController: UIViewController {
     appShellRouteLog("ChatProfileRootController nativeEvent chatId=\(route.chatId) type=\(type)")
     switch type {
     case "headerBack":
-      onClose?()
+      if let navigationController, navigationController.topViewController === self,
+        navigationController.viewControllers.count > 1
+      {
+        navigationController.popViewController(animated: true)
+      } else {
+        onClose?()
+      }
     case "profileAppearanceUpdated":
       profileView.refreshProfileAppearance()
       onProfileAppearanceUpdated?()
+    case "agentToast":
+      if let message = Self.normalizedString(payload["message"]) {
+        AppToastController.shared.show(message)
+      }
     case "headerSearchPressed":
-      AppToastController.shared.show("Search stays in the chat page.")
+      onSearchRequested?()
     case "headerAudioCallPressed":
       NativeCallRouteBridge.startOutgoing(route: route, callType: "voice")
     case "headerVideoCallPressed":
@@ -10506,7 +10540,13 @@ final class ChatProfileRootController: UIViewController {
       let action = Self.normalizedString(payload["action"]) ?? ""
       if action == "clearChat" {
         presentClearChatOptions()
+      } else if action == "muteToggle" {
+        toggleMute()
       }
+    case "profileContentPressed":
+      onContentRequested?(payload)
+    case "profileContactAction":
+      handleProfileContactAction(payload)
     case "profileGroupAction", "groupMemberTapped", "channelLink", "channelSetting", "channelAgents":
       _ = GroupProfileActionRouter.handle(
         payload: payload,
@@ -10548,6 +10588,54 @@ final class ChatProfileRootController: UIViewController {
       sheet.preferredCornerRadius = 28
     }
     topMostPresenter().present(host, animated: true)
+  }
+
+  private func toggleMute() {
+    guard let config = AppSessionConfig.current else {
+      AppToastController.shared.show("Unable to update mute")
+      return
+    }
+    let previous = isChatMuted
+    let next = !previous
+    isChatMuted = next
+    profileView.setIsChatMuted(next)
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        try await ChatHomeEditService.apply(
+          action: .mute(next),
+          chatID: route.chatId,
+          config: config
+        )
+        AppToastController.shared.show(next ? "Notifications muted" : "Notifications unmuted")
+      } catch {
+        isChatMuted = previous
+        profileView.setIsChatMuted(previous)
+        AppToastController.shared.show(error.localizedDescription)
+      }
+    }
+  }
+
+  private func handleProfileContactAction(_ payload: [String: Any]) {
+    let action = Self.normalizedString(payload["action"]) ?? ""
+    if action == "addContact" {
+      AppToastController.shared.show("Added to Contacts")
+      return
+    }
+    guard action == "block", let peerUserId = route.peerUserId else { return }
+
+    let alert = UIAlertController(
+      title: "Block \(route.title)?",
+      message: "They will no longer be able to contact you.",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    alert.addAction(UIAlertAction(title: "Block", style: .destructive) { _ in
+      let result = ChatEngine.shared.blockUser(["blockedUserId": peerUserId])
+      let accepted = (result["accepted"] as? Bool) == true
+      AppToastController.shared.show(accepted ? "User blocked" : "Unable to block user")
+    })
+    topMostPresenter().present(alert, animated: true)
   }
 
   private func presentClearChatOptions() {
@@ -10623,10 +10711,8 @@ final class ChatProfileRootController: UIViewController {
     AppToastController.shared.show("Chat cleared.")
   }
 
-  private static func backgroundColor(isDark: Bool) -> UIColor {
-    isDark
-      ? UIColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
-      : UIColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+  private static func backgroundColor(isDark _: Bool) -> UIColor {
+    ChatListAppearance.current.wallpaperBase
   }
 
   private static func resolvedAppearance(isDark: Bool) -> [String: Any] {
@@ -12327,6 +12413,20 @@ final class ChatConversationController: UIViewController {
     let onProfileAppearanceUpdated: () -> Void = { [weak self] in
       self?.mainView.refreshProfileAppearance()
     }
+    let onSearchRequested: () -> Void = { [weak self] in
+      guard let self else { return }
+      if let navigationController = self.navigationController,
+        navigationController.topViewController is ChatProfileRootController
+      {
+        navigationController.popViewController(animated: true)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
+        self?.mainView.openHeaderSearch()
+      }
+    }
+    let onContentRequested: ([String: Any]) -> Void = { [weak self] payload in
+      self?.mainView.openProfileContent(payload)
+    }
 
     guard let navigationController else {
       showProfileView(animated: animated)
@@ -12340,7 +12440,9 @@ final class ChatConversationController: UIViewController {
         route: profileRoute,
         isDark: isDark,
         onClose: onClose,
-        onProfileAppearanceUpdated: onProfileAppearanceUpdated
+        onProfileAppearanceUpdated: onProfileAppearanceUpdated,
+        onSearchRequested: onSearchRequested,
+        onContentRequested: onContentRequested
       )
       return
     }
@@ -12349,7 +12451,9 @@ final class ChatConversationController: UIViewController {
       route: profileRoute,
       isDark: isDark,
       onClose: onClose,
-      onProfileAppearanceUpdated: onProfileAppearanceUpdated
+      onProfileAppearanceUpdated: onProfileAppearanceUpdated,
+      onSearchRequested: onSearchRequested,
+      onContentRequested: onContentRequested
     )
     navigationController.pushViewController(controller, animated: animated)
   }
@@ -14065,25 +14169,76 @@ private struct AppPrimaryCapsuleButtonStyle: ButtonStyle {
 }
 
 private struct AppToastBanner: View {
-  let message: String
+  let presentation: AppToastController.Presentation
   let palette: AppThemePalette
 
+  private var tint: Color {
+    switch presentation.category {
+    case .info: return .blue
+    case .success: return .green
+    case .error: return .red
+    case .progress: return .blue
+    }
+  }
+
   var body: some View {
-    Text(message)
-      .font(.system(size: 14, weight: .semibold))
-      .foregroundStyle(palette.text)
-      .padding(.horizontal, 16)
-      .padding(.vertical, 12)
-      .frame(maxWidth: .infinity)
-      .background(
-        Capsule(style: .continuous)
-          .fill(palette.card)
+    HStack(spacing: 10) {
+      CategoryGlyph(category: presentation.category, tint: tint)
+      Text(presentation.message)
+        .font(.system(size: 14, weight: .semibold))
+        .foregroundStyle(palette.text)
+        .lineLimit(3)
+        .contentTransition(.opacity)
+    }
+    .padding(.leading, 10)
+    .padding(.trailing, 15)
+    .padding(.vertical, 9)
+    .frame(maxWidth: 420, alignment: .leading)
+    .background {
+      let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+      shape
+        .fill(.regularMaterial)
+        .overlay(shape.fill(palette.card.opacity(0.76)))
+    }
+    .overlay(
+      RoundedRectangle(cornerRadius: 18, style: .continuous)
+        .stroke(palette.border.opacity(0.86), lineWidth: 0.75)
+    )
+    .shadow(color: Color.black.opacity(0.16), radius: 16, y: 7)
+  }
+
+  private struct CategoryGlyph: View {
+    let category: AppToastController.Category
+    let tint: Color
+    @State private var active = false
+
+    private var systemImage: String {
+      switch category {
+      case .info: return "info"
+      case .success: return "checkmark"
+      case .error: return "exclamationmark"
+      case .progress: return "arrow.triangle.2.circlepath"
+      }
+    }
+
+    var body: some View {
+      ZStack {
+        Circle().fill(tint.opacity(0.16))
+        Image(systemName: systemImage)
+          .font(.system(size: 13, weight: .bold))
+          .foregroundStyle(tint)
+          .scaleEffect(active ? 1 : 0.55)
+          .rotationEffect(.degrees(category == .progress ? (active ? 360 : 0) : (active ? 0 : -14)))
+      }
+      .frame(width: 28, height: 28)
+      .animation(
+        category == .progress
+          ? .linear(duration: 0.9).repeatForever(autoreverses: false)
+          : .spring(response: 0.34, dampingFraction: 0.52),
+        value: active
       )
-      .overlay(
-        Capsule(style: .continuous)
-          .stroke(palette.border, lineWidth: 1)
-      )
-      .shadow(color: Color.black.opacity(0.12), radius: 18, y: 8)
+      .onAppear { active = true }
+    }
   }
 }
 
@@ -15860,6 +16015,17 @@ enum GroupProfileActionRouter {
         presentEditor(
           payload: payload, chatId: chatId, route: route, isChannel: isChannel,
           presenter: presenter, onEdited: onEdited)
+      case "reportRoom":
+        let alert = UIAlertController(
+          title: "Report \(roomLabel)",
+          message: "Open the chat and report a message so the review includes the exact content.",
+          preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Open Chat", style: .default) { _ in
+          onClose?()
+        })
+        presenter.present(alert, animated: true)
       case "leaveGroup":
         confirmDestructive(
           title: "Leave \(roomLabel)",
@@ -17227,15 +17393,21 @@ private struct AppToastHostView: View {
   var body: some View {
     VStack {
       Spacer()
-      if let message = toast.message {
-        AppToastBanner(message: message, palette: palette)
-          .padding(.horizontal, 20)
-          .padding(.bottom, 20)
-          .transition(.move(edge: .bottom).combined(with: .opacity))
+      if let presentation = toast.presentation {
+        AppToastBanner(presentation: presentation, palette: palette)
+          .id(presentation.id)
+          .padding(.horizontal, 16)
+          .padding(.bottom, 18)
+          .transition(
+            .asymmetric(
+              insertion: .scale(scale: 0.82, anchor: .bottom).combined(with: .opacity),
+              removal: .scale(scale: 0.94, anchor: .bottom).combined(with: .opacity)
+            )
+          )
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .animation(.spring(response: 0.3, dampingFraction: 0.82), value: toast.message)
+    .animation(.spring(response: 0.32, dampingFraction: 0.76), value: toast.presentation?.id)
     .allowsHitTesting(false)
   }
 }

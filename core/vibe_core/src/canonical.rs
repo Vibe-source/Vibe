@@ -372,7 +372,8 @@ fn build_snapshot(
         flags.insert(VibeMessageFlags::DECRYPTION_FAILED);
     }
 
-    let (media, mut media_thumbs) = build_media(payload, raw, &p.message_id);
+    let sealed_media = p.sealed_elsewhere || p.envelope.is_some();
+    let (media, mut media_thumbs) = build_media(payload, raw, &p.message_id, sealed_media);
     thumbs.append(&mut media_thumbs);
 
     // An envelope this crate cannot open (MLS, legacy RSA, agent-sealed) is not a failure
@@ -591,21 +592,26 @@ fn build_media(
     payload: Option<&Map<String, Value>>,
     raw: &Map<String, Value>,
     message_id: &str,
+    sealed: bool,
 ) -> (Option<VibeMediaRef>, Vec<VibeThumbnailBlob>) {
     let source = payload.unwrap_or(raw);
     let url = pick_str(source, &["mediaUrl", "media_url", "url", "fileUrl"])
         .or_else(|| pick_str(raw, &["mediaUrl", "media_url"]));
-    let media_key = pick_str(source, &["mediaKey", "media_key"]);
+    let media_key = pick_str(source, &["mediaKey", "media_key"])
+        .or_else(|| pick_str(raw, &["mediaKey", "media_key"]));
     let Some(url) = url.filter(|u| !u.is_empty()) else {
         return (None, Vec::new());
     };
+    // Sealed message with no key: the public URL is ciphertext, not playable media.
+    if sealed && media_key.as_deref().map(|k| k.is_empty()).unwrap_or(true) {
+        return (None, Vec::new());
+    }
 
     let identity = media::media_identity(&url, media_key.as_deref());
     let envelope = match media_key.as_deref() {
         Some(key) if !key.is_empty() => VibeMediaEnvelope::Gcm1 {
             key_ref: key.to_string(),
         },
-        // Pre-encryption uploads have no key and pass through untouched.
         _ => VibeMediaEnvelope::Plain,
     };
 
@@ -1203,6 +1209,18 @@ mod tests {
         let m = &out.messages[0];
         assert!(m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
         assert!(m.body.text.is_empty());
+    }
+
+    /// A public media URL on an unopened MLS frame is ciphertext, not Plain media.
+    #[test]
+    fn an_unopened_mls_media_url_is_not_plain_media() {
+        let aead = VibeDenyAllAead;
+        let unwrap = VibeDenyAllKeyUnwrapper;
+        let frame = r#"{"id":"mls-media","chat_id":"chat-1","sender_id":"peer","timestamp":5,"encrypted_content":"vmls1.AAAA","media_url":"https://media.vibegram.io/chat-media/x/photo.png"}"#;
+        let out = canonicalize_frame(frame.as_bytes(), &ctx(&aead, &unwrap, false)).unwrap();
+        let m = &out.messages[0];
+        assert!(m.flags.contains(VibeMessageFlags::DECRYPTION_FAILED));
+        assert!(m.media.is_none());
     }
 
     /// The host opens MLS and projects the plaintext into the frame. That row is

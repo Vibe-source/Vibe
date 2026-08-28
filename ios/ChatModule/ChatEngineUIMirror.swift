@@ -150,6 +150,10 @@ final class ChatEngineUIMirror: @unchecked Sendable {
   /// appears. Same predicate as the engine's own `agentBridgeAskByRequestId` scan.
   private var agentAskChatIds: Set<String> = []
 
+  /// Outgoing-message status inputs, so the cell footer never waits on the engine queue.
+  private var receiptIndex: [String: [String: String]] = [:]
+  private var localStatusIndex: [String: [String: String]] = [:]
+
   /// Until the first publish the mirror cannot distinguish "nothing is
   /// happening" from "nobody has told me yet", so readers fall back to the
   /// queue. One publish lands on the first engine notification.
@@ -174,7 +178,9 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     lastSeenByUserId: [String: Int64],
     pendingAskByChatId: [String: [ChatEngineBridgeAskSnapshot]] = [:],
     agentTurnRunningAtMsByChatId: [String: Int64] = [:],
-    agentAskChatIds: Set<String> = []
+    agentAskChatIds: Set<String> = [],
+    receiptIndex: [String: [String: String]] = [:],
+    localStatusIndex: [String: [String: String]] = [:]
   ) {
     lock.lock()
     defer { lock.unlock() }
@@ -185,6 +191,8 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     self.pendingAskByChatId = pendingAskByChatId
     self.agentTurnRunningAtMsByChatId = agentTurnRunningAtMsByChatId
     self.agentAskChatIds = agentAskChatIds
+    self.receiptIndex = receiptIndex
+    self.localStatusIndex = localStatusIndex
     hasPublished = true
     publishes += 1
   }
@@ -206,6 +214,18 @@ final class ChatEngineUIMirror: @unchecked Sendable {
 
   func typingUserIds(chatId: String) -> [String]? {
     read { Array(typingByChatId[chatId] ?? []).sorted() }
+  }
+
+  /// Inputs `ChatEngine.resolveDisplayStatus` needs for one outgoing row; outer `nil` = unpublished.
+  func displayStatusInputs(chatId: String, messageId: String, peerUserId: String?)
+    -> (receipt: String?, local: String?, peerOnline: Bool)?
+  {
+    read {
+      (
+        receiptIndex[chatId]?[messageId], localStatusIndex[chatId]?[messageId],
+        peerUserId.map { onlineUserIds.contains($0) } ?? false
+      )
+    }
   }
 
   /// Double-optional on purpose, and the two levels mean different things:

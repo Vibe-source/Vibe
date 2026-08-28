@@ -13,6 +13,7 @@ defmodule Vibe.Application do
     # Create ETS table for rate limiting before starting the endpoint
     # This must happen before any requests can hit the RateLimiter plug
     ensure_ets_table(:rate_limiter)
+    ensure_ets_table(:channel_throttle)
     # Bearer-token -> user cache; without it every authenticated request pays a
     # full DB round trip just to authenticate (see Vibe.Accounts.TokenCache).
     ensure_ets_table(:auth_token_cache)

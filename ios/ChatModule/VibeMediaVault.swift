@@ -107,11 +107,10 @@ final class VibeMediaVault {
   /// The address of one piece of remote media. Stable across re-signings, across launches, and
   /// across surfaces — see the type comment for why nothing about the response may enter it.
   static func identity(remoteURL: URL, mediaKey: String? = nil) -> String {
-    let base = chatStableRemoteMediaIdentity(remoteURL)
-    guard let key = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
-      return base
-    }
-    return base + "|k:" + key
+    // One URL has one ciphertext and one key: the key decrypts, it does not address. Keying on
+    // it made a row that lost its key (failed open, core frame) miss bytes already on disk.
+    _ = mediaKey
+    return chatStableRemoteMediaIdentity(remoteURL)
   }
 
   /// String form, for the many call sites that hold a raw URL string. A value that will not
@@ -121,10 +120,8 @@ final class VibeMediaVault {
     if let url = URL(string: trimmed), url.scheme != nil {
       return identity(remoteURL: url, mediaKey: mediaKey)
     }
-    guard let key = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
-      return trimmed
-    }
-    return trimmed + "|k:" + key
+    _ = mediaKey
+    return trimmed
   }
 
   private func slotName(for identity: String) -> String {

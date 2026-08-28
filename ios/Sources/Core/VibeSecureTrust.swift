@@ -1,68 +1,39 @@
 import Foundation
 import Security
 
-/// Remembers which signing key each peer showed us, so the server cannot
-/// quietly swap one in.
-///
-/// # The attack this exists for
-///
-/// Establishment asks the server for a peer's KeyPackage. MLS does not make the
-/// server honest: it can mint its own KeyPackage, hand that over instead, join
-/// the group as the "peer", and relay messages to the real one. Everything stays
-/// encrypted the whole time — to the attacker. Nothing in the protocol notices.
-///
-/// Two things stop it, and this type is both:
-///
-/// * **Pinning** — remember the key seen on first contact and refuse if it ever
-///   changes. This does not stop a server that lies from the very first
-///   message, but it collapses the attack window from "any time, repeatedly" to
-///   "first contact only, once".
-/// * **Safety numbers** — a short string derived from both identity keys. Two
-///   people who read it aloud and find it matching know there is nobody
-///   between them, which is the only thing that closes first-contact
-///   substitution.
-///
-/// # Why the Keychain
-///
-/// A pin is only as good as its storage. `UserDefaults` is a plist any process
-/// with file access can rewrite; an attacker who can edit the pin can erase it
-/// and re-pin their own key, and pinning becomes decoration. The Keychain is
-/// `ThisDeviceOnly` for the same reason the MLS store is — a pin restored onto
-/// a different device is a claim about a trust decision that device never made.
+/// Pins peer identities in the Keychain and derives comparison codes.
 enum VibeSecureTrust {
 
   /// What a peer's freshly-claimed KeyPackage means for trust.
   enum Verdict: Equatable {
-    /// Never seen this peer. The key is now pinned.
-    ///
-    /// Not "safe" — merely "not yet contradicted". A server lying from the
-    /// first message lands here, which is exactly why the safety number
-    /// exists and why the UI should offer to verify.
+    /// First contact; the key is now pinned.
     case pinnedOnFirstContact
     /// Same key as last time. Nothing has changed.
     case matchesPin
-    /// **Different key than the one pinned.** Either the peer reinstalled, or
-    /// someone is in the middle. The two are indistinguishable from here, so
-    /// the caller must fail closed and let a human decide.
+    /// Key changed; callers fail closed until the user verifies it.
     case changed(pinned: Data, offered: Data)
   }
 
   private static let service = "vibe.secure.trust"
+  private static let transportService = "vibe.secure.trust.transport"
+  private static let pendingService = "vibe.secure.trust.pending"
+  private static let pendingTransportService = "vibe.secure.trust.pending.transport"
   private static let queue = DispatchQueue(label: "vibe.secure.trust")
 
-  /// Compares `signatureKey` against what we pinned for `userId`, pinning it if
-  /// this is the first time.
-  ///
-  /// Deliberately returns a verdict rather than a `Bool`: `changed` is not
-  /// "invalid", it is "a human has to look at this", and collapsing it to false
-  /// would lose the distinction between a benign reinstall and an attack.
+
+  /// Pins on first contact and stages changed keys for user verification.
   static func evaluate(signatureKey: Data, userId: String) -> Verdict {
     queue.sync {
       guard let pinned = loadKey(userId: userId) else {
         _ = storeKey(signatureKey, userId: userId)
+        deleteKey(userId: userId, service: pendingService)
         return .pinnedOnFirstContact
       }
-      if pinned == signatureKey { return .matchesPin }
+      if pinned == signatureKey {
+        deleteKey(userId: userId, service: pendingService)
+        return .matchesPin
+      }
+      _ = storeKey(signatureKey, userId: userId, service: pendingService)
       return .changed(pinned: pinned, offered: signatureKey)
     }
   }
@@ -72,52 +43,113 @@ enum VibeSecureTrust {
     queue.sync { loadKey(userId: userId) }
   }
 
-  /// Replaces the pin for `userId`.
-  ///
-  /// Only ever call this because a *human* accepted the change — after
-  /// comparing a safety number, or explicitly choosing to trust a reinstall.
-  /// Calling it automatically on `changed` would undo the entire mechanism:
-  /// the point of a pin is that software cannot silently move it.
+  /// Replaces the MLS pin only after explicit user verification.
   @discardableResult
   static func acceptChange(signatureKey: Data, userId: String) -> Bool {
     queue.sync { storeKey(signatureKey, userId: userId) }
   }
 
-  /// Forgets every pin this device holds.
-  ///
-  /// **Only for the one case where every pin is known-dead**: this device's own
-  /// signing key was retired, which means it was minted per launch — and so were
-  /// its peers'. Every stored pin then names a key its owner will never sign
-  /// with again, `evaluate` returns `changed` for all of them, and `verifyPeer`
-  /// fails closed, so no conversation can re-establish. See
-  /// `VibeSecureSessions.retireStateForNewIdentityLocked`.
-  ///
-  /// This is the one operation that undoes what pinning is for, so it must never
-  /// become a general-purpose "reset trust" convenience: an attacker who can
-  /// provoke it gets a fresh first-contact window against every peer at once.
-  /// Nothing calls it except identity retirement, and that runs at most once per
-  /// key change.
+  // Legacy RSA transport pin for peers without MLS support.
+
+  /// Compares the peer's hybrid RSA public key against its pin, pinning on first contact.
+  static func evaluateTransport(publicKeyPem: String, userId: String) -> Verdict {
+    let offered = transportKeyBytes(publicKeyPem)
+    guard !offered.isEmpty else { return .matchesPin }
+    return queue.sync {
+      guard let pinned = loadKey(userId: userId, service: transportService) else {
+        _ = storeKey(offered, userId: userId, service: transportService)
+        deleteKey(userId: userId, service: pendingTransportService)
+        return .pinnedOnFirstContact
+      }
+      if pinned == offered {
+        deleteKey(userId: userId, service: pendingTransportService)
+        return .matchesPin
+      }
+      _ = storeKey(offered, userId: userId, service: pendingTransportService)
+      return .changed(pinned: pinned, offered: offered)
+    }
+  }
+
+  /// The hybrid key currently pinned for `userId`, as DER.
+  static func pinnedTransportKey(userId: String) -> Data? {
+    queue.sync { loadKey(userId: userId, service: transportService) }
+  }
+
+  /// Replaces the hybrid pin. Human-accepted changes only, exactly like `acceptChange`.
+  @discardableResult
+  static func acceptTransportChange(publicKeyPem: String, userId: String) -> Bool {
+    let offered = transportKeyBytes(publicKeyPem)
+    guard !offered.isEmpty else { return false }
+    return queue.sync { storeKey(offered, userId: userId, service: transportService) }
+  }
+
+  static func pendingChanges(userId: String) -> (signatureKey: Data?, transportKey: Data?) {
+    queue.sync {
+      (
+        loadKey(userId: userId, service: pendingService),
+        loadKey(userId: userId, service: pendingTransportService)
+      )
+    }
+  }
+
+  /// Promotes only the exact identity keys the user verified.
+  @discardableResult
+  static func acceptPendingChanges(
+    userId: String,
+    expectedSignatureKey: Data?,
+    expectedTransportKey: Data?
+  ) -> Bool {
+    queue.sync {
+      let signature = loadKey(userId: userId, service: pendingService)
+      let transport = loadKey(userId: userId, service: pendingTransportService)
+      guard expectedSignatureKey != nil || expectedTransportKey != nil else { return false }
+      guard signature == expectedSignatureKey, transport == expectedTransportKey else { return false }
+
+      var succeeded = true
+      if let signature {
+        let stored = storeKey(signature, userId: userId)
+        if stored { deleteKey(userId: userId, service: pendingService) }
+        succeeded = succeeded && stored
+      }
+      if let transport {
+        let stored = storeKey(transport, userId: userId, service: transportService)
+        if stored { deleteKey(userId: userId, service: pendingTransportService) }
+        succeeded = succeeded && stored
+      }
+      return succeeded
+    }
+  }
+
+  /// DER behind a PEM, so header and line-break drift is not read as a key change.
+  private static func transportKeyBytes(_ pem: String) -> Data {
+    let body = pem.split(whereSeparator: \.isNewline)
+      .filter { !$0.hasPrefix("-----") }
+      .joined()
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let der = Data(base64Encoded: body), !der.isEmpty { return der }
+    let raw = pem.trimmingCharacters(in: .whitespacesAndNewlines)
+    return raw.isEmpty ? Data() : Data(raw.utf8)
+  }
+
+  /// Clears all pins only when this device retires its own identity.
   static func clearAllPins() {
     queue.sync {
-      let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-      ]
-      let status = SecItemDelete(query as CFDictionary)
-      guard status == errSecSuccess || status == errSecItemNotFound else {
-        VibeLog.error("[VibeSecure] could not clear peer pins: OSStatus \(status)")
-        return
+      for pinService in [service, transportService, pendingService, pendingTransportService] {
+        let query: [String: Any] = [
+          kSecClass as String: kSecClassGenericPassword,
+          kSecAttrService as String: pinService,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+          VibeLog.error("[VibeSecure] could not clear peer pins: OSStatus \(status)")
+          return
+        }
       }
       VibeLog.notice("[VibeSecure] cleared every peer identity pin — they re-pin on next contact")
     }
   }
 
-  /// The digits two people compare out of band, or `nil` if either side's key
-  /// is unknown.
-  ///
-  /// Formatted in groups of five for reading aloud — losing your place in a
-  /// 60-digit run is how comparisons get abandoned halfway, and an abandoned
-  /// comparison protects nothing.
+  /// Returns the 60-digit comparison code in groups of five.
   static func safetyNumber(myKey: Data, peerKey: Data) -> String {
     let digits = vibeSafetyNumber(keyA: myKey, keyB: peerKey)
     return stride(from: 0, to: digits.count, by: 5)
@@ -129,9 +161,8 @@ enum VibeSecureTrust {
       .joined(separator: " ")
   }
 
-  // ── Keychain ────────────────────────────────────────────────────────────
 
-  private static func loadKey(userId: String) -> Data? {
+  private static func loadKey(userId: String, service: String = service) -> Data? {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -146,7 +177,16 @@ enum VibeSecureTrust {
     return data
   }
 
-  private static func storeKey(_ key: Data, userId: String) -> Bool {
+  private static func deleteKey(userId: String, service: String) {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: userId,
+    ]
+    SecItemDelete(query as CFDictionary)
+  }
+
+  private static func storeKey(_ key: Data, userId: String, service: String = service) -> Bool {
     let attributes: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,

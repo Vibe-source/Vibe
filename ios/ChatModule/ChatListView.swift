@@ -1211,6 +1211,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   private lazy var cachedHistoryPullIndicator = CachedHistoryPullIndicatorView()
   private var cachedHistoryPullIndicatorInstalled = false
   private var searchQuery = ""
+  private var searchModeActive = false
+  private var selectedSearchResultIndex: Int?
+  private let searchNavigationBar = UIVisualEffectView(
+    effect: UIBlurEffect(style: .systemChromeMaterial)
+  )
+  private let searchResultLabel = UILabel()
+  private let searchPreviousButton = UIButton(type: .system)
+  private let searchNextButton = UIButton(type: .system)
   private var nativeSendEnabled = false
   private var agentChatMode = false
   /// Agent mode still owns composer controls and transport, but its transcript follows the
@@ -2764,6 +2772,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     transitionOverlayHost.isUserInteractionEnabled = false
     transitionOverlayHost.clipsToBounds = false
     addSubview(transitionOverlayHost)
+    setupSearchNavigationBar()
 
     // Telegram-style viewport date feedback: capsules are created per day run on demand
     // (see updateScrollingDatePill) and are screen-fixed and non-interactive, so they
@@ -4016,10 +4025,16 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     layoutDebugPanel()
     updateTallBubbleGlassToggles(animatedIcons: false)
 
-    // Layout native input bar if enabled
-    if inputBarEnabled {
+    // Search owns the bottom surface while active; otherwise the composer keeps its slot.
+    if searchModeActive {
+      activeNativeInputView?.isHidden = true
+      layoutSearchNavigationBarAndInset()
+    } else if inputBarEnabled {
+      activeNativeInputView?.isHidden = false
+      searchNavigationBar.isHidden = true
       layoutInputBarAndInset()
     } else {
+      searchNavigationBar.isHidden = true
       let desiredBottomPadding = requestedContentPaddingBottom
       if abs(contentPaddingBottom - desiredBottomPadding) > 0.5 {
         contentPaddingBottom = desiredBottomPadding
@@ -18732,6 +18747,140 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     onNativeEvent(["type": "sendTransitionCompleted", "messageId": revealedMessageId ?? ""])
   }
 
+  private func setupSearchNavigationBar() {
+    searchNavigationBar.isHidden = true
+    searchNavigationBar.clipsToBounds = true
+    searchNavigationBar.layer.borderWidth = 0.5
+    searchNavigationBar.layer.borderColor = UIColor.separator.withAlphaComponent(0.42).cgColor
+    searchNavigationBar.contentView.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.18)
+    addSubview(searchNavigationBar)
+
+    searchResultLabel.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+    searchResultLabel.textColor = .label
+    searchResultLabel.accessibilityIdentifier = "chat.search.results"
+    searchNavigationBar.contentView.addSubview(searchResultLabel)
+
+    let symbolConfig = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+    searchPreviousButton.setImage(UIImage(systemName: "chevron.up", withConfiguration: symbolConfig), for: .normal)
+    searchNextButton.setImage(UIImage(systemName: "chevron.down", withConfiguration: symbolConfig), for: .normal)
+    searchPreviousButton.accessibilityLabel = "Previous search result"
+    searchNextButton.accessibilityLabel = "Next search result"
+    searchPreviousButton.addTarget(self, action: #selector(handleSearchPreviousPressed), for: .touchUpInside)
+    searchNextButton.addTarget(self, action: #selector(handleSearchNextPressed), for: .touchUpInside)
+    searchNavigationBar.contentView.addSubview(searchPreviousButton)
+    searchNavigationBar.contentView.addSubview(searchNextButton)
+  }
+
+  func setSearchModeActive(_ active: Bool) {
+    guard active != searchModeActive else { return }
+    searchModeActive = active
+    selectedSearchResultIndex = nil
+    searchNavigationBar.isHidden = !active
+    activeNativeInputView?.isHidden = active
+    updateSearchNavigationState(resetSelection: active)
+    setNeedsLayout()
+    layoutIfNeeded()
+  }
+
+  private var searchResultIndexPaths: [IndexPath] {
+    rows.enumerated().compactMap { index, row in
+      guard case .message = row.kind else { return nil }
+      return IndexPath(item: index, section: 0)
+    }
+  }
+
+  private func updateSearchNavigationState(resetSelection: Bool) {
+    guard searchModeActive else { return }
+    guard !searchQuery.isEmpty else {
+      selectedSearchResultIndex = nil
+      searchResultLabel.text = "Type to search"
+      searchPreviousButton.isEnabled = false
+      searchNextButton.isEnabled = false
+      searchPreviousButton.alpha = 0.34
+      searchNextButton.alpha = 0.34
+      return
+    }
+
+    let results = searchResultIndexPaths
+    guard !results.isEmpty else {
+      selectedSearchResultIndex = nil
+      searchResultLabel.text = "No results"
+      searchPreviousButton.isEnabled = false
+      searchNextButton.isEnabled = false
+      searchPreviousButton.alpha = 0.34
+      searchNextButton.alpha = 0.34
+      return
+    }
+
+    let selected: Int
+    if resetSelection || selectedSearchResultIndex == nil {
+      selected = results.count - 1
+    } else {
+      selected = min(max(0, selectedSearchResultIndex ?? 0), results.count - 1)
+    }
+    selectedSearchResultIndex = selected
+    searchResultLabel.text = "\(selected + 1) of \(results.count)"
+    searchPreviousButton.isEnabled = selected > 0
+    searchNextButton.isEnabled = selected < results.count - 1
+    searchPreviousButton.alpha = searchPreviousButton.isEnabled ? 1 : 0.34
+    searchNextButton.alpha = searchNextButton.isEnabled ? 1 : 0.34
+  }
+
+  private func scrollToSelectedSearchResult(animated: Bool) {
+    let results = searchResultIndexPaths
+    guard let selectedSearchResultIndex,
+      results.indices.contains(selectedSearchResultIndex)
+    else { return }
+    let indexPath = results[selectedSearchResultIndex]
+    guard indexPath.item < collectionView.numberOfItems(inSection: indexPath.section) else { return }
+    collectionView.layoutIfNeeded()
+    collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: animated)
+  }
+
+  private func navigateSearchResults(by delta: Int) {
+    let results = searchResultIndexPaths
+    guard !results.isEmpty else { return }
+    let current = selectedSearchResultIndex ?? (results.count - 1)
+    let next = min(max(0, current + delta), results.count - 1)
+    guard next != current else { return }
+    selectedSearchResultIndex = next
+    updateSearchNavigationState(resetSelection: false)
+    scrollToSelectedSearchResult(animated: true)
+    UISelectionFeedbackGenerator().selectionChanged()
+  }
+
+  @objc private func handleSearchPreviousPressed() {
+    navigateSearchResults(by: -1)
+  }
+
+  @objc private func handleSearchNextPressed() {
+    navigateSearchResults(by: 1)
+  }
+
+  private func layoutSearchNavigationBarAndInset() {
+    guard searchModeActive else { return }
+    let toolbarHeight: CGFloat = 52
+    let safeBottom = keyboardHeight > 0 ? 0 : effectiveRestingBottomSafeArea
+    let totalHeight = toolbarHeight + safeBottom
+    let y = max(0, bounds.height - keyboardHeight - totalHeight)
+    searchNavigationBar.isHidden = false
+    searchNavigationBar.frame = CGRect(x: 0, y: y, width: bounds.width, height: totalHeight)
+    searchResultLabel.frame = CGRect(x: 18, y: 0, width: max(0, bounds.width - 126), height: toolbarHeight)
+    searchPreviousButton.frame = CGRect(x: max(0, bounds.width - 104), y: 0, width: 52, height: toolbarHeight)
+    searchNextButton.frame = CGRect(x: max(0, bounds.width - 52), y: 0, width: 52, height: toolbarHeight)
+    updateSearchNavigationState(resetSelection: false)
+    bringSubviewToFront(searchNavigationBar)
+
+    let desiredBottomPadding = keyboardHeight + totalHeight
+    if abs(contentPaddingBottom - desiredBottomPadding) > 0.5 {
+      contentPaddingBottom = desiredBottomPadding
+      updateBottomAnchorInset()
+    }
+    positionTransitionOverlayHost()
+    layoutActivityOverlay()
+    layoutJumpToBottomButton()
+  }
+
   func setSearchQuery(_ value: String) {
     let nextQuery = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard nextQuery != searchQuery else { return }
@@ -18743,6 +18892,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       engineChatId
     )
     setRows(sourceRowsPayload)
+    updateSearchNavigationState(resetSelection: true)
+    guard !searchQuery.isEmpty else { return }
+    DispatchQueue.main.async { [weak self] in
+      self?.scrollToSelectedSearchResult(animated: false)
+    }
   }
 
   private func filterRowsForSearch(_ input: [[String: Any]]) -> [[String: Any]] {
@@ -19552,7 +19706,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   // MARK: - Keyboard Tracking
 
   @objc private func keyboardWillChangeFrame(_ notification: Notification) {
-    guard inputBarEnabled else { return }
+    guard inputBarEnabled || searchModeActive else { return }
     guard let info = notification.userInfo,
       let endFrame = info[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
     else { return }
@@ -19575,14 +19729,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       animation: (duration, options)
     )
     UIView.animate(withDuration: duration, delay: 0, options: options) { [weak self] in
-      self?.layoutInputBarAndInset()
-      self?.inputBar?.layoutIfNeeded()
-      self?.agentComposerView?.layoutIfNeeded()
+      guard let self else { return }
+      if self.searchModeActive {
+        self.layoutSearchNavigationBarAndInset()
+      } else {
+        self.layoutInputBarAndInset()
+      }
+      self.inputBar?.layoutIfNeeded()
+      self.agentComposerView?.layoutIfNeeded()
     }
   }
 
   @objc private func keyboardWillHide(_ notification: Notification) {
-    guard inputBarEnabled else { return }
+    guard inputBarEnabled || searchModeActive else { return }
     guard let info = notification.userInfo else { return }
     let duration =
       (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
@@ -19599,9 +19758,14 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       animation: (duration, options)
     )
     UIView.animate(withDuration: duration, delay: 0, options: options) { [weak self] in
-      self?.layoutInputBarAndInset()
-      self?.inputBar?.layoutIfNeeded()
-      self?.agentComposerView?.layoutIfNeeded()
+      guard let self else { return }
+      if self.searchModeActive {
+        self.layoutSearchNavigationBarAndInset()
+      } else {
+        self.layoutInputBarAndInset()
+      }
+      self.inputBar?.layoutIfNeeded()
+      self.agentComposerView?.layoutIfNeeded()
     }
   }
 
@@ -23010,8 +23174,39 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     return row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  /// Native full-screen image open (`ChatImageEdit` glass chrome + zoom transition).
-  /// Multi-image messages get a **centered** bottom filmstrip of that message's tiles only.
+  /// Opens shared profile items through the chat media, document, and browser routes.
+  func openProfileContent(
+    messageId: String,
+    tab: String,
+    urlString: String?,
+    sourceView: UIView? = nil
+  ) {
+    if tab == "links", let urlString, let url = URL(string: urlString) {
+      InAppBrowserViewController.present(url: url)
+      return
+    }
+
+    guard let row = rows.first(where: {
+      $0.messageId == messageId || $0.key == messageId
+    }) else {
+      if let urlString, let url = URL(string: urlString) {
+        InAppBrowserViewController.present(url: url)
+      }
+      return
+    }
+
+    if tab == "media" || tab == "gifs" {
+      if rowRepresentsVideoMedia(row) {
+        openDocumentInApp(row: row)
+      } else {
+        presentNativeImageOpen(for: row, gridIndex: 0, sourceView: sourceView)
+      }
+      return
+    }
+
+    openDocumentInApp(row: row)
+  }
+
   private func presentNativeImageOpen(
     for row: ChatListRow,
     gridIndex: Int,

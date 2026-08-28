@@ -4664,7 +4664,7 @@ private final class BubbleReplyPreviewView: UIView {
 
 }
 
-private final class BubbleLinkPreviewView: UIView {
+final class BubbleLinkPreviewView: UIView {
   private let accentView = UIView()
   private let iconView = UIImageView()
   private let siteLabel = UILabel()
@@ -10333,10 +10333,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     let cover = viewOnceShineCover
     cover.isHidden = false
+    let key = row.messageId ?? row.key
+    let sealed = chatViewOnceSealedImage(key: key)
+    if let sealed {
+      let concealed = chatViewOnceConcealedStill(from: sealed, cacheKey: key)
+      mediaImageView.image = concealed
+      mediaImageView.isHidden = false
+    }
     cover.apply(
-      image: mediaImageView.image,
-      showsFlame: row.visualKind == .videoNote,
-      circular: row.visualKind == .videoNote)
+      image: sealed,
+      cacheKey: key,
+      count: 1,
+      circular: row.visualKind == .videoNote,
+      timerSeconds: row.mediaTtlSeconds)
     cover.setActive(window != nil)
   }
   /// The tint plate inside the scrim. Reaching for it builds the scrim, because it cannot
@@ -11067,7 +11076,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   func currentMediaImage() -> UIImage? {
-    mediaImageView.image
+    if let row, row.viewOnce {
+      let key = row.messageId ?? row.key
+      return chatViewOnceSealedImage(key: key)
+    }
+    return mediaImageView.image
   }
 
   /// The URL the cell's own inline AVPlayer actually resolved and is playing —
@@ -11147,6 +11160,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaVideoHasCompletedOnce = false
       mediaVideoPlaybackActive = true
       if mediaVideoReady, mediaVideoPlayer != nil {
+        configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
         mediaVideoPlayer?.play()
       } else {
         refreshInlineVideoPlaybackIfNeeded()
@@ -11192,6 +11206,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     noteVideoNoteExpandSession()
     mediaVideoPlaybackActive = true
     if let player = mediaVideoPlayer {
+      configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
       player.seek(to: .zero)
       player.play()
     }
@@ -11974,14 +11989,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         row.isMe
         ? appearance.textColorMe
         : (row.isAgentMessage ? appearance.textColorThem : appearance.textColorThem)
-      let metaColor = resolvedMetaColor(for: textColor)
+      let usesViewOnceMetaPlate =
+        row.viewOnce && usesFullBleedMediaLayout(row) && row.visualKind != .videoNote
+      let metaColor =
+        usesViewOnceMetaPlate
+        ? UIColor(white: 1.0, alpha: 0.92)
+        : resolvedMetaColor(for: textColor)
       messageLabel.textColor = textColor
       editedLabel.textColor = metaColor
       pinnedLabel.textColor = metaColor
       viewIconView.tintColor = metaColor
       viewCountLabel.textColor = metaColor
       timestampLabel.textColor = metaColor
-      metaContainerView.backgroundColor = .clear
+      metaContainerView.backgroundColor =
+        usesViewOnceMetaPlate ? UIColor.black.withAlphaComponent(0.48) : .clear
+      metaContainerView.clipsToBounds = usesViewOnceMetaPlate
       configureMediaPresentation(
         for: row,
         textColor: textColor,
@@ -12628,6 +12650,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       }
       let metaX: CGFloat
       let metaY: CGFloat
+      let usesViewOnceMetaPlate =
+        row.viewOnce && isFullBleed && row.visualKind != .videoNote
       if row.visualKind == .videoNote {
         // Telegram: time + ✓ sit on the wallpaper UNDER the circle, bottom-right — the
         // circular clip cuts anything parented inside it.
@@ -12641,7 +12665,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         if metaContainerView.superview !== contentView {
           contentView.addSubview(metaContainerView)
         }
-        metaContainerView.layer.cornerRadius = 0
+        metaContainerView.layer.cornerRadius =
+          usesViewOnceMetaPlate ? (bubbleMetaHeight + 4.0) * 0.5 : 0
         if isFullBleed {
           metaX = bubbleFrame.maxX - metrics.metaWidth - 10
           metaY = bubbleFrame.maxY - bubbleMetaHeight - 8
@@ -12660,12 +12685,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         }
       }
 
+      let metaInsetX: CGFloat = usesViewOnceMetaPlate ? 6.0 : 0.0
+      let metaInsetY: CGFloat = usesViewOnceMetaPlate ? 2.0 : 0.0
       metaContainerView.frame = pixelAlignedRect(
         CGRect(
-          x: metaX,
-          y: metaY,
-          width: metrics.metaWidth,
-          height: bubbleMetaHeight
+          x: metaX - metaInsetX,
+          y: metaY - metaInsetY,
+          width: metrics.metaWidth + metaInsetX * 2.0,
+          height: bubbleMetaHeight + metaInsetY * 2.0
         ))
 
       mediaProgressOverlayView.frame = mediaContainerView.bounds
@@ -13345,6 +13372,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return remoteURL
   }
 
+  /// Sets the audio session so muted inline video won't interrupt the music player.
+  private func configureInlineVideoAudioSession(muted: Bool) {
+    let session = AVAudioSession.sharedInstance()
+    do {
+      if muted {
+        try session.setCategory(.playback, mode: .default, options: .mixWithOthers)
+      } else {
+        try session.setCategory(.playback, mode: .default)
+      }
+      try session.setActive(true)
+    } catch {
+      // Best-effort; inline video is cosmetic.
+    }
+  }
+
   private func stopInlineVideoPlayback(resetMutedState: Bool) {
     if mediaVideoPlayer != nil || mediaVideoPlayerURLKey != nil {
       inlineVideoLog(
@@ -13532,6 +13574,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       stopInlineVideoPlayback(resetMutedState: true)
       return
     }
+    if shouldShowViewOnceShineCover(row) {
+      mediaVideoPlayer?.pause()
+      _mediaVideoPlayerLayer?.opacity = 0.0
+      mediaVideoPlayerHostView.isHidden = true
+      return
+    }
     guard mediaVideoPlaybackActive, window != nil, !isContextMenuExtracted,
       !row.shouldShowUploadOverlay, !mediaIsDownloading
     else {
@@ -13625,6 +13673,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             if self.mediaVideoHasCompletedOnce || self.mediaVideoUserPaused {
               self.mediaVideoPlayer?.pause()
             } else {
+              self.configureInlineVideoAudioSession(muted: self.mediaVideoIsMuted || !self.mediaVideoHasAudio)
               self.mediaVideoPlayer?.play()
             }
             self.updateInlineVideoTimeBadge()
@@ -13659,6 +13708,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if mediaVideoHasCompletedOnce || mediaVideoUserPaused {
         mediaVideoPlayer?.pause()
       } else {
+        configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
         mediaVideoPlayer?.play()
       }
       inlineVideoLog(
@@ -14045,7 +14095,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     if row.visualKind == .video || row.visualKind == .videoNote {
-      mediaVideoInfoBadgeView.isHidden = hasActiveTransfer
+      mediaVideoInfoBadgeView.isHidden =
+        hasActiveTransfer || (row.viewOnce && row.visualKind == .video)
     } else {
       mediaVideoInfoBadgeView.isHidden = true
     }
@@ -14265,6 +14316,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressRingView.setDownloadState(needsDownload: false, isDownloading: false, progress: nil)
       mediaProgressSpinner.stopAnimating()
       mediaProgressSizeLabel.isHidden = true
+      refreshViewOnceShineCover()
       return
     }
 
@@ -14352,9 +14404,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaImageView.isHidden = false
       refreshInlineVideoPlayGlyph()
       mediaContainerView.backgroundColor = UIColor(white: 0.0, alpha: 0.35)
-      mediaBorderLayer.lineWidth = 1.0
+      mediaBorderLayer.lineWidth = row.viewOnce ? 1.5 : 1.0
       mediaBorderLayer.strokeColor =
-        appearance.accent.withAlphaComponent(appearance.isDark ? 0.48 : 0.38).cgColor
+        appearance.accent.withAlphaComponent(
+          row.viewOnce ? 0.92 : (appearance.isDark ? 0.48 : 0.38)
+        ).cgColor
       mediaBorderLayer.isHidden = false
 
     case .videoNote:
@@ -14450,6 +14504,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         }
       } else {
         mediaPrimaryIconView.isHidden = true
+      }
+      if row.viewOnce, row.visualKind == .media, row.messageType != "file" {
+        mediaBorderLayer.lineWidth = 1.5
+        mediaBorderLayer.strokeColor = appearance.accent.withAlphaComponent(0.92).cgColor
+        mediaBorderLayer.isHidden = false
       }
 
     case .text:
@@ -14719,7 +14778,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
                 row.messageId ?? "-",
                 shortUrl
               )
-              chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
+              if !row.viewOnce {
+                chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
+              }
               applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
             } else {
               let exists = FileManager.default.fileExists(atPath: path)
@@ -14738,7 +14799,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
                 chatMediaFileHeaderSummary(at: path)
               )
             }
-          } else if let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey),
+          } else if !row.viewOnce,
+            let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey),
             let diskImage = chatMediaPreviewImage(
               from: diskData,
               shouldAnimate: shouldAnimateMedia,
@@ -14754,7 +14816,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               "[ChatMediaLoad] disk preview OK msgId=%@ type=%@ bytes=%d url=%@",
               row.messageId ?? "-", row.messageType, diskData.count, shortUrl
             )
-            chatMediaImageCache.setObject(diskImage, forKey: cacheKey as NSString)
+            if !row.viewOnce {
+              chatMediaImageCache.setObject(diskImage, forKey: cacheKey as NSString)
+            }
             applyResolvedMediaPreviewImage(diskImage, for: row, mediaURL: naturalSizeURL)
           } else if chatMediaFailedURLs.contains(rawURLKey) {
             chatCellDebugLog(
@@ -14856,8 +14920,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
                 safeData.count,
                 shortUrl
               )
-              chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
-              chatMediaDiskCacheSave(safeData, forKey: cacheKey)
+              if !row.viewOnce {
+                chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
+                chatMediaDiskCacheSave(safeData, forKey: cacheKey)
+              } else {
+                chatViewOnceCacheSealed(image, key: row.messageId ?? row.key)
+              }
               DispatchQueue.main.async {
                 guard
                   let currentRow = self.row,
@@ -14891,6 +14959,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaProgressSpinner.stopAnimating()
       mediaProgressSizeLabel.isHidden = true
       updateMediaPlaceholderVisibility()
+      refreshViewOnceShineCover()
       return
     }
 
@@ -14979,18 +15048,32 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         row.messageId ?? row.key, row.messageType, sinceConfigureMs,
         mediaImageView.image != nil ? "Y" : "N", quality.rawValue)
     }
-    mediaImageView.image = image
-    mediaImageView.isHidden = false
     mediaPixelQuality = quality
-    // Drop the SF Symbol "photo" placeholder the moment real pixels land.
     if row.visualKind == .media || row.visualKind == .video || row.visualKind == .videoNote {
       mediaPrimaryIconView.isHidden = true
     }
-    // Natural size reporting only from full media — micro-thumbs are ~64px and would
-    // collapse the bubble aspect if used as layout truth.
     if quality == .full {
       reportNaturalMediaSizeIfNeeded(for: row, mediaURL: mediaURL, image: image)
     }
+    if row.viewOnce, shouldShowViewOnceShineCover(row) {
+      let key = row.messageId ?? row.key
+      chatViewOnceCacheSealed(image, key: key)
+      let concealed = chatViewOnceConcealedStill(from: image, cacheKey: key)
+      mediaImageView.image = concealed
+      mediaImageView.isHidden = false
+      if quality == .full,
+        let metrics = cachedLayoutMetrics,
+        metrics.isMediaLayout, usesFullBleedMediaLayout(row)
+      {
+        tailView.setImage(concealed)
+        tailView.isHidden = isGhostHidden || !row.shape.showTail
+      }
+      updateMediaPlaceholderVisibility()
+      refreshViewOnceShineCover()
+      return
+    }
+    mediaImageView.image = image
+    mediaImageView.isHidden = false
     updateMediaPlaceholderVisibility()
     if quality == .full,
       let metrics = cachedLayoutMetrics,
@@ -15467,6 +15550,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard mediaVideoHasAudio else { return }
     mediaVideoIsMuted.toggle()
     mediaVideoPlayer?.isMuted = mediaVideoIsMuted
+    configureInlineVideoAudioSession(muted: mediaVideoIsMuted)
     updateInlineVideoAudioIcon()
   }
 
@@ -15957,8 +16041,12 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   private func layoutMetaLabels(for row: ChatListRow) {
     let widths = bubbleMetaWidths(for: row)
-    var cursorX: CGFloat = 0.0
-    let baselineY = max(0.0, floor((bubbleMetaHeight - 12.0) * 0.5))
+    let usesViewOnceMetaPlate =
+      row.viewOnce && usesFullBleedMediaLayout(row) && row.visualKind != .videoNote
+    let metaInsetX: CGFloat = usesViewOnceMetaPlate ? 6.0 : 0.0
+    let metaInsetY: CGFloat = usesViewOnceMetaPlate ? 2.0 : 0.0
+    var cursorX = metaInsetX
+    let baselineY = metaInsetY + max(0.0, floor((bubbleMetaHeight - 12.0) * 0.5))
 
     func hide(_ label: UILabel) {
       label.isHidden = true
@@ -15967,7 +16055,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
     func place(_ label: UILabel, width: CGFloat, height: CGFloat = 12.0, centered: Bool = false) {
       label.isHidden = false
-      let y = centered ? floor((bubbleMetaHeight - height) * 0.5) : baselineY
+      let y =
+        centered ? metaInsetY + floor((bubbleMetaHeight - height) * 0.5) : baselineY
       label.frame = CGRect(x: cursorX, y: y, width: width, height: height)
       cursorX += width + bubbleMetaItemGap
     }
@@ -15999,7 +16088,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     place(timestampLabel, width: widths.timestamp)
-    let statusY = floor((bubbleMetaHeight - bubbleStatusSlotHeight) * 0.5)
+    let statusY =
+      metaInsetY + floor((bubbleMetaHeight - bubbleStatusSlotHeight) * 0.5)
     let statusFrame = pixelAlignedRect(
       CGRect(
         x: cursorX,

@@ -108,21 +108,7 @@ defmodule VibeWeb.Router do
     get "/user/:id/prekey-bundle", EncryptionController, :get_bundle
     post "/user/prekey-bundle", EncryptionController, :upload_bundle
 
-    # MLS KeyPackages — publish/claim one-time init keys so a peer device can
-    # be added to an MLS group (docs/secure-core-architecture.md §3-4). Claim
-    # is single-use: an atomic UPDATE marks a row claimed in the same
-    # statement that hands it out, so it never returns the same package twice.
-    # The literal "/count" route must stay above ":user_id" or it would match
-    # as a user id instead.
-    post "/mls/key-packages", MlsController, :publish
-    get "/mls/key-packages/count", MlsController, :count
-    get "/mls/key-packages/:user_id", MlsController, :claim
-    post "/mls/welcomes", MlsController, :post_welcome
-    get "/mls/welcomes", MlsController, :pending_welcomes
-    post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
-    get "/mls/chats/:chat_id/members", MlsController, :chat_members
-    # Whether the peer applied our Welcome — the signal that sealing is safe.
-    get "/mls/chats/:chat_id/welcome-status", MlsController, :welcome_status
+    # MLS KeyPackage/Welcome routes live in the strict-rate-limited scope below.
     # Group epoch keys — channels and groups past the MLS member cap.
     post "/group-keys", MlsController, :post_epoch_keys
     get "/group-keys", MlsController, :pending_epoch_keys
@@ -316,6 +302,17 @@ defmodule VibeWeb.Router do
   # High-cost / abuse-prone endpoints (require auth + strict rate limit)
   scope "/api", VibeWeb do
     pipe_through [:strict_rate_limited, :api_authenticated]
+
+    # MLS: a claim burns a one-time KeyPackage, so these sit under the strict bucket.
+    # "/count" must stay above ":user_id" or it would match as a user id.
+    post "/mls/key-packages", MlsController, :publish
+    get "/mls/key-packages/count", MlsController, :count
+    get "/mls/key-packages/:user_id", MlsController, :claim
+    post "/mls/welcomes", MlsController, :post_welcome
+    get "/mls/welcomes", MlsController, :pending_welcomes
+    post "/mls/welcomes/:id/ack", MlsController, :ack_welcome
+    get "/mls/chats/:chat_id/members", MlsController, :chat_members
+    get "/mls/chats/:chat_id/welcome-status", MlsController, :welcome_status
 
     # AI Agent
     post "/agent/chat", AgentController, :chat  # SSE streaming

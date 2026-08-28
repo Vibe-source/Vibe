@@ -161,6 +161,7 @@ enum VibeSecureEstablishment {
   static func establishDirectMessage(
     chatId: String,
     peerUserId: String,
+    myUserId: String? = nil,
     apiBase: URL,
     token: String?,
     completion: @escaping (Bool) -> Void
@@ -207,6 +208,17 @@ enum VibeSecureEstablishment {
         establishmentQueue.async {
           inFlight.remove(chatId)
           completion(ok)
+        }
+      }
+
+      if let me = myUserId?.uppercased(), !me.isEmpty {
+        let peer = peerUserId.uppercased()
+        if !peer.isEmpty, me > peer {
+          // Lower UUID creates the only group. Two groups for one DM are unreadable to each other.
+          drainPendingWelcomes(apiBase: apiBase, token: token, selfUserId: myUserId) { joined in
+            finish(joined.contains(chatId))
+          }
+          return
         }
       }
 
@@ -584,10 +596,8 @@ enum VibeSecureEstablishment {
           if VibeSecureSessions.shared.groupId(chatId: chatId) != nil {
             let senderUserId = entry["senderUserId"] as? String
             guard adoptIncoming(senderUserId: senderUserId, selfUserId: selfUserId) else {
-              // Our group wins the tie-break. Ack so the server stops
-              // redelivering; the peer is applying the same rule to the same
-              // pair of ids, so it is adopting ours right now.
-              ack(id: id, apiBase: apiBase, token: token)
+              // Our group wins. Do not ACK: an ACK is how the peer marks their
+              // Welcome delivered and starts sealing to a group we never joined.
               continue
             }
             // Deliberately no `discard` here. `joinSession` overwrites both the
@@ -708,14 +718,13 @@ enum VibeSecureEstablishment {
           VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
           return
         }
-        if incomingPending > 0 {
-          return
-        }
-        // Confirmed only when something was actually applied and nothing is
-        // still outstanding. `delivered > 0` alone is not enough for a group:
-        // one member joining does not mean the rest can read.
+        // incomingPending is often a competing group we refuse; don't let it
+        // block confirmation of a Welcome we sent that the peer already applied.
         if delivered > 0, pending == 0 {
           VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
+          return
+        }
+        if incomingPending > 0 {
           return
         }
 

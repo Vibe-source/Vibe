@@ -23,7 +23,7 @@ extension ChatAppearanceDraft {
       case "light": return false
       case "dark": return true
       default:
-        return UITraitCollection.current.userInterfaceStyle != .light
+        return ChatListAppearance.resolvedSystemStyle() == .dark
       }
     }()
     // Resolve via native preset path (no version key).
@@ -663,18 +663,15 @@ struct ChatThemesView: View {
         }
         .buttonStyle(.plain)
 
-        // Mode chips
-        HStack(spacing: 12) {
-          modeChip("Dark", selected: draft.mode == "dark") {
-            draft.mode = "dark"
-            if let id = draft.themeId { draft = draft.applying(themeId: id) }
-            ChatAppearanceDraftStore.save(draft)
-            AppAppearanceController.setOption(.dark)
+        HStack(spacing: 8) {
+          modeChip("Light", selected: draft.mode == "light") {
+            setMode(.light)
           }
-          modeChip("Night", selected: draft.mode == "system") {
-            draft.mode = "system"
-            ChatAppearanceDraftStore.save(draft)
-            AppAppearanceController.setOption(.system)
+          modeChip("Dark", selected: draft.mode == "dark") {
+            setMode(.dark)
+          }
+          modeChip("System", selected: draft.mode == "system") {
+            setMode(.system)
           }
         }
         .padding(.top, 4)
@@ -684,6 +681,11 @@ struct ChatThemesView: View {
     .background(palette.background.ignoresSafeArea())
     .navigationTitle("Chat Themes")
     .navigationBarTitleDisplayMode(.inline)
+  }
+
+  private func setMode(_ option: AppAppearanceOption) {
+    AppAppearanceController.setOption(option)
+    draft = ChatAppearanceDraftStore.current
   }
 
   private func modeChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View

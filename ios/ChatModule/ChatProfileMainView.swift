@@ -3,6 +3,137 @@ import UIKit
 import AVFoundation
 import PhotosUI
 
+import CryptoKit
+
+private struct ChatEncryptionVerifyView: View {
+  let peerUserId: String
+  private let pendingSignatureKey: Data?
+  private let pendingTransportKey: Data?
+  private let safetyNumber: String?
+  private let transportFingerprint: String?
+  private let identityChanged: Bool
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var acceptanceFailed = false
+
+  init(peerUserId: String) {
+    self.peerUserId = peerUserId
+    let pending = VibeSecureTrust.pendingChanges(userId: peerUserId)
+    pendingSignatureKey = pending.signatureKey
+    pendingTransportKey = pending.transportKey
+    identityChanged = pending.signatureKey != nil || pending.transportKey != nil
+
+    let signatureKey = pending.signatureKey ?? VibeSecureTrust.pinnedKey(userId: peerUserId)
+    let resolvedSafetyNumber: String?
+    if let mine = VibeSecureSessions.shared.mySignatureKey(), let signatureKey {
+      resolvedSafetyNumber = VibeSecureTrust.safetyNumber(myKey: mine, peerKey: signatureKey)
+    } else {
+      resolvedSafetyNumber = nil
+    }
+    safetyNumber = resolvedSafetyNumber
+
+    let transportKey =
+      pending.transportKey ?? VibeSecureTrust.pinnedTransportKey(userId: peerUserId)
+    if pending.transportKey != nil || resolvedSafetyNumber == nil {
+      transportFingerprint = Self.fingerprint(transportKey)
+    } else {
+      transportFingerprint = nil
+    }
+  }
+
+  var body: some View {
+    ScrollView {
+        VStack(alignment: .leading, spacing: 24) {
+          if identityChanged {
+            Label("Encryption identity changed", systemImage: "exclamationmark.triangle.fill")
+              .font(.headline)
+              .foregroundStyle(.orange)
+          }
+
+          Text(instructions)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+
+          if let safetyNumber {
+            verificationValue(
+              title: pendingSignatureKey == nil ? "Safety number" : "New safety number",
+              value: safetyNumber,
+              font: .system(.title3, design: .monospaced)
+            )
+          }
+
+          if let transportFingerprint {
+            verificationValue(
+              title: pendingTransportKey == nil
+                ? "Transport fingerprint" : "New transport fingerprint",
+              value: transportFingerprint,
+              font: .system(.footnote, design: .monospaced)
+            )
+          }
+
+          if safetyNumber == nil && transportFingerprint == nil {
+            Text("Encryption identity is not available yet.")
+              .foregroundStyle(.secondary)
+          }
+
+          if identityChanged {
+            Button("Accept Identity Change") {
+              let accepted = VibeSecureTrust.acceptPendingChanges(
+                userId: peerUserId,
+                expectedSignatureKey: pendingSignatureKey,
+                expectedTransportKey: pendingTransportKey
+              )
+              if accepted {
+                dismiss()
+              } else {
+                acceptanceFailed = true
+              }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+
+            if acceptanceFailed {
+              Text("The identity changed again. Close this screen and verify the latest code.")
+                .font(.footnote)
+                .foregroundStyle(.red)
+            }
+          }
+        }
+        .padding(24)
+      }
+    .navigationTitle("Verify Encryption")
+    .navigationBarTitleDisplayMode(.inline)
+  }
+
+  private var instructions: String {
+    if identityChanged {
+      return "Compare the replacement code with your contact over a trusted channel before accepting it."
+    }
+    return "Compare this code with your contact over a trusted channel. Matching codes verify the encryption identity."
+  }
+
+  private func verificationValue(title: String, value: String, font: Font) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text(title)
+        .font(.headline)
+      Text(value)
+        .font(font)
+        .tracking(1.2)
+        .textSelection(.enabled)
+    }
+  }
+
+  private static func fingerprint(_ key: Data?) -> String? {
+    guard let key else { return nil }
+    let hex = SHA256.hash(data: key).map { String(format: "%02X", $0) }.joined()
+    return stride(from: 0, to: hex.count, by: 4).map { offset in
+      let start = hex.index(hex.startIndex, offsetBy: offset)
+      let end = hex.index(start, offsetBy: min(4, hex.count - offset))
+      return String(hex[start..<end])
+    }.joined(separator: " ")
+  }
+}
+
 enum ChatProfileAppearanceMode: String, CaseIterable, Identifiable {
   case avatar
   case poster
@@ -758,6 +889,9 @@ private struct ChatProfileRow {
   let duration: CGFloat?
   let waveform: [CGFloat]?
   let thumbnailBase64: String?
+  let musicCoverURL: String?
+  let musicArtist: String?
+  let musicSource: String?
 
   static func parse(_ raw: [String: Any]) -> ChatProfileRow? {
     let message = raw["message"] as? [String: Any] ?? raw
@@ -767,7 +901,12 @@ private struct ChatProfileRow {
       ?? (raw["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
       ?? UUID().uuidString
     let type = ((message["type"] as? String) ?? (raw["type"] as? String) ?? "text").lowercased()
-    let text = (message["text"] as? String) ?? (raw["text"] as? String) ?? ""
+    let text =
+      (message["text"] as? String)
+      ?? (message["caption"] as? String)
+      ?? (raw["text"] as? String)
+      ?? (raw["caption"] as? String)
+      ?? ""
     let localMediaUrl =
       (message["localMediaUrl"] as? String)
       ?? (message["local_media_url"] as? String)
@@ -785,11 +924,19 @@ private struct ChatProfileRow {
       }
       return FileManager.default.fileExists(atPath: localPath)
     }()
+    let messageMediaUrl =
+      (message["mediaUrl"] as? String) ?? (message["media_url"] as? String)
+    let metadataMediaUrl =
+      (metadata?["mediaUrl"] as? String) ?? (metadata?["media_url"] as? String)
+    let messageAttachmentUrl =
+      (message["uri"] as? String) ?? (message["audioUrl"] as? String)
+    let metadataAttachmentUrl =
+      (metadata?["uri"] as? String) ?? (metadata?["audioUrl"] as? String)
     let remoteMediaUrl =
-      (message["mediaUrl"] as? String)
-      ?? (message["media_url"] as? String)
-      ?? (metadata?["mediaUrl"] as? String)
-      ?? (metadata?["media_url"] as? String)
+      messageMediaUrl
+      ?? metadataMediaUrl
+      ?? messageAttachmentUrl
+      ?? metadataAttachmentUrl
       ?? (raw["mediaUrl"] as? String)
     let mediaUrl = hasUsableLocalMedia ? resolvedLocalMediaUrl : remoteMediaUrl
     let mediaKey =
@@ -841,6 +988,7 @@ private struct ChatProfileRow {
 
     let duration: CGFloat? = {
       if let val = message["duration"] as? NSNumber { return CGFloat(val.floatValue) }
+      if let val = metadata?["duration"] as? NSNumber { return CGFloat(val.floatValue) }
       if let val = raw["duration"] as? NSNumber { return CGFloat(val.floatValue) }
       return nil
     }()
@@ -853,6 +1001,20 @@ private struct ChatProfileRow {
       ?? (metadata?["thumbnailBase64"] as? String)
       ?? (metadata?["thumbnail_base64"] as? String)
       ?? (raw["thumbnailBase64"] as? String)
+
+    let musicCoverURL =
+      (metadata?["cover"] as? String)
+      ?? (metadata?["coverUrl"] as? String)
+      ?? (metadata?["artworkUrl"] as? String)
+      ?? (message["cover"] as? String)
+    let musicArtist =
+      (metadata?["artist"] as? String)
+      ?? (metadata?["uploader"] as? String)
+      ?? (message["artist"] as? String)
+    let musicSource =
+      (metadata?["source"] as? String)
+      ?? (metadata?["platform"] as? String)
+      ?? (message["source"] as? String)
 
     return ChatProfileRow(
       messageId: messageId,
@@ -868,7 +1030,10 @@ private struct ChatProfileRow {
       isAgentMessage: isAgentMessage,
       duration: duration,
       waveform: waveform,
-      thumbnailBase64: thumbnailBase64
+      thumbnailBase64: thumbnailBase64,
+      musicCoverURL: musicCoverURL,
+      musicArtist: musicArtist,
+      musicSource: musicSource
     )
   }
 }
@@ -966,6 +1131,7 @@ private struct ChatProfileLinkItem {
 
 private enum ChatProfileTab: String, CaseIterable {
   case media
+  case music
   case voice
   case gifs
   case files
@@ -976,6 +1142,8 @@ private enum ChatProfileTab: String, CaseIterable {
     switch self {
     case .media:
       return "Media"
+    case .music:
+      return "Music"
     case .voice:
       return "Voice"
     case .gifs:
@@ -1155,6 +1323,15 @@ private struct ChatProfileSwiftUIContentItem: Identifiable {
   /// Normalized role key for grouping: owner | admin | member.
   var roleKey: String = "member"
   let payload: [String: Any]
+  var kind: String = ""
+  var mediaURL: String? = nil
+  var thumbnailBase64: String? = nil
+  var isVideo: Bool = false
+  var duration: CGFloat? = nil
+  var artist: String? = nil
+  var source: String? = nil
+  var coverURL: String? = nil
+  var detail: String = ""
 }
 
 private enum ChatProfileSwiftUIDestination: Hashable {
@@ -1162,6 +1339,7 @@ private enum ChatProfileSwiftUIDestination: Hashable {
   case bridgeHistory
   case bridgeSession(AgentBridgeHistorySession)
   case appearance
+  case encryption
   case tab(ChatProfileTab)
   case members
   /// Push (not sheet) — same navigation pattern as New Chat / contact search.
@@ -1183,6 +1361,8 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "bridge-session-\(session.id)"
     case .appearance:
       return "contact-photo-poster"
+    case .encryption:
+      return "verify-encryption"
     case .tab(let tab):
       return "shared-\(tab.rawValue)"
     case .members:
@@ -1201,6 +1381,24 @@ private enum ChatProfileSwiftUIDestination: Hashable {
       return "edit-room"
     }
   }
+}
+
+/// Interpolates a 0…1 progress so spacer height and media share one p (no clip-then-fill).
+private struct ChatProfileAnimatableProgress<Content: View>: View, Animatable {
+  var progress: CGFloat
+  var content: (CGFloat) -> Content
+
+  var animatableData: CGFloat {
+    get { progress }
+    set { progress = min(1, max(0, newValue)) }
+  }
+
+  init(progress: CGFloat, @ViewBuilder content: @escaping (CGFloat) -> Content) {
+    self.progress = progress
+    self.content = content
+  }
+
+  var body: some View { content(progress) }
 }
 
 private struct ChatProfileScrollOffsetPreferenceKey: PreferenceKey {
@@ -1262,6 +1460,7 @@ private struct ChatProfileSwiftUIRootView: View {
   // normal contact/group profile.
   var bridgeProvider: String = ""
   var bridgeChatId: String = ""
+  var chatId: String = ""
   var bridgeConnected: Bool = false
   var bridgePaired: Bool = false
   var bridgeDeviceLabel: String = ""
@@ -1296,15 +1495,22 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Discrete committed state: false = circle, true = full hero banner.
   /// Transitions only via spring — never half-driven by live offset.
   @State private var heroExpanded = false
+  @State private var heroImageAvailable = false
+
+  private var canExpandHero: Bool {
+    hasProfileImage && heroImageAvailable
+  }
   /// Soft 0…1 driven by `heroExpanded` (animates with the spring). ONE shared morph value.
   @State private var heroExpandProgress: CGFloat = 0
   /// Arms a single pull-down expand per overscroll (re-arms at rest).
   @State private var expandGestureArmed = true
   /// Ignore offset events right after a commit (prevents height/bounce re-entry).
   @State private var heroMorphInFlight = false
+  /// Seeds the banner once after the remote image becomes available.
+  @State private var didAutoExpandHero = false
+  /// Unused after we stopped snapping scroll at commit; kept at 0 so launch offset is a no-op.
+  @State private var morphCapturedPull: CGFloat = 0
   @State private var lastScrollOffsetSample: CGFloat = 0
-  /// Real ScrollViewReader handle — lets commit snap the ACTUAL scroll position to
-  /// top, not just the `localScrollOffset` state var (see setHeroExpanded).
   @State private var profileScrollProxy: ScrollViewProxy?
   private let profileScrollTopAnchorID = "profileScrollTop"
   /// Coarse gate so per-sample scroll logging doesn't spam.
@@ -1323,6 +1529,8 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var intelligenceLocal = AgentBridgeSelectionStore.selectedIntelligence()
   @State private var workModeLocal = AgentBridgeSelectionStore.selectedWorkMode()
   @State private var showAddMembersSheet = false
+  @State private var showUsernameQR = false
+  @State private var inlineEditDestination: ChatProfileSwiftUIDestination?
   /// Live channel profile from `GET /api/channel/:id` (admins, settings, actions).
   @State private var channelProfileCache: ChannelProfileService.Profile?
   @State private var channelSettingsLocal = ChannelProfileService.Settings.default
@@ -1330,7 +1538,9 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var isSharingChannelLink = false
 
   private var rowFill: Color {
-    Color(uiColor: posterGradientColors.0).opacity(isDark ? 0.055 : 0.11)
+    isDark
+      ? Color.white.opacity(0.06)
+      : Color.white.opacity(0.70)
   }
 
   /// Effective model pick for an agent: the in-view echo wins ("" = cleared), else the
@@ -1358,6 +1568,23 @@ private struct ChatProfileSwiftUIRootView: View {
 
   private var posterGradientColors: (UIColor, UIColor) {
     ChatProfileAppearancePalette.colors(for: appearanceSelection, mode: .poster)
+  }
+
+  /// Chat-theme accent — same colorize-by-theme result used by profile rows.
+  private var themeAccent: Color {
+    Color(uiColor: ChatListAppearance.current.accent)
+  }
+
+  private var pageColor: Color {
+    isDark ? Color.black : Color(uiColor: UIColor.systemGroupedBackground)
+  }
+
+  private var identityPrimary: Color {
+    isDark ? Color.white : Color.black.opacity(0.92)
+  }
+
+  private var identitySecondary: Color {
+    isDark ? Color.white.opacity(0.72) : Color.black.opacity(0.50)
   }
 
   private var posterImage: UIImage? {
@@ -1452,21 +1679,41 @@ private struct ChatProfileSwiftUIRootView: View {
   }
 
   /// Extra top air under nav for avatar + reflection.
-  private var avatarTopAir: CGFloat { 90 }
+  private var avatarTopAir: CGFloat { 76 }
 
-  private var avatarCircleSize: CGFloat { 120 }
+  private var avatarCircleSize: CGFloat { 104 }
 
   /// Spacer clears ONLY the pinned avatar (circle or hero). Name + actions live in scroll.
   private var avatarPinHeight: CGFloat {
-    Self.pixelRound(avatarTopAir + avatarCircleSize + 8)
+    Self.pixelRound(avatarTopAir + avatarCircleSize + 10)
   }
 
-  /// Spacer height = pure f(heroExpandProgress) — lockstep with media (linear shared p).
-  /// Drives the PINNED OVERLAY's own height only — animates smoothly with the spring.
+  /// Spacer height stays lockstep with the media for one shared morph value.
   private var scrollHeaderSpacer: CGFloat {
-    Self.pixelRound(
-      avatarPinHeight + (heroBaseHeight - avatarPinHeight) * heroExpandProgress
-    )
+    avatarPinHeight + (heroBaseHeight - avatarPinHeight) * effectiveHeroProgress
+  }
+
+  private var heroCollapseTravel: CGFloat {
+    Self.pixelRound(max(1, heroBaseHeight - avatarPinHeight - identityClusterLayoutHeight))
+  }
+
+  /// Home-style live collapse: the header consumes scroll one-for-one before rows continue.
+  private var liveHeroCollapseOffset: CGFloat {
+    guard canExpandHero, heroExpanded, !heroMorphInFlight else { return 0 }
+    return min(max(0, localScrollOffset), heroCollapseTravel)
+  }
+
+  private var postHeroCollapseScrollOffset: CGFloat {
+    max(0, localScrollOffset - liveHeroCollapseOffset)
+  }
+
+  /// A photo profile opens as a banner and scrubs continuously into the compact avatar.
+  private var effectiveHeroProgress: CGFloat {
+    if canExpandHero, !didAutoExpandHero { return 1 }
+    if canExpandHero, heroExpanded, !heroMorphInFlight {
+      return 1 - liveHeroCollapseOffset / heroCollapseTravel
+    }
+    return heroExpandProgress
   }
 
   /// Fixed page reflection (outside ScrollView).
@@ -1485,14 +1732,13 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// Fixed layout height reserved in the scroll content for the identity cluster.
   private var identityClusterLayoutHeight: CGFloat {
-    // name ~28 + subtitle ~14 + spacing + chips 56 + vertical padding
-    Self.pixelRound(28 + 3 + 16 + 8 + 56 + 18)
+    Self.pixelRound(28 + 3 + 15 + 10 + 52 + 6)
   }
 
   /// Natural top under the *collapsed* circle only — never driven by hero spacer.
   /// (Using scrollHeaderSpacer here shoved the floating cluster down during expand.)
   private var identityNaturalTopY: CGFloat {
-    Self.pixelRound(avatarPinHeight + 4)
+    Self.pixelRound(avatarPinHeight)
   }
 
   /// Pin stop under the status bar / island — keep tight so sticky name sits
@@ -1513,7 +1759,7 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// 0 free … 1 fully pinned. Tracks pin travel so name/actions scale with scroll.
   private var identityPinProgress: CGFloat {
-    let heroFade = max(0, 1 - heroExpandProgress / 0.15)
+    let heroFade = max(0, 1 - effectiveHeroProgress / 0.15)
     return min(1, max(0, identityClampedScroll / identityTravelDistance)) * heroFade
   }
 
@@ -1524,45 +1770,56 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// Sticky offset for the *in-scroll* collapsed identity: when it would pass
   /// under the nav, pin it. Zero while hero is expanded (identity lives on media).
+  /// Extra y while expand springs off an overscroll, so the band does not jump to rest first.
+  private func morphLaunchOffset(_ raw: CGFloat) -> CGFloat {
+    guard heroMorphInFlight, heroExpanded else { return 0 }
+    let p = min(1, max(0, raw))
+    return morphCapturedPull * (1 - p)
+  }
+
+  /// Travel that carries the single identity cluster from under the circle up onto
+  /// the hero bottom, plus the collapsed sticky pin (which only applies at p≈0).
+  private var identityClusterRideOffset: CGFloat {
+    identityRideOffset(effectiveHeroProgress)
+  }
+
+  private func identityRideOffset(_ raw: CGFloat) -> CGFloat {
+    let p = min(1, max(0, raw))
+    return -(identityClusterLayoutHeight + 16) * p
+      + collapsedIdentityStickyOffset * (1 - p)
+  }
+
+  private func heroSpacer(_ raw: CGFloat) -> CGFloat {
+    let p = min(1, max(0, raw))
+    return avatarPinHeight + (heroBaseHeight - avatarPinHeight) * p
+  }
+
   private var collapsedIdentityStickyOffset: CGFloat {
-    guard heroExpandProgress < 0.5 else { return 0 }
+    guard effectiveHeroProgress < 0.5 else { return 0 }
     // Content Y of identity top ≈ media band height; screen Y = that − scroll.
     let screenY = scrollHeaderSpacer - localScrollOffset
     return max(0, identityStickyTopY - screenY)
   }
 
   /// Soft avatar scroll blend — continuous via identityPinProgress (no cliff).
-  /// Scale + fade only; no blur on the image (the only blur anywhere is the
-  /// bottom-edge material band behind the name).
+  /// Scale + fade only; the join blur is a theme material overlay, not in the image.
   private var scrollAvatarScale: CGFloat {
-    1 - 0.04 * identityPinProgress
+    1 - 0.08 * identityPinProgress
   }
   private var scrollAvatarOpacity: CGFloat {
-    1 - 0.08 * identityPinProgress
+    1 - 0.34 * identityPinProgress
   }
 
   // Slightly underdamped ("soft") springs — a touch of settle instead of a hard,
   // critically-damped stop — collapse (hero->avatar) is faster than expand.
-  private static let heroExpandSpring = Animation.spring(response: 0.20, dampingFraction: 0.86)
-  private static let heroCollapseSpring = Animation.spring(response: 0.15, dampingFraction: 0.86)
+  private static let heroExpandSpring = Animation.spring(response: 0.32, dampingFraction: 0.90)
+  private static let heroCollapseSpring = Animation.spring(response: 0.12, dampingFraction: 0.95)
 
   var body: some View {
     NavigationStack(path: $navCoordinator.path) {
-      // Reflection under a single ScrollView that owns media + identity + rows.
+      // ONE scroll layer: media, identity and rows are all in the same ScrollView.
       ZStack(alignment: .top) {
-        Color.black.ignoresSafeArea()
-
-        ChatProfilePageReflection(
-          imageUri: hasProfileImage ? avatarUri : nil,
-          fallbackGlyph: avatarDisplayText,
-          fontStyleID: appearanceSelection.avatarFontStyleID,
-          height: pageReflectionHeight
-        )
-        .frame(maxWidth: .infinity)
-        .frame(height: pageReflectionHeight)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
-        .zIndex(0)
+        pageColor.ignoresSafeArea()
 
         // Media + rows are ONE scroll unit — the media band is the first scroll
         // element (see profileHeroScrollBand), so rows can never gap from the image
@@ -1579,38 +1836,45 @@ private struct ChatProfileSwiftUIRootView: View {
 
               offsetReader(heroHeight: scrollHeaderSpacer)
 
-              // Media (+ expanded name/actions on hero) — in the same scroll as rows.
-              profileHeroScrollBand
+              ChatProfileAnimatableProgress(
+                progress: canExpandHero ? effectiveHeroProgress : 0
+              ) { p in
+                VStack(spacing: 0) {
+                  profileHeroScrollBand(progress: p)
 
-              // Collapsed identity in document flow under the circle so name/actions
-              // scroll with the list (no floating overlay). Height → 0 as hero expands.
-              profileIdentityCluster(expand: 0, useCenter: true)
-                .frame(height: identityClusterLayoutHeight * (1 - heroExpandProgress))
-                .opacity(Double(max(0, 1 - heroExpandProgress)))
-                .scaleEffect(identityClusterScale, anchor: .top)
-                .offset(y: collapsedIdentityStickyOffset)
-                .clipped()
-                .allowsHitTesting(heroExpandProgress < 0.5)
+                  profileIdentityCluster(
+                    expand: p,
+                    useCenter: p < 0.5
+                  )
+                  .frame(height: identityClusterLayoutHeight * (1 - p), alignment: .top)
+                  .offset(y: identityRideOffset(p))
+                  .zIndex(1)
+                }
+              }
+              .offset(y: liveHeroCollapseOffset)
+              .padding(.bottom, liveHeroCollapseOffset)
+              .zIndex(2)
 
               VStack(spacing: 18) {
                 profileInfoSection
+                if bridgeProvider.isEmpty && !isGroupOrChannel {
+                  encryptionSection
+                }
                 if !bridgeProvider.isEmpty {
                   defaultViewSection
                 }
-                // Photo/poster: DM contacts only (not groups/channels).
-                if bridgeProvider.isEmpty, !isGroupOrChannel {
-                  appearanceSection
-                }
-                // Shared media tabs are DM-only (not group/channel).
                 if !isGroupOrChannel {
                   sharedContentSection
-                  contactActionsSection
-                  emergencySection
+                  if bridgeProvider.isEmpty {
+                    contactActionsSection
+                  }
                 }
-                dangerSection
+                if !isGroupOrChannel {
+                  dangerSection
+                }
               }
               .padding(.horizontal, 22)
-              .padding(.top, 4)
+              .padding(.top, 12)
               .padding(.bottom, 66)
             }
           }
@@ -1621,12 +1885,20 @@ private struct ChatProfileSwiftUIRootView: View {
           // the finger (or bounce-back physics) keeps moving the REAL offset for the
           // whole 0.28s spring while we've frozen the state var at 0, and it all
           // catches up in one jump when the freeze lifts (the "noisy soft jump").
-          .scrollDisabled(heroMorphInFlight)
           .onAppear { profileScrollProxy = scrollProxy }
         }
         .ignoresSafeArea(edges: .top)
         .background(Color.clear)
         .zIndex(2)
+
+      }
+      .overlay {
+        if let inlineEditDestination {
+          destinationView(for: inlineEditDestination)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(pageColor.ignoresSafeArea())
+            .transition(.opacity)
+        }
       }
       .background {
         GeometryReader { geo in
@@ -1641,18 +1913,33 @@ private struct ChatProfileSwiftUIRootView: View {
       .navigationBarBackButtonHidden(true)
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
-          Button {
-            onAction("headerBack")
-          } label: {
-            Image(systemName: "chevron.left")
-              .font(.system(size: 17, weight: .semibold))
+          if (inlineEditDestination == nil || !navCoordinator.path.isEmpty),
+            navCoordinator.path.last != .editRoom,
+            navCoordinator.path.last != .channelSettings
+          {
+            Button {
+              if navCoordinator.path.isEmpty {
+                NSLog("[ProfileNavigation] close-root chatId=%@", bridgeChatId)
+                onAction("headerBack")
+              } else {
+                NSLog("[ProfileNavigation] pop-inner depth=%d", navCoordinator.path.count)
+                navCoordinator.path.removeLast()
+              }
+            } label: {
+              Image(systemName: "chevron.left")
+                .font(.system(size: 17, weight: .semibold))
+            }
           }
         }
         // Group/channel: Edit only (no ⋯ menu). DM/default: no trailing chrome.
         ToolbarItem(placement: .topBarTrailing) {
-          if isGroupOrChannel, canManageGroupMembers {
-            Button(isChannel ? "Edit" : "Edit") {
-              navCoordinator.path.append(.editRoom)
+          if navCoordinator.path.isEmpty, inlineEditDestination == nil,
+            isGroupOrChannel, canManageGroupMembers
+          {
+            Button("Edit") {
+              withAnimation(.easeOut(duration: 0.16)) {
+                inlineEditDestination = isChannel ? .channelSettings : .editRoom
+              }
             }
             .font(.system(size: 17, weight: .semibold))
           }
@@ -1665,7 +1952,8 @@ private struct ChatProfileSwiftUIRootView: View {
       // push. Zoom transitions read as a morph/"pop" and also SIGBUS'd on members.
       .navigationDestination(for: ChatProfileSwiftUIDestination.self) { destination in
         switch destination {
-        case .members,
+        case .encryption,
+          .members,
           .bridgeSession,
           .channelAdmins,
           .channelSubscribers,
@@ -1681,17 +1969,22 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     }
-    .background(Color.black)
+    .background(pageColor)
     .onAppear {
       if selectedRepoNameLocal == nil {
         selectedRepoNameLocal = selectedRepositoryName
       }
+      autoExpandHeroIfPhoto()
     }
+    .onChange(of: canExpandHero) { _, _ in autoExpandHeroIfPhoto() }
     .onChange(of: selectedRepositoryName) { _, next in
       selectedRepoNameLocal = next
     }
     .onChange(of: navCoordinator.path.isEmpty) { _, isEmpty in
-      onNavigationActiveChanged(!isEmpty)
+      onNavigationActiveChanged(!isEmpty || inlineEditDestination != nil)
+    }
+    .onChange(of: inlineEditDestination) { _, destination in
+      onNavigationActiveChanged(destination != nil || !navCoordinator.path.isEmpty)
     }
     .task(id: isChannel ? bridgeChatId : "") {
       guard isChannel, !bridgeChatId.isEmpty else { return }
@@ -1699,6 +1992,9 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     .sheet(isPresented: $showAddMembersSheet) {
       addMembersSheetContent
+    }
+    .sheet(isPresented: $showUsernameQR) {
+      usernameQRSheet
     }
   }
 
@@ -1779,67 +2075,76 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  /// Commit circle ↔ hero. Settings-style: freeze offset, animate ONE progress for spacer+media.
-  /// Fallback-only avatars stay a fixed circle (no morph) so they match Home/chat tiles.
+  /// Photo profiles land already banner-sized — no spring on open, and the fallback
+  /// glyph never gets one.
+  private func autoExpandHeroIfPhoto() {
+    guard canExpandHero, !didAutoExpandHero else { return }
+    didAutoExpandHero = true
+    var t = Transaction()
+    t.disablesAnimations = true
+    withTransaction(t) {
+      heroExpanded = true
+      heroExpandProgress = 1
+      localScrollOffset = 0
+      lastScrollOffsetSample = 0
+      expandGestureArmed = false
+      morphCapturedPull = 0
+    }
+  }
+
+  /// Commit circle ↔ hero. Freezes the offset, then animates ONE progress for spacer+media.
+  /// Fallback-only avatars stay a fixed circle so they match Home/chat tiles.
   private func setHeroExpanded(_ expanded: Bool) {
-    guard hasProfileImage else { return }
-    guard heroExpanded != expanded, !heroMorphInFlight else { return }
+    guard canExpandHero else { return }
+    if expanded {
+      guard !heroExpanded, !heroMorphInFlight else { return }
+    } else if !heroExpanded, !heroMorphInFlight {
+      return
+    }
     NSLog(
       "[ProfileHeroMorph] commit expanded=%d fromP=%.3f localOffset=%.1f",
       expanded ? 1 : 0, Double(heroExpandProgress), Double(localScrollOffset)
     )
-    // scrollDisabled(heroMorphInFlight) flips on this SAME turn (SwiftUI applies it
-    // before the next render pass), which is what actually stops the real ScrollView
-    // from drifting during the spring — cancels an in-flight pan the same way
-    // UIScrollView.panGestureRecognizer.isEnabled=false does in the Settings header.
-    heroMorphInFlight = true
-    // Freeze scroll coupling — kill rubber-band before height morph.
-    // Expanding from overscroll (-60) with live offset caused list+image shift.
-    var freeze = Transaction()
-    freeze.disablesAnimations = true
-    withTransaction(freeze) {
-      if expanded {
-        localScrollOffset = 0
-        // Snap the REAL scroll position to match — without this the state var says
-        // 0 but the actual UIScrollView underneath is still wherever the pull left
-        // it, and that gap surfaces as one big jump when the freeze lifts.
-        profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
-      } else {
-        localScrollOffset = max(0, min(localScrollOffset, identityTravelDistance))
-      }
-    }
-    if expanded {
-      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-    } else {
-      UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
-    }
-    // Animate ONLY the shared progress. Spacer + morph both read heroExpandProgress.
+    // Do not scrollTo or disable the pan — both snap content to rest, then the
+    // spring runs, and the cancelled gesture needs a new finger ("re-pinch").
+    morphCapturedPull = expanded ? min(0, localScrollOffset) : 0
+    expandGestureArmed = !expanded
     heroExpanded = expanded
     let target: CGFloat = expanded ? 1 : 0
-    let spring = expanded ? Self.heroExpandSpring : Self.heroCollapseSpring
-    // Completion-driven unlock (iOS 17+) instead of a hardcoded asyncAfter guess —
-    // that fixed 0.28s delay was longer than the actual spring settle time on
-    // collapse, reading as "delay to come back to avatar."
-    withAnimation(spring, completionCriteria: .logicallyComplete) {
-      heroExpandProgress = target
-    } completion: { [self] in
-      var t = Transaction()
-      t.disablesAnimations = true
-      withTransaction(t) {
-        heroExpandProgress = target
-        if expanded {
-          localScrollOffset = 0
-          profileScrollProxy?.scrollTo(profileScrollTopAnchorID, anchor: .top)
-        }
+    if expanded {
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      heroMorphInFlight = true
+      withAnimation(Self.heroExpandSpring, completionCriteria: .logicallyComplete) {
+        heroExpandProgress = 1
+      } completion: { [self] in
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) { heroExpandProgress = 1 }
+        expandGestureArmed = false
+        morphCapturedPull = 0
+        heroMorphInFlight = false
+        NSLog(
+          "[ProfileHeroMorph] settle expanded=1 p=%.3f localOffset=%.1f",
+          Double(heroExpandProgress), Double(localScrollOffset)
+        )
       }
-      heroMorphInFlight = false
-      if !expanded {
+    } else {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.7)
+      heroMorphInFlight = true
+      withAnimation(Self.heroCollapseSpring, completionCriteria: .logicallyComplete) {
+        heroExpandProgress = 0
+      } completion: { [self] in
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) { heroExpandProgress = 0 }
         expandGestureArmed = true
+        morphCapturedPull = 0
+        heroMorphInFlight = false
+        NSLog(
+          "[ProfileHeroMorph] settle expanded=0 p=%.3f localOffset=%.1f",
+          Double(heroExpandProgress), Double(localScrollOffset)
+        )
       }
-      NSLog(
-        "[ProfileHeroMorph] settle expanded=%d p=%.3f localOffset=%.1f",
-        expanded ? 1 : 0, Double(heroExpandProgress), Double(localScrollOffset)
-      )
     }
   }
 
@@ -1847,85 +2152,73 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Expanded: name/actions sit on the hero bottom (still in this band, not a
   /// separate floating layer). Collapsed: media only; identity is the next
   /// sibling in the VStack. Morph/hero stretch unchanged.
-  private var profileHeroScrollBand: some View {
-    let p = hasProfileImage ? heroExpandProgress : 0
+  private func profileHeroScrollBand(progress p: CGFloat) -> some View {
+    let spacer = heroSpacer(p)
     return GeometryReader { g in
       let minY = g.frame(in: .named("profile-scroll")).minY
-      let pull = heroExpanded ? max(0, Self.pixelRound(minY)) : 0
-      let away = heroExpanded ? max(0, -minY) : 0
-      ZStack(alignment: .bottom) {
-        ChatProfileAvatarMorphView(
-          text: avatarDisplayText,
-          fontStyleID: appearanceSelection.avatarFontStyleID,
-          imageUri: hasProfileImage ? avatarUri : nil,
-          fallbackColors: avatarGradientColors,
-          morphEnabled: hasProfileImage,
-          width: g.size.width,
-          collapsedHeight: avatarPinHeight,
-          heroBaseHeight: heroBaseHeight,
-          expand: p,
-          overscrollStretch: hasProfileImage ? pull : 0,
-          topAir: avatarTopAir,
-          scrollScale: scrollAvatarScale,
-          scrollOpacity: scrollAvatarOpacity,
-          parallax: hasProfileImage ? Self.pixelRound(away * 0.5) : 0
-        )
-        .frame(
-          width: g.size.width,
-          height: scrollHeaderSpacer + (hasProfileImage ? pull : 0),
-          alignment: .top
-        )
-        .overlay(alignment: .bottom) {
-          if hasProfileImage {
-            heroBottomFalloff(height: scrollHeaderSpacer + pull)
+      // Pin to the screen top and grow by the LIVE overscroll, scaled by p. A frozen
+      // capture decouples the instant the finger keeps pulling — that was the top gap.
+      let pull = canExpandHero ? max(0, Self.pixelRound(minY)) * p : 0
+      let away = canExpandHero ? max(0, -minY) * p : 0
+      let stretch = pull
+      ChatProfileAvatarMorphView(
+        text: avatarDisplayText,
+        fontStyleID: appearanceSelection.avatarFontStyleID,
+        imageUri: hasProfileImage ? avatarUri : nil,
+        fallbackColors: avatarGradientColors,
+        morphEnabled: canExpandHero,
+        width: g.size.width,
+        collapsedHeight: avatarPinHeight,
+        heroBaseHeight: heroBaseHeight,
+        expand: p,
+        overscrollStretch: stretch,
+        topAir: avatarTopAir,
+        scrollScale: scrollAvatarScale,
+        scrollOpacity: scrollAvatarOpacity,
+        parallax: canExpandHero ? Self.pixelRound(away * 0.5) : 0,
+        onImageAvailabilityChanged: { available in
+          guard heroImageAvailable != available else { return }
+          heroImageAvailable = available
+          if !available {
+            heroExpanded = false
+            heroExpandProgress = 0
+            didAutoExpandHero = false
           }
         }
-        .offset(y: hasProfileImage ? -pull : 0)
-
-        // Expanded identity lives ON the hero (same scroll unit as media).
-        if p > 0.01 {
-          profileIdentityCluster(expand: p, useCenter: p < 0.5)
-            .padding(.bottom, 16)
+      )
+      .blur(radius: 3.5 * identityPinProgress)
+      .frame(
+        width: g.size.width,
+        height: spacer + stretch,
+        alignment: .top
+      )
+      .overlay(alignment: .bottom) {
+        if canExpandHero, p > 0.01 {
+          heroJoinFade(width: g.size.width, height: 18)
             .opacity(Double(p))
-            .allowsHitTesting(p > 0.45)
-            .offset(y: hasProfileImage ? -pull : 0)
         }
       }
-      .frame(width: g.size.width, height: scrollHeaderSpacer + (hasProfileImage ? pull : 0), alignment: .top)
+      .offset(y: -pull)
+      .frame(width: g.size.width, height: spacer + stretch, alignment: .top)
       .contentShape(Rectangle())
       .onTapGesture(count: 2) {
-        guard hasProfileImage else { return }
+        guard canExpandHero else { return }
         if abs(localScrollOffset) < 40, !heroMorphInFlight {
           setHeroExpanded(!heroExpanded)
         }
       }
     }
-    .frame(height: scrollHeaderSpacer)
+    .frame(height: spacer)
   }
 
-  /// Frosted-glass falloff at the hero's bottom edge, behind the name — the ONLY
-  /// blur anywhere, and it lives inside the image (rides + clips with the band
-  /// because it's the band's own overlay).
+  /// Pure blur band at the bottom edge — no gradient color overlay.
   @ViewBuilder
-  private func heroBottomFalloff(height: CGFloat) -> some View {
-    Rectangle()
-      .fill(.ultraThinMaterial)
-      .environment(\.colorScheme, .dark)
-      .frame(height: max(1, height))
-      .mask(
-        LinearGradient(
-          stops: [
-            .init(color: .clear, location: 0.0),
-            .init(color: .black.opacity(0.5), location: 0.6),
-            .init(color: .black, location: 1.0),
-          ],
-          startPoint: .top,
-          endPoint: .bottom
-        )
-      )
-      .opacity(Double(heroExpandProgress))
-      .allowsHitTesting(false)
+  private func heroJoinFade(width: CGFloat, height: CGFloat) -> some View {
+    EmptyView()
   }
+
+
+
 
 
   private func offsetReader(heroHeight: CGFloat) -> some View {
@@ -1938,11 +2231,6 @@ private struct ChatProfileSwiftUIRootView: View {
     }
     .frame(height: 0)
     .onPreferenceChange(ChatProfileScrollOffsetPreferenceKey.self) { value in
-      // During hero morph, ignore ALL scroll samples (stable freeze) — no live p.
-      guard !heroMorphInFlight else { return }
-
-      // Pixel-quantize offset to kill sub-pixel scroll thrash, but keep samples
-      // dense enough that name scale tracks the finger in real time.
       let scale = UIScreen.main.scale
       let nextValue = (value * scale).rounded() / scale
       guard abs(localScrollOffset - nextValue) >= 0.25 else { return }
@@ -1957,21 +2245,29 @@ private struct ChatProfileSwiftUIRootView: View {
       if abs(nextValue - lastProfileSampleLogOffset) > 8 {
         lastProfileSampleLogOffset = nextValue
         NSLog(
-          "[ProfileHeroMorph] sample offset=%.1f p=%.3f spacer=%.1f expanded=%d inFlight=%d",
+          "[ProfileHeroMorph] sample offset=%.1f p=%.3f spacer=%.1f expanded=%d inFlight=%d armed=%d",
           Double(nextValue), Double(heroExpandProgress), Double(scrollHeaderSpacer),
-          heroExpanded ? 1 : 0, heroMorphInFlight ? 1 : 0
+          heroExpanded ? 1 : 0, heroMorphInFlight ? 1 : 0, expandGestureArmed ? 1 : 0
         )
       }
 
-      // Pull-to-expand only when a real photo exists (fallback never morphs).
-      if hasProfileImage, !heroExpanded {
-        if expandGestureArmed, nextValue < -60 {
-          expandGestureArmed = false
-          NSLog("[ProfileHeroMorph] pull-threshold offset=%.1f", Double(nextValue))
-          setHeroExpanded(true)
-        }
-        if nextValue >= 0 {
-          expandGestureArmed = true
+      if canExpandHero {
+        if heroExpanded || heroMorphInFlight && heroExpandProgress > 0.15 {
+          if nextValue > 12 {
+            NSLog("[ProfileHeroMorph] compact-threshold offset=%.1f", Double(nextValue))
+            setHeroExpanded(false)
+          }
+        } else if !heroMorphInFlight {
+          if nextValue > -24 {
+            expandGestureArmed = true
+          }
+          if expandGestureArmed, nextValue < -60 {
+            expandGestureArmed = false
+            NSLog("[ProfileHeroMorph] pull-threshold offset=%.1f", Double(nextValue))
+            setHeroExpanded(true)
+          } else if nextValue < -60 {
+            NSLog("[ProfileHeroMorph] pull-ignored unarmed offset=%.1f", Double(nextValue))
+          }
         }
       }
 
@@ -1987,38 +2283,56 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Name + actions body. Used in-scroll: under the circle when collapsed, on
   /// the hero when expanded. Not a separate overlay layer outside the ScrollView.
   @ViewBuilder
-  private func profileIdentityCluster(expand: CGFloat, useCenter: Bool) -> some View {
+  private func profileIdentityCluster(expand: CGFloat, useCenter _: Bool) -> some View {
     let p = min(1, max(0, expand))
     let inset: CGFloat = 16
-    let nameAlign: Alignment = useCenter ? .center : .leading
-    let stackAlign: HorizontalAlignment = useCenter ? .center : .leading
+    let contentWidth = max(1, UIScreen.main.bounds.width - inset * 2)
+    let handleText: String? = {
+      if let groupHeaderSubtitle { return groupHeaderSubtitle }
+      let trimmed = username.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }()
+    let titleFont = UIFont.systemFont(ofSize: 28, weight: .bold)
+    let subtitleFont = UIFont.systemFont(ofSize: 13, weight: .light)
+    let titleWidth = min(
+      contentWidth,
+      (profileName as NSString).size(withAttributes: [.font: titleFont]).width
+        + (showsGoldTier ? 24 : 0)
+    )
+    let subtitleWidth = handleText.map {
+      min(contentWidth, ($0 as NSString).size(withAttributes: [.font: subtitleFont]).width)
+    } ?? 0
+    let titleCenterOffset = max(0, (contentWidth - titleWidth) * 0.5)
+    let subtitleCenterOffset = max(0, (contentWidth - subtitleWidth) * 0.5)
 
-    VStack(spacing: 8) {
-      VStack(alignment: stackAlign, spacing: 3) {
+    VStack(spacing: 10) {
+      VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 8) {
           Text(profileName)
             .font(.system(size: 28, weight: .bold))
-            .foregroundStyle(.white)
+            .foregroundStyle(identityPrimary)
             .lineLimit(1)
             .minimumScaleFactor(0.72)
-            .multilineTextAlignment(useCenter ? .center : .leading)
+            .multilineTextAlignment(.leading)
           if showsGoldTier {
             ChatProfileSwiftUITierBadge(label: "Gold")
           }
         }
+        .offset(x: titleCenterOffset * (1 - p))
 
-        if let groupHeaderSubtitle {
-          Text(groupHeaderSubtitle)
-            .font(.system(size: 14, weight: .regular))
-            .foregroundStyle(.white.opacity(0.72))
-            .lineLimit(1)
-            .multilineTextAlignment(useCenter ? .center : .leading)
-        }
+        Text(handleText ?? "")
+          .font(.system(size: 13, weight: .light))
+          .foregroundStyle(identitySecondary)
+          .lineLimit(1)
+          .multilineTextAlignment(.leading)
+          .frame(height: 15, alignment: .leading)
+          .opacity(handleText == nil ? 0 : 1)
+          .offset(x: subtitleCenterOffset * (1 - p))
       }
-      .frame(maxWidth: .infinity, alignment: nameAlign)
+      .frame(maxWidth: .infinity, alignment: .leading)
       .padding(.horizontal, inset)
 
-      actionRow(expand: p)
+      actionRow
     }
     .frame(maxWidth: .infinity, alignment: .top)
   }
@@ -2052,69 +2366,141 @@ private struct ChatProfileSwiftUIRootView: View {
     selectedRepoNameLocal = repo.name
   }
 
-  /// ONE always-mounted row. All chip geometry lerps with shared expand p.
+  /// ONE always-mounted pill row — identical geometry collapsed or expanded, so the
+  /// morph never reshapes it and there is never a second copy.
   @ViewBuilder
-  private func actionRow(expand: CGFloat) -> some View {
-    let p = min(1, max(0, expand))
-    let glassFill = Color.white.opacity(isDark ? 0.14 : 0.18)
-    // Fixed design width so we don't depend on GeometryReader mid-spring.
+  private var actionRow: some View {
+    let chipInk = isDark ? Color.white.opacity(0.84) : Color.black.opacity(0.76)
     let rowWidth = UIScreen.main.bounds.width - 16
-    let count: CGFloat = 4
-    let circleSide: CGFloat = 56
-    let circleSpacing: CGFloat = 14
-    let pillSpacing: CGFloat = 8
-    let pillHPad: CGFloat = 10
-    let pillHeight: CGFloat = 70
-    let spacing = circleSpacing + (pillSpacing - circleSpacing) * p
-    let circlesWidth = count * circleSide + (count - 1) * circleSpacing
-    let centerPad = max(0, (rowWidth - circlesWidth) * 0.5)
-    let hPad = centerPad + (pillHPad - centerPad) * p
-    let pillWidth = max(
-      circleSide,
-      (rowWidth - 2 * pillHPad - (count - 1) * pillSpacing) / count
-    )
-    let chipW = circleSide + (pillWidth - circleSide) * p
-    let chipH = circleSide + (pillHeight - circleSide) * p
+    let count: CGFloat = isGroupOrChannel ? 3 : 4
+    let spacing: CGFloat = 8
+    let hPad: CGFloat = 10
+    let chipH: CGFloat = 52
+    let chipW = (rowWidth - 2 * hPad - (count - 1) * spacing) / count
 
     HStack(spacing: spacing) {
-      ChatProfileSwiftUIActionButton(
-        title: isChatMuted ? "unmute" : "mute",
-        systemImage: isChatMuted ? "bell" : "bell.slash",
-        fill: glassFill,
-        expand: p,
-        chipWidth: chipW,
-        chipHeight: chipH
-      ) { onAction("muteToggle") }
+      if isGroupOrChannel {
+        ChatProfileSwiftUIActionButton(
+          title: isChatMuted ? "unmute" : "mute",
+          systemImage: isChatMuted ? "bell" : "bell.slash",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("muteToggle") }
 
-      ChatProfileSwiftUIActionButton(
-        title: "search",
-        systemImage: "magnifyingglass",
-        fill: glassFill,
-        expand: p,
-        chipWidth: chipW,
-        chipHeight: chipH
-      ) { onAction("search") }
+        ChatProfileSwiftUIActionButton(
+          title: "search",
+          systemImage: "magnifyingglass",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("search") }
 
-      ChatProfileSwiftUIActionButton(
-        title: "call",
-        systemImage: "phone",
-        fill: glassFill,
-        expand: p,
-        chipWidth: chipW,
-        chipHeight: chipH
-      ) { onAction("audio") }
+        Menu {
+          Button("Report", systemImage: "exclamationmark.circle") {
+            onAction("reportRoom")
+          }
+          Button("Clear Messages", systemImage: "bubble.left.and.exclamationmark.bubble.right") {
+            onAction("clearChat")
+          }
+          Divider()
+          if isGroupOwner {
+            Button(
+              isChannel ? "Delete Channel" : "Delete Group",
+              systemImage: "trash",
+              role: .destructive
+            ) { onAction("deleteGroup") }
+          } else {
+            Button(
+              isChannel ? "Leave Channel" : "Leave Group",
+              systemImage: "rectangle.portrait.and.arrow.right",
+              role: .destructive
+            ) { onAction("leaveGroup") }
+          }
+        } label: {
+          VStack(spacing: 1) {
+            Image(systemName: "ellipsis")
+              .font(.system(size: 18, weight: .semibold))
+            Text("more")
+              .font(.system(size: 10, weight: .medium))
+          }
+          .foregroundStyle(chipInk)
+          .frame(width: chipW, height: chipH)
+          .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+              .fill(.ultraThinMaterial)
+              .environment(\.colorScheme, isDark ? .dark : .light)
+          }
+          .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+              .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+          }
+        }
+        .buttonStyle(.plain)
+      } else {
+        ChatProfileSwiftUIActionButton(
+          title: "call",
+          systemImage: "phone",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("audio") }
 
-      ChatProfileSwiftUIActionButton(
-        title: "video",
-        systemImage: "video",
-        fill: glassFill,
-        expand: p,
-        chipWidth: chipW,
-        chipHeight: chipH
-      ) { onAction("video") }
+        ChatProfileSwiftUIActionButton(
+          title: "video",
+          systemImage: "video",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("video") }
+
+        ChatProfileSwiftUIActionButton(
+          title: "search",
+          systemImage: "magnifyingglass",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("search") }
+
+        ChatProfileSwiftUIActionButton(
+          title: isChatMuted ? "unmute" : "mute",
+          systemImage: isChatMuted ? "bell" : "bell.slash",
+          fill: .clear,
+          ink: chipInk,
+          isDark: isDark,
+          chipWidth: chipW,
+          chipHeight: chipH
+        ) { onAction("muteToggle") }
+      }
     }
     .padding(.horizontal, hPad)
     .frame(width: rowWidth, height: chipH)
+  }
+
+  private var encryptionSection: some View {
+    ChatProfileSwiftUISection(fill: rowFill) {
+      Button { navCoordinator.path.append(.encryption) } label: {
+        ChatProfileSwiftUIRow(
+          title: "Verify encryption",
+          subtitle: "Safety number and identity key",
+          trailingSystemImage: "lock.shield",
+          showsChevron: true,
+          separatorColor: separatorColor,
+          isLast: true
+        )
+      }
+      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+    }
   }
 
   @ViewBuilder
@@ -2154,16 +2540,45 @@ private struct ChatProfileSwiftUIRootView: View {
     } else if !username.isEmpty || !note.isEmpty {
       ChatProfileSwiftUISection(fill: rowFill) {
         if !username.isEmpty {
-          ChatProfileSwiftUIRow(
-            title: "username",
-            subtitle: username,
-            trailingSystemImage: "doc.on.doc",
-            showsChevron: false,
-            separatorColor: separatorColor,
-            isLast: note.isEmpty
-          )
-          .onTapGesture {
-            onCopyUsername()
+          HStack(spacing: 0) {
+            Button {
+              onCopyUsername()
+            } label: {
+              VStack(alignment: .leading, spacing: 4) {
+                Text("username")
+                  .font(.system(size: 15, weight: .regular))
+                  .foregroundStyle(.primary)
+                Text(username)
+                  .font(.system(size: 17, weight: .regular))
+                  .foregroundStyle(themeAccent)
+                  .lineLimit(1)
+              }
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(.leading, 22)
+              .padding(.vertical, 13)
+              .contentShape(Rectangle())
+            }
+            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+            Button {
+              showUsernameQR = true
+            } label: {
+              Image(systemName: "qrcode")
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(themeAccent)
+                .frame(width: 58, height: 58)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+            .accessibilityLabel("Show username QR code")
+          }
+          .overlay(alignment: .bottom) {
+            if !note.isEmpty {
+              Rectangle()
+                .fill(separatorColor)
+                .frame(height: 1 / UIScreen.main.scale)
+                .padding(.leading, 22)
+            }
           }
         }
 
@@ -2186,46 +2601,71 @@ private struct ChatProfileSwiftUIRootView: View {
   private var groupTopicSection: some View {
     if isChannel {
       channelProfileSections
-    } else {
-      let hasEdit = canManageGroupMembers
-      let hasMembers = showsMemberList
-      if hasEdit || hasMembers {
-        VStack(alignment: .leading, spacing: 8) {
-          profileSectionHeader("Group")
-          ChatProfileSwiftUISection(fill: rowFill) {
-            if hasEdit {
-              Button {
-                navCoordinator.path.append(.editRoom)
-              } label: {
-                ChatProfileSwiftUIRow(
-                  title: "Edit group",
-                  subtitle: "Name, photo, description",
-                  trailingSystemImage: nil,
-                  showsChevron: true,
-                  separatorColor: separatorColor,
-                  isLast: !hasMembers
-                )
-              }
-              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-            }
+    } else if showsMemberList {
+      let memberItems = swiftUIMemberItems()
+      let previewItems = Array(memberItems.prefix(5))
+      let palette = AppThemePalette.resolve(for: isDark ? .dark : .light)
 
-            if hasMembers {
-              Button {
-                onMembersScreenAppeared?()
-                navCoordinator.path.append(.members)
-              } label: {
-                ChatProfileSwiftUIRow(
-                  title: "Members",
-                  subtitle: groupMembersSubtitle,
-                  trailingSystemImage: nil,
-                  showsChevron: true,
-                  separatorColor: separatorColor,
-                  isLast: true
-                )
-              }
-              .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      ChatProfileSwiftUISection(fill: rowFill) {
+        if canManageGroupMembers {
+          Button {
+            showAddMembersSheet = true
+          } label: {
+            HStack(spacing: 12) {
+              Image(systemName: "person.badge.plus")
+                .font(.system(size: 20, weight: .regular))
+                .foregroundStyle(themeAccent)
+                .frame(width: 42, height: 42)
+              Text("Add Members")
+                .font(.system(size: 17, weight: .regular))
+                .foregroundStyle(themeAccent)
+              Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 5)
+            .overlay(alignment: .bottom) {
+              Rectangle()
+                .fill(separatorColor)
+                .frame(height: 1 / UIScreen.main.scale)
+                .padding(.leading, 70)
             }
           }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
+
+        ForEach(Array(previewItems.enumerated()), id: \.element.id) { index, item in
+          Button {
+            onContentPressed(item.payload)
+          } label: {
+            ChatProfileMemberHomeStyleRow(item: item, palette: palette)
+              .padding(.horizontal, 16)
+              .overlay(alignment: .bottom) {
+                if index < previewItems.count - 1 || memberItems.count > previewItems.count {
+                  Rectangle()
+                    .fill(separatorColor)
+                    .frame(height: 1 / UIScreen.main.scale)
+                    .padding(.leading, 70)
+                }
+              }
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+        }
+
+        if memberItems.count > previewItems.count || memberItems.isEmpty {
+          Button {
+            onMembersScreenAppeared?()
+            navCoordinator.path.append(.members)
+          } label: {
+            ChatProfileSwiftUIRow(
+              title: memberItems.isEmpty ? "Members" : "View All Members",
+              trailingText: memberItems.isEmpty ? groupMembersSubtitle : "\(memberItems.count)",
+              showsChevron: true,
+              titleColor: themeAccent,
+              separatorColor: separatorColor,
+              isLast: true
+            )
+          }
+          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
         }
       }
     }
@@ -2310,7 +2750,9 @@ private struct ChatProfileSwiftUIRootView: View {
         }
 
         Button {
-          navCoordinator.path.append(.channelSettings)
+          withAnimation(.easeOut(duration: 0.16)) {
+            inlineEditDestination = .channelSettings
+          }
         } label: {
           ChatProfileSwiftUIRow(
             title: "Channel settings",
@@ -2879,30 +3321,55 @@ private struct ChatProfileSwiftUIRootView: View {
     }
   }
 
-  private var appearanceSection: some View {
-    ChatProfileSwiftUISection(fill: rowFill) {
-      Button {
-        navCoordinator.path.append(.appearance)
-      } label: {
-        ChatProfileSwiftUIRow(
-          title: isChannel ? "Photo & Poster" : "Contact Photo & Poster",
-          leading: AnyView(
-            ChatProfileMiniAvatar(
-              text: avatarDisplayText,
-              fontStyleID: appearanceSelection.avatarFontStyleID,
-              colors: avatarGradientColors,
-              imageUri: hasProfileImage ? avatarUri : nil
-            )
-          ),
-          trailingSystemImage: nil,
-          showsChevron: true,
-          separatorColor: separatorColor,
-          isLast: true
-        )
-        .matchedTransitionSource(id: ChatProfileSwiftUIDestination.appearance.transitionID, in: morphNamespace)
+  private var usernameQRSheet: some View {
+    let handle = username.trimmingCharacters(in: CharacterSet(charactersIn: "@ "))
+    let encoded = handle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? handle
+    let value = "vibe://u?username=\(encoded)"
+
+    return NavigationStack {
+      VStack(spacing: 22) {
+        Spacer(minLength: 24)
+        ZStack {
+          RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .fill(Color.white)
+            .frame(width: 248, height: 248)
+            .shadow(color: Color.black.opacity(0.14), radius: 24, y: 12)
+
+          if let image = QRCodeRenderer.image(for: value) {
+            Image(uiImage: image)
+              .interpolation(.none)
+              .resizable()
+              .scaledToFit()
+              .frame(width: 194, height: 194)
+          } else {
+            Image(systemName: "qrcode")
+              .font(.system(size: 72, weight: .light))
+              .foregroundStyle(.secondary)
+          }
+        }
+
+        VStack(spacing: 6) {
+          Text(username)
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundStyle(.primary)
+          Text("Scan to open this Vibegram profile")
+            .font(.system(size: 14, weight: .regular))
+            .foregroundStyle(.secondary)
+        }
+        Spacer()
       }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      .frame(maxWidth: .infinity)
+      .background(pageColor.ignoresSafeArea())
+      .navigationTitle("QR Code")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarTrailing) {
+          Button("Done") { showUsernameQR = false }
+        }
+      }
     }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
   }
 
   private var bridgeHistorySubtitle: String {
@@ -2916,42 +3383,39 @@ private struct ChatProfileSwiftUIRootView: View {
   @ViewBuilder
   private var sharedContentSection: some View {
     if !tabSummaries.isEmpty {
-      ChatProfileSwiftUISection(fill: rowFill) {
-        ForEach(Array(tabSummaries.enumerated()), id: \.element.id) { index, summary in
-          let destination = ChatProfileSwiftUIDestination.tab(summary.tab)
-          Button {
-            navCoordinator.path.append(destination)
-          } label: {
-            ChatProfileSwiftUIRow(
-              title: summary.title,
-              subtitle: summary.subtitle,
-              trailingSystemImage: nil,
-              showsChevron: true,
-              separatorColor: separatorColor,
-              isLast: index == tabSummaries.count - 1
-            )
-            .matchedTransitionSource(id: destination.transitionID, in: morphNamespace)
-          }
-          .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-        }
-      }
+      ChatProfileSwiftUIExpandedContentView(
+        title: "Shared Content",
+        items: [],
+        fill: rowFill,
+        separatorColor: separatorColor,
+        onContentPressed: onContentPressed,
+        tabs: tabSummaries,
+        tabItems: tabItems,
+        initialTab: tabSummaries.first?.tab,
+        embedded: true
+      )
     }
   }
 
   private var contactActionsSection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
-      Button { onAction("shareContact") } label: {
-        ChatProfileSwiftUIRow(title: "Share Contact", separatorColor: separatorColor, isLast: false)
+      Button { onAction("addContact") } label: {
+        ChatProfileSwiftUIRow(
+          title: "Add to Contacts",
+          titleColor: themeAccent,
+          separatorColor: separatorColor,
+          isLast: false
+        )
       }
       .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
 
-      Button { onAction("createNewContact") } label: {
-        ChatProfileSwiftUIRow(title: "Create New Contact", separatorColor: separatorColor, isLast: false)
-      }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-
-      Button { onAction("addToExisting") } label: {
-        ChatProfileSwiftUIRow(title: "Add to Existing Contact", separatorColor: separatorColor, isLast: true)
+      Button(role: .destructive) { onAction("block") } label: {
+        ChatProfileSwiftUIRow(
+          title: "Block User",
+          titleColor: .red,
+          separatorColor: separatorColor,
+          isLast: true
+        )
       }
       .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
     }
@@ -2995,23 +3459,10 @@ private struct ChatProfileSwiftUIRootView: View {
         }
       }
     } else {
-      // DM / contact / agent profile: Clear Chat (for me, or for both when the
-      // host presents the confirmation sheet) + Block. Clear Chat is the one
-      // destructive that keeps the conversation identity and only wipes history.
       ChatProfileSwiftUISection(fill: rowFill) {
         Button(role: .destructive) { onAction("clearChat") } label: {
           ChatProfileSwiftUIRow(
             title: "Clear Chat",
-            titleColor: .red,
-            separatorColor: separatorColor,
-            isLast: false
-          )
-        }
-        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-
-        Button { onAction("block") } label: {
-          ChatProfileSwiftUIRow(
-            title: "Block Contact",
             titleColor: .red,
             separatorColor: separatorColor,
             isLast: true
@@ -3019,6 +3470,16 @@ private struct ChatProfileSwiftUIRootView: View {
         }
         .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
       }
+    }
+  }
+
+  private func closePresentedEditor() {
+    if inlineEditDestination != nil {
+      withAnimation(.easeOut(duration: 0.16)) {
+        inlineEditDestination = nil
+      }
+    } else if !navCoordinator.path.isEmpty {
+      navCoordinator.path.removeLast()
     }
   }
 
@@ -3091,13 +3552,24 @@ private struct ChatProfileSwiftUIRootView: View {
         initialSelection: appearanceSelection,
         onSave: onSaveAppearance
       )
+    case .encryption:
+      if let peerUserId = ChatEngine.shared.peerUserId(chatId: chatId), !peerUserId.isEmpty {
+        ChatEncryptionVerifyView(peerUserId: peerUserId)
+      } else {
+        Text("Encryption identity is not available yet.")
+          .foregroundStyle(.secondary)
+          .navigationTitle("Verify Encryption")
+      }
     case .tab(let tab):
       ChatProfileSwiftUIExpandedContentView(
-        title: tabSummaries.first(where: { $0.tab == tab })?.title ?? tab.label,
-        items: tabItems[tab] ?? [],
+        title: "Shared Content",
+        items: [],
         fill: rowFill,
         separatorColor: separatorColor,
-        onContentPressed: onContentPressed
+        onContentPressed: onContentPressed,
+        tabs: tabSummaries,
+        tabItems: tabItems,
+        initialTab: tab
       )
     case .channelAdmins:
       // Reuse the same group member list (avatar + name + role, A–Z sections).
@@ -3135,7 +3607,9 @@ private struct ChatProfileSwiftUIRootView: View {
           return max(channelSubscribers.count, groupMembers.count)
         }(),
         onEditName: {
-          navCoordinator.path.append(.editRoom)
+          withAnimation(.easeOut(duration: 0.16)) {
+            inlineEditDestination = .editRoom
+          }
         },
         onOpenAppearance: {
           // Photo/poster disabled for channels — identity is edit name/description only.
@@ -3162,7 +3636,8 @@ private struct ChatProfileSwiftUIRootView: View {
         },
         onSettingsChanged: { next in
           channelSettingsLocal = next
-        }
+        },
+        onDismiss: closePresentedEditor
       )
     case .channelRecentActions:
       ChannelRecentActionsPage(actions: channelProfileCache?.recentActions ?? [])
@@ -3174,7 +3649,13 @@ private struct ChatProfileSwiftUIRootView: View {
           isChannel: isChannel,
           initialName: profileName,
           initialDescription: note,
-          initialAvatarUri: avatarUri
+          initialAvatarUri: avatarUri,
+          memberCount: memberCount ?? groupMembers.count,
+          onOpenMembers: {
+            onMembersScreenAppeared?()
+            navCoordinator.path.append(isChannel ? .channelSubscribers : .members)
+          },
+          onDismiss: closePresentedEditor
         ) { name, description, avatarUrl in
           onAction("roomEdited:\(name)")
           if !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -3183,9 +3664,7 @@ private struct ChatProfileSwiftUIRootView: View {
           if let avatarUrl, !avatarUrl.isEmpty {
             onAction("roomAvatar:\(avatarUrl)")
           }
-          if !navCoordinator.path.isEmpty {
-            navCoordinator.path.removeLast()
-          }
+          closePresentedEditor()
         }
       } else {
         Text("Not signed in")
@@ -3371,8 +3850,8 @@ private func chatProfileMemberItems(from raw: [[String: Any]]) -> [ChatGroupMemb
       peerUserId: userId,
       chatId: nil,
       preferPushAvatar: true,
-      isAgent: false,
-      agentId: nil,
+      isAgent: rawRole == "agent_admin",
+      agentId: rawRole == "agent_admin" ? userId : nil,
       displayName: name
     )
     out.append(
@@ -3571,12 +4050,22 @@ private struct ChatProfileMemberHomeStyleRow: View {
       }
       .frame(width: 42, height: 42)
       .clipShape(Circle())
+      .overlay(alignment: .bottomTrailing) {
+        if item.roleKey == "agent_admin" {
+          Image(systemName: "sparkles")
+            .font(.system(size: 8, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 16, height: 16)
+            .background(palette.accent, in: Circle())
+            .overlay(Circle().stroke(palette.card, lineWidth: 1.5))
+        }
+      }
       .animation(.easeInOut(duration: 0.22), value: image != nil)
 
       VStack(alignment: .leading, spacing: 2) {
         Text(item.title)
-          .font(.system(size: 16, weight: .semibold))
-          .foregroundStyle(Color.white)
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(palette.text)
           .lineLimit(1)
         if item.roleKey == "owner" || item.roleKey == "admin" || item.roleKey == "agent_admin"
           || item.roleKey == "subscriber"
@@ -3686,6 +4175,7 @@ private struct ChatProfilePageReflection: View {
             .resizable()
             .scaledToFill()
             .frame(width: w, height: height)
+            .scaleEffect(1.3)
             .blur(radius: 46)
             .opacity(0.40)
             .mask(
@@ -3769,6 +4259,7 @@ private struct ChatProfileAvatarMorphView: View {
   /// Downward media shift inside the clipped band while it scrolls away (expanded
   /// hero only) — the image trails the scroll at half speed, Telegram-style.
   var parallax: CGFloat = 0
+  var onImageAvailabilityChanged: (Bool) -> Void = { _ in }
 
   @State private var image: UIImage?
   @State private var loadedUri: String?
@@ -3787,7 +4278,8 @@ private struct ChatProfileAvatarMorphView: View {
     topAir: CGFloat = 90,
     scrollScale: CGFloat = 1,
     scrollOpacity: CGFloat = 1,
-    parallax: CGFloat = 0
+    parallax: CGFloat = 0,
+    onImageAvailabilityChanged: @escaping (Bool) -> Void = { _ in }
   ) {
     self.text = text
     self.fontStyleID = fontStyleID
@@ -3803,6 +4295,7 @@ private struct ChatProfileAvatarMorphView: View {
     self.scrollScale = scrollScale
     self.scrollOpacity = scrollOpacity
     self.parallax = morphEnabled ? parallax : 0
+    self.onImageAvailabilityChanged = onImageAvailabilityChanged
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
     _image = State(initialValue: primed)
@@ -3813,7 +4306,7 @@ private struct ChatProfileAvatarMorphView: View {
     morphEnabled ? min(1, max(0, expand)) : 0
   }
 
-  private var circleSize: CGFloat { 120 }
+  private var circleSize: CGFloat { 104 }
 
   private static func pixelRound(_ value: CGFloat) -> CGFloat {
     let scale = UIScreen.main.scale
@@ -3821,15 +4314,15 @@ private struct ChatProfileAvatarMorphView: View {
   }
 
   private var bandHeight: CGFloat {
-    Self.pixelRound(collapsedHeight + (heroBaseHeight - collapsedHeight) * p + overscrollStretch)
+    collapsedHeight + (heroBaseHeight - collapsedHeight) * p + overscrollStretch
   }
 
   private var mediaW: CGFloat {
-    Self.pixelRound(circleSize + (width - circleSize) * p)
+    circleSize + (width - circleSize) * p
   }
 
   private var mediaH: CGFloat {
-    Self.pixelRound(circleSize + (heroBaseHeight - circleSize) * p + overscrollStretch)
+    circleSize + (heroBaseHeight - circleSize) * p + overscrollStretch
   }
 
   private var mediaCorner: CGFloat {
@@ -3837,7 +4330,7 @@ private struct ChatProfileAvatarMorphView: View {
   }
 
   private var mediaTop: CGFloat {
-    Self.pixelRound(topAir * (1 - p))
+    topAir * (1 - p)
   }
 
   var body: some View {
@@ -3851,52 +4344,85 @@ private struct ChatProfileAvatarMorphView: View {
     // Linear shared p only — no topAttach/sizeGrow (those made expand worse).
     return mediaBody
       .frame(width: mediaW, height: mediaH)
-      .clipShape(shape)
+      .mask(shape.padding(.bottom, -40 * p)) // Allow mask to bleed
       .scaleEffect(s, anchor: .top)
       .opacity(Double(o))
       .frame(width: width, alignment: .center)
       .padding(.top, mediaTop)
       .offset(y: parallax * p)
       .frame(width: width, height: bandHeight, alignment: .top)
+      .padding(.bottom, 40 * p) // Add padding so it doesn't clip the bleed
       .clipped()
+      .padding(.bottom, -40 * p) // Restore frame height
       .animation(nil, value: scrollScale)
+      .onAppear { onImageAvailabilityChanged(image != nil) }
       .task(id: normalizedUri ?? "") { await loadImage() }
+      .onReceive(NotificationCenter.default.publisher(for: ChatAvatarImageStore.didReplaceNotification)) {
+        notification in
+        guard let key = notification.object as? String,
+          key == normalizedUri,
+          let refreshed = ChatAvatarImageStore.cached(for: key)
+        else { return }
+        image = refreshed
+        loadedUri = key
+        onImageAvailabilityChanged(true)
+      }
+  }
+
+  @ViewBuilder
+  private var mediaFill: some View {
+    if morphEnabled, let image {
+      Image(uiImage: image)
+        .resizable()
+        .scaledToFill()
+    } else {
+      ZStack {
+        LinearGradient(
+          colors: [
+            Color(uiColor: fallbackColors.0),
+            Color(uiColor: fallbackColors.1),
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+        Text(text)
+          .font(.system(
+            size: max(10, mediaW * 0.4),
+            weight: .semibold,
+            design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
+          ))
+          .foregroundStyle(.white)
+          .minimumScaleFactor(0.4)
+          .lineLimit(1)
+          .multilineTextAlignment(.center)
+      }
+    }
   }
 
   @ViewBuilder
   private var mediaBody: some View {
-    Group {
-      if morphEnabled, let image {
+    let edgeCut = morphEnabled && image != nil ? 10 * p : 0
+
+    ZStack {
+      mediaFill
+        .mask(Rectangle().padding(.bottom, edgeCut))
+
+      if morphEnabled, let image, p > 0.001 {
         Image(uiImage: image)
           .resizable()
           .scaledToFill()
-      } else {
-        // Match Home/chat `ChatAvatarNodeView` fallback: vertical palette gradient
-        // + single white initial (not a flat gray plate / oversized bold glyph).
-        ZStack {
-          LinearGradient(
-            colors: [
-              Color(uiColor: fallbackColors.0),
-              Color(uiColor: fallbackColors.1),
-            ],
-            startPoint: .top,
-            endPoint: .bottom
+          .frame(width: mediaW, height: mediaH)
+          .blur(radius: 52 * p, opaque: false)
+          .mask(
+            Rectangle()
+              .padding(.top, max(0, mediaH - 54))
+              .padding(.bottom, -32 * p)
+              .blur(radius: 10 * p)
           )
-          Text(text)
-            .font(.system(
-              size: max(10, mediaW * 0.4),
-              weight: .semibold,
-              design: ChatProfileAvatarFontStyle.style(id: fontStyleID).design
-            ))
-            .foregroundStyle(.white)
-            .minimumScaleFactor(0.4)
-            .lineLimit(1)
-            .multilineTextAlignment(.center)
-        }
+          .opacity(p)
       }
     }
     .frame(width: mediaW, height: mediaH)
-    .clipped()
   }
 
   private var normalizedUri: String? {
@@ -3910,17 +4436,23 @@ private struct ChatProfileAvatarMorphView: View {
     if let normalized, let cached = ChatAvatarImageStore.cached(for: normalized) {
       loadedUri = normalized
       image = cached
+      onImageAvailabilityChanged(true)
       return
     }
     guard let normalized else {
+      loadedUri = nil
       image = nil
+      onImageAvailabilityChanged(false)
       return
     }
     loadedUri = normalized
+    image = nil
+    onImageAvailabilityChanged(false)
     // Hero-quality decode (list cells keep 384; banner needs more pixels).
     let loaded = await ChatAvatarImageStore.loadHero(from: normalized)
-    guard !Task.isCancelled else { return }
+    guard !Task.isCancelled, loadedUri == normalized else { return }
     image = loaded
+    onImageAvailabilityChanged(loaded != nil)
   }
 }
 
@@ -4991,34 +5523,57 @@ private struct ChatProfileSwiftUIActionButton: View {
   let title: String
   let systemImage: String
   let fill: Color
-  var expand: CGFloat = 0
+  var ink: Color = .white
+  var isDark: Bool = true
   var chipWidth: CGFloat = 56
-  var chipHeight: CGFloat = 56
+  var chipHeight: CGFloat = 70
   let action: () -> Void
 
-  var body: some View {
-    let p = min(1, max(0, expand))
-    let labelT = max(0, min(1, (p - 0.15) / 0.40))
-    let corner = (chipHeight * 0.5) * (1 - p) + 16 * p
+  @State private var iconAnimating = false
 
-    Button(action: action) {
-      VStack(spacing: 3 * p) {
+  /// Pill, never a circle — the row keeps one shape through the whole morph.
+  private let corner: CGFloat = 14
+
+  private var iconKickAngle: Double {
+    if systemImage.hasPrefix("bell") { return -14 }
+    if systemImage == "phone" { return -12 }
+    if systemImage == "magnifyingglass" { return 9 }
+    return 0
+  }
+
+  var body: some View {
+    Button {
+      withAnimation(.spring(response: 0.22, dampingFraction: 0.46)) {
+        iconAnimating = true
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.58)) {
+          iconAnimating = false
+        }
+      }
+      action()
+    } label: {
+      VStack(spacing: 1) {
         Image(systemName: systemImage)
-          .font(.system(size: 24, weight: .regular))
+          .font(.system(size: 18, weight: .regular))
+          .rotationEffect(.degrees(iconAnimating ? iconKickAngle : 0))
+          .scaleEffect(iconAnimating ? 1.16 : 1)
+          .offset(x: iconAnimating && systemImage == "video" ? 2 : 0)
         Text(title)
-          .font(.system(size: 11, weight: .medium))
+          .font(.system(size: 10, weight: .medium))
           .lineLimit(1)
           .minimumScaleFactor(0.75)
-          .opacity(Double(labelT))
-          .frame(height: 13 * labelT)
-          .clipped()
       }
-      .foregroundStyle(.white)
+      .foregroundStyle(ink)
       .frame(width: chipWidth, height: chipHeight)
-      .glassEffect(
-        .regular.tint(fill).interactive(),
-        in: RoundedRectangle(cornerRadius: corner, style: .continuous)
-      )
+      .background {
+        let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
+        shape
+          .fill(.ultraThinMaterial)
+          .environment(\.colorScheme, isDark ? .dark : .light)
+          .overlay(shape.stroke(Color.primary.opacity(0.08), lineWidth: 0.6))
+      }
+      .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
     }
     .buttonStyle(.plain)
     .frame(width: chipWidth, height: chipHeight)
@@ -5033,8 +5588,55 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
   let onContentPressed: ([String: Any]) -> Void
   var trailingToolbarSystemImage: String? = nil
   var onTrailingToolbarPressed: (() -> Void)? = nil
+  var tabs: [ChatProfileSwiftUITabSummary] = []
+  var tabItems: [ChatProfileTab: [ChatProfileSwiftUIContentItem]] = [:]
+  var initialTab: ChatProfileTab? = nil
+  var embedded = false
 
+  @State private var selectedTab: ChatProfileTab?
+
+  private var activeTab: ChatProfileTab {
+    selectedTab ?? initialTab ?? tabs.first?.tab ?? .media
+  }
+
+  private var activeItems: [ChatProfileSwiftUIContentItem] {
+    tabItems[activeTab] ?? []
+  }
+
+  @ViewBuilder
   var body: some View {
+    if tabs.isEmpty {
+      legacyList
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(false)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar {
+          if let trailingToolbarSystemImage, let onTrailingToolbarPressed {
+            ToolbarItem(placement: .topBarTrailing) {
+              Button(action: onTrailingToolbarPressed) {
+                Image(systemName: trailingToolbarSystemImage)
+              }
+            }
+          }
+        }
+    } else if embedded {
+      sharedBody
+    } else {
+      ScrollView(.vertical, showsIndicators: false) {
+        sharedBody
+          .padding(.horizontal, 18)
+          .padding(.vertical, 14)
+      }
+      .background(Color(uiColor: ChatListAppearance.current.wallpaperBase).ignoresSafeArea())
+      .navigationTitle(title)
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(.hidden, for: .navigationBar)
+    }
+  }
+
+  private var legacyList: some View {
     List {
       Section {
         if items.isEmpty {
@@ -5045,35 +5647,7 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
             Button {
               onContentPressed(item.payload)
             } label: {
-              HStack(spacing: 14) {
-                Image(systemName: item.systemImage)
-                  .font(.system(size: 18, weight: .semibold))
-                  .foregroundStyle(.secondary)
-                  .frame(width: 28)
-
-                VStack(alignment: .leading, spacing: 4) {
-                  Text(item.title)
-                    .font(.system(size: 16, weight: .regular))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-
-                  if !item.subtitle.isEmpty {
-                    Text(item.subtitle)
-                      .font(.system(size: 13, weight: .regular))
-                      .foregroundStyle(.secondary)
-                      .lineLimit(1)
-                  }
-                }
-              }
-              .padding(.vertical, 5)
-              .overlay(alignment: .bottom) {
-                if index != items.count - 1 {
-                  Rectangle()
-                    .fill(separatorColor)
-                    .frame(height: 1 / UIScreen.main.scale)
-                    .padding(.leading, 42)
-                }
-              }
+              genericRow(item: item, index: index, count: items.count)
             }
             .buttonStyle(.plain)
             .listRowBackground(fill)
@@ -5083,20 +5657,287 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
     }
     .listStyle(.insetGrouped)
     .scrollContentBackground(.hidden)
-    .background(Color(uiColor: UIColor.systemGroupedBackground))
-    .navigationTitle(title)
-    .navigationBarTitleDisplayMode(.inline)
-    .navigationBarBackButtonHidden(false)
-    .toolbar(.visible, for: .navigationBar)
-    .toolbarBackground(.hidden, for: .navigationBar)
-    .toolbar {
-      if let trailingToolbarSystemImage, let onTrailingToolbarPressed {
-        ToolbarItem(placement: .topBarTrailing) {
-          Button(action: onTrailingToolbarPressed) {
-            Image(systemName: trailingToolbarSystemImage)
+    .background(Color(uiColor: ChatListAppearance.current.wallpaperBase))
+  }
+
+  private var sharedBody: some View {
+    VStack(spacing: 14) {
+      tabStrip
+      sharedItems
+    }
+  }
+
+  private var tabStrip: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 4) {
+        ForEach(tabs) { summary in
+          Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+              selectedTab = summary.tab
+            }
+          } label: {
+            Text(summary.title)
+              .font(.system(size: 15, weight: activeTab == summary.tab ? .semibold : .medium))
+              .foregroundStyle(activeTab == summary.tab ? Color.primary : Color.secondary)
+              .padding(.horizontal, 16)
+              .frame(height: 38)
+              .background {
+                if activeTab == summary.tab {
+                  Capsule().fill(Color.primary.opacity(0.13))
+                }
+              }
+              .contentShape(Capsule())
+          }
+          .buttonStyle(.plain)
+        }
+      }
+      .padding(3)
+    }
+    .background(.ultraThinMaterial, in: Capsule())
+    .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: 1))
+  }
+
+  @ViewBuilder
+  private var sharedItems: some View {
+    if activeItems.isEmpty {
+      Text("No shared content yet")
+        .font(.system(size: 15, weight: .regular))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 34)
+    } else {
+      switch activeTab {
+      case .media, .gifs:
+        mediaGrid
+      case .music:
+        musicList
+      case .links:
+        linksList
+      case .voice, .files, .pinned:
+        genericList
+      }
+    }
+  }
+
+  private var mediaGrid: some View {
+    let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
+    return LazyVGrid(columns: columns, spacing: 3) {
+      ForEach(activeItems) { item in
+        MediaThumbnail(
+          urlString: item.mediaURL,
+          isVideo: item.isVideo,
+          thumbnailBase64: item.thumbnailBase64,
+          onPressed: { sourceView in
+            var payload = item.payload
+            payload["sourceView"] = sourceView
+            onContentPressed(payload)
+          }
+        )
+        .aspectRatio(1, contentMode: .fit)
+        .overlay(alignment: .bottomTrailing) {
+          if item.isVideo {
+            Image(systemName: "play.fill")
+              .font(.system(size: 12, weight: .bold))
+              .foregroundStyle(.white)
+              .padding(7)
+              .background(.black.opacity(0.58), in: Circle())
+              .padding(7)
           }
         }
       }
+    }
+    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+  }
+
+  private var musicList: some View {
+    VStack(spacing: 0) {
+      ForEach(Array(activeItems.enumerated()), id: \.element.id) { index, item in
+        Button {
+          onContentPressed(item.payload)
+        } label: {
+          HStack(spacing: 12) {
+            ZStack {
+              MediaThumbnail(
+                urlString: item.coverURL,
+                isVideo: false,
+                thumbnailBase64: item.thumbnailBase64
+              )
+              Image(systemName: "play.fill")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(.white)
+                .shadow(radius: 3)
+            }
+            .frame(width: 54, height: 54)
+            .clipShape(Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+              Text(item.title)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+              Text(item.subtitle.isEmpty ? (item.artist ?? "Music") : item.subtitle)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+          }
+          .padding(.horizontal, 14)
+          .frame(minHeight: 72)
+          .overlay(alignment: .bottom) {
+            if index != activeItems.count - 1 {
+              Rectangle()
+                .fill(separatorColor)
+                .frame(height: 1 / UIScreen.main.scale)
+                .padding(.leading, 80)
+            }
+          }
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      }
+    }
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+  }
+
+  private var linksList: some View {
+    VStack(spacing: 12) {
+      ForEach(activeItems) { item in
+        Button {
+          onContentPressed(item.payload)
+        } label: {
+          VStack(alignment: .leading, spacing: 8) {
+            LinkPreview(urlString: item.mediaURL ?? item.title)
+              .frame(height: 74)
+            if !item.detail.isEmpty, item.detail != item.title {
+              Text(item.detail)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+            }
+          }
+          .padding(10)
+          .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        }
+        .buttonStyle(.plain)
+      }
+    }
+  }
+
+  private var genericList: some View {
+    VStack(spacing: 0) {
+      ForEach(Array(activeItems.enumerated()), id: \.element.id) { index, item in
+        Button {
+          onContentPressed(item.payload)
+        } label: {
+          genericRow(item: item, index: index, count: activeItems.count)
+            .padding(.horizontal, 14)
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      }
+    }
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+  }
+
+  private func genericRow(
+    item: ChatProfileSwiftUIContentItem,
+    index: Int,
+    count: Int
+  ) -> some View {
+    HStack(spacing: 14) {
+      Image(systemName: item.systemImage)
+        .font(.system(size: 18, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .frame(width: 28)
+      VStack(alignment: .leading, spacing: 4) {
+        Text(item.title)
+          .font(.system(size: 16, weight: .regular))
+          .foregroundStyle(.primary)
+          .lineLimit(1)
+        if !item.subtitle.isEmpty {
+          Text(item.subtitle)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+      }
+      Spacer()
+    }
+    .padding(.vertical, 10)
+    .overlay(alignment: .bottom) {
+      if index != count - 1 {
+        Rectangle()
+          .fill(separatorColor)
+          .frame(height: 1 / UIScreen.main.scale)
+          .padding(.leading, 42)
+      }
+    }
+  }
+
+  private struct MediaThumbnail: UIViewRepresentable {
+    let urlString: String?
+    let isVideo: Bool
+    let thumbnailBase64: String?
+    var onPressed: ((UIView) -> Void)? = nil
+
+    final class Coordinator: NSObject {
+      var onPressed: ((UIView) -> Void)?
+
+      init(onPressed: ((UIView) -> Void)?) {
+        self.onPressed = onPressed
+      }
+
+      @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
+        guard let view = recognizer.view as? ChatMainProfileMediaCellNode else { return }
+        onPressed?(view.mediaTransitionSourceView)
+      }
+    }
+
+    func makeCoordinator() -> Coordinator {
+      Coordinator(onPressed: onPressed)
+    }
+
+    func makeUIView(context: Context) -> ChatMainProfileMediaCellNode {
+      let view = ChatMainProfileMediaCellNode()
+      if onPressed != nil {
+        view.addGestureRecognizer(
+          UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        )
+      }
+      return view
+    }
+
+    func updateUIView(_ view: ChatMainProfileMediaCellNode, context: Context) {
+      context.coordinator.onPressed = onPressed
+      view.configure(
+        urlString: urlString,
+        isVideo: isVideo,
+        thumbnailBase64: thumbnailBase64
+      )
+      view.applyTheme(
+        placeholderTintColor: ChatListAppearance.current.timeColorThem,
+        placeholderBackgroundColor: ChatListAppearance.current.textColorThem.withAlphaComponent(0.06)
+      )
+    }
+  }
+
+  private struct LinkPreview: UIViewRepresentable {
+    let urlString: String
+
+    func makeUIView(context: Context) -> BubbleLinkPreviewView {
+      let view = BubbleLinkPreviewView()
+      view.isUserInteractionEnabled = false
+      return view
+    }
+
+    func updateUIView(_ view: BubbleLinkPreviewView, context: Context) {
+      guard let url = URL(string: urlString) else {
+        view.reset()
+        return
+      }
+      view.configure(url: url, appearance: .current, isMe: false)
     }
   }
 }
@@ -5661,6 +6502,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   private var mediaRows: [ChatProfileRow] = []
   private var voiceRows: [ChatProfileRow] = []
   private var gifRows: [ChatProfileRow] = []
+  private var musicRows: [ChatProfileRow] = []
   private var fileRows: [ChatProfileRow] = []
   private var pinnedRows: [ChatProfileRow] = []
   private var linkRows: [ChatProfileLinkItem] = []
@@ -5754,6 +6596,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     guard previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle else {
       return
     }
+    ChatListAppearance.invalidateBootstrap()
     applyTheme()
     tableView.reloadData()
     layoutHeroHeaderViewIfNeeded(force: true)
@@ -5769,6 +6612,20 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
   @objc private func handleAgentBridgeSelectionDidChange() {
     // Repo subtitle is owned by SwiftUI `@State` / Menu selection — do NOT rebuild
     // the whole hosting tree here (that reassignment was a source of open/jump).
+  }
+
+  @objc private func handleAppearanceDraftDidChange() {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.handleAppearanceDraftDidChange()
+      }
+      return
+    }
+    ChatListAppearance.invalidateBootstrap()
+    applyTheme()
+    tableView.reloadData()
+    layoutHeroHeaderViewIfNeeded(force: true)
+    renderSwiftUIProfile()
   }
 
   override func safeAreaInsetsDidChange() {
@@ -5852,6 +6709,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     tableView.scrollIndicatorInsets = UIEdgeInsets(
       top: headerHeight, left: 0.0, bottom: 0.0, right: 0.0)
     swiftUIContainerView.frame = bounds
+    // First mount happens here, not at init: only now are bounds and safe-area
+    // insets real, so the nav bar and hero lay out once instead of during the push.
+    if swiftUIHostingController == nil {
+      renderSwiftUIProfile()
+    }
+    attachSwiftUIHostIfNeeded()
     swiftUIHostingController?.view.frame = swiftUIContainerView.bounds
 
     layoutHeroHeaderViewIfNeeded(force: true)
@@ -6446,6 +7309,12 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       name: AgentBridgeSelectionStore.didChangeNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppearanceDraftDidChange),
+      name: ChatAppearanceDraftStore.didChangeNotification,
+      object: nil
+    )
 
     // Background gradient
     backgroundGradientLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
@@ -6536,10 +7405,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     floatingAvatarView.clipsToBounds = false
     floatingAvatarView.isUserInteractionEnabled = false
 
-    // Pre-mount black so the first frame never flashes a system grouped /
-    // high-contrast gradient before the SwiftUI soft-black hero paints.
-    backgroundColor = .black
-    swiftUIContainerView.backgroundColor = .black
+    // Pre-mount the live page color so the first frame never flashes a black or
+    // white plate behind the pushed profile.
+    backgroundColor = ChatListAppearance.current.wallpaperBase
+    swiftUIContainerView.backgroundColor = ChatListAppearance.current.wallpaperBase
     swiftUIContainerView.clipsToBounds = false
     swiftUIContainerView.layer.zPosition = 30.0
     addSubview(swiftUIContainerView)
@@ -6583,8 +7452,14 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       needsBatchedSwiftUIRender = true
       return
     }
-    // Collapse multiple calls in the same run-loop (applyRoute + async rows + members)
-    // into one host update so the profile does not jump on open.
+    if swiftUIHostingController == nil {
+      // A zero-bounds first mount lays the nav bar and hero out at 0pt and then
+      // shifts both when the real frame lands mid-push; layoutSubviews mounts it.
+      guard bounds.width > 0, bounds.height > 0 else { return }
+      performSwiftUIProfileRender()
+      return
+    }
+    // Collapse later updates in the same run loop into one host replacement.
     guard !swiftUIRenderCoalesceScheduled else { return }
     swiftUIRenderCoalesceScheduled = true
     DispatchQueue.main.async { [weak self] in
@@ -6602,6 +7477,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       ? (headerTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "User" : headerTitle)
       : profileName
 
+    let resolvedUsername = resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines)
     let membersSig = groupMembers.map { entry -> String in
       let id =
         (entry["userId"] as? String) ?? (entry["id"] as? String) ?? (entry["memberId"] as? String)
@@ -6613,6 +7489,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     let tabsSig = availableTabs.map(\.rawValue).joined(separator: ",")
     let signature = [
       resolvedName,
+      resolvedUsername,
       engineChatId,
       engineMyUserId,
       "\(isGroupOrChannel)",
@@ -6629,7 +7506,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       bridgeDeviceLabel,
       "\(rows.count)",
       tabsSig,
-      "\(mediaRows.count)/\(voiceRows.count)/\(fileRows.count)/\(linkRows.count)",
+      "\(mediaRows.count)/\(musicRows.count)/\(voiceRows.count)/\(fileRows.count)/\(linkRows.count)",
       AgentBridgeSelectionStore.selectedRepository(
         chatId: engineChatId.isEmpty ? nil : engineChatId
       )?.id ?? "",
@@ -6641,6 +7518,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       "\(channelJoinApprovalRequired)",
       "\(channelRestrictSavingContent)",
       "\(channelSubscriberCount ?? -1)",
+      "\(traitCollection.userInterfaceStyle.rawValue)",
+      "\(ChatListAppearance.current.isDark)",
+      ChatListAppearance.current.visualKey,
     ].joined(separator: "|")
     // Skip no-op host reassignments that recreate the ScrollView and jump offset.
     if signature == lastSwiftUIRenderSignature, swiftUIHostingController != nil {
@@ -6648,12 +7528,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     lastSwiftUIRenderSignature = signature
 
+    let effectiveIsDark = (traitCollection.userInterfaceStyle == .unspecified
+      ? ChatListAppearance.resolvedSystemStyle()
+      : traitCollection.userInterfaceStyle) == .dark
+
     let rootView = ChatProfileSwiftUIRootView(
       profileName: resolvedName,
-      username: resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines),
+      username: resolvedUsername,
       note: profileBio.trimmingCharacters(in: .whitespacesAndNewlines),
       isChatMuted: isChatMuted,
-      isDark: traitCollection.userInterfaceStyle == .dark,
+      isDark: effectiveIsDark,
       historySubtitle: latestChatHistorySubtitle(),
       historyItems: swiftUIHistoryItems(),
       tabSummaries: swiftUITabSummaries(),
@@ -6678,6 +7562,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       )?.name,
       bridgeProvider: bridgeProvider,
       bridgeChatId: engineChatId,
+      chatId: engineChatId,
       bridgeConnected: bridgeConnected,
       bridgePaired: bridgePaired,
       bridgeDeviceLabel: bridgeDeviceLabel,
@@ -6703,7 +7588,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
         let username = self.resolvedIdentifierRawValue().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !username.isEmpty else { return }
         UIPasteboard.general.string = username
-        self.onNativeEvent(["type": "profileIdPressed", "id": username])
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        self.onNativeEvent(["type": "agentToast", "message": "Username copied"])
       },
       onAction: { [weak self] action in
         self?.handleSwiftUIProfileAction(action)
@@ -6738,15 +7624,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       withTransaction(transaction) {
         host.rootView = erasedRoot
       }
+      host.view.backgroundColor = ChatListAppearance.current.wallpaperBase
       host.view.frame = swiftUIContainerView.bounds
       swiftUIContainerView.bringSubviewToFront(host.view)
     } else {
       let host = UIHostingController(rootView: erasedRoot)
-      // Pre-paint black (matches soft-black hero) so open never shows a white or
-      // high-contrast gradient flash while the tree settles.
-      host.view.backgroundColor = .black
+      // Pre-paint the page color so the push never flashes a black or white plate.
+      host.view.backgroundColor = ChatListAppearance.current.wallpaperBase
       host.view.isOpaque = true
       host.view.frame = swiftUIContainerView.bounds
+      host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       swiftUIContainerView.addSubview(host.view)
       swiftUIContainerView.bringSubviewToFront(host.view)
       swiftUIHostingController = host
@@ -6819,7 +7706,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       presentAgentConfigEditor()
     case "headerBack":
       handleBackPressed()
-    case "shareContact", "createNewContact", "addToExisting":
+    case "addContact", "shareContact", "createNewContact", "addToExisting":
       onNativeEvent(["type": "profileContactAction", "action": action])
     case "addToEmergency":
       onNativeEvent(["type": "profileContactAction", "action": "addToEmergency"])
@@ -6829,7 +7716,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       onNativeEvent(["type": "headerMenuAction", "action": "clearChat"])
     case "block":
       onNativeEvent(["type": "profileContactAction", "action": "block"])
-    case "editGroup", "leaveGroup", "deleteGroup":
+    case "editGroup", "leaveGroup", "deleteGroup", "reportRoom":
       onNativeEvent([
         "type": "profileGroupAction",
         "action": action,
@@ -7069,6 +7956,10 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       return mediaRows.enumerated().map { index, row in
         swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
       }
+    case .music:
+      return musicRows.enumerated().map { index, row in
+        swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
+      }
     case .voice:
       return voiceRows.enumerated().map { index, row in
         swiftUIContentItem(for: row, tab: tab, index: index, explicitURL: row.mediaUrl)
@@ -7126,10 +8017,18 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       }
     }()
 
-    let subtitleParts = [
-      row.type.isEmpty ? nil : row.type.capitalized,
-      formattedRowDate(row),
-    ].compactMap { $0 }
+    let durationText: String? = {
+      guard let duration = row.duration, duration.isFinite, duration > 0 else { return nil }
+      let seconds = Int(duration.rounded())
+      return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }()
+    let subtitleParts: [String] = {
+      if tab == .music {
+        return [row.musicArtist, durationText, formattedRowDate(row)].compactMap { $0 }
+      }
+      return [row.type.isEmpty ? nil : row.type.capitalized, formattedRowDate(row)]
+        .compactMap { $0 }
+    }()
 
     var payload: [String: Any] = [
       "type": "profileContentPressed",
@@ -7147,7 +8046,16 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       title: title,
       subtitle: subtitleParts.joined(separator: " • "),
       systemImage: swiftUIContentSystemImage(for: tab, row: row),
-      payload: payload
+      payload: payload,
+      kind: row.type,
+      mediaURL: row.mediaUrl,
+      thumbnailBase64: row.thumbnailBase64,
+      isVideo: row.type == "video",
+      duration: row.duration,
+      artist: row.musicArtist,
+      source: row.musicSource,
+      coverURL: row.musicCoverURL,
+      detail: row.text
     )
   }
 
@@ -7471,7 +8379,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     currentRowIconBackgroundColor = rowAccent.withAlphaComponent(0.12)
 
     [muteActionButton, searchActionButton, audioActionButton, videoActionButton].forEach {
-      $0.applyTheme(foreground: text, background: card)
+      $0.applyTheme(foreground: text, background: card, isDark: isDark)
     }
     configureBackButtonStyle()
 
@@ -7690,7 +8598,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     }
     voiceRows = rows.filter { $0.type == "voice" }
     gifRows = rows.filter { $0.type == "gif" }
-    fileRows = rows.filter { ["file", "music"].contains($0.type) }
+    musicRows = rows.filter { $0.type == "music" }
+    fileRows = rows.filter { $0.type == "file" }
     pinnedRows = rows.filter { $0.isPinned }
 
     let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
@@ -7720,6 +8629,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
 
     var tabs: [ChatProfileTab] = []
     if !mediaRows.isEmpty { tabs.append(.media) }
+    if !musicRows.isEmpty { tabs.append(.music) }
     if !voiceRows.isEmpty { tabs.append(.voice) }
     if !gifRows.isEmpty { tabs.append(.gifs) }
     if !fileRows.isEmpty { tabs.append(.files) }
@@ -7739,6 +8649,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch tab {
     case .media:
       return mediaRows.count
+    case .music:
+      return musicRows.count
     case .voice:
       return voiceRows.count
     case .gifs:
@@ -7756,6 +8668,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch tab {
     case .media:
       return "Media"
+    case .music:
+      return "Music"
     case .voice:
       return "Voice"
     case .gifs:
@@ -7774,6 +8688,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch tab {
     case .media:
       return count == 1 ? "1 photo or video" : "\(count) photos and videos"
+    case .music:
+      return count == 1 ? "1 music file" : "\(count) music files"
     case .voice:
       return count == 1 ? "1 voice message" : "\(count) voice messages"
     case .gifs:
@@ -7791,6 +8707,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch tab {
     case .media:
       return "photo.on.rectangle.angled"
+    case .music:
+      return "music.note"
     case .voice:
       return "waveform"
     case .gifs:
@@ -8039,6 +8957,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch activeTab {
     case .media:
       return Int(ceil(Double(mediaRows.count) / 3.0))
+    case .music:
+      return musicRows.count
     case .voice:
       return voiceRows.count
     case .gifs:
@@ -8057,6 +8977,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     case .media:
       guard mediaRows.indices.contains(index) else { return nil }
       return mediaRows[index]
+    case .music:
+      guard musicRows.indices.contains(index) else { return nil }
+      return musicRows[index]
     case .voice:
       guard voiceRows.indices.contains(index) else { return nil }
       return voiceRows[index]
@@ -8079,6 +9002,9 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     switch activeTab {
     case .media:
       return formattedRowDate(row) ?? "Media"
+    case .music:
+      return [row.musicArtist, formattedRowDate(row)].compactMap { $0 }
+        .joined(separator: " · ")
     case .voice:
       return [formattedFileSize(row.fileSize), formattedRowDate(row)].compactMap { $0 }
         .joined(separator: " · ")
@@ -8100,6 +9026,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       if row.type == "video" { return "Video" }
       if row.type == "sticker" { return "Sticker" }
       return "Photo"
+    case .music:
+      return row.fileName ?? (row.text.isEmpty ? "Music" : row.text)
     case .voice:
       return row.fileName ?? "Voice message"
     case .gifs:
@@ -8515,6 +9443,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       var targetRows: [Any] = []
       switch tab {
       case .media: targetRows = mediaRows
+      case .music: targetRows = musicRows
       case .voice: targetRows = voiceRows
       case .gifs: targetRows = gifRows
       case .files: targetRows = fileRows
@@ -8542,6 +9471,7 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       var targetRows: [Any] = []
       switch tab {
       case .media: targetRows = mediaRows
+      case .music: targetRows = musicRows
       case .voice: targetRows = voiceRows
       case .gifs: targetRows = gifRows
       case .files: targetRows = fileRows

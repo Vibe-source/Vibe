@@ -2151,7 +2151,7 @@ private struct ProfileSettingsDetailView: View {
         config: config
       )
       // Seed memory/disk cache so Settings header + tab bar hit instantly.
-      ChatAvatarImageStore.cacheHero(image, for: remoteURL)
+      ChatAvatarImageStore.replaceHero(image, for: remoteURL)
       draft.profileImage = remoteURL
       // JSON profile update — profileImage is the remote URL string only.
       _ = try await AppProfileController.shared.updateFields(["profileImage": remoteURL])
@@ -2722,7 +2722,7 @@ private struct QRCodePanel: View {
   }
 }
 
-private enum QRCodeRenderer {
+enum QRCodeRenderer {
   static let context = CIContext()
 
   static func image(for value: String) -> UIImage? {

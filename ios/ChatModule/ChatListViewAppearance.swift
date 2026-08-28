@@ -1165,22 +1165,43 @@ struct ChatListAppearance {
       base = seeded
     }
 
-    let wallpaperGradient = parseGradient(
-      draft.wallpaperGradient,
-      fallback: base.wallpaperGradient
-    )
+    let isThemePlate = draft.themeId != nil && draft.wallpaperKind != "custom"
+
+    let wallpaperGradient: [UIColor] = {
+      if isThemePlate {
+        return base.wallpaperGradient
+      }
+      return parseGradient(
+        draft.wallpaperGradient,
+        fallback: base.wallpaperGradient
+      )
+    }()
     let wallpaperScrollGradient = draft.wallpaperScrollGradient.compactMap(parseColor)
-    let bubbleMeGradient = parseGradient(
-      draft.bubbleMeGradient,
-      fallback: base.bubbleMeGradient
-    )
-    let bubbleThemGradient = parseGradient(
-      draft.bubbleThemGradient,
-      fallback: base.bubbleThemGradient
-    )
+    let bubbleMeGradient: [UIColor] = {
+      if isThemePlate {
+        return base.bubbleMeGradient
+      }
+      return parseGradient(
+        draft.bubbleMeGradient,
+        fallback: base.bubbleMeGradient
+      )
+    }()
+    let bubbleThemGradient: [UIColor] = {
+      if isThemePlate {
+        return base.bubbleThemGradient
+      }
+      return parseGradient(
+        draft.bubbleThemGradient,
+        fallback: base.bubbleThemGradient
+      )
+    }()
     let bubbleThemColor = bubbleThemGradient.first ?? base.bubbleThemColor
-    let accent =
-      parseColor(draft.accent) ?? base.accent
+    let accent: UIColor = {
+      if isThemePlate {
+        return base.accent
+      }
+      return parseColor(draft.accent) ?? base.accent
+    }()
     let messageCornerRadius = ChatAppearanceDraft.messageCornerRadiusPoints(
       normalized: draft.messageCornerRadius
     )

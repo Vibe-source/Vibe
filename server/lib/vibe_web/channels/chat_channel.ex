@@ -91,6 +91,7 @@ defmodule VibeWeb.ChatChannel do
     ack_started_at = System.monotonic_time(:microsecond)
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
+    VibeWeb.ChannelThrottle.check!(user_id, :message)
 
     # Check send permission using cached socket assigns (no DB hit)
     can_send =
@@ -257,6 +258,8 @@ defmodule VibeWeb.ChatChannel do
         end
       end
     end
+  catch
+    {:throttled, reply} -> {:reply, {:error, reply}, socket}
   end
 
   @impl true
@@ -511,7 +514,10 @@ defmodule VibeWeb.ChatChannel do
 
   @impl true
   def handle_in("typing", payload, socket) do
-    broadcast_from!(socket, "typing", payload)
+    if VibeWeb.ChannelThrottle.check(socket.assigns.user_id, :typing) == :ok do
+      broadcast_from!(socket, "typing", payload)
+    end
+
     {:noreply, socket}
   end
 
@@ -555,6 +561,7 @@ defmodule VibeWeb.ChatChannel do
   def handle_in("react-message", %{"messageId" => msg_id, "emoji" => emoji}, socket) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
+    VibeWeb.ChannelThrottle.check!(user_id, :react)
 
     case Chat.toggle_reaction(chat_id, msg_id, user_id, emoji) do
       {:ok, %{reactions: reactions} = result} ->
@@ -575,6 +582,8 @@ defmodule VibeWeb.ChatChannel do
       {:error, reason} ->
         {:reply, {:error, %{reason: engagement_error(reason)}}, socket}
     end
+  catch
+    {:throttled, reply} -> {:reply, {:error, reply}, socket}
   end
 
   # A malformed payload must not take the whole topic down with it.
@@ -636,6 +645,7 @@ defmodule VibeWeb.ChatChannel do
   def handle_in("delete-message", %{"messageId" => msg_id} = payload, socket) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
+    VibeWeb.ChannelThrottle.check!(user_id, :delete)
 
     for_everyone =
       case Map.get(payload, "forEveryone", true) do
@@ -675,6 +685,8 @@ defmodule VibeWeb.ChatChannel do
       {:error, reason} ->
         {:reply, {:error, %{reason: inspect(reason)}}, socket}
     end
+  catch
+    {:throttled, reply} -> {:reply, {:error, reply}, socket}
   end
 
   @impl true
@@ -685,6 +697,7 @@ defmodule VibeWeb.ChatChannel do
       ) do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
+    VibeWeb.ChannelThrottle.check!(user_id, :edit)
     edited_at = Map.get(payload, "editedAt")
 
     case Vibe.Chat.edit_message(chat_id, msg_id, user_id, encrypted_content, edited_at) do
@@ -718,6 +731,8 @@ defmodule VibeWeb.ChatChannel do
       {:error, reason} ->
         {:reply, {:error, %{reason: inspect(reason)}}, socket}
     end
+  catch
+    {:throttled, reply} -> {:reply, {:error, reply}, socket}
   end
 
   defp engagement_error(reason) when is_atom(reason), do: to_string(reason)

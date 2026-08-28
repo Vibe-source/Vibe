@@ -336,7 +336,6 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
   private func installFileSheet() {
     let isDark = appearance.isDark
-    let rowColor = accentColor
 
     fileScrollView.translatesAutoresizingMaskIntoConstraints = false
     fileScrollView.alwaysBounceVertical = true
@@ -350,8 +349,9 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
     let card = UIView()
     card.backgroundColor = primaryTextColor.withAlphaComponent(isDark ? 0.08 : 0.06)
-    card.layer.cornerRadius = 16
+    card.layer.cornerRadius = 26
     card.layer.cornerCurve = .continuous
+    card.clipsToBounds = true
     let cardStack = UIStackView()
     cardStack.translatesAutoresizingMaskIntoConstraints = false
     cardStack.axis = .vertical
@@ -361,30 +361,30 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
     let galleryRow = AttachmentRowView(
       title: "Select from Gallery",
       symbol: "photo",
-      color: rowColor,
+      color: .systemBlue,
       isDark: isDark,
       showDivider: true,
-      showChevron: false
+      showChevron: true
     ) { [weak self] in
       self?.openFullGalleryPicker()
     }
     let docRow = AttachmentRowView(
       title: "Select from Files",
-      symbol: "icloud",
-      color: rowColor,
+      symbol: "folder",
+      color: .systemOrange,
       isDark: isDark,
       showDivider: true,
-      showChevron: false
+      showChevron: true
     ) { [weak self] in
       self?.openFilePicker()
     }
     let scanRow = AttachmentRowView(
       title: "Scan Document",
       symbol: "doc.viewfinder",
-      color: rowColor,
+      color: .systemIndigo,
       isDark: isDark,
       showDivider: false,
-      showChevron: false
+      showChevron: true
     ) { [weak self] in
       self?.openDocumentScanner()
     }
@@ -443,25 +443,42 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
   private func setupArticleHost() {
     articleView.backgroundColor = .clear
+    let card = UIView()
+    card.tag = 10
+    card.backgroundColor = primaryTextColor.withAlphaComponent(appearance.isDark ? 0.08 : 0.06)
+    card.layer.cornerRadius = 26
+    card.layer.cornerCurve = .continuous
+    articleView.addSubview(card)
+
     let title = UILabel()
     title.text = "Article"
-    title.font = .systemFont(ofSize: 22, weight: .semibold)
+    title.font = .systemFont(ofSize: 17, weight: .semibold)
     title.textColor = primaryTextColor
-    title.textAlignment = .center
-    articleView.addSubview(title)
+    card.addSubview(title)
     title.tag = 11
+
     articleField.placeholder = "Paste a link or title"
     articleField.font = .systemFont(ofSize: 16)
     articleField.textColor = primaryTextColor
-    articleField.borderStyle = .roundedRect
+    articleField.borderStyle = .none
+    articleField.backgroundColor = primaryTextColor.withAlphaComponent(appearance.isDark ? 0.08 : 0.06)
+    articleField.layer.cornerRadius = 14
+    articleField.layer.cornerCurve = .continuous
+    articleField.clipsToBounds = true
+    articleField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 8))
+    articleField.leftViewMode = .always
     articleField.returnKeyType = .send
     articleField.delegate = self
-    articleView.addSubview(articleField)
+    card.addSubview(articleField)
     articleField.tag = 12
+
     articleSendButton.setTitle("Send Article", for: .normal)
-    articleSendButton.setTitleColor(accentColor, for: .normal)
+    articleSendButton.setTitleColor(.white, for: .normal)
+    articleSendButton.backgroundColor = accentColor
+    articleSendButton.layer.cornerRadius = 14
+    articleSendButton.layer.cornerCurve = .continuous
     articleSendButton.addTarget(self, action: #selector(sendArticle), for: .touchUpInside)
-    articleView.addSubview(articleSendButton)
+    card.addSubview(articleSendButton)
     articleSendButton.tag = 13
   }
 
@@ -764,9 +781,11 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
 
   private func layoutComposerHosts() {
     let bounds = articleView.bounds
-    articleView.viewWithTag(11)?.frame = CGRect(x: 16, y: 24, width: bounds.width - 32, height: 28)
-    articleField.frame = CGRect(x: 16, y: 68, width: bounds.width - 32, height: 44)
-    articleSendButton.frame = CGRect(x: 16, y: 124, width: bounds.width - 32, height: 44)
+    let card = articleView.viewWithTag(10)
+    card?.frame = CGRect(x: 16, y: 12, width: bounds.width - 32, height: 168)
+    articleView.viewWithTag(11)?.frame = CGRect(x: 16, y: 16, width: (card?.bounds.width ?? 0) - 32, height: 22)
+    articleField.frame = CGRect(x: 16, y: 48, width: (card?.bounds.width ?? bounds.width) - 32, height: 44)
+    articleSendButton.frame = CGRect(x: 16, y: 104, width: (card?.bounds.width ?? bounds.width) - 32, height: 44)
     checklistView.viewWithTag(21)?.frame = CGRect(x: 16, y: 24, width: bounds.width - 32, height: 28)
     checklistField.frame = CGRect(x: 16, y: 68, width: bounds.width - 32, height: 44)
     let send = checklistView.viewWithTag(24)
@@ -827,34 +846,29 @@ final class ChatAttachmentMenuController: UIViewController, UITextFieldDelegate 
       galleryEmptyLabel.isHidden = false
     }
 
+    let width = contentView.bounds.width
     let dir: CGFloat = section.rawValue > previous.rawValue ? 1.0 : -1.0
-    target.alpha = 0
-    target.transform = CGAffineTransform(translationX: 0, y: dir * 15)
+    target.alpha = 1
+    target.transform = CGAffineTransform(translationX: dir * width, y: 0)
     from.transform = .identity
-
-    // Manage empty label alpha if it belongs to target or from
+    from.alpha = 1
     if targetEmptyLabelVisible {
-      galleryEmptyLabel.alpha = 0
-    } else if fromEmptyLabelVisible {
       galleryEmptyLabel.alpha = 1
+      galleryEmptyLabel.transform = CGAffineTransform(translationX: dir * width, y: 0)
     }
 
-    UIView.animate(withDuration: 0.25, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
-      from.alpha = 0
-      from.transform = CGAffineTransform(translationX: 0, y: -dir * 15)
-
-      target.alpha = 1
+    UIView.animate(withDuration: 0.32, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState]) {
+      from.transform = CGAffineTransform(translationX: -dir * width, y: 0)
       target.transform = .identity
-
       if targetEmptyLabelVisible {
-        self.galleryEmptyLabel.alpha = 1
+        self.galleryEmptyLabel.transform = .identity
       } else if fromEmptyLabelVisible {
-        self.galleryEmptyLabel.alpha = 0
+        self.galleryEmptyLabel.transform = CGAffineTransform(translationX: -dir * width, y: 0)
       }
     } completion: { _ in
       self.showHostView(for: section)
-      from.alpha = 1
       from.transform = .identity
+      self.galleryEmptyLabel.transform = .identity
       self.galleryEmptyLabel.alpha = 1
     }
   }
@@ -2277,19 +2291,21 @@ private final class AttachmentRowView: UIControl {
 
     iconContainer.translatesAutoresizingMaskIntoConstraints = false
     iconContainer.layer.cornerRadius = 8
-    iconContainer.backgroundColor = color.withAlphaComponent(isDark ? 0.18 : 0.12)
+    iconContainer.layer.cornerCurve = .continuous
+    iconContainer.clipsToBounds = true
+    iconContainer.backgroundColor = color.withAlphaComponent(isDark ? 0.78 : 0.88)
     addSubview(iconContainer)
 
     iconView.translatesAutoresizingMaskIntoConstraints = false
     iconView.contentMode = .scaleAspectFit
     iconView.image = UIImage(
       systemName: symbol,
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold))
-    iconView.tintColor = color
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold))
+    iconView.tintColor = .white
     iconContainer.addSubview(iconView)
 
     titleLabel.translatesAutoresizingMaskIntoConstraints = false
-    titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+    titleLabel.font = .systemFont(ofSize: 17, weight: .regular)
     titleLabel.textColor = isDark ? .white : .black
     titleLabel.text = title
     addSubview(titleLabel)
@@ -2298,7 +2314,7 @@ private final class AttachmentRowView: UIControl {
     chevronView.contentMode = .scaleAspectFit
     chevronView.image = UIImage(
       systemName: "chevron.right",
-      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold))
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
     chevronView.tintColor = (isDark ? UIColor.white : UIColor.black).withAlphaComponent(
       isDark ? 0.5 : 0.32)
     chevronView.isHidden = !showChevron
@@ -2311,12 +2327,12 @@ private final class AttachmentRowView: UIControl {
     addSubview(divider)
 
     NSLayoutConstraint.activate([
-      heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
+      heightAnchor.constraint(equalToConstant: 62),
 
-      iconContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+      iconContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
       iconContainer.centerYAnchor.constraint(equalTo: centerYAnchor),
-      iconContainer.widthAnchor.constraint(equalToConstant: 30),
-      iconContainer.heightAnchor.constraint(equalToConstant: 30),
+      iconContainer.widthAnchor.constraint(equalToConstant: 34),
+      iconContainer.heightAnchor.constraint(equalToConstant: 34),
 
       iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
       iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
