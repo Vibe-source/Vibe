@@ -235,7 +235,7 @@ async function registerUser(prefix) {
   if (res.status !== 200 || !res.json || !res.json.token) {
     throw new Error(`registration failed for ${payload.username}: ${res.status} ${res.text.slice(0, 200)}`);
   }
-  return { username: payload.username, userId: res.json.userId, token: res.json.token };
+  return { username: payload.username, password: payload.password, userId: res.json.userId, token: res.json.token };
 }
 
 let mainUser = null;
@@ -546,28 +546,34 @@ async function check5BearerAndSessions() {
 // ===================================================================
 
 async function check6LoginThrottle() {
-  await check("6.1", "login-throttle.11th-attempt", async () => {
+  await check("6.1", "login-throttle.correct-password-blocked-after-failures", async () => {
     const user = await registerUser("throttle");
     const statuses = [];
-    let eleventh = null;
-    for (let i = 1; i <= 11; i++) {
+    for (let i = 1; i <= 10; i++) {
       const res = await httpRequest(`${OPTS.core}/api/login`, {
         method: "POST",
         headers: jsonHeaders(),
         body: JSON.stringify({ credential: user.username, password: "definitely-wrong-password" }),
       });
       statuses.push(res.status);
-      if (i === 11) eleventh = res;
     }
-    const answeredByRateLimiter = eleventh.headers["x-ratelimit-limit"] !== undefined || eleventh.headers["retry-after"] !== undefined;
-    const ok = eleventh.status === 429 || eleventh.status === 423;
+    // The real security property: after the failures, the CORRECT password must NOT log in.
+    // The server returns a generic 401 on lockout (anti-enumeration), so status alone can't
+    // distinguish throttle from a wrong password — proving the valid password is refused does.
+    const correct = await httpRequest(`${OPTS.core}/api/login`, {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ credential: user.username, password: user.password }),
+    });
+    const blocked = correct.status !== 200;
+    const byRateLimiter = correct.headers["x-ratelimit-limit"] !== undefined || correct.headers["retry-after"] !== undefined;
     return {
-      status: ok ? "PASS" : "FAIL",
-      expected: "11th attempt -> 429 or 423 (attempts 1-10 -> 401 invalid_credentials)",
-      observed: `statuses=[${statuses.join(",")}] 11th=${eleventh.status}`,
-      note: answeredByRateLimiter
-        ? "answered by RateLimiter (:auth bucket, 10/60s) — x-ratelimit-limit/retry-after present; LoginThrottle's own 15-min lock never gets a turn to answer since it also fires at the 11th call and both would read 401 otherwise"
-        : "no rate-limit headers on the 11th response — did not come from RateLimiter; check LoginThrottle wiring",
+      status: blocked ? "PASS" : "FAIL",
+      expected: "after 10 wrong logins, the CORRECT password is refused (LoginThrottle 10/15min and/or :auth bucket 10/60s)",
+      observed: `wrong=[${statuses.join(",")}] correct-password=${correct.status} (${blocked ? "blocked" : "LOGGED IN — protection failed"})`,
+      note: byRateLimiter
+        ? "blocked with rate-limit headers — the :auth IP bucket answered; LoginThrottle's account lock is the second layer"
+        : "blocked with a generic 401 and no rate-limit headers — LoginThrottle's account lock answered (correct anti-enumeration behavior)",
     };
   });
 }
