@@ -100,10 +100,16 @@ defmodule VibeAgents.Voice.OpenAIRealtime do
            Mint.WebSocket.upgrade(:wss, conn, "/v1/realtime?model=#{state.model}", [
              {"authorization", "Bearer #{state.api_key}"}
            ]) do
+      Logger.info("[VibeAgents.Voice.OpenAIRealtime] connecting model=#{state.model}")
       {:ok, %{state | conn: conn, ref: ref}}
     else
-      {:error, _conn, reason} -> {:error, reason}
-      {:error, reason} -> {:error, reason}
+      {:error, _conn, reason} ->
+        Logger.warning("[VibeAgents.Voice.OpenAIRealtime] connect failed: #{inspect(reason)}")
+        {:error, reason}
+
+      {:error, reason} ->
+        Logger.warning("[VibeAgents.Voice.OpenAIRealtime] connect failed: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -147,7 +153,14 @@ defmodule VibeAgents.Voice.OpenAIRealtime do
   end
 
   def handle_cast(:commit, state) do
-    {:noreply, send_event(state, %{"type" => "input_audio_buffer.commit"})}
+    # Explicit end-of-utterance: flush the buffer and force a reply. server_vad still
+    # drives mid-call turns on its own; this covers push-to-talk with no trailing silence.
+    state =
+      state
+      |> send_event(%{"type" => "input_audio_buffer.commit"})
+      |> send_event(%{"type" => "response.create"})
+
+    {:noreply, state}
   end
 
   def handle_cast(:interrupt, state) do
@@ -210,9 +223,11 @@ defmodule VibeAgents.Voice.OpenAIRealtime do
   defp handle_response({:done, ref}, %{ref: ref} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
+        Logger.debug("[VibeAgents.Voice.OpenAIRealtime] websocket upgraded status=#{state.status}")
         %{state | conn: conn, websocket: websocket}
 
       {:error, conn, reason} ->
+        Logger.warning("[VibeAgents.Voice.OpenAIRealtime] upgrade failed status=#{state.status}: #{inspect(reason)}")
         notify(state.owner, {:error, reason})
         %{state | conn: conn}
     end
@@ -255,6 +270,7 @@ defmodule VibeAgents.Voice.OpenAIRealtime do
   end
 
   defp handle_event(%{"type" => "session.updated"}, %{ready: false} = state) do
+    Logger.info("[VibeAgents.Voice.OpenAIRealtime] session ready")
     notify(state.owner, {:ready})
     %{state | ready: true}
   end
@@ -388,11 +404,13 @@ defmodule VibeAgents.Voice.OpenAIRealtime do
         "type" => "realtime",
         "model" => state.model,
         "instructions" => state.instructions,
-        "output_modalities" => ["audio", "text"],
+        # GA Realtime accepts ["audio"] or ["text"], never both; audio still yields transcripts.
+        "output_modalities" => ["audio"],
         "audio" => %{
           "input" => %{
             "format" => %{"type" => "audio/pcm", "rate" => 24_000},
-            "turn_detection" => %{"type" => "server_vad"}
+            "turn_detection" => %{"type" => "server_vad"},
+            "transcription" => %{"model" => "gpt-4o-mini-transcribe"}
           },
           "output" => %{
             "format" => %{"type" => "audio/pcm", "rate" => 24_000},

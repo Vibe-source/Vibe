@@ -230,6 +230,9 @@ defmodule VibeAgents.Tools.Executor do
         "handoff_to_agent" -> Handoff.handoff_to_agent(state.run, input)
         "remember" -> Memory.remember(state.run, input)
         "recall" -> Memory.recall(state.run, input)
+        # Pure gate: reaching execution means the broker already got approval. Tell the
+        # model it may now do the described action with its real tools.
+        "request_approval" -> %{"ok" => true, "approved" => true}
         _ -> %{"ok" => false, "error" => "Unknown tool #{name}"}
       end
 

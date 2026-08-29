@@ -4,6 +4,8 @@ defmodule VibeAgents.Sandbox.Client do
 
   @timeout 30_000
   @exec_timeout 250_000
+  # Gateway browser calls wait up to SANDBOX_BROWSER_TIMEOUT_MS (default 90 s) for a cold Chromium.
+  @browser_timeout 120_000
 
   def configured?, do: not is_nil(base_url()) and not is_nil(token())
 
@@ -13,9 +15,11 @@ defmodule VibeAgents.Sandbox.Client do
   def write_file(id, body), do: put("/v1/sandboxes/#{id}/files", body)
   def read_file(id, path), do: get("/v1/sandboxes/#{id}/files?path=#{URI.encode_www_form(path)}")
   def tree(id, path, depth), do: get("/v1/sandboxes/#{id}/tree?path=#{URI.encode_www_form(path || "")}&depth=#{depth || 2}")
-  def browser_navigate(id, body), do: post("/v1/sandboxes/#{id}/browser/navigate", body)
-  def browser_action(id, body), do: post("/v1/sandboxes/#{id}/browser/action", body)
-  def browser_screenshot(id, max_width \\ 1024), do: get("/v1/sandboxes/#{id}/browser/screenshot?maxWidth=#{max_width}")
+  def browser_navigate(id, body), do: post("/v1/sandboxes/#{id}/browser/navigate", body, @browser_timeout)
+  def browser_action(id, body), do: post("/v1/sandboxes/#{id}/browser/action", body, @browser_timeout)
+
+  def browser_screenshot(id, max_width \\ 1024),
+    do: request(:get, "/v1/sandboxes/#{id}/browser/screenshot?maxWidth=#{max_width}", nil, @browser_timeout)
   def stop(id), do: post("/v1/sandboxes/#{id}/stop", %{})
   def delete(id), do: delete_request("/v1/sandboxes/#{id}")
 

@@ -226,3 +226,10 @@ agent-runtime/deps/
 contracts/_build/
 contracts/deps/
 sandbox-gateway/target/
+
+# Load-test fixtures/output (contain throwaway user tokens + local metrics)
+scripts/loadtest/results/
+scripts/loadtest/*.wav
+scripts/*/out/
+scripts/voice-probe/*.wav
+scripts/voice-probe/*.aiff

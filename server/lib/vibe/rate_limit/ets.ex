@@ -1,7 +1,8 @@
 defmodule Vibe.RateLimit.ETS do
   @moduledoc """
-  Today's node-local ETS rate limiter (sliding window), moved verbatim behind
-  `Vibe.RateLimit.Backend` so `VibeWeb.Plugs.RateLimiter` can swap backends.
+  Node-local ETS rate limiter (fixed window) behind `Vibe.RateLimit.Backend`.
+  The count is bumped with atomic `:ets.update_counter`, so a concurrent burst
+  cannot race past the limit the way a lookup-then-insert pair could.
   """
   @behaviour Vibe.RateLimit.Backend
 
@@ -11,46 +12,37 @@ defmodule Vibe.RateLimit.ETS do
   def hit(key, max_requests, window_ms) do
     ensure_table_exists()
     now = System.system_time(:millisecond)
-    window_start = now - window_ms
+    bucket_start = div(now, window_ms) * window_ms
+    reset_at = bucket_start + window_ms
+    entry = {key, bucket_start}
 
-    case :ets.lookup(@table, key) do
-      [] ->
-        # First request - allow and record. Guard the table against unbounded
-        # growth (a burst of never-before-seen identifiers) by pruning expired
-        # keys once it crosses a soft cap.
-        maybe_prune(window_ms)
-        :ets.insert(@table, {key, [{now, 1}]})
-        {:ok, max_requests - 1, now + window_ms}
+    # Atomic: insert {entry, 0} if absent, then +1, returning the new count. Two
+    # simultaneous callers get 1 and 2, never both "first".
+    count = :ets.update_counter(@table, entry, {2, 1}, {entry, 0})
+    if count == 1, do: maybe_prune(window_ms)
 
-      [{^key, requests}] ->
-        recent_requests = Enum.filter(requests, fn {timestamp, _} -> timestamp > window_start end)
-        total_count = Enum.reduce(recent_requests, 0, fn {_, count}, acc -> acc + count end)
-
-        if total_count >= max_requests do
-          oldest_in_window =
-            recent_requests |> Enum.map(fn {ts, _} -> ts end) |> Enum.min(fn -> now end)
-
-          retry_after = oldest_in_window + window_ms - now
-          {:error, max(retry_after, 1000), oldest_in_window + window_ms}
-        else
-          new_requests = [{now, 1} | recent_requests] |> Enum.take(max_requests * 2)
-          :ets.insert(@table, {key, new_requests})
-
-          reset_at_ms =
-            new_requests
-            |> Enum.map(fn {timestamp, _} -> timestamp end)
-            |> Enum.min(fn -> now end)
-            |> Kernel.+(window_ms)
-
-          {:ok, max_requests - total_count - 1, reset_at_ms}
-        end
+    if count > max_requests do
+      {:error, max(reset_at - now, 1000), reset_at}
+    else
+      {:ok, max_requests - count, reset_at}
     end
   end
 
   defp ensure_table_exists do
     case :ets.whereis(@table) do
       :undefined ->
-        :ets.new(@table, [:set, :public, :named_table, {:read_concurrency, true}])
+        try do
+          :ets.new(@table, [
+            :set,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, true},
+            {:decentralized_counters, true}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
 
       _ ->
         :ok
@@ -67,16 +59,9 @@ defmodule Vibe.RateLimit.ETS do
     if :ets.info(@table, :size) > max_keys do
       cutoff = System.system_time(:millisecond) - window_ms
 
+      # Drop every bucket whose window has fully elapsed; match on {{_, bucket_start}, _}.
       try do
-        :ets.foldl(
-          fn {key, requests}, acc ->
-            newest = requests |> Enum.map(fn {ts, _} -> ts end) |> Enum.max(fn -> 0 end)
-            if newest < cutoff, do: [key | acc], else: acc
-          end,
-          [],
-          @table
-        )
-        |> Enum.each(&:ets.delete(@table, &1))
+        :ets.select_delete(@table, [{{{:_, :"$1"}, :_}, [{:<, {:+, :"$1", window_ms}, cutoff}], [true]}])
       rescue
         _ -> :ok
       end

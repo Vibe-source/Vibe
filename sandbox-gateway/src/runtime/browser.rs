@@ -14,7 +14,15 @@ use crate::state::AppState;
 use super::now_unix;
 
 const BROWSER_SCRIPT: &str = "/opt/vibe/browser.js";
-const BROWSER_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_BROWSER_TIMEOUT_MS: u64 = 90_000;
+
+/// A cold Chromium start on a 1-CPU sandbox can take 30-60 s; SANDBOX_BROWSER_TIMEOUT_MS overrides.
+fn browser_timeout_ms() -> u64 {
+    std::env::var("SANDBOX_BROWSER_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BROWSER_TIMEOUT_MS)
+}
 
 fn parse_first_json_line(stdout: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(stdout);
@@ -76,7 +84,7 @@ async fn run_browser_script(
         Ok::<(), GatewayError>(())
     };
 
-    tokio::time::timeout(std::time::Duration::from_millis(BROWSER_TIMEOUT_MS), drain)
+    tokio::time::timeout(std::time::Duration::from_millis(browser_timeout_ms()), drain)
         .await
         .map_err(|_| GatewayError::Internal(anyhow::anyhow!("browser script timed out")))??;
 

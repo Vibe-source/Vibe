@@ -242,6 +242,24 @@ defmodule Vibe.AI.ToolRegistry do
       category: "interaction",
       always_on: true,
       testability: "dry_run"
+    },
+    # Isolated-runtime only: gates capabilities.computer/.browser in AgentGateway. A no-op for
+    # embedded agents (the runtime honors them; the embedded loop has no sandbox tools).
+    %{
+      id: "computer_run",
+      name: "Computer",
+      description: "Run shell/python/node on the agent's own sandboxed computer (isolated runtime).",
+      category: "computer",
+      always_on: false,
+      testability: "dry_run"
+    },
+    %{
+      id: "browser_open",
+      name: "Browser",
+      description: "Open and drive a real browser on the agent's computer (isolated runtime).",
+      category: "computer",
+      always_on: false,
+      testability: "dry_run"
     }
   ]
 
@@ -268,6 +286,8 @@ defmodule Vibe.AI.ToolRegistry do
   @doc "Toggleable tool ids only."
   def toggleable_tool_ids, do: Enum.map(toggleable_tools(), & &1.id)
 
-  @doc "Default selection for a new agent: every toggleable tool."
-  def default_tool_ids, do: toggleable_tool_ids()
+  @doc "Default selection for a new agent: every toggleable tool except the opt-in computer set."
+  def default_tool_ids do
+    Enum.reject(toggleable_tools(), &(&1.category == "computer")) |> Enum.map(& &1.id)
+  end
 end
