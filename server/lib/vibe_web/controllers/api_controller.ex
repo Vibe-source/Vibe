@@ -14,6 +14,26 @@ defmodule VibeWeb.ApiController do
     json(conn, %{pong: System.system_time(:millisecond)})
   end
 
+  @doc "Liveness+DB readiness probe for a load balancer / orchestrator; never raises."
+  def ready(conn, _params) do
+    if db_ok?() do
+      json(conn, %{status: "ready", db: "ok", node: node()})
+    else
+      conn |> put_status(503) |> json(%{status: "not_ready", db: "error", node: node()})
+    end
+  end
+
+  defp db_ok? do
+    case Vibe.Repo.query("SELECT 1", [], timeout: 2_000) do
+      {:ok, _result} -> true
+      {:error, _reason} -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
   def info(conn, _params) do
     json(conn, %{
       name: "Vibe Server (Elixir)",

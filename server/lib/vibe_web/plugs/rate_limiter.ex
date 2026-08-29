@@ -1,9 +1,8 @@
 defmodule VibeWeb.Plugs.RateLimiter do
   @moduledoc """
-  Rate limiting plug to prevent brute force attacks.
-  Uses ETS for in-memory rate limiting (resets on server restart).
-
-  For production, consider using Redis-based rate limiting for distributed environments.
+  Rate limiting plug. Delegates the actual counting to `Vibe.RateLimit.backend()`
+  (node-local ETS by default, or Valkey when `RATE_LIMIT_BACKEND=valkey`) — this
+  module only resolves limits/identifiers and shapes the response.
   """
   import Plug.Conn
   require Logger
@@ -26,16 +25,9 @@ defmodule VibeWeb.Plugs.RateLimiter do
     ai_media: {10, 300_000}
   }
 
-  def init(opts) do
-    # Ensure ETS table exists
-    ensure_table_exists()
-    opts
-  end
+  def init(opts), do: opts
 
   def call(conn, opts) do
-    # Ensure table exists at runtime (defensive check)
-    ensure_table_exists()
-
     limit_type = Keyword.get(opts, :type, :api)
     {max_requests, window_ms} = resolve_limits(limit_type)
 
@@ -43,7 +35,7 @@ defmodule VibeWeb.Plugs.RateLimiter do
     bucket = request_bucket(conn.request_path)
     key = {limit_type, bucket, identifier.kind, identifier.value}
 
-    case check_rate_limit(key, max_requests, window_ms) do
+    case Vibe.RateLimit.backend().hit(key, max_requests, window_ms) do
       {:ok, remaining, reset_at_ms} ->
         maybe_log_request(
           conn,
@@ -59,6 +51,7 @@ defmodule VibeWeb.Plugs.RateLimiter do
 
       {:error, retry_after_ms, reset_at_ms} ->
         retry_after_seconds = div(retry_after_ms, 1000) + 1
+        :telemetry.execute([:vibe, :rate_limit, :blocked], %{count: 1}, %{type: limit_type})
 
         Logger.warning(
           "[RateLimiter] blocked request " <>
@@ -97,89 +90,6 @@ defmodule VibeWeb.Plugs.RateLimiter do
       true ->
         identifier(:ip, forwarded_or_remote_ip(conn))
     end
-  end
-
-  defp ensure_table_exists do
-    case :ets.whereis(:rate_limiter) do
-      :undefined ->
-        :ets.new(:rate_limiter, [:set, :public, :named_table, {:read_concurrency, true}])
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp check_rate_limit(key, max_requests, window_ms) do
-    now = System.system_time(:millisecond)
-    window_start = now - window_ms
-
-    case :ets.lookup(:rate_limiter, key) do
-      [] ->
-        # First request - allow and record. Guard the table against unbounded
-        # growth (a burst of never-before-seen identifiers) by pruning expired
-        # keys once it crosses a soft cap. With the XFF fix an attacker can no
-        # longer mint distinct identifiers at will, so this only ever trims genuine
-        # churn.
-        maybe_prune(window_ms)
-        :ets.insert(:rate_limiter, {key, [{now, 1}]})
-        {:ok, max_requests - 1, now + window_ms}
-
-      [{^key, requests}] ->
-        # Filter out old requests outside the window
-        recent_requests = Enum.filter(requests, fn {timestamp, _} -> timestamp > window_start end)
-        total_count = Enum.reduce(recent_requests, 0, fn {_, count}, acc -> acc + count end)
-
-        if total_count >= max_requests do
-          # Rate limited - calculate retry-after
-          oldest_in_window =
-            recent_requests |> Enum.map(fn {ts, _} -> ts end) |> Enum.min(fn -> now end)
-
-          retry_after = oldest_in_window + window_ms - now
-          {:error, max(retry_after, 1000), oldest_in_window + window_ms}
-        else
-          # Allow and record
-          new_requests = [{now, 1} | recent_requests] |> Enum.take(max_requests * 2)
-          :ets.insert(:rate_limiter, {key, new_requests})
-
-          reset_at_ms =
-            new_requests
-            |> Enum.map(fn {timestamp, _} -> timestamp end)
-            |> Enum.min(fn -> now end)
-            |> Kernel.+(window_ms)
-
-          {:ok, max_requests - total_count - 1, reset_at_ms}
-        end
-    end
-  end
-
-  # Soft ceiling on distinct rate-limit keys. When exceeded, drop every key whose
-  # entire window has already elapsed (they would reset to "allowed" anyway), so a
-  # transient flood cannot pin memory. Cheap: runs only when the table is large.
-  @max_keys_default 200_000
-  defp maybe_prune(window_ms) do
-    max_keys = parse_positive_env("RATE_LIMIT_MAX_KEYS", @max_keys_default)
-
-    if :ets.info(:rate_limiter, :size) > max_keys do
-      cutoff = System.system_time(:millisecond) - window_ms
-
-      # match_delete rows whose newest timestamp is older than the window. Guarded
-      # so a matchspec/table hiccup can never take down the request path.
-      try do
-        :ets.foldl(
-          fn {key, requests}, acc ->
-            newest = requests |> Enum.map(fn {ts, _} -> ts end) |> Enum.max(fn -> 0 end)
-            if newest < cutoff, do: [key | acc], else: acc
-          end,
-          [],
-          :rate_limiter
-        )
-        |> Enum.each(&:ets.delete(:rate_limiter, &1))
-      rescue
-        _ -> :ok
-      end
-    end
-
-    :ok
   end
 
   defp resolve_limits(limit_type) do

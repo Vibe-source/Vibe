@@ -29,14 +29,30 @@ defmodule Vibe.Application do
     # Per-(claimer, target) KeyPackage claim cap. Owned here so a request
     # process dying does not drop the table (see Vibe.Mls.check_claim_quota/2).
     ensure_ets_table(:mls_claim_quota)
+    # Login-failure throttle, internal-auth replay cache, and isolated-run relay state.
+    ensure_ets_table(:login_throttle)
+    ensure_ets_table(:vibe_internal_nonces)
+    ensure_ets_table(:agent_run_seen)
+    ensure_ets_table(:agent_run_state)
 
-    children = [
-      # Start the Telemetry supervisor
-      # VibeWeb.Telemetry,
-      # Start the Ecto repository
-      Vibe.Repo,
-      # Start the PubSub system
-      {Phoenix.PubSub, name: Vibe.PubSub},
+    # Redact credential-shaped substrings from every log line, before anything logs.
+    Vibe.LogScrub.install()
+    Vibe.Telemetry.SlowQuery.attach()
+
+    children =
+      [
+        # Start the Ecto repository
+        Vibe.Repo,
+        # Start the PubSub system
+        {Phoenix.PubSub, name: Vibe.PubSub},
+        # Cross-node cache invalidation relay (docs/agent-platform-v1.md §5, phase 4)
+        Vibe.Cache
+      ] ++
+        Vibe.Cluster.child_specs() ++
+        Vibe.RateLimit.redix_child_specs() ++
+        [Vibe.Telemetry.Metrics.reporter_child_spec()] ++
+        Vibe.Telemetry.MetricsServer.child_specs() ++
+        [
       # Start Presence tracking
       VibeWeb.Presence,
       # Start Finch HTTP client for AI APIs
@@ -75,7 +91,7 @@ defmodule Vibe.Application do
       # per {chat_id, team_run_id}; docs/team-architecture-v2.md §4)
       {Registry, keys: :unique, name: Vibe.AI.TeamRunRegistry},
       {DynamicSupervisor, name: Vibe.AI.TeamRunMonitorSupervisor, strategy: :one_for_one}
-    ]
+        ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options

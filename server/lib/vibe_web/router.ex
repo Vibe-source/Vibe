@@ -43,6 +43,21 @@ defmodule VibeWeb.Router do
     plug VibeWeb.Plugs.RateLimiter, type: :public_agent
   end
 
+  # Multipart bodies are parsed here, not in the endpoint, so only upload routes pay for
+  # the 120 MB ceiling; every other route is capped by the endpoint's JSON limit.
+  pipeline :multipart_upload do
+    plug Plug.Parsers,
+      parsers: [:multipart],
+      pass: ["*/*"],
+      length: String.to_integer(System.get_env("MAX_UPLOAD_BYTES") || "120000000")
+  end
+
+  # Runtime → core service calls (docs/agent-platform-v1.md §3.1). Never exposed via Caddy.
+  pipeline :internal do
+    plug :accepts, ["json"]
+    plug VibeWeb.Plugs.InternalServiceAuth
+  end
+
   # Auth endpoints with rate limiting
   scope "/api", VibeWeb do
     pipe_through :auth_rate_limited
@@ -56,6 +71,7 @@ defmodule VibeWeb.Router do
 
     # Health & Bootstrap
     get "/health", ApiController, :health
+    get "/ready", ApiController, :ready
     get "/ping", ApiController, :ping
     get "/info", ApiController, :info
     get "/servers", ApiController, :servers
@@ -92,6 +108,8 @@ defmodule VibeWeb.Router do
     # this server. Authenticated: only a caller who just proved possession of
     # the old secret may rotate it.
     post "/upgrade-identity", AuthController, :upgrade_identity
+    post "/auth/logout", AuthController, :logout
+    post "/auth/logout-all", AuthController, :logout_all
 
     # User
     get "/user/:id", UserController, :show
@@ -211,6 +229,9 @@ defmodule VibeWeb.Router do
     post "/agents/:id/approval_tasks/:task_id/reject", AgentsController, :reject_task
     # Opaque token claim for sender-declared decision actions (not runbook approve/reject).
     post "/decisions/actions", AgentsController, :respond_decision_action
+    # Isolated-runtime surfaces (docs/agent-platform-v1.md §3.7 / §3.2).
+    post "/agents/:id/voice/sessions", AgentsController, :voice_session
+    get "/agents/:id/computer/preview", AgentsController, :computer_preview
     delete "/agents/:id", AgentsController, :delete
 
     # Builder
@@ -284,9 +305,6 @@ defmodule VibeWeb.Router do
     # Share links — turn a pasted @handle or vibegram.io link into something openable.
     get "/links/resolve", LinkController, :resolve
 
-    # Media Upload
-    post "/media/upload", MediaController, :upload
-
     # Relay → Bridge registration
     get "/packet/bootstrap", BridgeController, :packet_bootstrap
     post "/relay/register-bridge", BridgeController, :register_relay
@@ -297,6 +315,26 @@ defmodule VibeWeb.Router do
     pipe_through [:api_stream, :api_authenticated]
 
     post "/vibeagent/chat/stream", VibeagentController, :chat_stream
+  end
+
+  # Media upload — the only route that parses multipart (see :multipart_upload).
+  scope "/api", VibeWeb do
+    pipe_through [:api, :api_authenticated, :multipart_upload]
+
+    post "/media/upload", MediaController, :upload
+  end
+
+  # Agent runtime → core (signed, internal network only; Caddy answers 403 for /internal/*).
+  scope "/internal/v1", VibeWeb do
+    pipe_through :internal
+
+    post "/agent-events", InternalAgentController, :agent_events
+    post "/deliveries", InternalAgentController, :deliveries
+    post "/approvals", InternalAgentController, :approvals
+    post "/provider-auth", InternalAgentController, :provider_auth
+    post "/handoffs", InternalAgentController, :handoffs
+    get "/agents/:identifier/card", InternalAgentController, :card
+    get "/healthz", InternalAgentController, :healthz
   end
 
   # High-cost / abuse-prone endpoints (require auth + strict rate limit)
@@ -321,9 +359,9 @@ defmodule VibeWeb.Router do
 
   end
 
-  # AI media editing — authenticated, and on its own paid-call rate limit.
+  # AI media editing — authenticated, on its own paid-call rate limit, multipart bodies.
   scope "/api", VibeWeb do
-    pipe_through [:ai_media_rate_limited, :api_authenticated]
+    pipe_through [:ai_media_rate_limited, :api_authenticated, :multipart_upload]
 
     post "/ai/edit_image", AIController, :edit_image
     post "/ai/edit_video", AIController, :edit_video

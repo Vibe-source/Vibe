@@ -1,10 +1,19 @@
 defmodule VibeWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :vibe
 
-  @parser_length (case Integer.parse(System.get_env("MAX_REQUEST_BYTES") || "120000000") do
-                    {value, _} when value > 0 -> value
-                    _ -> 120_000_000
-                  end)
+  # JSON/urlencoded cap. MLS welcome posts carry a base64 ratchet tree up to
+  # ~5.5MB encoded (Vibe.Mls @max_ratchet_tree_bytes), so this sits above that.
+  @max_json_body_bytes (case Integer.parse(System.get_env("MAX_JSON_BODY_BYTES") || "8000000") do
+                          {value, _} when value > 0 -> value
+                          _ -> 8_000_000
+                        end)
+
+  # Content-Length sanity ceiling across all routes, enforced by BodyLimit
+  # before parsing. Multipart uploads get their own cap in the router pipeline.
+  @max_upload_body_bytes (case Integer.parse(System.get_env("MAX_UPLOAD_BYTES") || "120000000") do
+                             {value, _} when value > 0 -> value
+                             _ -> 120_000_000
+                           end)
 
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
@@ -56,10 +65,12 @@ defmodule VibeWeb.Endpoint do
   plug(Plug.RequestId)
   plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
 
+  plug(VibeWeb.Plugs.BodyLimit, max_bytes: @max_upload_body_bytes)
+
   plug(Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
+    parsers: [:urlencoded, :json],
     pass: ["*/*"],
-    length: @parser_length,
+    length: @max_json_body_bytes,
     json_decoder: Phoenix.json_library(),
     body_reader: {VibeWeb.Plugs.RawBodyReader, :read_body, []}
   )
@@ -110,6 +121,7 @@ defmodule VibeWeb.Endpoint do
     ]
   )
 
+  plug(VibeWeb.Plugs.SecurityHeaders)
   plug(VibeWeb.Router)
 
   @doc """

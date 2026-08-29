@@ -272,6 +272,11 @@ defmodule Vibe.AI.StandaloneAgent do
     end
   end
 
+  @doc "Public wrapper: deliver runtime Outputs (docs/agent-platform-v1.md §3.3) via the same send path."
+  def deliver_outputs(%AgentSchema{} = agent, chat_id, outputs, reply_to_id) when is_list(outputs) do
+    maybe_deliver(agent, chat_id, outputs, "send", reply_to_id)
+  end
+
   defp deliver_output_to_chat(agent, chat_id, output, reply_to_id, timestamp) do
     message_id = Ecto.UUID.generate()
     message_type = output_type(output)
@@ -1035,6 +1040,49 @@ defmodule Vibe.AI.StandaloneAgent do
   end
 
   defp recent_chat_history(_, _, _), do: []
+
+  @runtime_history_limit 30
+
+  @doc "Chat history as RunRequest.context.history entries ({role,authorName,text,ts}), capped at 30."
+  def history_for_runtime(chat_id, requester_user_id, agent_user_id)
+      when is_binary(chat_id) and is_binary(requester_user_id) and is_binary(agent_user_id) do
+    chat_id
+    |> Chat.get_messages_for_user(requester_user_id)
+    |> Enum.map(&runtime_history_entry(&1, agent_user_id))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.take(-@runtime_history_limit)
+  end
+
+  def history_for_runtime(_, _, _), do: []
+
+  defp runtime_history_entry(message, agent_user_id) when is_map(message) do
+    from_id = Map.get(message, :from_id) || Map.get(message, "from_id")
+    agent_turn? = from_id == agent_user_id
+
+    case message_text_for_history(message, agent_turn?) do
+      nil ->
+        nil
+
+      text ->
+        %{
+          role: if(agent_turn?, do: "assistant", else: "user"),
+          authorName: runtime_history_author_name(message, agent_turn?),
+          text: text,
+          ts: Map.get(message, :timestamp) || Map.get(message, "timestamp")
+        }
+    end
+  end
+
+  defp runtime_history_entry(_message, _agent_user_id), do: nil
+
+  # Assistant turns carry the agent's display name in message metadata already
+  # (deliver_output_to_chat); user turns are left unnamed (see runtime handoff notes).
+  defp runtime_history_author_name(message, true) do
+    metadata = Map.get(message, :metadata) || Map.get(message, "metadata") || %{}
+    map_value(metadata, :agentName) || map_value(metadata, :agent_name)
+  end
+
+  defp runtime_history_author_name(_message, false), do: nil
 
   # Same memory the built-in DM gets (AgentChannel.turn_memory_from_messages), derived from
   # what this agent already delivered into the chat — so "send it again" resends the same

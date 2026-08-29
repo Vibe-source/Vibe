@@ -17,6 +17,7 @@ defmodule Vibe.AI.AgentDecisions do
   alias Vibe.AgentDecisionAction
   alias Vibe.AgentEvent
   alias Vibe.AgentEventThread
+  alias Vibe.AgentGateway
   alias Vibe.Agents
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
@@ -235,7 +236,7 @@ defmodule Vibe.AI.AgentDecisions do
     }
 
     with {:ok, message_payload} <-
-           post_decision_message(agent, thread, body, metadata) do
+           post_decision_message(agent, thread.chat_id, thread.root_message_id, body, metadata) do
       task =
         task
         |> AgentApprovalTask.changeset(%{message_id: message_payload.message_id})
@@ -244,6 +245,134 @@ defmodule Vibe.AI.AgentDecisions do
       {:ok, %{status: "approval_required", approval_task: task, message: message_payload}}
     end
   end
+
+  @doc """
+  Runtime-sourced decision (isolated run approval/permission). Same message/token
+  plumbing as `create_declared_decision/6`, but no thread/event to attach to.
+  """
+  def create_runtime_decision(agent, chat_id, params) when is_map(params) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    run_id = params["runId"] || params[:runId]
+    decision_id = params["decisionId"] || params[:decisionId]
+    kind = params["kind"] || params[:kind] || "approval"
+    title = params["title"] || params[:title] || "Decision required"
+    detail = params["detail"] || params[:detail]
+    risk = params["risk"] || params[:risk]
+    raw_actions = params["actions"] || params[:actions] || []
+
+    with {:ok, action_mode} <- normalize_action_mode(params["actionMode"] || params[:actionMode]),
+         {:ok, expires_at} <- normalize_expires_at(params["expiresAt"] || params[:expiresAt]),
+         {:ok, actions} <- normalize_actions(raw_actions) do
+      prepared =
+        actions
+        |> Enum.with_index()
+        |> Enum.map(fn {action, index} ->
+          {token, hash} = generate_action_token()
+          {action, index, token, hash}
+        end)
+
+      task =
+        %AgentApprovalTask{}
+        |> AgentApprovalTask.changeset(%{
+          agent_id: agent.id,
+          chat_id: chat_id,
+          requested_action: %{
+            "actionType" => "runtime_decision",
+            "runId" => run_id,
+            "decisionId" => decision_id,
+            "kind" => kind,
+            "risk" => risk
+          },
+          rationale: "Runtime decision request for run #{run_id}",
+          status: "pending",
+          action_mode: action_mode,
+          expires_at: expires_at,
+          source: "runtime"
+        })
+        |> Repo.insert!()
+
+      Enum.each(prepared, fn {action, index, _token, hash} ->
+        %AgentDecisionAction{}
+        |> AgentDecisionAction.changeset(%{
+          task_id: task.id,
+          action_id: action.id,
+          label: action.label,
+          style: action.style,
+          confirm: action.confirm,
+          token_hash: hash,
+          status: "pending",
+          position: index
+        })
+        |> Repo.insert!()
+      end)
+
+      client_actions =
+        Enum.map(prepared, fn {action, _index, token, _hash} ->
+          %{
+            "id" => action.id,
+            "label" => action.label,
+            "style" => action.style,
+            "confirm" => action.confirm,
+            "token" => token
+          }
+        end)
+
+      service =
+        service_node(%{
+          kind: "decision",
+          text: title,
+          status: "pending",
+          parts: decision_pending_parts(title, detail),
+          decision: %{
+            "taskId" => task.id,
+            "actionMode" => action_mode,
+            "expiresAt" => DateTime.to_iso8601(expires_at),
+            "actions" => client_actions,
+            "chosen" => nil
+          }
+        })
+
+      body = if is_binary(detail) and detail != "", do: "#{title}\n\n#{detail}", else: title
+
+      metadata = %{
+        @service_key => service,
+        "status" => "pending_decision",
+        "runId" => run_id,
+        "decisionId" => decision_id
+      }
+
+      with {:ok, message_payload} <- post_decision_message(agent, chat_id, nil, body, metadata) do
+        task =
+          task
+          |> AgentApprovalTask.changeset(%{message_id: message_payload.message_id})
+          |> Repo.update!()
+
+        {:ok, %{taskId: task.id, messageId: message_payload.message_id}}
+      end
+    end
+  end
+
+  @doc "True when `decision_id` is a pending/decided runtime-sourced decision task."
+  def runtime_decision?(decision_id) when is_binary(decision_id) and decision_id != "" do
+    not is_nil(runtime_decision_run_id(decision_id))
+  end
+
+  def runtime_decision?(_decision_id), do: false
+
+  @doc "The `runId` embedded in a runtime-sourced task's requested_action, or nil."
+  def runtime_decision_run_id(decision_id) when is_binary(decision_id) and decision_id != "" do
+    Repo.one(
+      from(t in AgentApprovalTask,
+        where:
+          t.source == "runtime" and
+            fragment("?->>'decisionId' = ?", t.requested_action, ^decision_id),
+        select: fragment("?->>'runId'", t.requested_action),
+        limit: 1
+      )
+    )
+  end
+
+  def runtime_decision_run_id(_decision_id), do: nil
 
   # ── Respond ────────────────────────────────────────────────────────────────
 
@@ -474,7 +603,7 @@ defmodule Vibe.AI.AgentDecisions do
     end
   end
 
-  defp post_decision_message(agent, thread, body, metadata) do
+  defp post_decision_message(agent, chat_id, reply_to_id, body, metadata) do
     message_id = Ecto.UUID.generate()
     timestamp = System.system_time(:millisecond)
 
@@ -487,7 +616,7 @@ defmodule Vibe.AI.AgentDecisions do
     attrs =
       %{
         id: message_id,
-        chat_id: thread.chat_id,
+        chat_id: chat_id,
         from_id: agent.agent_user_id,
         encrypted_content: AgentMessageCrypto.encrypt_for_storage(body || ""),
         type: "system",
@@ -503,7 +632,7 @@ defmodule Vibe.AI.AgentDecisions do
             if(agent_username, do: "@#{agent_username}", else: nil)
           )
           |> Map.put("text", body),
-        reply_to_id: thread.root_message_id,
+        reply_to_id: reply_to_id,
         timestamp: timestamp
       }
       |> Enum.reject(fn {_k, v} -> is_nil(v) end)
@@ -514,7 +643,7 @@ defmodule Vibe.AI.AgentDecisions do
         payload = %{
           "id" => message_id,
           "fromId" => agent.agent_user_id,
-          "chatId" => thread.chat_id,
+          "chatId" => chat_id,
           "encryptedContent" => "",
           "plainContent" => body,
           "plaintext" => body,
@@ -525,7 +654,7 @@ defmodule Vibe.AI.AgentDecisions do
           "isAgentMessage" => true
         }
 
-        VibeWeb.Endpoint.broadcast!("chat:#{thread.chat_id}", "message", payload)
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "message", payload)
 
         {:ok, %{message_id: message_id, payload: payload}}
 
@@ -687,6 +816,39 @@ defmodule Vibe.AI.AgentDecisions do
     else
       %{task: Repo.get!(AgentApprovalTask, task.id), expired: false}
     end
+  end
+
+  # Runtime decisions resolve into the isolated run, not an owner-configured webhook.
+  defp maybe_dispatch_callback(%{
+         task: %{requested_action: %{"actionType" => "runtime_decision"}} = task,
+         action: action,
+         actor: actor
+       }) do
+    run_id = task.requested_action["runId"]
+    decision_id = task.requested_action["decisionId"]
+    kind = task.requested_action["kind"] || "approval"
+
+    outcome =
+      case action.action_id do
+        id when id in ["approve", "allow_once", "allow_run"] -> "approve"
+        id when id in ["reject", "deny"] -> "reject"
+        _ -> action.action_id
+      end
+
+    outcome =
+      cond do
+        kind == "permission" and action.action_id in ["allow_once", "allow_run"] -> "grant"
+        kind == "permission" and action.action_id in ["reject", "deny"] -> "deny"
+        true -> outcome
+      end
+
+    AgentGateway.decision(run_id, %{
+      decisionId: decision_id,
+      kind: kind,
+      outcome: outcome,
+      actionId: action.action_id,
+      actorUserId: actor && actor.id
+    })
   end
 
   defp maybe_dispatch_callback(%{task: task, action: action, actor: actor}) do

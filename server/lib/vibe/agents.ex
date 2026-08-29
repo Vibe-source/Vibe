@@ -176,29 +176,36 @@ defmodule Vibe.Agents do
         Repo.transaction(fn ->
           maybe_update_shadow_user!(agent, attrs)
 
-          agent
-          |> Agent.changeset(%{
-            display_name: display_name_from_attrs(attrs, agent.display_name),
-            model_provider: model_selection.provider,
-            model_id: model_selection.model_id,
-            system_prompt: Map.get(attrs, "system_prompt", Map.get(attrs, :system_prompt, agent.system_prompt || "")),
-            prompt_variables: update_prompt_variables(agent, attrs),
-            persona: map_get(attrs, "persona", agent.persona),
-            avatar_url: map_get(attrs, "avatar_url", agent.avatar_url),
-            welcome_message: map_get(attrs, "welcome_message", agent.welcome_message),
-            enabled_tools: normalize_enabled_tools(Map.get(attrs, "enabled_tools", Map.get(attrs, :enabled_tools, agent.enabled_tools))),
-            output_modes: normalize_output_modes(Map.get(attrs, "output_modes", Map.get(attrs, :output_modes, agent.output_modes))),
-            voice_provider: map_get(attrs, "voice_provider", agent.voice_provider),
-            voice_profile: map_get(attrs, "voice_profile", agent.voice_profile),
-            callback_url: normalize_callback_url(Map.get(attrs, "callback_url", Map.get(attrs, :callback_url, agent.callback_url))),
-            autonomy_mode: normalize_autonomy_mode(Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))),
-            default_destination_chat_id: string_or_existing(agent.default_destination_chat_id, attrs, "default_destination_chat_id"),
-            event_types_enabled: normalize_optional_string_list(Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, agent.event_types_enabled))),
-            cost_budget_daily: integer_or_existing(agent.cost_budget_daily, attrs, "cost_budget_daily"),
-            cost_budget_monthly: integer_or_existing(agent.cost_budget_monthly, attrs, "cost_budget_monthly"),
-            approval_rules: map_or_existing(agent.approval_rules || %{}, attrs, "approval_rules"),
-            status: normalize_status_update(agent, attrs)
-          })
+          updated =
+            agent
+            |> Agent.owner_changeset(%{
+              display_name: display_name_from_attrs(attrs, agent.display_name),
+              model_provider: model_selection.provider,
+              model_id: model_selection.model_id,
+              system_prompt: Map.get(attrs, "system_prompt", Map.get(attrs, :system_prompt, agent.system_prompt || "")),
+              prompt_variables: update_prompt_variables(agent, attrs),
+              persona: map_get(attrs, "persona", agent.persona),
+              avatar_url: map_get(attrs, "avatar_url", agent.avatar_url),
+              welcome_message: map_get(attrs, "welcome_message", agent.welcome_message),
+              enabled_tools: normalize_enabled_tools(Map.get(attrs, "enabled_tools", Map.get(attrs, :enabled_tools, agent.enabled_tools))),
+              output_modes: normalize_output_modes(Map.get(attrs, "output_modes", Map.get(attrs, :output_modes, agent.output_modes))),
+              voice_provider: map_get(attrs, "voice_provider", agent.voice_provider),
+              voice_profile: map_get(attrs, "voice_profile", agent.voice_profile),
+              callback_url: normalize_callback_url(Map.get(attrs, "callback_url", Map.get(attrs, :callback_url, agent.callback_url))),
+              autonomy_mode: normalize_autonomy_mode(Map.get(attrs, "autonomy_mode", Map.get(attrs, :autonomy_mode, agent.autonomy_mode))),
+              default_destination_chat_id: string_or_existing(agent.default_destination_chat_id, attrs, "default_destination_chat_id"),
+              event_types_enabled: normalize_optional_string_list(Map.get(attrs, "event_types_enabled", Map.get(attrs, :event_types_enabled, agent.event_types_enabled))),
+              cost_budget_daily: integer_or_existing(agent.cost_budget_daily, attrs, "cost_budget_daily"),
+              cost_budget_monthly: integer_or_existing(agent.cost_budget_monthly, attrs, "cost_budget_monthly"),
+              approval_rules: map_or_existing(agent.approval_rules || %{}, attrs, "approval_rules"),
+              execution_mode: map_get(attrs, "execution_mode", agent.execution_mode)
+            })
+            |> Repo.update!()
+
+          # status is privileged (excluded from owner_changeset); keep the existing
+          # toggle behaviour here via the internal changeset instead.
+          updated
+          |> Agent.changeset(%{status: normalize_status_update(updated, attrs)})
           |> Repo.update!()
         end)
         |> case do
@@ -793,6 +800,7 @@ defmodule Vibe.Agents do
       enabledTools: agent.enabled_tools || [],
       outputModes: agent.output_modes || [],
       autonomyMode: agent.autonomy_mode,
+      executionMode: agent.execution_mode,
       defaultDestinationChatId: agent.default_destination_chat_id,
       eventTypesEnabled: agent.event_types_enabled || [],
       costBudgetDaily: agent.cost_budget_daily,

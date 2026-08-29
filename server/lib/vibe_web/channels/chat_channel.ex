@@ -1,10 +1,13 @@
 defmodule VibeWeb.ChatChannel do
   use VibeWeb, :channel
+  alias Vibe.Agent
   alias Vibe.AgentBridge
+  alias Vibe.AgentGateway
   alias Vibe.Agents
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
   alias Vibe.Notifications
+  alias Vibe.AI.AgentDecisions
   alias Vibe.AI.GroupAgent
   alias Vibe.AI.LocalAgentWorker
   alias Vibe.AI.StandaloneAgent
@@ -475,6 +478,7 @@ defmodule VibeWeb.ChatChannel do
     "chat:" <> chat_id = socket.topic
     user_id = socket.assigns.user_id
     request_id = normalize_bridge_string(payload["requestId"] || payload["request_id"])
+    run_id = normalize_bridge_string(payload["runId"] || payload["run_id"])
 
     decision =
       case normalize_bridge_string(payload["decision"] || payload["action"]) do
@@ -482,34 +486,95 @@ defmodule VibeWeb.ChatChannel do
         _ -> "answer"
       end
 
-    if is_nil(request_id) do
-      {:reply, {:error, %{reason: "invalid_request_id"}}, socket}
-    else
-      response_payload =
-        %{
-          "requestId" => request_id,
-          "chatId" => chat_id,
-          "requesterUserId" => user_id,
-          "decision" => decision
-        }
-        |> put_optional_string("answerEnc", normalize_bridge_string(payload["answerEnc"]))
-        |> put_optional_string(
-          "provider",
-          normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
-        )
-        |> put_optional_string(
-          "computerId",
-          normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
-        )
+    cond do
+      is_nil(request_id) ->
+        {:reply, {:error, %{reason: "invalid_request_id"}}, socket}
 
-      # The phone answered — drop the buffered ask so it isn't replayed on rejoin.
-      AgentBridge.clear_pending_ask(chat_id, request_id)
+      (is_binary(run_id) or AgentDecisions.runtime_decision?(request_id)) and
+          Chat.is_participant?(chat_id, user_id) ->
+        handle_isolated_ask_response(request_id, run_id, payload, user_id, socket)
 
-      case AgentBridge.dispatch_ask_response(user_id, response_payload) do
-        :ok -> {:reply, :ok, socket}
-        {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
-      end
+      true ->
+        handle_bridge_ask_response(chat_id, request_id, decision, payload, user_id, socket)
     end
+  end
+
+  # Isolated-runtime asks answer in plaintext (runtime:"isolated") — routed to the
+  # runtime via AgentGateway.decision/3, never the encrypted bridge path below.
+  defp handle_isolated_ask_response(request_id, run_id, payload, user_id, socket) do
+    resolved_run_id = run_id || AgentDecisions.runtime_decision_run_id(request_id)
+
+    case AgentGateway.decision(resolved_run_id, %{
+           decisionId: request_id,
+           kind: "ask",
+           outcome: "answer",
+           answer: payload["answer"],
+           actorUserId: user_id
+         }) do
+      {:ok, _result} -> {:reply, :ok, socket}
+      {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
+
+  defp handle_bridge_ask_response(chat_id, request_id, decision, payload, user_id, socket) do
+    response_payload =
+      %{
+        "requestId" => request_id,
+        "chatId" => chat_id,
+        "requesterUserId" => user_id,
+        "decision" => decision
+      }
+      |> put_optional_string("answerEnc", normalize_bridge_string(payload["answerEnc"]))
+      |> put_optional_string(
+        "provider",
+        normalize_bridge_provider(payload["provider"] || payload["agentBridgeProvider"])
+      )
+      |> put_optional_string(
+        "computerId",
+        normalize_bridge_string(payload["computerId"] || payload["agentBridgeComputerId"])
+      )
+
+    # The phone answered — drop the buffered ask so it isn't replayed on rejoin.
+    AgentBridge.clear_pending_ask(chat_id, request_id)
+
+    case AgentBridge.dispatch_ask_response(user_id, response_payload) do
+      :ok -> {:reply, :ok, socket}
+      {:error, reason} -> {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
+
+  # phone → server: cancel an isolated-runtime run. Only a participant who is
+  # either the run's requester or the agent's owner may cancel it.
+  @impl true
+  def handle_in("agent-run-control", %{"runId" => run_id, "action" => "cancel"} = payload, socket)
+      when is_binary(run_id) and run_id != "" do
+    "chat:" <> chat_id = socket.topic
+    user_id = socket.assigns.user_id
+
+    with true <- Chat.is_participant?(chat_id, user_id),
+         {:ok, run} <- AgentGateway.get_run(run_id),
+         true <- run_cancel_authorized?(run, chat_id, user_id),
+         {:ok, result} <- AgentGateway.cancel(run_id, payload["reason"], user_id) do
+      status = result["status"] || result[:status]
+      {:reply, {:ok, %{runId: run_id, status: status}}, socket}
+    else
+      _ -> {:reply, {:error, %{reason: "not_allowed"}}, socket}
+    end
+  end
+
+  @impl true
+  def handle_in("agent-run-control", _payload, socket),
+    do: {:reply, {:error, %{reason: "invalid_payload"}}, socket}
+
+  # AgentGateway.get_run/1 returns {run, events}; "run" carries chatId/requesterUserId/
+  # ownerUserId as sent in the original RunRequest.
+  defp run_cancel_authorized?(run, chat_id, user_id) do
+    run_map = run["run"] || run[:run] || run
+    run_chat_id = run_map["chatId"] || run_map[:chatId]
+    requester = run_map["requesterUserId"] || run_map[:requesterUserId]
+    owner = run_map["ownerUserId"] || run_map[:ownerUserId]
+
+    run_chat_id == chat_id and (user_id == requester or user_id == owner)
   end
 
   @impl true
@@ -1639,38 +1704,138 @@ defmodule VibeWeb.ChatChannel do
          dispatch_text,
          data,
          attachment_context,
-         _trigger_type,
-         requester_user_id
+         trigger_type,
+         requester_user_id,
+         opts \\ []
        ) do
+    parent_run_id = opts[:parent_run_id]
+
     Task.start(fn ->
       broadcast_agent_activity(chat_id, agent.agent_user_id, "Thinking...", "running")
 
       try do
-        attachments =
-          attachment_context_to_attachments(attachment_context)
+        attachments = attachment_context_to_attachments(attachment_context)
 
-        case StandaloneAgent.handle_chat_message(
-               agent,
-               chat_id,
-               dispatch_text,
-               attachments: attachments,
-               reply_to_id: data["id"],
-               requester_user_id: requester_user_id
-             ) do
-          {:ok, _response} ->
-            Logger.info(
-              "[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}"
+        cond do
+          AgentGateway.kill_switch?() ->
+            post_kill_switch_notice(agent, chat_id, data["id"])
+
+          AgentGateway.execution_mode_for(agent) == "isolated" and AgentGateway.enabled?() ->
+            dispatch_isolated(
+              agent,
+              chat_id,
+              dispatch_text,
+              attachments,
+              data,
+              requester_user_id,
+              parent_run_id,
+              trigger_type
             )
 
-          {:error, reason} ->
-            Logger.error(
-              "[ChatChannel] Standalone agent dispatch failed chat_id=#{chat_id} agent_id=#{agent.id} reason=#{inspect(reason)}"
-            )
+          true ->
+            dispatch_embedded(agent, chat_id, dispatch_text, attachments, data, requester_user_id)
         end
       after
         stop_agent_activity(chat_id, agent.agent_user_id)
       end
     end)
+  end
+
+  defp dispatch_isolated(
+         agent,
+         chat_id,
+         dispatch_text,
+         attachments,
+         data,
+         requester_user_id,
+         parent_run_id,
+         trigger_type
+       ) do
+    case AgentGateway.start_run(%{
+           agent: agent,
+           chat_id: chat_id,
+           requester_user_id: requester_user_id,
+           text: dispatch_text,
+           attachments: attachments,
+           reply_to_id: data["id"],
+           parent_run_id: parent_run_id,
+           source: if(parent_run_id, do: "handoff", else: "chat")
+         }) do
+      {:ok, _run} ->
+        Logger.info(
+          "[ChatChannel] isolated run started chat_id=#{chat_id} agent_id=#{agent.id}"
+        )
+
+      {:error, :unreachable} ->
+        Logger.warning(
+          "[ChatChannel] agent-runtime unreachable, falling back to embedded chat_id=#{chat_id} agent_id=#{agent.id}"
+        )
+
+        dispatch_embedded(agent, chat_id, dispatch_text, attachments, data, requester_user_id)
+
+      {:error, :kill_switch} ->
+        post_kill_switch_notice(agent, chat_id, data["id"])
+
+      # The runtime's own kill switch answers 503; surface it exactly like the local one.
+      {:error, {:http_error, 503, %{"error" => "kill_switch"}}} ->
+        post_kill_switch_notice(agent, chat_id, data["id"])
+
+      {:error, reason} ->
+        Logger.error(
+          "[ChatChannel] isolated run failed chat_id=#{chat_id} agent_id=#{agent.id} trigger=#{trigger_type} reason=#{inspect(reason)}"
+        )
+    end
+  end
+
+  defp dispatch_embedded(agent, chat_id, dispatch_text, attachments, data, requester_user_id) do
+    case StandaloneAgent.handle_chat_message(
+           agent,
+           chat_id,
+           dispatch_text,
+           attachments: attachments,
+           reply_to_id: data["id"],
+           requester_user_id: requester_user_id
+         ) do
+      {:ok, _response} ->
+        Logger.info(
+          "[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}"
+        )
+
+      {:error, reason} ->
+        Logger.error(
+          "[ChatChannel] Standalone agent dispatch failed chat_id=#{chat_id} agent_id=#{agent.id} reason=#{inspect(reason)}"
+        )
+    end
+  end
+
+  defp post_kill_switch_notice(agent, chat_id, reply_to_id) do
+    outputs = [
+      %{"type" => "text", "text" => "Agents are paused by the operator", "metadata" => %{}}
+    ]
+
+    _ = StandaloneAgent.deliver_outputs(agent, chat_id, outputs, reply_to_id)
+    :ok
+  end
+
+  @doc """
+  Starts a standalone-agent run for a `handoff_to_agent` target (docs/agent-platform-v1.md
+  §3.8), reusing the same kill-switch/execution-mode routing as a normal dispatch.
+  """
+  def dispatch_agent_mention(chat_id, %Agent{} = target_agent, opts) when is_list(opts) do
+    text = Keyword.get(opts, :text, "") || ""
+    parent_run_id = Keyword.get(opts, :parent_run_id)
+    reply_to_id = Keyword.get(opts, :reply_to_id) || Ecto.UUID.generate()
+
+    spawn_standalone_dispatch(
+      chat_id,
+      target_agent,
+      text,
+      %{"id" => reply_to_id},
+      %{image_urls: [], document_urls: [], audio_urls: []},
+      "handoff",
+      nil,
+      parent_run_id: parent_run_id
+    )
   end
 
   defp spawn_group_dispatch(chat_id, dispatch_text, user_id, metadata) do
@@ -2022,7 +2187,8 @@ defmodule VibeWeb.ChatChannel do
 
   defp durable_media_url(_), do: nil
 
-  defp broadcast_agent_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
+  @doc "Public so Vibe.AgentRelay can keep the typing/'Thinking...' indicator in sync for isolated runs."
+  def broadcast_agent_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "typing", %{
       "userId" => agent_user_id,
       "isAgent" => true
@@ -2045,7 +2211,8 @@ defmodule VibeWeb.ChatChannel do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", payload)
   end
 
-  defp stop_agent_activity(chat_id, agent_user_id) do
+  @doc "Public so Vibe.AgentRelay can clear the typing indicator when an isolated run ends."
+  def stop_agent_activity(chat_id, agent_user_id) do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-progress", %{
       "userId" => agent_user_id,
       "isAgent" => true,

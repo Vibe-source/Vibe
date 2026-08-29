@@ -173,6 +173,10 @@ if config_env() == :prod do
         end
     end
 
+  # statement_timeout bounds every query server-side (PgBouncer strips it from startup
+  # params, so it is also listed in ignore_startup_parameters there — see deploy/pgbouncer).
+  db_statement_timeout_ms = System.get_env("DB_STATEMENT_TIMEOUT_MS") || "30000"
+
   config :vibe, Vibe.Repo,
     ssl: ssl_opts,
     prepare: :unnamed,
@@ -184,7 +188,21 @@ if config_env() == :prod do
     connect_timeout: 30_000,
     handshake_timeout: 30_000,
     idle_interval: 10_000,
+    parameters: [statement_timeout: db_statement_timeout_ms, application_name: "vibe-core"],
     socket_options: maybe_ipv6
+
+  # Isolated agent runtime (docs/agent-platform-v1.md). Unset = embedded runtime only.
+  config :vibe, :agent_gateway,
+    url: System.get_env("VIBE_AGENT_RUNTIME_URL"),
+    hmac_key: System.get_env("VIBE_INTERNAL_HMAC_KEY"),
+    execution_mode: System.get_env("VIBE_AGENT_EXECUTION_MODE"),
+    kill_switch: System.get_env("VIBE_AI_KILL_SWITCH") in ["1", "true", "TRUE"]
+
+  # Optional multi-node pieces; each is a no-op when its variable is unset.
+  config :vibe, :valkey_url, System.get_env("VALKEY_URL")
+  config :vibe, :rate_limit_backend, System.get_env("RATE_LIMIT_BACKEND") || "ets"
+  config :vibe, :cluster_strategy, System.get_env("CLUSTER_STRATEGY") || "none"
+  config :vibe, :metrics_port, String.to_integer(System.get_env("METRICS_PORT") || "9568")
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
@@ -201,9 +219,14 @@ if config_env() == :prod do
   host = System.get_env("PHX_HOST") || "example.com"
   port = String.to_integer(System.get_env("PORT") || "4000")
 
+  # Unset = the app's own https origin plus the web client. Phoenix checks this header only
+  # when a browser sends one, so native apps (no Origin) are unaffected; "false" disables.
   check_origin =
     case System.get_env("PHX_CHECK_ORIGIN") do
       nil ->
+        ["https://" <> host, "https://vibe-io-nine.vercel.app"]
+
+      "false" ->
         false
 
       raw ->

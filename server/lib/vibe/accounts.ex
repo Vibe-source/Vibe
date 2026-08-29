@@ -192,13 +192,35 @@ defmodule Vibe.Accounts do
   end
 
   @doc """
-  Check if token is still valid (not expired).
-  Returns true if token_expires_at is in the future or not set (legacy users).
+  Check if token is still valid: not past its sliding expiry (or unset, for
+  legacy rows), and not past the absolute AUTH_TOKEN_MAX_LIFETIME_DAYS
+  lifetime measured from token_issued_at — sliding expiry cannot extend past it.
   """
-  def token_valid?(%User{token_expires_at: nil}), do: true
+  def token_valid?(%User{} = user) do
+    expiry_ok? =
+      case user.token_expires_at do
+        nil -> true
+        expires_at -> DateTime.compare(expires_at, DateTime.utc_now()) == :gt
+      end
 
-  def token_valid?(%User{token_expires_at: expires_at}) do
-    DateTime.compare(expires_at, DateTime.utc_now()) == :gt
+    expiry_ok? and not token_past_max_lifetime?(user)
+  end
+
+  defp token_past_max_lifetime?(%User{token_issued_at: nil}), do: false
+
+  defp token_past_max_lifetime?(%User{token_issued_at: issued_at}) do
+    DateTime.diff(DateTime.utc_now(), issued_at, :second) > token_max_lifetime_seconds()
+  end
+
+  @doc "Absolute token lifetime in seconds, from AUTH_TOKEN_MAX_LIFETIME_DAYS (default 90)."
+  def token_max_lifetime_seconds do
+    days =
+      case Integer.parse(System.get_env("AUTH_TOKEN_MAX_LIFETIME_DAYS") || "90") do
+        {value, _} when value > 0 -> value
+        _ -> 90
+      end
+
+    days * 24 * 60 * 60
   end
 
   def get_user_by_username(username) do
@@ -289,6 +311,14 @@ defmodule Vibe.Accounts do
   def update_user(%User{} = user, attrs) do
     user
     |> User.changeset(attrs)
+    |> Repo.update()
+    |> tap_invalidate_token_cache(user)
+  end
+
+  @doc "User-driven profile update — only the fields User.profile_changeset/2 casts."
+  def update_profile(%User{} = user, attrs) do
+    user
+    |> User.profile_changeset(attrs)
     |> Repo.update()
     |> tap_invalidate_token_cache(user)
   end
@@ -471,19 +501,24 @@ defmodule Vibe.Accounts do
       device ->
         now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-        Repo.transaction(fn ->
-          {:ok, device} =
+        result =
+          Repo.transaction(fn ->
+            {:ok, device} =
+              device
+              |> AccountDevice.changeset(%{"revoked_at" => now})
+              |> Repo.update()
+
+            {_count, _} =
+              DeviceSession
+              |> where([s], s.account_device_id == ^device_id and is_nil(s.revoked_at))
+              |> Repo.update_all(set: [revoked_at: now])
+
             device
-            |> AccountDevice.changeset(%{"revoked_at" => now})
-            |> Repo.update()
+          end)
 
-          {_count, _} =
-            DeviceSession
-            |> where([s], s.account_device_id == ^device_id and is_nil(s.revoked_at))
-            |> Repo.update_all(set: [revoked_at: now])
-
-          device
-        end)
+        # No conn here (context layer) — controller is out of this brief's scope.
+        Vibe.Audit.record(nil, "device.revoke", actor_user_id: user_id, target_id: device_id)
+        result
     end
   end
 
@@ -608,6 +643,7 @@ defmodule Vibe.Accounts do
         # A revoked session must stop authenticating immediately, not once the
         # cached auth entry ages out.
         TokenCache.invalidate_user(user_id)
+        Vibe.Audit.record(nil, "session.revoke", actor_user_id: user_id, target_id: session_id)
         result
     end
   end
@@ -624,6 +660,35 @@ defmodule Vibe.Accounts do
       session ->
         revoke_session(user_id, session.id)
     end
+  end
+
+  @doc "Clears the bearer login_token + its expiry/issued-at, and evicts the auth cache."
+  def revoke_login_token(%User{} = user) do
+    update_user(user, %{
+      "login_token" => nil,
+      "token_expires_at" => nil,
+      "token_issued_at" => nil
+    })
+  end
+
+  @doc "Revokes the login_token and every device session — sign-out everywhere."
+  def revoke_all_sessions(%User{} = user) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Repo.transaction(fn ->
+      case revoke_login_token(user) do
+        {:ok, updated} ->
+          DeviceSession
+          |> where([s], s.user_id == ^user.id and is_nil(s.revoked_at))
+          |> Repo.update_all(set: [revoked_at: now])
+
+          TokenCache.invalidate_user(user.id)
+          updated
+
+        {:error, changeset} ->
+          Repo.rollback(changeset)
+      end
+    end)
   end
 
   @doc "Starts a pairing request from a not-yet-authenticated requester device."

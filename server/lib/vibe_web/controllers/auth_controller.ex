@@ -32,13 +32,13 @@ defmodule VibeWeb.AuthController do
         conn |> put_status(400) |> json(%{error: "Username can only contain letters, numbers, and underscores"})
 
       Accounts.reserved_username?(username) ->
-        conn |> put_status(409) |> json(%{error: "Username taken"})
+        conn |> put_status(409) |> json(%{error: "username_taken"})
 
       String.length(password) < 8 ->
         conn |> put_status(400) |> json(%{error: "Password must be at least 8 characters"})
 
       Accounts.username_exists?(username) ->
-        conn |> put_status(409) |> json(%{error: "Username taken"})
+        conn |> put_status(409) |> json(%{error: "username_taken"})
 
       params["phoneNumber"] && is_nil(normalized_phone) ->
         conn |> put_status(400) |> json(%{error: "Invalid phone number format"})
@@ -110,11 +110,14 @@ defmodule VibeWeb.AuthController do
               "secure_id" => secure_id,
               "login_token" => login_token,
               "token_expires_at" => token_expires_at,
+              "token_issued_at" => DateTime.utc_now() |> DateTime.truncate(:second),
               "phone_number" => normalized_phone
             }
 
             case Accounts.create_user(user_params) do
               {:ok, user} ->
+                Vibe.Audit.record(conn, "register", actor_user_id: user.id)
+
                 json(conn, %{
                   userId: user.id,
                   username: user.username,
@@ -141,38 +144,60 @@ defmodule VibeWeb.AuthController do
     credential = credential |> to_string() |> String.trim()
     password = to_string(password)
 
-    user =
-      Accounts.get_user_by_username(credential) ||
-        Accounts.get_user_by_phone(credential) ||
-        get_user_by_secure_id(credential)
+    if Vibe.Accounts.LoginThrottle.locked?(credential) do
+      Vibe.Audit.record(conn, "login.failure", metadata: %{username: credential})
+      invalid_credentials(conn)
+    else
+      user =
+        Accounts.get_user_by_username(credential) ||
+          Accounts.get_user_by_phone(credential) ||
+          get_user_by_secure_id(credential)
 
-    case user do
-      nil ->
-        # SECURITY: Use consistent error message to prevent user enumeration
-        conn |> put_status(401) |> json(%{error: "Invalid credentials"})
+      case user do
+        nil ->
+          login_failed(conn, credential)
 
-      %User{is_agent: true} ->
-        conn |> put_status(401) |> json(%{error: "Invalid credentials"})
+        %User{is_agent: true} ->
+          login_failed(conn, credential)
 
-      %User{} = u ->
-        case Accounts.verify_password_with_info(password, u.password_hash) do
-          {:ok, :current} ->
-            issue_login_response(conn, u)
+        %User{} = u ->
+          case Accounts.verify_password_with_info(password, u.password_hash) do
+            {:ok, :current} ->
+              login_succeeded(conn, credential, u)
+              issue_login_response(conn, u)
 
-          {:ok, :legacy} ->
-            user_for_login =
-              case Accounts.upgrade_password_hash(u, password) do
-                {:ok, upgraded_user} -> upgraded_user
-                _ -> u
-              end
+            {:ok, :legacy} ->
+              user_for_login =
+                case Accounts.upgrade_password_hash(u, password) do
+                  {:ok, upgraded_user} -> upgraded_user
+                  _ -> u
+                end
 
-            issue_login_response(conn, user_for_login)
+              login_succeeded(conn, credential, u)
+              issue_login_response(conn, user_for_login)
 
-          :error ->
-            # SECURITY: Use consistent error message to prevent user enumeration
-            conn |> put_status(401) |> json(%{error: "Invalid credentials"})
-        end
+            :error ->
+              login_failed(conn, credential)
+          end
+      end
     end
+  end
+
+  # SECURITY: same generic response for unknown user, wrong password, and
+  # locked — a distinct message per case would let a client enumerate accounts.
+  defp login_failed(conn, credential) do
+    Vibe.Accounts.LoginThrottle.record_failure(credential)
+    Vibe.Audit.record(conn, "login.failure", metadata: %{username: credential})
+    invalid_credentials(conn)
+  end
+
+  defp login_succeeded(conn, credential, %User{} = user) do
+    Vibe.Accounts.LoginThrottle.record_success(credential)
+    Vibe.Audit.record(conn, "login.success", actor_user_id: user.id)
+  end
+
+  defp invalid_credentials(conn) do
+    conn |> put_status(401) |> json(%{error: "invalid_credentials"})
   end
 
   @doc """
@@ -216,6 +241,7 @@ defmodule VibeWeb.AuthController do
            }) do
         {:ok, updated_user} ->
           Logger.info("[Auth] identity upgraded to v3 user_id=#{updated_user.id}")
+          Vibe.Audit.record(conn, "identity.upgrade", actor_user_id: updated_user.id)
           json(conn, %{ok: true, secureId: updated_user.secure_id, identityKey: "v3"})
 
         {:error, _changeset} ->
@@ -224,6 +250,34 @@ defmodule VibeWeb.AuthController do
     else
       _ ->
         conn |> put_status(400) |> json(%{error: "credential and password are required"})
+    end
+  end
+
+  @doc "POST /api/auth/logout — revokes only the login_token used for this session."
+  def logout(conn, _params) do
+    user = conn.assigns.current_user
+
+    case Accounts.revoke_login_token(user) do
+      {:ok, _updated} ->
+        Vibe.Audit.record(conn, "logout", actor_user_id: user.id)
+        json(conn, %{ok: true})
+
+      {:error, _changeset} ->
+        conn |> put_status(500) |> json(%{error: "logout_failed"})
+    end
+  end
+
+  @doc "POST /api/auth/logout-all — revokes login_token and every device session."
+  def logout_all(conn, _params) do
+    user = conn.assigns.current_user
+
+    case Accounts.revoke_all_sessions(user) do
+      {:ok, _updated} ->
+        Vibe.Audit.record(conn, "logout_all", actor_user_id: user.id)
+        json(conn, %{ok: true})
+
+      {:error, _changeset} ->
+        conn |> put_status(500) |> json(%{error: "logout_failed"})
     end
   end
 
@@ -243,7 +297,8 @@ defmodule VibeWeb.AuthController do
 
     case Accounts.update_user(user, %{
            "login_token" => new_token,
-           "token_expires_at" => token_expires_at
+           "token_expires_at" => token_expires_at,
+           "token_issued_at" => DateTime.utc_now() |> DateTime.truncate(:second)
          }) do
       {:ok, updated_user} ->
         json(conn, %{

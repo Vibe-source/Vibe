@@ -4,7 +4,7 @@ defmodule Vibe.AgentApprovalTask do
 
   @statuses ~w[pending approved rejected expired]
   @action_modes ~w[single multi]
-  @sources ~w[runbook declared]
+  @sources ~w[runbook declared runtime]
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
@@ -57,9 +57,22 @@ defmodule Vibe.AgentApprovalTask do
       :chosen_action_id,
       :source
     ])
-    |> validate_required([:agent_id, :thread_id, :event_id, :requested_action, :status, :chat_id])
+    |> validate_required([:agent_id, :requested_action, :status, :chat_id])
+    |> maybe_require_thread_and_event(attrs)
     |> validate_inclusion(:status, @statuses)
     |> validate_inclusion(:action_mode, @action_modes)
     |> validate_inclusion(:source, @sources)
+  end
+
+  # Runtime-sourced decisions (isolated agent runs) have no AgentEventThread/AgentEvent
+  # to attach to; every other source still requires both (unchanged behaviour).
+  defp maybe_require_thread_and_event(changeset, attrs) do
+    source = attrs[:source] || attrs["source"] || get_field(changeset, :source)
+
+    if source == "runtime" do
+      changeset
+    else
+      validate_required(changeset, [:thread_id, :event_id])
+    end
   end
 end

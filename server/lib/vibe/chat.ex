@@ -220,15 +220,21 @@ defmodule Vibe.Chat do
 
   defp saved_message_reactions(_emoji), do: []
 
+  # Hot path: called on every channel message. 30s TTL, cross-node invalidated
+  # by every membership-changing function below (see participant_cache_key/2).
   def is_participant?(chat_id, user_id) do
-    Repo.exists?(
-      from(p in Participant,
-        where:
-          p.chat_id == ^chat_id and p.user_id == ^user_id and
-            (is_nil(p.deleted) or p.deleted == false)
+    Vibe.Cache.fetch(participant_cache_key(chat_id, user_id), 30_000, fn ->
+      Repo.exists?(
+        from(p in Participant,
+          where:
+            p.chat_id == ^chat_id and p.user_id == ^user_id and
+              (is_nil(p.deleted) or p.deleted == false)
+        )
       )
-    )
+    end)
   end
+
+  defp participant_cache_key(chat_id, user_id), do: {:participant, chat_id, user_id}
 
   def get_participant_ids(chat_id) do
     Repo.all(
@@ -732,6 +738,7 @@ defmodule Vibe.Chat do
 
     case result do
       {:ok, room} ->
+        Enum.each(user_ids, &Vibe.Cache.invalidate(participant_cache_key(id, &1)))
         ChatHomeCache.invalidate_users(user_ids)
         {:ok, room}
 
@@ -1999,6 +2006,11 @@ defmodule Vibe.Chat do
                  set: [deleted: true, archived: false, messages_cleared_at: now]
                ) do
             {count, _} when count > 0 ->
+              Enum.each(
+                target_user_ids,
+                &Vibe.Cache.invalidate(participant_cache_key(chat_id, &1))
+              )
+
               ChatHomeCache.invalidate_users(target_user_ids)
 
               {:ok,
@@ -2043,6 +2055,7 @@ defmodule Vibe.Chat do
         from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
         |> Repo.update_all(set: [deleted: false, archived: false])
 
+        Vibe.Cache.invalidate(participant_cache_key(chat_id, user_id))
         ChatHomeCache.invalidate_user(user_id)
         :restored
 
@@ -2147,6 +2160,7 @@ defmodule Vibe.Chat do
         :ok
     end
 
+    Vibe.Cache.invalidate(participant_cache_key(chat_id, user_id))
     invalidate_chat_home_cache(chat_id)
     ChatHomeCache.invalidate_user(user_id)
     result
@@ -2172,6 +2186,7 @@ defmodule Vibe.Chat do
         :ok
     end
 
+    Vibe.Cache.invalidate(participant_cache_key(chat_id, user_id))
     invalidate_chat_home_cache(chat_id)
     ChatHomeCache.invalidate_user(user_id)
     result
@@ -2273,6 +2288,7 @@ defmodule Vibe.Chat do
 
         case Repo.delete(room) do
           {:ok, _} ->
+            Vibe.Cache.invalidate({:participant, chat_id})
             ChatHomeCache.invalidate_users(member_ids)
             {:ok, chat_id}
 
@@ -2301,6 +2317,7 @@ defmodule Vibe.Chat do
             :ok
         end
 
+        Vibe.Cache.invalidate(participant_cache_key(chat_id, user_id))
         invalidate_chat_home_cache(chat_id)
         ChatHomeCache.invalidate_user(user_id)
         result
@@ -2524,6 +2541,7 @@ defmodule Vibe.Chat do
     case Repo.get(Room, channel_id) do
       %Room{type: "channel", access_type: "public", join_approval_required: false} = room ->
         with {:ok, _} <- insert_channel_subscriber(room.id, user_id) do
+          Vibe.Cache.invalidate(participant_cache_key(room.id, user_id))
           invalidate_chat_home_cache(room.id)
           ChatHomeCache.invalidate_user(user_id)
           {:ok, canonical_room_summary(room, role: "subscriber")}
@@ -2549,6 +2567,7 @@ defmodule Vibe.Chat do
 
       %Participant{} = participant ->
         result = Repo.delete(participant)
+        Vibe.Cache.invalidate(participant_cache_key(channel_id, user_id))
         invalidate_chat_home_cache(channel_id)
         ChatHomeCache.invalidate_user(user_id)
         result
@@ -2796,6 +2815,7 @@ defmodule Vibe.Chat do
            end) do
         {:ok, request} ->
           if request.status == "approved" do
+            Vibe.Cache.invalidate(participant_cache_key(channel_id, request.user_id))
             invalidate_chat_home_cache(channel_id)
             ChatHomeCache.invalidate_user(request.user_id)
           end
@@ -2848,6 +2868,7 @@ defmodule Vibe.Chat do
                attach_channel_agent_in_transaction!(room, agent, actor_id, attrs)
              end) do
           {:ok, assignment} ->
+            Vibe.Cache.invalidate(participant_cache_key(channel_id, agent.agent_user_id))
             invalidate_chat_home_cache(channel_id)
             ChatHomeCache.invalidate_user(agent.agent_user_id)
             {:ok, channel_agent_payload(Repo.preload(assignment, agent: :agent_user))}
@@ -2912,6 +2933,7 @@ defmodule Vibe.Chat do
                agent.agent_user_id
              end) do
           {:ok, agent_user_id} ->
+            Vibe.Cache.invalidate(participant_cache_key(channel_id, agent_user_id))
             invalidate_chat_home_cache(channel_id)
             ChatHomeCache.invalidate_user(agent_user_id)
             :ok
@@ -3416,6 +3438,7 @@ defmodule Vibe.Chat do
 
   defp join_channel_immediately(room, user_id, nil) do
     with {:ok, _} <- insert_channel_subscriber(room.id, user_id) do
+      Vibe.Cache.invalidate(participant_cache_key(room.id, user_id))
       invalidate_chat_home_cache(room.id)
       ChatHomeCache.invalidate_user(user_id)
       {:ok, %{status: "joined", room: canonical_room_summary(room, role: "subscriber")}}
@@ -3433,6 +3456,7 @@ defmodule Vibe.Chat do
            end
          end) do
       {:ok, _} ->
+        Vibe.Cache.invalidate(participant_cache_key(room.id, user_id))
         invalidate_chat_home_cache(room.id)
         ChatHomeCache.invalidate_user(user_id)
         {:ok, %{status: "joined", room: canonical_room_summary(room, role: "subscriber")}}

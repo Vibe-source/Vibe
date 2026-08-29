@@ -99,12 +99,14 @@ defmodule VibeWeb.UserController do
 
         with user when not is_nil(user) <- Accounts.get_user(id),
              merged_update_attrs <- merge_existing_push_token_update(update_attrs, user),
-             {:ok, updated_user} <- Accounts.update_user(user, merged_update_attrs) do
+             {:ok, updated_user} <- apply_profile_update(user, merged_update_attrs) do
           if Map.has_key?(merged_update_attrs, :push_token) do
             Logger.info(
               "[UserController] push_token updated user_id=#{updated_user.id} targets=#{inspect(push_token_target_summary(updated_user.push_token))}"
             )
           end
+
+          Vibe.Audit.record(conn, "profile.update", actor_user_id: updated_user.id)
 
           json(conn, %{
             success: true,
@@ -138,6 +140,29 @@ defmodule VibeWeb.UserController do
       end
     end
   end
+
+  # push_token/username/phone_number aren't in profile_changeset/2's allow-list,
+  # so they still go through the full User.changeset/2; the rest is schema-limited.
+  @identity_keys [:push_token, :phone_number, :username]
+
+  defp apply_profile_update(user, attrs) do
+    {identity_attrs, profile_attrs} = Map.split(attrs, @identity_keys)
+
+    Vibe.Repo.transaction(fn ->
+      with {:ok, user} <- apply_identity_attrs(user, identity_attrs),
+           {:ok, user} <- apply_profile_attrs(user, profile_attrs) do
+        user
+      else
+        {:error, changeset} -> Vibe.Repo.rollback(changeset)
+      end
+    end)
+  end
+
+  defp apply_identity_attrs(user, attrs) when map_size(attrs) == 0, do: {:ok, user}
+  defp apply_identity_attrs(user, attrs), do: Accounts.update_user(user, attrs)
+
+  defp apply_profile_attrs(user, attrs) when map_size(attrs) == 0, do: {:ok, user}
+  defp apply_profile_attrs(user, attrs), do: Accounts.update_profile(user, attrs)
 
   defp resolve_push_token_update(params) when is_map(params) do
     explicit =

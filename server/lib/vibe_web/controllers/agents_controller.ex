@@ -27,6 +27,45 @@ defmodule VibeWeb.AgentsController do
     end
   end
 
+  @doc "POST /api/agents/:id/voice/sessions — a call with an isolated agent (docs/agent-voice-v1.md)."
+  def voice_session(conn, %{"id" => id} = params) do
+    user = conn.assigns.current_user
+    chat_id = params["chatId"] || params["chat_id"]
+
+    with %{} = agent <- Agents.get_agent(id),
+         true <- agent.status == "published" or agent.owner_user_id == user.id,
+         true <- is_binary(chat_id) and Vibe.Chat.is_participant?(chat_id, user.id),
+         true <- Vibe.AgentGateway.enabled?(),
+         {:ok, session} <-
+           Vibe.AgentGateway.voice_session(%{
+             "agentId" => agent.id,
+             "userId" => user.id,
+             "chatId" => chat_id,
+             "agentProfile" => Vibe.AgentGateway.agent_profile(Vibe.Repo.preload(agent, :agent_user))
+           }) do
+      json(conn, session)
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      false -> conn |> put_status(:forbidden) |> json(%{error: "voice_not_available"})
+      {:error, reason} -> conn |> put_status(:bad_gateway) |> json(%{error: "runtime_unavailable", detail: inspect(reason)})
+    end
+  end
+
+  @doc "GET /api/agents/:id/computer/preview — latest sandbox screenshot (owner only)."
+  def computer_preview(conn, %{"id" => id}) do
+    user = conn.assigns.current_user
+
+    with %{} = agent <- Agents.get_agent(id, user.id),
+         true <- Vibe.AgentGateway.enabled?(),
+         {:ok, preview} <- Vibe.AgentGateway.computer_preview(agent.id) do
+      json(conn, preview)
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      false -> conn |> put_status(:forbidden) |> json(%{error: "computer_not_available"})
+      {:error, _reason} -> conn |> put_status(:not_found) |> json(%{error: "no_preview"})
+    end
+  end
+
   def index(conn, _params) do
     owner_id = conn.assigns.current_user.id
     quota = Agents.quota_for_user(owner_id)

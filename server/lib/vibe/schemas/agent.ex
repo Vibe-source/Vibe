@@ -5,6 +5,7 @@ defmodule Vibe.Agent do
   @statuses ~w[draft published disabled archived]
   @output_modes ~w[text media voice]
   @autonomy_modes ~w[draft_first manual safe_auto approval_required full_auto]
+  @execution_modes ~w[embedded isolated]
   @model_providers Vibe.AI.ModelRegistry.provider_ids()
 
   @primary_key {:id, :binary_id, autogenerate: true}
@@ -41,6 +42,9 @@ defmodule Vibe.Agent do
     field :previous_secret_expires_at, :utc_datetime
     field :published_at, :utc_datetime
     field :last_invoked_at, :utc_datetime
+    # "embedded" runs in this app's own model path; "isolated" routes dispatch to
+    # the agent-runtime service (docs/agent-platform-v1.md). Default unchanged.
+    field :execution_mode, :string, default: "embedded"
     # Runtime-only: whether the CURRENT request is the owner talking to this agent in
     # their private 1:1 DM (Chat.effective_agent_policy/3). Never persisted, never cast —
     # StandaloneAgent stamps it per-invocation to gate owner-only tools/prompt data.
@@ -84,7 +88,8 @@ defmodule Vibe.Agent do
       :previous_secret_hash,
       :previous_secret_expires_at,
       :published_at,
-      :last_invoked_at
+      :last_invoked_at,
+      :execution_mode
     ])
     |> validate_required([
       :owner_user_id,
@@ -101,11 +106,51 @@ defmodule Vibe.Agent do
     |> validate_inclusion(:model_provider, @model_providers)
     |> validate_model_selection()
     |> validate_inclusion(:autonomy_mode, @autonomy_modes)
+    |> validate_inclusion(:execution_mode, @execution_modes)
     |> validate_change(:output_modes, fn :output_modes, modes ->
       invalid = Enum.reject(List.wrap(modes), &(&1 in @output_modes))
       if invalid == [], do: [], else: [output_modes: "contains invalid modes: #{Enum.join(invalid, ", ")}"]
     end)
     |> unique_constraint(:agent_user_id)
+    |> check_constraint(:model_provider, name: :agents_model_provider_check)
+  end
+
+  # Owner-facing update path: casts everything the owner may edit, never the
+  # privileged/internal fields (secret material, status, ids, timestamps).
+  def owner_changeset(agent, attrs) do
+    agent
+    |> cast(attrs, [
+      :display_name,
+      :model_provider,
+      :model_id,
+      :system_prompt,
+      :prompt_variables,
+      :persona,
+      :avatar_url,
+      :welcome_message,
+      :enabled_tools,
+      :output_modes,
+      :voice_provider,
+      :voice_profile,
+      :callback_url,
+      :autonomy_mode,
+      :default_destination_chat_id,
+      :event_types_enabled,
+      :cost_budget_daily,
+      :cost_budget_monthly,
+      :approval_rules,
+      :runbook_ids,
+      :execution_mode
+    ])
+    |> validate_length(:display_name, min: 1, max: 80)
+    |> validate_inclusion(:model_provider, @model_providers)
+    |> validate_model_selection()
+    |> validate_inclusion(:autonomy_mode, @autonomy_modes)
+    |> validate_inclusion(:execution_mode, @execution_modes)
+    |> validate_change(:output_modes, fn :output_modes, modes ->
+      invalid = Enum.reject(List.wrap(modes), &(&1 in @output_modes))
+      if invalid == [], do: [], else: [output_modes: "contains invalid modes: #{Enum.join(invalid, ", ")}"]
+    end)
     |> check_constraint(:model_provider, name: :agents_model_provider_check)
   end
 
