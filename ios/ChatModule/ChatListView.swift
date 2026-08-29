@@ -14969,10 +14969,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       NSLog("[ChatListView][ask] DROP — no stored payload requestId=%@", requestId)
       return
     }
-    // Body is E2E-sealed (`askEnc`); fall back to plaintext `request` for a keyless pairing.
+    // Body is E2E-sealed (`askEnc`); an isolated-runtime run (agent-platform-v1) sends `ask`
+    // plaintext instead. Fall back to plaintext `request` for a keyless pairing.
     var body: [String: Any]
     if let dec = AgentRuntimeCrypto.decrypt(payload["askEnc"]) {
       body = dec
+    } else if payload["askEnc"] == nil, let ask = payload["ask"] as? [String: Any] {
+      body = ["request": ask]
     } else if let raw = payload["request"] as? [String: Any] {
       body = ["request": raw]
     } else {
@@ -19383,10 +19386,12 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// composer's trailing control to STOP. Covers Vibe AI, Claude/Codex DMs, and
   /// multi-agent groups. Mirrors the full-page view's `isLive` check.
   private func agentComposerHasLiveTask() -> Bool {
-    guard agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents() else {
-      return false
-    }
     let bridgeSurface = currentBridgeProvider != nil || groupHasBridgeAgents()
+    guard agentChatMode || bridgeSurface else {
+      // Isolated-runtime chats carry no bridge provider; this mirror-backed check never
+      // hops the engine queue from the main thread (see .vibe/memory.md "Composer STOP...").
+      return ChatEngine.shared.bridgeRunIsActive(chatId: engineChatId)
+    }
     if bridgeSurface {
       // A real live row always wins, including concurrent workers in an agent group.
       if rows.contains(where: bridgeRowIsLive) { return true }
@@ -19426,6 +19431,11 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     guard !chatId.isEmpty else {
       NSLog("[ChatListView] agentComposerStop skipped — no chatId")
       return
+    }
+
+    if let runId = ChatEngine.shared.activeIsolatedRunId(chatId: chatId) {
+      NSLog("[ChatListView] agentComposerStop isolated chat=%@ runId=%@", chatId, runId)
+      _ = ChatEngine.shared.cancelAgentRun(chatId: chatId, runId: runId)
     }
 
     let liveRows = rows.filter(bridgeRowIsLive)
@@ -24740,21 +24750,23 @@ extension ChatListView: ChatInputBarDelegate {
   }
 
   func inputBarDidRequestStopStreaming() {
+    let isolatedRunId = ChatEngine.shared.activeIsolatedRunId(chatId: engineChatId)
     let canStop =
-      agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents()
+      agentChatMode || currentBridgeProvider != nil || groupHasBridgeAgents() || isolatedRunId != nil
     guard canStop, agentComposerHasLiveTask() || agentStreaming else { return }
 
-    // Bridge / multi-agent group: cancel every live run immediately (SIGTERM on the
-    // computer). Do this first so cancel is not gated on the native stream path.
+    // Isolated-runtime / bridge / multi-agent group: cancel every live run immediately
+    // (SIGTERM / agent-run-control). Do this first so cancel is not gated on the native path.
     let hasLiveBridge = rows.contains(where: bridgeRowIsLive)
       || currentBridgeProvider != nil
       || groupHasBridgeAgents()
-    if hasLiveBridge && (currentBridgeProvider != nil || groupHasBridgeAgents()) {
+    if isolatedRunId != nil || (hasLiveBridge && (currentBridgeProvider != nil || groupHasBridgeAgents())) {
       agentComposerStopActiveTask()
     }
 
-    // Native Vibe AI stream (agent chat without a bridge provider).
-    let isNativeAgentStream = currentBridgeProvider == nil && !groupHasBridgeAgents()
+    // Native Vibe AI stream (agent chat without a bridge provider or isolated run).
+    let isNativeAgentStream =
+      currentBridgeProvider == nil && !groupHasBridgeAgents() && isolatedRunId == nil
     if isNativeAgentStream && (agentChatMode || agentStreaming) {
       stopRequestedAgentStream = true
       syncComposerStopState()

@@ -439,6 +439,14 @@ final class ChatEngine {
     let updatedAtMs: Int64
   }
 
+  /// Latest "computer" preview frame for an isolated-runtime run (agent-platform-v1 §3.4).
+  struct AgentPreviewState {
+    let image: UIImage
+    let label: String
+    let runId: String
+    let updatedAtMs: Int64
+  }
+
   private struct PendingCallSignal {
     let id: String
     let event: String
@@ -544,6 +552,10 @@ final class ChatEngine {
   // for a short grace after the last running push so a transient blip doesn't blank it.
   private var agentTurnRunningAtMsByChatId: [String: Int64] = [:]
   private static let agentTurnRunningGraceMs: Int64 = 12_000
+  // Isolated-runtime (agent-platform-v1) run tracking: runId per chat while running, and
+  // the latest "computer" preview frame. Cleared on agent-run-state terminal status.
+  private var activeIsolatedRunIdByChatId: [String: String] = [:]
+  private var latestAgentPreviewByChatId: [String: AgentPreviewState] = [:]
   // Per-session terminal latch: chatId -> (sessionId -> the tail item's content signature
   // at the moment we saw the run finish). Presence of a sessionId key == "this session is
   // settled; do NOT re-light its tail cell from the chat-wide running grace." Needed because
@@ -2861,6 +2873,19 @@ final class ChatEngine {
     return syncOnQueue { agentBridgeAskByRequestId[requestId] }
   }
 
+  /// Isolated-runtime run id for a chat, if one is active. One-shot read (tap/notification
+  /// triggered, not a render hot-path) — safe to hop the engine queue here.
+  func activeIsolatedRunId(chatId rawChatId: String?) -> String? {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
+    return syncOnQueue { activeIsolatedRunIdByChatId[chatId] }
+  }
+
+  /// Latest decoded "computer" preview frame for a chat, if any.
+  func latestAgentPreview(chatId rawChatId: String?) -> AgentPreviewState? {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
+    return syncOnQueue { latestAgentPreviewByChatId[chatId] }
+  }
+
   /// Atomically claim an ask requestId for sheet presentation. Returns `true` exactly
   /// once per requestId — that caller should present the sheet; every later caller gets
   /// `false` and must skip. This is the cross-surface dedup: the chat bubble view and a
@@ -2968,6 +2993,19 @@ final class ChatEngine {
       return ["accepted": false, "reason": "invalid_request_id"]
     }
 
+    // The ask is resolved once; drop the cached request so a stale sheet can't
+    // re-answer it. Refresh the running mark too: the CLI takes a beat to resume
+    // streaming after an approval, and the outstanding-ask hold just ended — without
+    // this the settle-clear's grace could expire in that resume gap.
+    // Isolated-runtime asks (agent-platform-v1) answer in plaintext, keyed by runId.
+    let storedAsk: [String: Any]? = syncOnQueue {
+      let ask = agentBridgeAskByRequestId.removeValue(forKey: requestId)
+      agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+      return ask
+    }
+    let isIsolated = normalizedString(storedAsk?["runtime"]) == "isolated"
+    let storedRunId = normalizedString(storedAsk?["runId"] ?? storedAsk?["run_id"])
+
     var wirePayload: [String: Any] = ["requestId": requestId, "decision": decision]
     if let provider, !provider.isEmpty { wirePayload["provider"] = provider }
     if let computerId = AgentBridgeSelectionStore.selectedRepository(chatId: chatId)?.computerId,
@@ -2975,19 +3013,15 @@ final class ChatEngine {
     {
       wirePayload["computerId"] = computerId
     }
-    if let answer = payload["answer"] as? [String: Any], !answer.isEmpty,
-      let sealed = AgentRuntimeCrypto.encrypt(["answer": answer])
-    {
-      wirePayload["answerEnc"] = sealed
+    if isIsolated, let storedRunId, !storedRunId.isEmpty {
+      wirePayload["runId"] = storedRunId
     }
-
-    // The ask is resolved once; drop the cached request so a stale sheet can't
-    // re-answer it. Refresh the running mark too: the CLI takes a beat to resume
-    // streaming after an approval, and the outstanding-ask hold just ended — without
-    // this the settle-clear's grace could expire in that resume gap.
-    syncOnQueue {
-      _ = agentBridgeAskByRequestId.removeValue(forKey: requestId)
-      agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    if let answer = payload["answer"] as? [String: Any], !answer.isEmpty {
+      if isIsolated {
+        wirePayload["answer"] = answer
+      } else if let sealed = AgentRuntimeCrypto.encrypt(["answer": answer]) {
+        wirePayload["answerEnc"] = sealed
+      }
     }
 
     return syncOnQueue {
@@ -3015,6 +3049,41 @@ final class ChatEngine {
         payload: ["chatId": chatId, "requestId": requestId, "decision": decision, "ref": ref]
       )
       return ["accepted": true, "transport": "native", "ref": ref, "requestId": requestId]
+    }
+  }
+
+  /// Cancel an isolated-runtime run: client → core `"agent-run-control"` (agent-platform-v1 §3.4).
+  @discardableResult
+  func cancelAgentRun(chatId rawChatId: String, runId rawRunId: String) -> [String: Any] {
+    let chatId = normalizedString(rawChatId) ?? rawChatId
+    let runId = normalizedString(rawRunId) ?? rawRunId
+    guard !chatId.isEmpty, !runId.isEmpty else {
+      return ["accepted": false, "reason": "invalid_args"]
+    }
+    return syncOnQueue {
+      guard let client = phoenixClient else {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "agent_run_cancel_no_socket")
+        }
+        return ["accepted": false, "reason": "no_native_socket"]
+      }
+      guard nativeJoinedChatIds.contains(chatId), (state["connected"] as? Bool) == true else {
+        joinNativeChatTopicIfNeededLocked(chatId: chatId)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+          self?.ensureNativeTransport(trigger: "agent_run_cancel_chat_not_joined")
+        }
+        return ["accepted": false, "reason": "chat_not_joined"]
+      }
+      let ref = client.push(
+        topic: chatTopic(for: chatId),
+        event: "agent-run-control",
+        payload: ["chatId": chatId, "runId": runId, "action": "cancel"]
+      )
+      appendJournalLocked(
+        event: "native-agent-run-cancel",
+        payload: ["chatId": chatId, "runId": runId, "ref": ref]
+      )
+      return ["accepted": true, "transport": "native", "ref": ref, "runId": runId]
     }
   }
 
@@ -7876,6 +7945,7 @@ final class ChatEngine {
       // ingest settle-clear can promptly retire the stale stream row once the transcript
       // confirms done, instead of waiting out the full grace.
       agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+      activeIsolatedRunIdByChatId.removeValue(forKey: chatId)
       // Latch THIS frame's own session settled (never the chat's live slot, which in a
       // group may hold a different provider still streaming — Fable's group hole). This
       // gates the imminent post-done transcript re-push from re-widening the tail cell.
@@ -7947,6 +8017,11 @@ final class ChatEngine {
     // mid-run and wipes the live header → "Start session" flicker + collapsed cell. Every
     // stream frame is proof the turn is alive, so it keeps the grace fresh.
     agentTurnRunningAtMsByChatId[chatId] = Int64(nowMs())
+    // Isolated-runtime run bookkeeping (agent-platform-v1 §3.4): streamId == runId by
+    // contract, but read the explicit field first since it survives a relay reshape.
+    if normalizedString(payload["runtime"]) == "isolated" {
+      activeIsolatedRunIdByChatId[chatId] = normalizedString(payload["runId"] ?? payload["run_id"]) ?? streamId
+    }
     // A live (non-terminal) frame for this session is genuine proof-of-life — drop any
     // stale terminal latch so the tail cell tracks the grace again (a resumed/continued run).
     if let liveSessionId = frameSessionId, !liveSessionId.isEmpty {
@@ -9359,6 +9434,51 @@ final class ChatEngine {
               "requestId": requestId,
             ]
           )
+          return
+        }
+        if frame.event == "agent-approval" {
+          // Isolated-runtime approval/permission request (agent-platform-v1 §3.4). The
+          // decision message itself renders through the existing service-decision cell.
+          let runId = self.normalizedString(frame.payload["runId"] ?? frame.payload["run_id"]) ?? ""
+          if !runId.isEmpty {
+            self.activeIsolatedRunIdByChatId[chatId] = runId
+          }
+          self.agentTurnRunningAtMsByChatId[chatId] = Int64(self.nowMs())
+          self.setAgentProgressLocked(
+            chatId: chatId, label: "Waiting for approval", tool: nil, status: "running")
+          return
+        }
+        if frame.event == "agent-run-state" {
+          // Terminal-only signal for an isolated run — the paired agent-stream "done"
+          // frame settles the row; this clears the running/waiting header + cancel bookkeeping.
+          let runId = self.normalizedString(frame.payload["runId"] ?? frame.payload["run_id"]) ?? ""
+          let status = (self.normalizedString(frame.payload["status"]) ?? "").lowercased()
+          let reason = self.normalizedString(frame.payload["reason"]) ?? ""
+          let staleRun =
+            !runId.isEmpty && self.activeIsolatedRunIdByChatId[chatId] != nil
+            && self.activeIsolatedRunIdByChatId[chatId] != runId
+          guard !staleRun, ["completed", "failed", "cancelled"].contains(status) else { return }
+          self.activeIsolatedRunIdByChatId.removeValue(forKey: chatId)
+          self.agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+          let settleStatus = status == "completed" ? "done" : (status == "failed" ? "error" : "stopped")
+          self.clearAgentProgressLocked(
+            chatId: chatId, status: settleStatus, reason: "runState(\(status):\(reason))")
+          return
+        }
+        if frame.event == "agent-preview" {
+          // Live "computer" screenshot for an isolated run. Decode off-main (this whole
+          // handler already runs on the engine's async queue) and keep only the latest.
+          let runId = self.normalizedString(frame.payload["runId"] ?? frame.payload["run_id"]) ?? ""
+          let label = self.normalizedString(frame.payload["label"]) ?? "Computer"
+          if let b64 = frame.payload["imageBase64"] as? String,
+            let data = Data(base64Encoded: b64),
+            let image = UIImage(data: data)
+          {
+            self.latestAgentPreviewByChatId[chatId] = AgentPreviewState(
+              image: image, label: label, runId: runId, updatedAtMs: Int64(self.nowMs()))
+            self.postChangeLocked(
+              reason: "agentPreview", userInfo: ["chatId": chatId, "runId": runId])
+          }
           return
         }
         if frame.event == "typing" || frame.event == "stop-typing" {

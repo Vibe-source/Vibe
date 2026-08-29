@@ -550,18 +550,47 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return btn
   }()
 
+  /// "Computer" button — visible only once an isolated-runtime run (agent-platform-v1)
+  /// has posted a live preview frame for this chat. Presents the full-screen preview sheet.
+  private lazy var headerComputerButton: UIButton = {
+    let btn = UIButton(type: .system)
+    btn.setImage(UIImage(systemName: "display"), for: .normal)
+    btn.addTarget(self, action: #selector(computerPreviewTapped), for: .touchUpInside)
+    btn.accessibilityLabel = "Computer"
+    btn.setContentHuggingPriority(.required, for: .horizontal)
+    btn.setContentCompressionResistancePriority(.required, for: .horizontal)
+    btn.isHidden = true
+    return btn
+  }()
+
   /// Container for ONLY history + new chat — the cloud (profile) is deliberately NOT in
   /// here; it stays its own standalone bar-button item. Arranged left→right as
   /// new chat, history, so new chat animates in hugging the history button while the
   /// cloud (a separate item further trailing) never shares a wrapper with them.
   private lazy var headerHistoryActionsStack: UIStackView = {
     let stack = UIStackView(arrangedSubviews: [
-      headerNewChatActionButton, headerHistoryButton,
+      headerComputerButton, headerNewChatActionButton, headerHistoryButton,
     ])
     stack.axis = .horizontal
     stack.alignment = .center
     stack.spacing = 16
     return stack
+  }()
+
+  /// Floating 96pt live "computer" thumbnail above the composer; tap opens the full sheet.
+  /// Hidden until the first `agent-preview` frame for this chat.
+  private lazy var computerThumbnailView: UIImageView = {
+    let iv = UIImageView()
+    iv.contentMode = .scaleAspectFill
+    iv.clipsToBounds = true
+    iv.layer.cornerRadius = 14
+    iv.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+    iv.isUserInteractionEnabled = true
+    iv.isHidden = true
+    iv.translatesAutoresizingMaskIntoConstraints = false
+    iv.accessibilityLabel = "Computer preview"
+    iv.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(computerPreviewTapped)))
+    return iv
   }()
 
   /// Floating "jump to latest" control above the composer; appears when the feed is
@@ -720,7 +749,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// Chat + provider context (history surface) so a runtime card can route a
   /// full-file-open request to the user's bridge. Nil in the live agent view.
   var agentBridgeChatId: String? {
-    didSet { composerView.bridgeChatId = agentBridgeChatId }
+    didSet {
+      composerView.bridgeChatId = agentBridgeChatId
+      if isViewLoaded { updateComputerPreviewAffordances() }
+    }
   }
   var agentBridgeProvider: String? {
     didSet {
@@ -883,6 +915,22 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     onPresentProfile?()
   }
 
+  @objc private func computerPreviewTapped() {
+    guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
+    present(VibeAgentComputerPreviewViewController(chatId: chatId, appearance: appearance), animated: true)
+  }
+
+  /// Show/hide the header button + floating thumbnail once a "computer" preview frame
+  /// has arrived for this chat (agent-platform-v1 §3.4).
+  private func updateComputerPreviewAffordances() {
+    let preview = agentBridgeChatId.flatMap { ChatEngine.shared.latestAgentPreview(chatId: $0) }
+    headerComputerButton.isHidden = preview == nil
+    computerThumbnailView.isHidden = preview == nil
+    if let preview {
+      computerThumbnailView.image = preview.image
+    }
+  }
+
   @objc private func handleTranscriptTap() {
     view.endEditing(true)
   }
@@ -1028,6 +1076,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     repoPickerButton.showsMenuAsPrimaryAction = true
     updateRepoPickerStyle()
     view.addSubview(repoPickerButton)
+    view.addSubview(computerThumbnailView)
 
     progressSheet.translatesAutoresizingMaskIntoConstraints = false
     progressSheet.applyAppearance(appearance)
@@ -1087,6 +1136,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       editToastBlur.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
       repoPickerButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16.0),
       repoPickerButton.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
+      computerThumbnailView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16.0),
+      computerThumbnailView.bottomAnchor.constraint(equalTo: composerView.topAnchor, constant: -8.0),
+      computerThumbnailView.widthAnchor.constraint(equalToConstant: 96),
+      computerThumbnailView.heightAnchor.constraint(equalToConstant: 96),
       progressSheet.topAnchor.constraint(equalTo: view.topAnchor),
       progressSheet.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       progressSheet.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -1138,6 +1191,7 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     trackStreamStarts(messages)
     indexProgress()
     updateWorkspace()
+    updateComputerPreviewAffordances()
     observeKeyboard()
     observeLiveMessages()
     // First landing is handled in viewDidLayoutSubviews (once content + insets resolve)
@@ -1498,6 +1552,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       if (note.userInfo?["reason"] as? String) == "agentBridgeAsk" {
         self.handleAgentBridgeAsk(note.userInfo ?? [:])
       }
+      if (note.userInfo?["reason"] as? String) == "agentPreview",
+        (note.userInfo?["chatId"] as? String) == self.agentBridgeChatId
+      {
+        self.updateComputerPreviewAffordances()
+      }
     }
   }
 
@@ -1563,11 +1622,13 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       return
     }
 
-    // The body is E2E-sealed (`askEnc`); fall back to plaintext `request` for a
-    // keyless pairing. Decrypted shape is { kind, request: {...} }.
+    // The body is E2E-sealed (`askEnc`); an isolated-runtime run (agent-platform-v1) sends
+    // `ask` plaintext instead. Fall back to plaintext `request` for a keyless pairing.
     var body: [String: Any]
     if let dec = AgentRuntimeCrypto.decrypt(payload["askEnc"]) {
       body = dec
+    } else if payload["askEnc"] == nil, let ask = payload["ask"] as? [String: Any] {
+      body = ["request": ask]
     } else if let raw = payload["request"] as? [String: Any] {
       body = ["request": raw]
     } else {
@@ -2499,6 +2560,10 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// the single running task for this chat+provider when taskId is absent.
   private func stopActiveTask() {
     guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
+    if let runId = ChatEngine.shared.activeIsolatedRunId(chatId: chatId) {
+      NSLog("[AgentView] stopActiveTask isolated chat=%@ runId=%@", chatId, runId)
+      _ = ChatEngine.shared.cancelAgentRun(chatId: chatId, runId: runId)
+    }
     let provider = agentBridgeProvider ?? "codex"
     let taskId = messages.first {
       $0.isStreaming || $0.runtime?.status == "running"
