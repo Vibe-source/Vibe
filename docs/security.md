@@ -3,6 +3,12 @@
 > **Authoritative Architecture & Design Document:** For the core cryptographic architecture, audit findings, protocol selection (MLS), crate layout, and phased migration roadmap, see [docs/secure-core-architecture.md](secure-core-architecture.md).
 >
 > **Current-Status & Qualification Tracking:** Production migration gates are tracked in `docs/production-timeline-core-refactor.md`. Detailed line-by-line audit findings are documented in `docs/encryption-media-status-2026-08.md`.
+>
+> **Server & agent hardening (2026-08-28):** the production-readiness gap analysis against the ABR
+> checklist is [docs/security-readiness-gap-2026-08.md](security-readiness-gap-2026-08.md); the agent
+> isolation, capability broker and sandbox model are specified in
+> [docs/agent-platform-v1.md](agent-platform-v1.md). The token/session, headers, body-limit and audit
+> statements below are superseded by those two documents where they differ.
 
 ---
 

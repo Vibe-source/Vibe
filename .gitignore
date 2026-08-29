@@ -200,3 +200,29 @@ vibe-diagnostics-*.txt
 # BEAM crash dumps. Local boot artifacts (~3 MB), never useful to another checkout.
 erl_crash.dump
 **/erl_crash.dump
+
+# Local Agix state and generated iOS delivery artifacts
+.agix-notes/
+.agix-plan/
+*.mobileprovision
+*.cer
+*.dSYM.zip
+ios/fastlane/report.xml
+outline.txt
+
+# Agent Platform v1 (docs/agent-platform-v1.md): the runtime, contracts, sandbox gateway and the
+# VPS deploy stack are source. Re-include what the broad *.sh / Dockerfile / *.env.example rules eat.
+!deploy/**/*.sh
+!deploy/**/Dockerfile
+!deploy/**/*.env.example
+!deploy/compose.yml
+!agent-runtime/Dockerfile
+!agent-runtime/start.sh
+!sandbox-gateway/Dockerfile
+!scripts/*.sh
+deploy/env/*.env
+agent-runtime/_build/
+agent-runtime/deps/
+contracts/_build/
+contracts/deps/
+sandbox-gateway/target/

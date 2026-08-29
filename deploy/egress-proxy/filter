@@ -1,0 +1,13 @@
+# Egress allowlist for sandbox-net. FilterExtended On (tinyproxy.conf): each line is a POSIX
+# extended regex matched against the request host. FilterDefaultDeny Yes: no match = blocked.
+^(.*\.)?googleapis\.com$
+^(.*\.)?github\.com$
+^(.*\.)?githubusercontent\.com$
+^pypi\.org$
+^files\.pythonhosted\.org$
+^registry\.npmjs\.org$
+^(.*\.)?wikipedia\.org$
+^duckduckgo\.com$
+^(.*\.)?duckduckgo\.com$
+
+# --- Add additional allowed domains below this line. One POSIX extended regex per line. ---

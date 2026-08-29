@@ -136,6 +136,10 @@ sit on the same messenger security surface.
 
 ## Roadmap (short)
 
+0. **Isolated ingress (2026-08)** — provider traffic moves to `agents.<host>/v1/*` on the
+   isolated agent runtime; the core keeps `/api/agents/:identifier/*` as aliases. Same auth,
+   same payloads, plus `Idempotency-Key` and `GET /v1/tasks/:id`. See
+   [agent-platform-v1.md](agent-platform-v1.md) §3.5.
 1. **Streaming task lifecycle** — card `capabilities.streaming` and progressive
    agent-turn frames for long provider runs.
 2. **Provider verification badges** — trust signal for known provider organizations

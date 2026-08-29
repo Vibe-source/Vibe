@@ -1,0 +1,70 @@
+{
+	email {$ACME_EMAIL}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+(access_log) {
+	# File (not just stdout): fail2ban's caddy-auth jail tails this on the
+	# host via the bind mount in compose.yml.
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
+
+# Chat core — websockets pass through reverse_proxy by default, no extra config.
+api.{$VIBE_DOMAIN} {
+	import security_headers
+	import access_log
+	encode gzip zstd
+
+	@internal path /internal/*
+	respond @internal 403
+
+	request_body {
+		max_size 130MB
+	}
+
+	reverse_proxy core:4000
+}
+
+# Isolated agent runtime — provider ingress (/v1/*) and voice sockets.
+agents.{$VIBE_DOMAIN} {
+	import security_headers
+	import access_log
+	encode gzip zstd
+
+	@internal path /internal/*
+	respond @internal 403
+
+	request_body {
+		max_size 8MB
+	}
+
+	reverse_proxy agent-runtime:4100
+}
+
+# Bare domain — SPA served by core. Same /internal/* block: core's router is
+# host-agnostic, so those routes are reachable here too without it.
+{$VIBE_DOMAIN} {
+	import security_headers
+	import access_log
+	encode gzip zstd
+
+	@internal path /internal/*
+	respond @internal 403
+
+	reverse_proxy core:4000
+}

@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: core
+    static_configs:
+      - targets: ["core:9568"]
+  - job_name: agent-runtime
+    static_configs:
+      - targets: ["agent-runtime:9568"]
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
