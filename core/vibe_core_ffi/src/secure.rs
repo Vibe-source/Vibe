@@ -245,6 +245,13 @@ pub fn vibe_safety_number(key_a: Vec<u8>, key_b: Vec<u8>) -> String {
     vibe_secure::vibe_safety_number(&key_a, &key_b)
 }
 
+/// The same safety number as a hex key block — 64 chars, ungrouped. Same slow
+/// hash and same ordering as the digits, so the two never disagree.
+#[uniffi::export]
+pub fn vibe_safety_code_hex(key_a: Vec<u8>, key_b: Vec<u8>) -> String {
+    vibe_secure::vibe_safety_code_hex(&key_a, &key_b)
+}
+
 /// Group id from a `vmls1.` header, without opening the ciphertext.
 #[uniffi::export]
 pub fn vibe_mls_group_id_from_envelope(envelope: String) -> Result<Vec<u8>, VibeFfiError> {
@@ -350,6 +357,15 @@ impl VibeSecureSessionHandle {
             detail: "secure: session lock poisoned".to_owned(),
         })?;
         Ok(guard.has_pending_commit())
+    }
+
+    /// Every other member's signature key, so a joiner can pin the identity that
+    /// is actually in the group instead of one the server offers separately.
+    pub fn peer_signature_keys(&self) -> Result<Vec<Vec<u8>>, VibeFfiError> {
+        let guard = self.inner.lock().map_err(|_| VibeFfiError::Internal {
+            detail: "secure: session lock poisoned".to_owned(),
+        })?;
+        Ok(guard.peer_signature_keys())
     }
 
     /// Joins a group from a Welcome produced by another member's `add_members`.

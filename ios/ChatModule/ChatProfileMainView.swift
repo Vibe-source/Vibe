@@ -3,21 +3,29 @@ import UIKit
 import AVFoundation
 import PhotosUI
 
+import CoreImage.CIFilterBuiltins
 import CryptoKit
 
 private struct ChatEncryptionVerifyView: View {
+  let chatId: String
   let peerUserId: String
   private let pendingSignatureKey: Data?
   private let pendingTransportKey: Data?
   private let safetyNumber: String?
+  private let safetyCode: String?
+  private let safetyQR: UIImage?
   private let transportFingerprint: String?
   private let identityChanged: Bool
 
   @Environment(\.dismiss) private var dismiss
   @State private var acceptanceFailed = false
 
-  init(peerUserId: String) {
+  init(chatId: String, peerUserId: String) {
+    self.chatId = chatId
     self.peerUserId = peerUserId
+    // A joiner claims no KeyPackage, so it can reach this screen holding no pin
+    // at all; the group's own tree is the missing half.
+    VibeSecureSessions.shared.ensurePeerPinned(chatId: chatId, peerUserId: peerUserId)
     let pending = VibeSecureTrust.pendingChanges(userId: peerUserId)
     pendingSignatureKey = pending.signatureKey
     pendingTransportKey = pending.transportKey
@@ -25,12 +33,17 @@ private struct ChatEncryptionVerifyView: View {
 
     let signatureKey = pending.signatureKey ?? VibeSecureTrust.pinnedKey(userId: peerUserId)
     let resolvedSafetyNumber: String?
+    let resolvedCode: String?
     if let mine = VibeSecureSessions.shared.mySignatureKey(), let signatureKey {
       resolvedSafetyNumber = VibeSecureTrust.safetyNumber(myKey: mine, peerKey: signatureKey)
+      resolvedCode = VibeSecureTrust.safetyCodeHex(myKey: mine, peerKey: signatureKey)
     } else {
       resolvedSafetyNumber = nil
+      resolvedCode = nil
     }
     safetyNumber = resolvedSafetyNumber
+    safetyCode = resolvedCode
+    safetyQR = resolvedCode.flatMap { Self.qrImage(for: $0) }
 
     let transportKey =
       pending.transportKey ?? VibeSecureTrust.pinnedTransportKey(userId: peerUserId)
@@ -54,11 +67,11 @@ private struct ChatEncryptionVerifyView: View {
             .font(.subheadline)
             .foregroundStyle(.secondary)
 
-          if let safetyNumber {
-            verificationValue(
-              title: pendingSignatureKey == nil ? "Safety number" : "New safety number",
-              value: safetyNumber,
-              font: .system(.title3, design: .monospaced)
+          if let safetyCode {
+            encryptionKey(
+              title: pendingSignatureKey == nil ? "Encryption key" : "New encryption key",
+              code: safetyCode,
+              readAloud: safetyNumber
             )
           }
 
@@ -110,6 +123,102 @@ private struct ChatEncryptionVerifyView: View {
       return "Compare the replacement code with your contact over a trusted channel before accepting it."
     }
     return "Compare this code with your contact over a trusted channel. Matching codes verify the encryption identity."
+  }
+
+  /// Three views of one fingerprint: QR to scan, hex block to compare on
+  /// screen, digits to read aloud on a call.
+  private func encryptionKey(title: String, code: String, readAloud: String?) -> some View {
+    VStack(alignment: .leading, spacing: 16) {
+      Text(title)
+        .font(.headline)
+      if let safetyQR {
+        Image(uiImage: safetyQR)
+          .interpolation(.none)
+          .resizable()
+          .scaledToFit()
+          .frame(maxWidth: 232)
+          .padding(18)
+          .background(Color.white, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+          .frame(maxWidth: .infinity, alignment: .center)
+          .accessibilityHidden(true)
+      }
+      keyBlock(code)
+      if let readAloud {
+        VStack(alignment: .leading, spacing: 4) {
+          Text("Read aloud")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+          Text(readAloud)
+            .font(.system(.footnote, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+        }
+      }
+    }
+  }
+
+  /// Four rows of four groups — the shape an eye scans for a mismatch.
+  private func keyBlock(_ code: String) -> some View {
+    let groups = stride(from: 0, to: code.count, by: 4).map { offset -> String in
+      let start = code.index(code.startIndex, offsetBy: offset)
+      let end = code.index(start, offsetBy: min(4, code.count - offset))
+      return String(code[start..<end])
+    }
+    let rows = stride(from: 0, to: groups.count, by: 4).map { offset in
+      Array(groups[offset..<min(offset + 4, groups.count)])
+    }
+    return VStack(alignment: .leading, spacing: 8) {
+      ForEach(rows.indices, id: \.self) { row in
+        HStack(spacing: 14) {
+          ForEach(rows[row].indices, id: \.self) { column in
+            Text(rows[row][column])
+              .font(.system(.title3, design: .monospaced))
+              .fontWeight(.medium)
+          }
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .center)
+    .textSelection(.enabled)
+  }
+
+  /// Encodes the code, not the key pair — the code is already order-independent,
+  /// so both sides render byte-identical images.
+  private static func qrImage(for code: String) -> UIImage? {
+    guard !code.isEmpty else { return nil }
+    let filter = CIFilter.qrCodeGenerator()
+    filter.message = Data(code.utf8)
+    filter.correctionLevel = "M"
+    guard let output = filter.outputImage else { return nil }
+    let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+    let extent = scaled.extent
+
+    // Modules opaque, quiet zone clear, so the ramp paints only the code.
+    let mask = scaled.applyingFilter("CIColorInvert").applyingFilter("CIMaskToAlpha")
+
+    let (near, far) = tint(for: code)
+    let ramp = CIFilter.linearGradient()
+    ramp.point0 = CGPoint(x: extent.minX, y: extent.maxY)
+    ramp.point1 = CGPoint(x: extent.maxX, y: extent.minY)
+    ramp.color0 = CIColor(color: near)
+    ramp.color1 = CIColor(color: far)
+    guard let gradient = ramp.outputImage?.cropped(to: extent) else { return nil }
+
+    let tinted = gradient.applyingFilter(
+      "CISourceInCompositing", parameters: [kCIInputBackgroundImageKey: mask])
+    guard let cg = CIContext().createCGImage(tinted, from: extent) else { return nil }
+    return UIImage(cgImage: cg)
+  }
+
+  /// Hue seeded by the code, clamped to the blue–magenta band: each pair looks
+  /// distinct, and every result stays dark enough on white to still scan.
+  private static func tint(for code: String) -> (UIColor, UIColor) {
+    let seed = code.unicodeScalars.reduce(UInt32(0)) { ($0 &* 31) &+ $1.value }
+    let hue = 0.55 + (CGFloat(seed % 1000) / 1000) * 0.33
+    return (
+      UIColor(hue: hue, saturation: 0.90, brightness: 0.44, alpha: 1),
+      UIColor(hue: hue + 0.06, saturation: 0.95, brightness: 0.30, alpha: 1)
+    )
   }
 
   private func verificationValue(title: String, value: String, font: Font) -> some View {
@@ -2176,6 +2285,7 @@ private struct ChatProfileSwiftUIRootView: View {
         scrollScale: scrollAvatarScale,
         scrollOpacity: scrollAvatarOpacity,
         parallax: canExpandHero ? Self.pixelRound(away * 0.5) : 0,
+        edgeFadeColor: pageColor,
         onImageAvailabilityChanged: { available in
           guard heroImageAvailable != available else { return }
           heroImageAvailable = available
@@ -2304,6 +2414,14 @@ private struct ChatProfileSwiftUIRootView: View {
     } ?? 0
     let titleCenterOffset = max(0, (contentWidth - titleWidth) * 0.5)
     let subtitleCenterOffset = max(0, (contentWidth - subtitleWidth) * 0.5)
+    // Height-collapse in Y, exactly like Home's search bar (layoutSearchBar):
+    // height shrinks 1:1 with scroll (top pinned, bottom recedes), content
+    // fades fast in the last 30% of that shrink.
+    let actionCollapseY = collapsedIdentityStickyOffset
+    let actionRowBand: CGFloat = 52
+    let actionBarHeight = max(0, actionRowBand - min(actionCollapseY, actionRowBand))
+    let actionContentRatio = actionRowBand > 0 ? actionBarHeight / actionRowBand : 0
+    let actionVisibility = max(0, min(1, (actionContentRatio - 0.7) / 0.3))
 
     VStack(spacing: 10) {
       VStack(alignment: .leading, spacing: 3) {
@@ -2332,7 +2450,12 @@ private struct ChatProfileSwiftUIRootView: View {
       .frame(maxWidth: .infinity, alignment: .leading)
       .padding(.horizontal, inset)
 
+      // Bottom recedes as height shrinks — same clip Home uses on its bar.
       actionRow
+        .opacity(Double(actionVisibility))
+        .frame(height: actionBarHeight, alignment: .top)
+        .clipped()
+        .allowsHitTesting(actionBarHeight > actionRowBand * 0.5)
     }
     .frame(maxWidth: .infinity, alignment: .top)
   }
@@ -3554,7 +3677,7 @@ private struct ChatProfileSwiftUIRootView: View {
       )
     case .encryption:
       if let peerUserId = ChatEngine.shared.peerUserId(chatId: chatId), !peerUserId.isEmpty {
-        ChatEncryptionVerifyView(peerUserId: peerUserId)
+        ChatEncryptionVerifyView(chatId: chatId, peerUserId: peerUserId)
       } else {
         Text("Encryption identity is not available yet.")
           .foregroundStyle(.secondary)
@@ -4259,6 +4382,8 @@ private struct ChatProfileAvatarMorphView: View {
   /// Downward media shift inside the clipped band while it scrolls away (expanded
   /// hero only) — the image trails the scroll at half speed, Telegram-style.
   var parallax: CGFloat = 0
+  /// Page background the bottom edge dissolves into, so the image shows no edge.
+  var edgeFadeColor: Color = .black
   var onImageAvailabilityChanged: (Bool) -> Void = { _ in }
 
   @State private var image: UIImage?
@@ -4279,6 +4404,7 @@ private struct ChatProfileAvatarMorphView: View {
     scrollScale: CGFloat = 1,
     scrollOpacity: CGFloat = 1,
     parallax: CGFloat = 0,
+    edgeFadeColor: Color = .black,
     onImageAvailabilityChanged: @escaping (Bool) -> Void = { _ in }
   ) {
     self.text = text
@@ -4295,6 +4421,7 @@ private struct ChatProfileAvatarMorphView: View {
     self.scrollScale = scrollScale
     self.scrollOpacity = scrollOpacity
     self.parallax = morphEnabled ? parallax : 0
+    self.edgeFadeColor = edgeFadeColor
     self.onImageAvailabilityChanged = onImageAvailabilityChanged
     let normalized = imageUri?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     let primed = normalized.flatMap { ChatAvatarImageStore.cached(for: $0) }
@@ -4344,16 +4471,14 @@ private struct ChatProfileAvatarMorphView: View {
     // Linear shared p only — no topAttach/sizeGrow (those made expand worse).
     return mediaBody
       .frame(width: mediaW, height: mediaH)
-      .mask(shape.padding(.bottom, -40 * p)) // Allow mask to bleed
+      .clipShape(shape)
       .scaleEffect(s, anchor: .top)
       .opacity(Double(o))
       .frame(width: width, alignment: .center)
       .padding(.top, mediaTop)
       .offset(y: parallax * p)
       .frame(width: width, height: bandHeight, alignment: .top)
-      .padding(.bottom, 40 * p) // Add padding so it doesn't clip the bleed
       .clipped()
-      .padding(.bottom, -40 * p) // Restore frame height
       .animation(nil, value: scrollScale)
       .onAppear { onImageAvailabilityChanged(image != nil) }
       .task(id: normalizedUri ?? "") { await loadImage() }
@@ -4401,28 +4526,54 @@ private struct ChatProfileAvatarMorphView: View {
 
   @ViewBuilder
   private var mediaBody: some View {
-    let edgeCut = morphEnabled && image != nil ? 10 * p : 0
+    // No edge at the bottom: the blur ramps in over a tall band and the colour ramp
+    // reaches the page background on the last pixel, so the image dissolves into it.
+    let edgeBlurHeight = max(72, min(180, mediaH * 0.42))
 
-    ZStack {
+    ZStack(alignment: .bottom) {
       mediaFill
-        .mask(Rectangle().padding(.bottom, edgeCut))
 
       if morphEnabled, let image, p > 0.001 {
         Image(uiImage: image)
           .resizable()
           .scaledToFill()
           .frame(width: mediaW, height: mediaH)
-          .blur(radius: 52 * p, opaque: false)
+          .blur(radius: 44 * p, opaque: true)
+          .frame(width: mediaW, height: edgeBlurHeight, alignment: .bottom)
+          .clipped()
           .mask(
-            Rectangle()
-              .padding(.top, max(0, mediaH - 54))
-              .padding(.bottom, -32 * p)
-              .blur(radius: 10 * p)
+            LinearGradient(
+              stops: [
+                .init(color: .black.opacity(0), location: 0),
+                .init(color: .black.opacity(0.22), location: 0.3),
+                .init(color: .black.opacity(0.72), location: 0.62),
+                .init(color: .black, location: 0.86),
+                .init(color: .black, location: 1),
+              ],
+              startPoint: .top,
+              endPoint: .bottom
+            )
           )
           .opacity(p)
+
+        LinearGradient(
+          stops: [
+            .init(color: edgeFadeColor.opacity(0), location: 0),
+            .init(color: edgeFadeColor.opacity(0.16), location: 0.42),
+            .init(color: edgeFadeColor.opacity(0.58), location: 0.72),
+            .init(color: edgeFadeColor.opacity(0.94), location: 0.92),
+            .init(color: edgeFadeColor, location: 1),
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+        .frame(width: mediaW, height: edgeBlurHeight)
+        .allowsHitTesting(false)
+        .opacity(p)
       }
     }
     .frame(width: mediaW, height: mediaH)
+    .clipped()
   }
 
   private var normalizedUri: String? {

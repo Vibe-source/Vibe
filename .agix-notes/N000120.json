@@ -1,6 +1,6 @@
 {
   "id": 120,
-  "status": "open",
+  "status": "done",
   "priority": 2,
   "kind": "handoff",
   "body": "MLS item 2 implemented: ChatEngine peerUserId accessor; VibeSecureTrust pending MLS/transport keychain slots with acceptPendingChanges; ChatEncryptionVerifyView safety-number/fingerprint sheet wired into DM profile. agix build attempted but Xcode dependency resolution was blocked by sandbox Operation not permitted in ~/.cache/clang and ~/Library/Caches; no install.",
@@ -14,5 +14,5 @@
   "agent": "",
   "author": "Vibe Team",
   "created_at": 1787922004,
-  "updated_at": 1787922004
+  "updated_at": 1787931340
 }

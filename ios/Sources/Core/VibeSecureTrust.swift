@@ -161,6 +161,11 @@ enum VibeSecureTrust {
       .joined(separator: " ")
   }
 
+  /// The same fingerprint as a hex key block, ungrouped — the view chunks it.
+  static func safetyCodeHex(myKey: Data, peerKey: Data) -> String {
+    vibeSafetyCodeHex(keyA: myKey, keyB: peerKey)
+  }
+
 
   private static func loadKey(userId: String, service: String = service) -> Data? {
     let query: [String: Any] = [

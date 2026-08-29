@@ -43,6 +43,9 @@ use crate::VIBE_SECURE_CIPHERSUITE;
 /// abandoned comparison protects nothing.
 pub const VIBE_SAFETY_NUMBER_DIGITS: usize = 60;
 
+/// How many hex chars the key block carries: 32 bytes, 16 from each side.
+pub const VIBE_SAFETY_CODE_HEX_CHARS: usize = 64;
+
 /// How many iterations of hashing go into each side's half.
 ///
 /// Deliberately slow in the same spirit as Signal's 5200 rounds: it costs a
@@ -107,11 +110,7 @@ pub fn inspect_key_package(
 /// [`VIBE_SAFETY_NUMBER_DIGITS`] decimal digits with no grouping — how to chunk
 /// them for display is the platform's business.
 pub fn vibe_safety_number(key_a: &[u8], key_b: &[u8]) -> String {
-    let (first, second) = if key_a <= key_b {
-        (key_a, key_b)
-    } else {
-        (key_b, key_a)
-    };
+    let (first, second) = sorted(key_a, key_b);
 
     let mut digits = String::with_capacity(VIBE_SAFETY_NUMBER_DIGITS);
     digits.push_str(&fingerprint(first, VIBE_SAFETY_NUMBER_DIGITS / 2));
@@ -119,17 +118,36 @@ pub fn vibe_safety_number(key_a: &[u8], key_b: &[u8]) -> String {
     digits
 }
 
-/// One party's half of the safety number: iterated hashing, then the leading
-/// bytes rendered as decimal groups.
-fn fingerprint(key: &[u8], digits: usize) -> String {
-    let mut hash = {
-        let mut hasher = Sha256::new();
-        // Domain separation: this hash must never collide with any other use
-        // of SHA-256 over the same key elsewhere in the system.
-        hasher.update(b"vibe/safety-number/v1");
-        hasher.update(key);
-        hasher.finalize().to_vec()
-    };
+/// The same fingerprint rendered as hex, for screens that show a key block
+/// rather than digits. Same slow hash, same ordering — one truth, two shapes.
+pub fn vibe_safety_code_hex(key_a: &[u8], key_b: &[u8]) -> String {
+    let (first, second) = sorted(key_a, key_b);
+    let mut out = String::with_capacity(VIBE_SAFETY_CODE_HEX_CHARS);
+    for key in [first, second] {
+        for byte in iterated_hash(key).iter().take(VIBE_SAFETY_CODE_HEX_CHARS / 4) {
+            out.push_str(&format!("{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// Order-independent pairing: neither side can know who is "first".
+fn sorted<'a>(key_a: &'a [u8], key_b: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+    if key_a <= key_b {
+        (key_a, key_b)
+    } else {
+        (key_b, key_a)
+    }
+}
+
+/// The slow hash both renderings share, so hex and digits describe one key.
+fn iterated_hash(key: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    // Domain separation: this hash must never collide with any other use of
+    // SHA-256 over the same key elsewhere in the system.
+    hasher.update(b"vibe/safety-number/v1");
+    hasher.update(key);
+    let mut hash = hasher.finalize().to_vec();
 
     for _ in 0..SAFETY_NUMBER_ITERATIONS {
         let mut hasher = Sha256::new();
@@ -137,6 +155,13 @@ fn fingerprint(key: &[u8], digits: usize) -> String {
         hasher.update(key);
         hash = hasher.finalize().to_vec();
     }
+    hash
+}
+
+/// One party's half of the safety number: iterated hashing, then the leading
+/// bytes rendered as decimal groups.
+fn fingerprint(key: &[u8], digits: usize) -> String {
+    let hash = iterated_hash(key);
 
     // Each 5-digit group comes from 40 bits, taken modulo 100_000. The bias
     // from 2^40 not dividing 100_000 is under one part in 10^7 — irrelevant
@@ -210,6 +235,19 @@ mod tests {
         let a = key(4);
         let b = key(8);
         assert_eq!(vibe_safety_number(&a, &b), vibe_safety_number(&a, &b));
+    }
+
+    #[test]
+    fn the_hex_code_is_order_independent_and_the_advertised_length() {
+        let a = key(1);
+        let b = key(2);
+        let code = vibe_safety_code_hex(&a, &b);
+        assert_eq!(code, vibe_safety_code_hex(&b, &a));
+        assert_eq!(code.len(), VIBE_SAFETY_CODE_HEX_CHARS);
+        assert!(code
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(code, vibe_safety_code_hex(&a, &key(3)));
     }
 
     #[test]

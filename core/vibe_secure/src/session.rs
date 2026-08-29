@@ -198,6 +198,17 @@ impl VibeSecureSession {
         self.group.pending_commit().is_some()
     }
 
+    /// Signature keys of every member but this device, read from the group's own
+    /// ratchet tree — the only copy a hostile server cannot substitute.
+    pub fn peer_signature_keys(&self) -> Vec<Vec<u8>> {
+        let me = self.group.own_leaf_index();
+        self.group
+            .members()
+            .filter(|member| member.index != me)
+            .map(|member| member.signature_key)
+            .collect()
+    }
+
     /// Joins a group from a Welcome message, as produced by
     /// [`VibeCommitOutput::welcome`].
     ///

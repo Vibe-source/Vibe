@@ -2213,6 +2213,12 @@ public protocol VibeSecureSessionHandleProtocol : AnyObject {
     func `open`(envelope: String) throws  -> Data
     
     /**
+     * Every other member's signature key, so a joiner can pin the identity that
+     * is actually in the group instead of one the server offers separately.
+     */
+    func peerSignatureKeys() throws  -> [Data]
+    
+    /**
      * Seals `plaintext` as a `vmls1.` envelope string.
      */
     func seal(plaintext: Data) throws  -> String
@@ -2359,6 +2365,17 @@ open func `open`(envelope: String)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
     uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_open(self.uniffiClonePointer(),
         FfiConverterString.lower(envelope),$0
+    )
+})
+}
+    
+    /**
+     * Every other member's signature key, so a joiner can pin the identity that
+     * is actually in the group instead of one the server offers separately.
+     */
+open func peerSignatureKeys()throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeVibeFfiError.lift) {
+    uniffi_vibe_core_ffi_fn_method_vibesecuresessionhandle_peer_signature_keys(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -6759,6 +6776,18 @@ public func vibeMlsGroupIdFromEnvelope(envelope: String)throws  -> Data {
 })
 }
 /**
+ * The same safety number as a hex key block — 64 chars, ungrouped. Same slow
+ * hash and same ordering as the digits, so the two never disagree.
+ */
+public func vibeSafetyCodeHex(keyA: Data, keyB: Data) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_vibe_core_ffi_fn_func_vibe_safety_code_hex(
+        FfiConverterData.lower(keyA),
+        FfiConverterData.lower(keyB),$0
+    )
+})
+}
+/**
  * The safety number two people compare out of band to prove nobody is in the
  * middle.
  *
@@ -6807,6 +6836,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_func_vibe_mls_group_id_from_envelope() != 33383) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_func_vibe_safety_code_hex() != 59956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_func_vibe_safety_number() != 16482) {
@@ -6921,6 +6953,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_open() != 64976) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_peer_signature_keys() != 54077) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vibe_core_ffi_checksum_method_vibesecuresessionhandle_seal() != 2398) {

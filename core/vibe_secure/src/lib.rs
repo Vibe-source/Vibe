@@ -82,7 +82,8 @@ pub use padding::{VibePaddingError, VIBE_PAD_BUCKETS};
 pub use provider::VibeSecureProvider;
 pub use session::{VibeCommitOutput, VibeMlsEnvelopeHeader, VibeSecureSession};
 pub use trust::{
-    inspect_key_package, vibe_safety_number, VibeKeyPackageIdentity, VIBE_SAFETY_NUMBER_DIGITS,
+    inspect_key_package, vibe_safety_code_hex, vibe_safety_number, VibeKeyPackageIdentity,
+    VIBE_SAFETY_CODE_HEX_CHARS, VIBE_SAFETY_NUMBER_DIGITS,
 };
 
 /// The one ciphersuite this build speaks: X25519 for key agreement, AES-128-GCM

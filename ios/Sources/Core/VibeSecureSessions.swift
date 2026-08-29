@@ -406,6 +406,33 @@ final class VibeSecureSessions {
     return VibeSecureTrust.safetyNumber(myKey: mine, peerKey: theirs)
   }
 
+  /// Pins the peer identity carried by this chat's own MLS group.
+  ///
+  /// A joiner never claims a KeyPackage, so `verifyPeer` never runs there and it
+  /// would otherwise hold no pin at all — no pin, no safety number.
+  @discardableResult
+  func ensurePeerPinned(chatId: String, peerUserId: String) -> Bool {
+    guard !peerUserId.isEmpty else { return false }
+    let keys: [Data] = queue.sync {
+      guard let session = sessionLocked(chatId: chatId) else { return [] }
+      return (try? session.peerSignatureKeys()) ?? []
+    }
+    // One peer is the only case where the key maps to `peerUserId` without
+    // guessing; an MLS credential carries a device id, not a user id.
+    guard keys.count == 1, let peerKey = keys.first, !peerKey.isEmpty else { return false }
+    switch VibeSecureTrust.evaluate(signatureKey: peerKey, userId: peerUserId) {
+    case .pinnedOnFirstContact:
+      VibeLog.info("[VibeSecure] pinned \(peerUserId) from the group tree for \(chatId)")
+      return true
+    case .matchesPin:
+      return true
+    case .changed:
+      VibeLog.error(
+        "[VibeSecure] group identity for \(peerUserId) differs from the pin — awaiting verification")
+      return false
+    }
+  }
+
   /// Registers a session established elsewhere (group creation or a Welcome).
   func register(session: VibeSecureSessionHandle, chatId: String) {
     queue.sync { sessions[chatId] = session }

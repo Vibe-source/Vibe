@@ -5,8 +5,8 @@
 
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use vibe_secure::{
-    VibeDeviceIdentity, VibeSecureError, VibeSecureSession, VIBE_MLS_MAX_CIPHERTEXT,
-    VIBE_MLS_SEALED_PREFIX,
+    vibe_safety_number, VibeDeviceIdentity, VibeSecureError, VibeSecureSession,
+    VIBE_MLS_MAX_CIPHERTEXT, VIBE_MLS_SEALED_PREFIX,
 };
 
 fn provider() -> OpenMlsRustCrypto {
@@ -375,5 +375,44 @@ fn the_same_message_cannot_be_opened_twice() {
     assert!(
         bob_session.open(&sealed, &bob_provider).is_err(),
         "a second open must fail, or the receiver would not need a plaintext cache"
+    );
+}
+
+/// 12. A joiner claims no KeyPackage, so the group tree is the only place its
+/// half of the safety number can come from.
+#[test]
+fn both_sides_read_each_other_out_of_the_group_and_agree_on_the_safety_number() {
+    let alice_provider = provider();
+    let bob_provider = provider();
+    let alice_identity = identity("alice-device-1", &alice_provider);
+    let bob_identity = identity("bob-device-1", &bob_provider);
+
+    let (alice_session, bob_session) = paired_dm(
+        &alice_identity,
+        &alice_provider,
+        &bob_identity,
+        &bob_provider,
+    );
+
+    assert_eq!(
+        alice_session.peer_signature_keys(),
+        vec![bob_identity.signature_key()],
+        "the creator sees exactly the member it added"
+    );
+    assert_eq!(
+        bob_session.peer_signature_keys(),
+        vec![alice_identity.signature_key()],
+        "the joiner sees exactly the creator, without ever claiming a KeyPackage"
+    );
+
+    assert_eq!(
+        vibe_safety_number(
+            &alice_identity.signature_key(),
+            &alice_session.peer_signature_keys()[0]
+        ),
+        vibe_safety_number(
+            &bob_identity.signature_key(),
+            &bob_session.peer_signature_keys()[0]
+        )
     );
 }

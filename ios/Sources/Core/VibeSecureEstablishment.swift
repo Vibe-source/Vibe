@@ -593,8 +593,8 @@ enum VibeSecureEstablishment {
           else { continue }
           let ratchetTree = (entry["ratchetTree"] as? String).flatMap { Data(base64Encoded: $0) }
 
+          let senderUserId = entry["senderUserId"] as? String
           if VibeSecureSessions.shared.groupId(chatId: chatId) != nil {
-            let senderUserId = entry["senderUserId"] as? String
             guard adoptIncoming(senderUserId: senderUserId, selfUserId: selfUserId) else {
               // Our group wins. Do not ACK: an ACK is how the peer marks their
               // Welcome delivered and starts sealing to a group we never joined.
@@ -615,6 +615,12 @@ enum VibeSecureEstablishment {
             continue
           }
           VibeLog.info("[VibeSecure] joined MLS session for \(chatId)")
+          // The joiner claims no KeyPackage, so this is its only chance to pin
+          // the peer identity the group actually carries.
+          if let senderUserId, senderUserId != selfUserId {
+            VibeSecureSessions.shared.ensurePeerPinned(
+              chatId: chatId, peerUserId: senderUserId)
+          }
           joined.append(chatId)
           ack(id: id, apiBase: apiBase, token: token)
         }
