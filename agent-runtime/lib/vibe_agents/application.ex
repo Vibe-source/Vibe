@@ -12,7 +12,10 @@ defmodule VibeAgents.Application do
       {DynamicSupervisor, name: VibeAgents.Runs.Supervisor, strategy: :one_for_one},
       {Task.Supervisor, name: VibeAgents.TaskSupervisor},
       VibeAgents.Outbox,
+      # Dispatcher before Resumer: the resumer's queued runs go through admission.
+      VibeAgents.Runs.Dispatcher,
       VibeAgents.Runs.Resumer,
+      VibeAgents.Runs.Janitor,
       {Registry, keys: :unique, name: VibeAgents.Voice.Registry},
       {DynamicSupervisor, name: VibeAgents.Voice.Supervisor, strategy: :one_for_one},
       VibeAgents.Voice.Sessions,

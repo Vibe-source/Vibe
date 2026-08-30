@@ -24,22 +24,95 @@ in one doesn't take the chat core down with it.
 
 ## 2. Sizing
 
-Baseline target: a 4-8 GB / 2-4 vCPU VPS (e.g. Hetzner CX32/CX42, DigitalOcean equivalent).
+**Launch target: Hetzner CX33 — 4 vCPU / 8 GB / 80 GB (~$10/mo).** Numbers below are
+measured, not estimated — the whole stack was built and loaded under compose on
+2026-08-29. 4 vCPU is the number that matters; see the sandbox table below.
 
-| Service | Memory limit | Notes |
+Compose v2 does enforce `deploy.resources.limits` (verified against
+`HostConfig.Memory`), but they are ceilings, not reservations: they sum to ~6.6 GB
+while the stack actually resides in far less.
+
+| Service | Limit | Idle | Under load |
+|---|---|---|---|
+| postgres | 2 GB | **92 MB** | **1172 MB** |
+| core | 1 GB | 177 MB | 204 MB (no sockets — see below) |
+| doc-renderer | 1 GB | 62 MB | 199 MB typical export |
+| agent-runtime | 1 GB | 133 MB | 136 MB |
+| caddy / valkey / pgbouncer / backup / gateway / egress | 128-384 MB ea. | 35 MB | 43 MB |
+| **Base stack** | | **~500 MB** | **~1.75 GB** |
+
+Postgres idles at 92 MB, not 1 GB: `shared_buffers` is mapped lazily and only
+materialises as pages are touched. Under 40 pooled clients each looping a 400k-row
+sort it reached 1172 MB and stopped there — bounded by `shared_buffers`, well inside
+its 2 GB limit.
+
+Sandboxes sit entirely **on top** of that, one per computer-using agent, reaped after
+`SANDBOX_IDLE_TTL_SECONDS` (30 min). Text-only agents allocate none. Measured peak
+unreclaimable (anon) memory per sandbox:
+
+| Sandbox | Peak anon |
+|---|---|
+| idle | ~1 MB |
+| code/shell agent | **145 MB** |
+| browser agent (Chromium) | **393 MB** — on a light page; real sites go higher |
+
+Hence `SANDBOX_DEFAULT_MEMORY_MB=1024`, not 512: at a 512 cap a browsing sandbox
+peaked at 501 MB, 98 % of its limit. The limit is a ceiling, so a code agent still
+only costs its 145 MB.
+
+**CPU binds before memory.** Each sandbox takes `SANDBOX_DEFAULT_CPUS` (1.0), so
+`SANDBOX_MAX_CONTAINERS` × that must leave the base stack some vCPU. Memory would
+allow far more sandboxes than the CPU does. `SANDBOX_MAX_CONTAINERS` is real
+admission control — the N+1th create returns `sandbox capacity exceeded` rather than
+overcommitting — so size it to the box and never leave it at the gateway's 32 default.
+
+| Box | `SANDBOX_MAX_CONTAINERS` | Concurrent agents |
 |---|---|---|
-| postgres | 2 GB | `shared_buffers 1GB` — see `deploy/postgres/postgresql.conf` |
-| core | 1 GB | Elixir release + yt-dlp/ffmpeg subprocess spikes |
-| agent-runtime | 1 GB | one BEAM process per concurrent run |
-| valkey | 384 MB | `maxmemory 256mb` cap, no persistence |
-| doc-renderer | 512 MB | weasyprint spikes on large PDFs |
-| pgbouncer / caddy / sandbox-gateway / egress-proxy / backup | 128-256 MB each | |
+| **Hetzner CX33 — 4 vCPU / 8 GB / 80 GB** (launch) | **4** | ~4 code or 4 browser |
+| CX43 — 8 vCPU / 16 GB | 8 | first scale step |
+| 16 vCPU / 32 GB | 16 | |
 
-At 4 GB total limits above plus OS + container overhead, an 8 GB box has comfortable
-headroom; a 4 GB box works but leaves little for sandbox containers (each sandbox gets its
-own memory budget via `SANDBOX_DEFAULT_MEMORY_MB` on top of this table). Scale up before
-scaling out — phase 4 (`agent-platform-v1.md` §5) adds a second VPS via libcluster only
-once one box is genuinely full.
+The 4 vCPU is what's being bought on CX33 — memory is not the constraint at that
+size, and the 8 GB simply leaves ~5 GB spare over the measured 2.9 GB peak.
+
+Whole stack under load plus 5 working sandboxes measured **2.9 GB**, so 4 GB is a real
+launch box, not a demo one. Move to 8 GB when either concurrent sandboxes or connected
+sockets grow — scale up before scaling out; phase 4 (`agent-platform-v1.md` §5) adds a
+second VPS via libcluster only once one box is full.
+
+**Untested here: websocket fan-out.** A messenger's real core-memory axis is connected
+sockets. `docs/capacity-500k.md` §0 measures that separately at **~75 KB/connection**
+(3,000 real sockets, BEAM RSS delta). Core's 204 MB above is a no-sockets floor; add
+75 KB per concurrent user on top.
+
+Disk: Postgres + the Chromium-bearing sandbox image (~1 GB) + per-sandbox volumes (no
+per-agent quota yet — Phase 2). 80 GB is comfortable, 40 GB is not. Media moves to R2 at
+cutover, so it does not grow the disk.
+
+### What N users actually cost
+
+**Agents at rest are rows, not processes.** 1,000 users × 5 agents = 5,000 Postgres rows
+≈ 0 MB and $0. Nothing runs until a message arrives, so the axis that costs money is
+**concurrent runs**, never agent count.
+
+At 1,000 concurrent users (75 KB/socket):
+
+| | Cost |
+|---|---|
+| 1,000 sockets | 73 MB |
+| base stack under load | 1,750 MB |
+| **total** | **~1.8 GB** — comfortable on 8 GB |
+| 5,000 agents at rest | ~0 MB, $0 |
+
+Concurrent runs at that size — 1 % of users messaging at once is ~10 runs, 10 % is ~100.
+Each *text* run is a BEAM process plus a model call (cost is tokens, already pay-per-use);
+only a *computer-using* run allocates a sandbox. So the limits that matter are
+`VIBE_AGENTS_MAX_CONCURRENT_RUNS` (loop slots) and `SANDBOX_MAX_CONTAINERS` (sandboxes),
+and beyond them work **queues** rather than failing or overcommitting the box.
+
+Sockets are not the first ceiling either: per `capacity-500k.md` §0, the connect/join
+storm is — join does synchronous DB work, and p99 join went 32 ms → 2.15 s between 400
+and 3,000 sockets at a fast ramp. Fix that before adding RAM.
 
 ## 3. DNS
 

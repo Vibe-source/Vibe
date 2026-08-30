@@ -1498,9 +1498,11 @@ final class ChatInputBar: UIView {
   // MARK: Layout constants
   private let sideSize: CGFloat = 36
   private let sideGap: CGFloat = 6
-  private let topVPad: CGFloat = 2
+  /// Air above the pill and how far the pill sits off the home indicator. They trade
+  /// against each other so the bar's resting height — the transcript's clearance — holds.
+  private let topVPad: CGFloat = 8
   private let bottomVPad: CGFloat = 5
-  private let composerSafeBottomReduction: CGFloat = 6
+  private let composerSafeBottomReduction: CGFloat = 12
   private let backgroundMaskTopOverlap: CGFloat = 0
   private let minPillH: CGFloat = 40
   private let maxPillH: CGFloat = 120
@@ -1528,6 +1530,12 @@ final class ChatInputBar: UIView {
       if pendingGifPanelOpen, keyboardHeightForPanels <= 0 {
         pendingGifPanelOpen = false
         setGifPanelVisible(true, animated: true)
+      }
+      // The panel's search lift is measured from this height, and it arrives a notification
+      // AFTER the field takes focus — without this the panel lifts by zero and the keys cover it.
+      if gifPanelVisible, isGifPanelSearchActive, abs(oldValue - keyboardHeightForPanels) > 0.5 {
+        setNeedsLayout()
+        delegate?.inputBarHeightDidChange()
       }
     }
   }
@@ -1586,7 +1594,7 @@ final class ChatInputBar: UIView {
   /// handoff between them, so the composer keeps one resting height across a swap.
   var bottomSlotOccupied: Bool {
     gifPanelVisible || pendingGifPanelOpen || keyboardHeightForPanels > 0
-      || keyboardProgress > 0.01 || textView.isFirstResponder
+      || keyboardProgress > 0.01 || keyboardArrivalPending
   }
   /// Height to hold the bar at while a keyboard is on its way but has not reported yet.
   /// Without it the bar falls to the bottom for the frames between focus and the first
@@ -2176,7 +2184,7 @@ final class ChatInputBar: UIView {
     pillContainer.addSubview(textView)
 
     // GIF button (inside pill, trailing side before Send)
-    gifButton.setImage(chatGifStickerGlyphImage(size: CGSize(width: 24, height: 24)), for: .normal)
+    gifButton.setImage(chatGifStickerGlyphImage(size: CGSize(width: 21, height: 21)), for: .normal)
     gifButton.contentVerticalAlignment = .center
     gifButton.contentHorizontalAlignment = .center
     gifButton.imageEdgeInsets = .zero
@@ -3103,11 +3111,11 @@ final class ChatInputBar: UIView {
     let pillRight = w - dynamicHPad - (sideSize * micVisibility) - (sideGap * micVisibility)
     let sendW: CGFloat = 44
     let sendH: CGFloat = 32
-    let gifButtonSize: CGFloat = 28
+    let gifButtonSize: CGFloat = 26
     let gifTextReserve: CGFloat =
       isRecording ? 0 : max(24, gifButtonSize - (8 * clampedSendProgress))
     let pillW = max(1, pillRight - pillX)
-    let sendActionReserve = (sendW + 2) * clampedSendProgress
+    let sendActionReserve = (sendW + 10) * clampedSendProgress
     let slashVisible = false
     let inlineAttachReserve: CGFloat = 0.0
     let textW = max(
@@ -3207,7 +3215,9 @@ final class ChatInputBar: UIView {
       } else if gifPanelVisible, gifPanelHostController != nil {
         updateGifPanelOverlayFrame()
       }
-      panel.isHidden = !gifPanelVisible && panel.alpha <= 0.01
+      // Hiding slides on transform and leaves alpha at 1, so the alpha test re-showed a
+      // dismissed panel on the next layout — that is the panel stranded under the keyboard.
+      panel.isHidden = !gifPanelVisible && !gifPanelTransitionInFlight
     }
 
     // Side buttons are perfectly circular
@@ -3567,18 +3577,17 @@ final class ChatInputBar: UIView {
   /// on older iOS we fall back to UIBlurEffect(style: .systemMaterial).
   private func refreshGlass() {
     if #available(iOS 26.0, *) {
-      let attachEffect = UIGlassEffect()
-      attachEffect.isInteractive = true
-      attachGlass.effect = attachEffect
-
-      let micEffect = UIGlassEffect()
-      micEffect.isInteractive = true
-      micGlass.effect = micEffect
-
-      let pillEffect = UIGlassEffect()
-      pillEffect.isInteractive = true
-      pillGlass.effect = pillEffect
-      pillGlass.contentView.backgroundColor = pillTint
+      // Clear glass, same family as the header chips: a plate tint reads as flat gray.
+      func makeGlassEffect() -> UIGlassEffect {
+        let effect = UIGlassEffect(style: .regular)
+        effect.isInteractive = true
+        effect.tintColor = .clear
+        return effect
+      }
+      attachGlass.effect = makeGlassEffect()
+      micGlass.effect = makeGlassEffect()
+      pillGlass.effect = makeGlassEffect()
+      pillGlass.contentView.backgroundColor = .clear
 
       let lockEffect = UIGlassEffect()
       lockEffect.isInteractive = true
@@ -3714,10 +3723,9 @@ final class ChatInputBar: UIView {
 
       // GIF State (moves in toward Send area while Send expands)
       self.gifButton.alpha = showSend ? 0.9 : 1.0
+      // No inward slide: it walked the glyph into the send button as that one entered.
       self.gifButton.transform =
-        showSend
-        ? CGAffineTransform(translationX: 4, y: 0).scaledBy(x: 0.92, y: 0.92)
-        : .identity
+        showSend ? CGAffineTransform(scaleX: 0.92, y: 0.92) : .identity
 
       // Send State
       self.sendButton.alpha = showSend ? 1 : 0
@@ -5746,6 +5754,15 @@ extension ChatInputBar: UITextViewDelegate {
     // Same slot, one occupant. Focusing the composer cancels a pending open or hides the panel.
     guard gifPanelVisible || pendingGifPanelOpen else { return }
     setGifPanelVisible(false, animated: true)
+  }
+
+  func textViewDidEndEditing(_ textView: UITextView) {
+    // Focus can be dropped with no keyboard notification behind it; without this the bar
+    // keeps reserving the slot and the list keeps a keyboard's worth of bottom inset.
+    guard keyboardArrivalPending else { return }
+    keyboardArrivalPending = false
+    setNeedsLayout()
+    delegate?.inputBarHeightDidChange()
   }
 
   func textViewDidChange(_ tv: UITextView) {

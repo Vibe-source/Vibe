@@ -12,10 +12,12 @@ defmodule VibeContracts.RunEventTest do
     "payload" => %{"text" => "hi"}
   }
 
-  test "kinds/0 lists all 16 frozen kinds" do
-    assert length(RunEvent.kinds()) == 16
+  test "kinds/0 lists all 18 frozen kinds" do
+    assert length(RunEvent.kinds()) == 18
     assert "run.tool.completed" in RunEvent.kinds()
     assert "run.ask" in RunEvent.kinds()
+    assert "run.computer.state" in RunEvent.kinds()
+    assert "run.computer.control" in RunEvent.kinds()
   end
 
   test "terminal?/1 is true only for cancelled/completed/failed" do

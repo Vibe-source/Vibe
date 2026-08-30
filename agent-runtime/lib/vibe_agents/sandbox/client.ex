@@ -23,6 +23,28 @@ defmodule VibeAgents.Sandbox.Client do
   def stop(id), do: post("/v1/sandboxes/#{id}/stop", %{})
   def delete(id), do: delete_request("/v1/sandboxes/#{id}")
 
+  # Computer sessions (docs/agent-computer-v1.md §3.1). `session` refreshes that viewer's idle clock.
+  def computer_session(id, body), do: post("/v1/sandboxes/#{id}/computer/session", body)
+
+  def close_computer_session(id, session_id),
+    do: delete_request("/v1/sandboxes/#{id}/computer/session/#{URI.encode_www_form(session_id)}")
+
+  def computer_frame(id, since \\ 0, session \\ nil),
+    do: get(with_query("/v1/sandboxes/#{id}/computer/frame", since: since, session: session))
+
+  def computer_state(id, session \\ nil),
+    do: get(with_query("/v1/sandboxes/#{id}/computer/state", session: session))
+
+  def computer_control(id, body), do: post("/v1/sandboxes/#{id}/computer/control", body)
+  def computer_input(id, body), do: post("/v1/sandboxes/#{id}/computer/input", body)
+
+  defp with_query(path, pairs) do
+    case pairs |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> URI.encode_query() do
+      "" -> path
+      query -> path <> "?" <> query
+    end
+  end
+
   defp get(path), do: request(:get, path, nil, @timeout)
   defp post(path, body, timeout \\ @timeout), do: request(:post, path, body, timeout)
   defp put(path, body), do: request(:put, path, body, @timeout)
@@ -49,6 +71,10 @@ defmodule VibeAgents.Sandbox.Client do
       req = Elixir.Finch.build(method, url, json_headers, encoded)
 
       case Elixir.Finch.request(req, VibeAgents.Finch, receive_timeout: timeout) do
+        # 204 = nothing newer than `since` on computer/frame; not an error, not an empty body.
+        {:ok, %{status: 204}} ->
+          {:ok, :no_change}
+
         {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
           case Jason.decode(resp_body) do
             {:ok, decoded} -> {:ok, decoded}

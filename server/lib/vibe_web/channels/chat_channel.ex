@@ -6,6 +6,7 @@ defmodule VibeWeb.ChatChannel do
   alias Vibe.Agents
   alias Vibe.Chat
   alias Vibe.Chat.AgentMessageCrypto
+  alias Vibe.Chat.JoinCache
   alias Vibe.Notifications
   alias Vibe.AI.AgentDecisions
   alias Vibe.AI.GroupAgent
@@ -22,26 +23,27 @@ defmodule VibeWeb.ChatChannel do
     user_id = socket.assigns.user_id
     # Verify access and cache room type + role in socket assigns
     # so we skip DB queries on every message send.
-    case Chat.get_user_role(chat_id, user_id) do
+    # Role and type come from ONE query: join is the connect-storm bottleneck and
+    # it is DB-bound, so what matters is round trips per join (capacity-500k.md §0).
+    case Chat.join_context(chat_id, user_id) do
       nil ->
         {:error, %{reason: "unauthorized"}}
 
-      role ->
-        room_type = Chat.get_room_type(chat_id) || "dm"
+      {role, type} ->
+        room_type = type || "dm"
         socket = assign(socket, :room_type, room_type)
         socket = assign(socket, :user_role, role)
 
         # Resolve the standalone-agent gate ONCE here instead of on every message.
-        # These are 2-3 DB queries; on the send path they held the sender's "sent"
-        # ack hostage for ~1s+ per message. Staleness is acceptable: toggling an
-        # agent's incoming-chat setting takes effect on the next channel join.
+        # On the send path it held the sender's "sent" ack hostage for ~1s+.
+        # Cached per chat: staleness was already the contract here, since toggling
+        # an agent's incoming-chat setting only took effect on the next join.
         standalone_agent =
           case room_type do
             "dm" ->
-              chat_id
-              |> Chat.get_participant_ids()
-              |> Enum.reject(&(&1 == user_id))
-              |> Enum.find_value(&Agents.get_agent_by_shadow_user/1)
+              JoinCache.fetch_dm_agent(chat_id, user_id, fn ->
+                Chat.dm_standalone_agent(chat_id, user_id)
+              end)
 
             _ ->
               nil
@@ -1780,6 +1782,9 @@ defmodule VibeWeb.ChatChannel do
       {:error, {:http_error, 503, %{"error" => "kill_switch"}}} ->
         post_kill_switch_notice(agent, chat_id, data["id"])
 
+      {:error, :agent_credits_exhausted} ->
+        post_credits_notice(agent, chat_id, data["id"])
+
       {:error, reason} ->
         Logger.error(
           "[ChatChannel] isolated run failed chat_id=#{chat_id} agent_id=#{agent.id} trigger=#{trigger_type} reason=#{inspect(reason)}"
@@ -1801,6 +1806,9 @@ defmodule VibeWeb.ChatChannel do
           "[ChatChannel] Standalone agent responded chat_id=#{chat_id} agent_id=#{agent.id}"
         )
 
+      {:error, :agent_credits_exhausted} ->
+        post_credits_notice(agent, chat_id, data["id"])
+
       {:error, reason} ->
         Logger.error(
           "[ChatChannel] Standalone agent dispatch failed chat_id=#{chat_id} agent_id=#{agent.id} reason=#{inspect(reason)}"
@@ -1811,6 +1819,19 @@ defmodule VibeWeb.ChatChannel do
   defp post_kill_switch_notice(agent, chat_id, reply_to_id) do
     outputs = [
       %{"type" => "text", "text" => "Agents are paused by the operator", "metadata" => %{}}
+    ]
+
+    _ = StandaloneAgent.deliver_outputs(agent, chat_id, outputs, reply_to_id)
+    :ok
+  end
+
+  defp post_credits_notice(agent, chat_id, reply_to_id) do
+    outputs = [
+      %{
+        "type" => "text",
+        "text" => "This agent is out of usage credits for the month.",
+        "metadata" => %{}
+      }
     ]
 
     _ = StandaloneAgent.deliver_outputs(agent, chat_id, outputs, reply_to_id)

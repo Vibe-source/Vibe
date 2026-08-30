@@ -25,6 +25,9 @@ func videoNoteRenderedSide(expanded: Bool, rowWidth: CGFloat, maxBubbleWidth: CG
   return min(videoNoteDefaultSide, maxBubbleWidth)
 }
 let bubbleMaxWidthFactor: CGFloat = 0.85
+let bubbleURLOnlyMaxWidthFactor: CGFloat = 0.92
+let bubbleMusicPreviewMaxWidthFactor: CGFloat = 0.76
+let bubbleMediaMaxWidthFactor: CGFloat = 0.78
 // Agent-turn bubbles carry long structured prose (headings, nested lists, code). WhatsApp
 // Meta AI style needs a bit more air than a one-line Telegram chat bubble: 14pt horizontal
 // + 10pt vertical keeps text off the plate edge without looking like a card. Plain text

@@ -5,6 +5,7 @@
 // Usage: node browser.js '<json request>' — prints exactly one JSON line to stdout.
 const { spawn } = require('child_process');
 const dns = require('dns').promises;
+const fs = require('fs');
 const net = require('net');
 const { chromium } = require('playwright-core');
 
@@ -13,9 +14,12 @@ const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
 const USER_DATA_DIR = '/home/agent/.vibe-browser';
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium';
 const DEFAULT_MAX_WIDTH = 1024;
+const DEFAULT_QUALITY = 70;
 const NAV_TIMEOUT_MS = 20000;
 const ACTION_TIMEOUT_MS = 10000;
 const LAUNCH_WAIT_MS = 15000;
+const DISPLAY = process.env.DISPLAY || ':99';
+const XVFB_SCREEN = process.env.XVFB_SCREEN || '1280x800x24';
 
 // [network, prefix bits] — SSRF guard for navigate/click-driven navigation.
 const BLOCKED_V4_RANGES = [
@@ -79,20 +83,52 @@ async function waitForCdp(deadline) {
   return false;
 }
 
+function xvfbSocket() {
+  return `/tmp/.X11-unix/X${DISPLAY.replace(':', '').split('.')[0]}`;
+}
+
+// Headed Chromium needs an X display: headless is refused by Google sign-in, which is the
+// point of this browser. One detached Xvfb per container, reused by later invocations.
+async function ensureXvfb() {
+  if (fs.existsSync(xvfbSocket())) return;
+  const child = spawn('Xvfb', [DISPLAY, '-screen', '0', XVFB_SCREEN, '-nolisten', 'tcp'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const deadline = Date.now() + LAUNCH_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(xvfbSocket())) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('Xvfb did not create its display socket');
+}
+
 // Launches ONE persistent, detached Chromium; later CLI invocations reconnect over CDP instead
 // of relaunching, so browser state (cookies, tabs) survives across separate `node browser.js` runs.
 async function launchChromium() {
+  await ensureXvfb();
+  const [screenWidth, screenHeight] = XVFB_SCREEN.split('x');
   const args = [
-    '--headless=new',
     `--remote-debugging-port=${CDP_PORT}`,
     `--user-data-dir=${USER_DATA_DIR}`,
     '--no-sandbox',
     '--disable-gpu',
+    `--window-size=${screenWidth},${screenHeight}`,
+    '--window-position=0,0',
+    // Headed reintroduces the first-run tab, and a container's /dev/shm is too small to render into.
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-dev-shm-usage',
   ];
   if (process.env.HTTPS_PROXY) {
     args.push(`--proxy-server=${process.env.HTTPS_PROXY}`);
   }
-  const child = spawn(CHROMIUM_PATH, args, { detached: true, stdio: 'ignore' });
+  const child = spawn(CHROMIUM_PATH, args, {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, DISPLAY },
+  });
   child.unref();
   const ready = await waitForCdp(Date.now() + LAUNCH_WAIT_MS);
   if (!ready) throw new Error('chromium did not become ready on the CDP port');
@@ -134,16 +170,56 @@ async function runAction(page, action) {
 
 // Renders at exactly maxWidth instead of capturing full-size then downscaling: no image
 // library needed, and it keeps every screenshot at a predictable, bounded size.
-async function takeScreenshot(page, maxWidth) {
+async function takeScreenshot(page, maxWidth, quality) {
   const width = Number(maxWidth) > 0 ? Math.floor(Number(maxWidth)) : DEFAULT_MAX_WIDTH;
+  const jpegQuality = Number(quality) > 0 ? Math.floor(Number(quality)) : DEFAULT_QUALITY;
   const current = page.viewportSize();
   if (!current || current.width !== width) {
     const ratio = current ? current.height / current.width : 9 / 16;
     await page.setViewportSize({ width, height: Math.round(width * ratio) });
   }
-  const buffer = await page.screenshot({ type: 'jpeg', quality: 70 });
+  const buffer = await page.screenshot({ type: 'jpeg', quality: jpegQuality });
   const size = page.viewportSize();
   return { imageBase64: buffer.toString('base64'), mime: 'image/jpeg', width: size.width, height: size.height };
+}
+
+async function readState(browser, page) {
+  const tabCount = browser.contexts().reduce((total, ctx) => total + ctx.pages().length, 0);
+  let loading = false;
+  try {
+    loading = (await page.evaluate(() => document.readyState)) !== 'complete';
+  } catch {
+    loading = true;
+  }
+  return { url: page.url(), title: await page.title(), loading, tabCount };
+}
+
+// Raw viewport coordinates: the frame the viewer clicked on was captured at this same viewport.
+async function runInput(page, input) {
+  switch (input.kind) {
+    case 'click':
+      await page.mouse.click(Number(input.x) || 0, Number(input.y) || 0);
+      return;
+    case 'type':
+      await page.keyboard.type(String(input.text ?? ''), { delay: 12 });
+      return;
+    case 'key':
+      await page.keyboard.press(String(input.key ?? input.text ?? 'Enter'));
+      return;
+    case 'scroll':
+      await page.mouse.wheel(0, Number(input.deltaY) || 0);
+      return;
+    case 'back':
+      await page.goBack({ timeout: NAV_TIMEOUT_MS, waitUntil: 'domcontentloaded' }).catch(() => null);
+      return;
+    case 'navigate': {
+      const url = await assertSafeUrl(input.url);
+      await page.goto(url.toString(), { timeout: NAV_TIMEOUT_MS, waitUntil: 'domcontentloaded' });
+      return;
+    }
+    default:
+      throw new Error(`unknown input kind: ${input.kind}`);
+  }
 }
 
 // Never calls browser.close(): that sends CDP Browser.close and would kill the persistent
@@ -162,8 +238,13 @@ async function handle(request) {
     case 'action':
       await runAction(page, request.action || {});
       return { ok: true, url: page.url(), title: await page.title() };
+    case 'state':
+      return readState(browser, page);
+    case 'input':
+      await runInput(page, request.input || {});
+      return { ok: true, url: page.url(), title: await page.title() };
     case 'screenshot':
-      return takeScreenshot(page, request.maxWidth);
+      return takeScreenshot(page, request.maxWidth, request.quality);
     default:
       throw new Error(`unknown kind: ${request.kind}`);
   }

@@ -8,6 +8,7 @@ defmodule Vibe.AgentGateway do
   require Logger
 
   alias Vibe.Agent
+  alias Vibe.AgentUsage
   alias Vibe.Chat
   alias Vibe.AI.StandaloneAgent
 
@@ -42,33 +43,40 @@ defmodule Vibe.AgentGateway do
       agent = Map.fetch!(params, :agent) |> Vibe.Repo.preload(:agent_user)
       chat_id = Map.fetch!(params, :chat_id)
 
-      body =
-        %{
-          "idempotencyKey" => params[:idempotency_key],
-          "source" => params[:source] || "chat",
-          "agentId" => agent.id,
-          "agentUserId" => agent.agent_user_id,
-          "ownerUserId" => agent.owner_user_id,
-          "requesterUserId" => params[:requester_user_id],
-          "chatId" => chat_id,
-          "chatKind" => Chat.get_room_type(chat_id) || "dm",
-          "replyToId" => params[:reply_to_id],
-          "parentRunId" => params[:parent_run_id],
-          "input" => %{
-            "text" => params[:text] || "",
-            "attachments" => normalize_attachments(params[:attachments] || [])
-          },
-          "agentProfile" => agent_profile(agent),
-          "context" => %{
-            "history" => history_for(agent, chat_id, params[:requester_user_id]),
-            "participants" => participants_for(chat_id, agent.agent_user_id)
-          },
-          "capabilities" => capabilities_for(agent)
-        }
-        |> compact()
-
-      request(:post, "/internal/v1/runs", body)
+      case AgentUsage.check_entitlement(agent.owner_user_id) do
+        :ok -> do_start_run(agent, chat_id, params)
+        err -> err
+      end
     end
+  end
+
+  defp do_start_run(agent, chat_id, params) do
+    body =
+      %{
+        "idempotencyKey" => params[:idempotency_key],
+        "source" => params[:source] || "chat",
+        "agentId" => agent.id,
+        "agentUserId" => agent.agent_user_id,
+        "ownerUserId" => agent.owner_user_id,
+        "requesterUserId" => params[:requester_user_id],
+        "chatId" => chat_id,
+        "chatKind" => Chat.get_room_type(chat_id) || "dm",
+        "replyToId" => params[:reply_to_id],
+        "parentRunId" => params[:parent_run_id],
+        "input" => %{
+          "text" => params[:text] || "",
+          "attachments" => normalize_attachments(params[:attachments] || [])
+        },
+        "agentProfile" => agent_profile(agent),
+        "context" => %{
+          "history" => history_for(agent, chat_id, params[:requester_user_id]),
+          "participants" => participants_for(chat_id, agent.agent_user_id)
+        },
+        "capabilities" => capabilities_for(agent)
+      }
+      |> compact()
+
+    request(:post, "/internal/v1/runs", body)
   end
 
   @doc "`POST /internal/v1/runs/:runId/cancel`."
@@ -106,6 +114,45 @@ defmodule Vibe.AgentGateway do
   @doc "`GET /internal/v1/agents/:agentId/computer/preview` — latest screenshot."
   def computer_preview(agent_id) do
     request(:get, "/internal/v1/agents/#{agent_id}/computer/preview", nil)
+  end
+
+  @doc "`POST /internal/v1/agents/:agentId/computer/session` — `{viewerId, fps?, width?, quality?}`."
+  def computer_session(agent_id, params) when is_map(params) do
+    request(:post, "/internal/v1/agents/#{agent_id}/computer/session", compact(params))
+  end
+
+  @doc "`DELETE /internal/v1/agents/:agentId/computer/session/:sessionId`."
+  def close_computer_session(agent_id, session_id) do
+    request(:delete, "/internal/v1/agents/#{agent_id}/computer/session/#{session_id}", nil)
+  end
+
+  @doc "`GET …/computer/frame?since=` — `{:ok, :no_change}` on 204, nothing newer than `since`."
+  # `session` rides along so a polling viewer refreshes its own idle clock; without it
+  # the gateway reaps a viewer that is still watching.
+  def computer_frame(agent_id, opts \\ []) do
+    since = Keyword.get(opts, :since, 0)
+    query = "since=#{since}" <> session_query(Keyword.get(opts, :session))
+    request(:get, "/internal/v1/agents/#{agent_id}/computer/frame?#{query}", nil)
+  end
+
+  defp session_query(session) when is_binary(session) and session != "",
+    do: "&session=#{URI.encode_www_form(session)}"
+
+  defp session_query(_session), do: ""
+
+  @doc "`GET /internal/v1/agents/:agentId/computer/state`."
+  def computer_state(agent_id) do
+    request(:get, "/internal/v1/agents/#{agent_id}/computer/state", nil)
+  end
+
+  @doc "`POST …/computer/control` — `{action:\"grant\"|\"release\", sessionId, ttlSeconds?}`."
+  def computer_control(agent_id, params) when is_map(params) do
+    request(:post, "/internal/v1/agents/#{agent_id}/computer/control", compact(params))
+  end
+
+  @doc "`POST …/computer/input` — `{sessionId, kind, x?, y?, text?, key?, deltaY?, url?}`."
+  def computer_input(agent_id, params) when is_map(params) do
+    request(:post, "/internal/v1/agents/#{agent_id}/computer/input", compact(params))
   end
 
   @doc "`POST /internal/v1/voice/sessions` — params is `{agentId,userId,chatId,agentProfile}`."
@@ -204,6 +251,10 @@ defmodule Vibe.AgentGateway do
       url = runtime_url() <> path
 
       case http_client().(method, url, headers, json_body) do
+        # 204 = nothing new (computer/frame polling); not an error, not an empty body.
+        {:ok, %{status: 204}} ->
+          {:ok, :no_change}
+
         {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
           {:ok, decode(resp_body)}
 

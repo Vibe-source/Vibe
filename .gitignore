@@ -138,7 +138,6 @@ xctest_output/
 # Elixir build outputs and compiled files
 server/_build/
 server/.mix/
-server/mix.lock
 *.beam
 *.erl
 

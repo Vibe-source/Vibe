@@ -20,6 +20,12 @@ pub struct Config {
     pub max_output_bytes: usize,
     pub max_file_bytes: usize,
     pub log_format: String,
+    pub computer_max_live: usize,
+    pub computer_session_max_seconds: u64,
+    pub computer_viewer_idle_seconds: u64,
+    pub computer_default_fps: u32,
+    pub computer_default_width: u32,
+    pub computer_default_quality: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +92,12 @@ impl Config {
             max_output_bytes: env_parsed("SANDBOX_MAX_OUTPUT_BYTES", 1_000_000usize)?,
             max_file_bytes: env_parsed("SANDBOX_MAX_FILE_BYTES", 4_000_000usize)?,
             log_format: env_string("LOG_FORMAT", "text"),
+            computer_max_live: env_parsed("COMPUTER_MAX_LIVE", 2usize)?,
+            computer_session_max_seconds: env_parsed("COMPUTER_SESSION_MAX_SECONDS", 900u64)?,
+            computer_viewer_idle_seconds: env_parsed("COMPUTER_VIEWER_IDLE_SECONDS", 60u64)?,
+            computer_default_fps: env_parsed("COMPUTER_DEFAULT_FPS", 3u32)?,
+            computer_default_width: env_parsed("COMPUTER_DEFAULT_WIDTH", 720u32)?,
+            computer_default_quality: env_parsed("COMPUTER_DEFAULT_QUALITY", 55u32)?,
         })
     }
 }
@@ -111,6 +123,12 @@ pub fn test_config() -> Config {
         max_output_bytes: 1_000_000,
         max_file_bytes: 4_000_000,
         log_format: "text".into(),
+        computer_max_live: 2,
+        computer_session_max_seconds: 900,
+        computer_viewer_idle_seconds: 60,
+        computer_default_fps: 3,
+        computer_default_width: 720,
+        computer_default_quality: 55,
     }
 }
 

@@ -43,6 +43,11 @@ struct ChatServiceMessage: Equatable {
         return "\(label) · \(actor)"
       case "decision.expired":
         return "Decision expired"
+      case "secure.waiting":
+        let target = templateArgs["targetName"] ?? "them"
+        return "Waiting for \(target) to join"
+      case "secure.joined":
+        return "Joined"
       default:
         break
       }

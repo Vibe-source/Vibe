@@ -95,6 +95,8 @@ final class VibeMediaVault {
   private var promisedByKind: [VibeMediaKind: [String: URL]] = [:]
   private var unavailableIdentities = Set<String>()
   private var failureCountByIdentity: [String: Int] = [:]
+  /// Keyed legacy slots already probed this session (kind + legacy identity), under `lock`.
+  private var legacyProbedKeys = Set<String>()
 
   /// A transport error may be a passing blip; a non-2xx is the origin's final answer. Three
   /// tries then silence, so a dead URL is not re-requested on every scroll pass.
@@ -104,13 +106,19 @@ final class VibeMediaVault {
 
   // MARK: - Identity
 
+  /// Media keys seen per identity this session, so a plain `cachedURL` miss can still reach
+  /// the keyed slot an older build wrote. Guarded by `keyMemoLock`.
+  private static let keyMemoLock = NSLock()
+  private static var mediaKeyByIdentity: [String: String] = [:]
+
   /// The address of one piece of remote media. Stable across re-signings, across launches, and
   /// across surfaces — see the type comment for why nothing about the response may enter it.
   static func identity(remoteURL: URL, mediaKey: String? = nil) -> String {
     // One URL has one ciphertext and one key: the key decrypts, it does not address. Keying on
     // it made a row that lost its key (failed open, core frame) miss bytes already on disk.
-    _ = mediaKey
-    return chatStableRemoteMediaIdentity(remoteURL)
+    let identity = chatStableRemoteMediaIdentity(remoteURL)
+    rememberMediaKey(mediaKey, for: identity)
+    return identity
   }
 
   /// String form, for the many call sites that hold a raw URL string. A value that will not
@@ -120,8 +128,30 @@ final class VibeMediaVault {
     if let url = URL(string: trimmed), url.scheme != nil {
       return identity(remoteURL: url, mediaKey: mediaKey)
     }
-    _ = mediaKey
+    rememberMediaKey(mediaKey, for: trimmed)
     return trimmed
+  }
+
+  private static func rememberMediaKey(_ mediaKey: String?, for identity: String) {
+    guard let key = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+      !identity.isEmpty
+    else { return }
+    keyMemoLock.lock()
+    if mediaKeyByIdentity[identity] == nil { mediaKeyByIdentity[identity] = key }
+    keyMemoLock.unlock()
+  }
+
+  private static func rememberedMediaKey(for identity: String) -> String? {
+    keyMemoLock.lock()
+    defer { keyMemoLock.unlock() }
+    return mediaKeyByIdentity[identity]
+  }
+
+  /// The keyed address older builds gave this media, or nil without a non-empty key.
+  static func legacyKeyedIdentity(remoteURL: URL, mediaKey: String?) -> String? {
+    guard let key = mediaKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
+    else { return nil }
+    return chatStableRemoteMediaIdentity(remoteURL) + "|k:" + key
   }
 
   private func slotName(for identity: String) -> String {
@@ -278,6 +308,13 @@ final class VibeMediaVault {
       recordInIndex(promised, kind: kind, identity: identity)
       return promised
     }
+    // A caller that ever passed a media key for this identity self-heals the keyed slot.
+    if let key = Self.rememberedMediaKey(for: identity),
+      let adopted = adoptLegacyKeyed(
+        legacyIdentity: identity + "|k:" + key, identity: identity, kind: kind)
+    {
+      return adopted
+    }
     for candidate in legacyCandidates {
       guard FileManager.default.fileExists(atPath: candidate.path) else { continue }
       if let adopted = adopt(
@@ -292,6 +329,82 @@ final class VibeMediaVault {
 
   func contains(_ identity: String, kind: VibeMediaKind) -> Bool {
     cachedURL(for: identity, kind: kind) != nil
+  }
+
+  // MARK: - Keyed legacy slots
+
+  /// What an older build stored under the keyed address: the slot file for a hash-named kind,
+  /// the slot directory for `.document`. Only entries that exist on disk.
+  func legacyKeyedCandidateURLs(remoteURL: URL, mediaKey: String?, kind: VibeMediaKind) -> [URL]
+  {
+    guard let legacy = Self.legacyKeyedIdentity(remoteURL: remoteURL, mediaKey: mediaKey)
+    else { return [] }
+    return legacyKeyedCandidateURLs(legacyIdentity: legacy, kind: kind)
+  }
+
+  private func legacyKeyedCandidateURLs(legacyIdentity: String, kind: VibeMediaKind) -> [URL] {
+    let fm = FileManager.default
+    let legacySlot = slotName(for: legacyIdentity)
+    if kind.preservesDisplayName {
+      let dir = directory(for: kind).appendingPathComponent(legacySlot, isDirectory: true)
+      return fm.fileExists(atPath: dir.path) ? [dir] : []
+    }
+    // The index is keyed by basename, so it answers for whatever extension the file carries.
+    guard let file = index(for: kind)[legacySlot], fm.fileExists(atPath: file.path) else {
+      return []
+    }
+    return [file]
+  }
+
+  /// Moves the keyed-slot file to the current address and returns it, or nil when none exists.
+  @discardableResult
+  func adoptLegacyKeyed(remoteURL: URL, mediaKey: String?, kind: VibeMediaKind) -> URL? {
+    guard let legacy = Self.legacyKeyedIdentity(remoteURL: remoteURL, mediaKey: mediaKey)
+    else { return nil }
+    return adoptLegacyKeyed(
+      legacyIdentity: legacy,
+      identity: Self.identity(remoteURL: remoteURL, mediaKey: mediaKey),
+      kind: kind)
+  }
+
+  /// One probe per session and key: a miss is remembered so scrolling never re-stats the slot.
+  private func adoptLegacyKeyed(
+    legacyIdentity: String, identity: String, kind: VibeMediaKind
+  ) -> URL? {
+    lock.lock()
+    let firstProbe = legacyProbedKeys.insert(kind.rawValue + ":" + legacyIdentity).inserted
+    lock.unlock()
+    guard firstProbe,
+      let candidate = legacyKeyedCandidateURLs(legacyIdentity: legacyIdentity, kind: kind).first
+    else { return nil }
+    let source: URL
+    if kind.preservesDisplayName {
+      guard let file = Self.firstRegularFile(in: candidate) else { return nil }
+      source = file
+    } else {
+      source = candidate
+    }
+    guard
+      let adopted = adopt(
+        fileAt: source, for: identity, kind: kind, displayName: source.lastPathComponent,
+        move: true)
+    else { return nil }
+    if kind.preservesDisplayName {
+      try? FileManager.default.removeItem(at: candidate)
+    }
+    let legacySlot = slotName(for: legacyIdentity)
+    lock.lock()
+    indexByKind[kind]?.removeValue(forKey: legacySlot)
+    promisedByKind[kind]?.removeValue(forKey: legacySlot)
+    lock.unlock()
+    VibeLog.info(
+      "vault-legacy-hit", category: "media",
+      metadata: [
+        "kind": kind.rawValue,
+        "identity": identity,
+        "file": adopted.lastPathComponent,
+      ])
+    return adopted
   }
 
   // MARK: - Writing

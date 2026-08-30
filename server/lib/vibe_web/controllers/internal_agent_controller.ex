@@ -11,6 +11,7 @@ defmodule VibeWeb.InternalAgentController do
   alias Vibe.AgentGateway
   alias Vibe.AgentRelay
   alias Vibe.Agents
+  alias Vibe.AgentUsage
   alias Vibe.AI.AgentDecisions
   alias Vibe.AI.StandaloneAgent
   alias Vibe.Chat
@@ -28,6 +29,7 @@ defmodule VibeWeb.InternalAgentController do
              true <- agent_in_chat?(validated["agentUserId"], validated["chatId"]),
              false <- seen?(validated) do
           mark_seen(validated)
+          maybe_record_usage(validated)
           AgentRelay.handle(validated)
           acc + 1
         else
@@ -61,6 +63,19 @@ defmodule VibeWeb.InternalAgentController do
   end
 
   defp agent_in_chat?(_agent_user_id, _chat_id), do: false
+
+  # Meters a completed isolated run. Never raises — usage capture must not drop the event.
+  defp maybe_record_usage(%{"kind" => "run.completed"} = event) do
+    case Agents.get_agent(event["agentId"]) do
+      nil -> :ok
+      agent -> AgentUsage.record_run_completed(agent, event)
+    end
+  rescue
+    error ->
+      Logger.warning("[InternalAgentController] usage capture failed error=#{Exception.message(error)}")
+  end
+
+  defp maybe_record_usage(_event), do: :ok
 
   @doc "Public A2A card for the runtime's `/v1/agents/:identifier/card` proxy."
   def card(conn, %{"identifier" => identifier}) do

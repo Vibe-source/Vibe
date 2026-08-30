@@ -3,6 +3,7 @@ defmodule Vibe.AI.StandaloneAgent do
 
   require Logger
 
+  alias Vibe.AgentUsage
   alias Vibe.Chat
   alias Vibe.Notifications
   alias Vibe.Agent, as: AgentSchema
@@ -81,7 +82,8 @@ defmodule Vibe.AI.StandaloneAgent do
           normalize_string(params["agentTurnId"] || params["agent_turn_id"]) ||
             Ecto.UUID.generate()
 
-        with {:ok, scoped_agent} <-
+        with :ok <- AgentUsage.check_entitlement(agent.owner_user_id),
+             {:ok, scoped_agent} <-
                delivery_scoped_agent(agent, response_mode, vibe_chat_id, requester_user_id),
              {:ok, outputs} <-
                generate_outputs(
@@ -101,6 +103,13 @@ defmodule Vibe.AI.StandaloneAgent do
           # both the invoke response `outputs` map and Chat.add_message attrs
           # (via output_metadata → deliver_output_to_chat metadata merge).
           outputs = put_provider_content_on_outputs(outputs, provider_content)
+
+          AgentUsage.record_embedded(
+            agent,
+            agent_turn_id,
+            VibeContracts.ModelRates.estimate_tokens(message),
+            VibeContracts.ModelRates.estimate_tokens(Enum.map_join(outputs, " ", &(&1["text"] || "")))
+          )
 
           with {:ok, deliveries} <-
                  maybe_deliver(scoped_agent, vibe_chat_id, outputs, response_mode, reply_to_id) do

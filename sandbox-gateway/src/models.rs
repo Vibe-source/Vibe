@@ -167,6 +167,127 @@ pub struct ScreenshotResponse {
     pub height: u32,
 }
 
+/// Who may drive the sandbox browser. Transitions live in `runtime::computer`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Control {
+    #[default]
+    Agent,
+    User,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComputerSessionRequest {
+    #[serde(rename = "viewerId")]
+    pub viewer_id: String,
+    pub fps: Option<u32>,
+    pub width: Option<u32>,
+    pub quality: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerSessionResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub fps: u32,
+    pub width: u32,
+    pub quality: u32,
+    pub control: Control,
+    pub holder: Option<String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerSessionClosedResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ComputerFrameQuery {
+    pub since: Option<u64>,
+    /// Optional: refreshes just this viewer's idle clock. Absent, every viewer is refreshed.
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerFrameResponse {
+    pub seq: u64,
+    #[serde(rename = "imageBase64")]
+    pub image_base64: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub url: String,
+    pub title: String,
+    pub loading: bool,
+    pub control: Control,
+    #[serde(rename = "capturedAt")]
+    pub captured_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerStateResponse {
+    pub url: String,
+    pub title: String,
+    pub loading: bool,
+    pub control: Control,
+    pub holder: Option<String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<i64>,
+    #[serde(rename = "tabCount")]
+    pub tab_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComputerControlRequest {
+    pub action: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "ttlSeconds")]
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerControlResponse {
+    pub control: Control,
+    pub holder: Option<String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComputerInputRequest {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub kind: String,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub text: Option<String>,
+    pub key: Option<String>,
+    #[serde(rename = "deltaY")]
+    pub delta_y: Option<f64>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputerInputResponse {
+    pub ok: bool,
+    pub url: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BrowserStateResponse {
+    pub url: String,
+    pub title: String,
+    pub loading: bool,
+    #[serde(rename = "tabCount")]
+    pub tab_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthzResponse {
     pub ok: bool,
@@ -323,6 +444,88 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["containers"], 3);
         assert_eq!(v["image"], "vibe-sandbox:latest");
+    }
+
+    #[test]
+    fn computer_session_request_parses_frozen_field_names() {
+        let json = r#"{"viewerId":"user:7","fps":4,"width":720,"quality":55}"#;
+        let req: ComputerSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.viewer_id, "user:7");
+        assert_eq!(req.fps, Some(4));
+
+        let minimal: ComputerSessionRequest =
+            serde_json::from_str(r#"{"viewerId":"user:7"}"#).unwrap();
+        assert!(minimal.fps.is_none());
+        assert!(minimal.quality.is_none());
+    }
+
+    #[test]
+    fn computer_frame_response_uses_frozen_names() {
+        let resp = ComputerFrameResponse {
+            seq: 4,
+            image_base64: "aGk=".into(),
+            mime: "image/jpeg".into(),
+            width: 720,
+            height: 405,
+            url: "https://a.example/".into(),
+            title: "A".into(),
+            loading: false,
+            control: Control::User,
+            captured_at: 1700,
+        };
+        let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["imageBase64"], "aGk=");
+        assert_eq!(v["capturedAt"], 1700);
+        assert_eq!(v["control"], "user");
+        assert!(v.get("image_base64").is_none());
+    }
+
+    #[test]
+    fn computer_state_response_nulls_an_unheld_control() {
+        let resp = ComputerStateResponse {
+            url: "https://a.example/".into(),
+            title: "A".into(),
+            loading: true,
+            control: Control::Agent,
+            holder: None,
+            expires_at: None,
+            tab_count: 2,
+        };
+        let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["control"], "agent");
+        assert!(v["holder"].is_null());
+        assert!(v["expiresAt"].is_null());
+        assert_eq!(v["tabCount"], 2);
+    }
+
+    #[test]
+    fn computer_input_request_parses_every_frozen_field() {
+        let json = r#"{"sessionId":"cs_1","kind":"scroll","x":10.5,"y":20.0,"text":"hi",
+            "key":"Enter","deltaY":-120.0,"url":"https://a.example/"}"#;
+        let req: ComputerInputRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.session_id, "cs_1");
+        assert_eq!(req.kind, "scroll");
+        assert_eq!(req.delta_y, Some(-120.0));
+        assert_eq!(req.url.as_deref(), Some("https://a.example/"));
+    }
+
+    #[test]
+    fn computer_control_request_parses_grant() {
+        let req: ComputerControlRequest =
+            serde_json::from_str(r#"{"action":"grant","sessionId":"cs_1","ttlSeconds":300}"#)
+                .unwrap();
+        assert_eq!(req.action, "grant");
+        assert_eq!(req.ttl_seconds, Some(300));
+    }
+
+    #[test]
+    fn computer_frame_query_parses_since_and_session() {
+        let q: ComputerFrameQuery = serde_urlencoded::from_str("since=7&session=cs_1").unwrap();
+        assert_eq!(q.since, Some(7));
+        assert_eq!(q.session.as_deref(), Some("cs_1"));
+
+        let bare: ComputerFrameQuery = serde_urlencoded::from_str("").unwrap();
+        assert!(bare.since.is_none());
     }
 
     #[test]

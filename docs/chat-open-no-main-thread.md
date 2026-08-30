@@ -277,7 +277,9 @@ the main thread, so this is the reported "the push isn't smooth and swiping back
 doesn't follow my finger": the finger was queued behind a transcript nobody could
 see, under a raster that is a pixel-exact photograph of the same thing.
 
-The mount now waits for `completeTranscriptPresentation()`. It also does *less*
+The mount now waits for `completeTranscriptPresentation()` — for a while this held
+only above `coveredEagerSeedMountRowBudget`, so every ordinary chat still mounted
+inside the slide; the budget is 0 and the rule is unconditional. It also does *less*
 work than before — with the mount deferred, mid-push payloads take the stash lane
 and upgrade it monotonically instead of arriving as `retain-frozen` and then
 `apply-pending`, so an open mounts once rather than mounting, freezing and

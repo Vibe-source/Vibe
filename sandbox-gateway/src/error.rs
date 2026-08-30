@@ -16,6 +16,8 @@ pub enum GatewayError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    TooManyRequests(String),
+    #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
 
@@ -26,6 +28,7 @@ impl GatewayError {
             GatewayError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             GatewayError::NotFound => (StatusCode::NOT_FOUND, "not_found".to_string()),
             GatewayError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            GatewayError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             GatewayError::Internal(err) => {
                 tracing::error!(error = %err, "internal error");
                 (

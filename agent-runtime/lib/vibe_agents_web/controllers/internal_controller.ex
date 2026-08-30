@@ -63,6 +63,56 @@ defmodule VibeAgentsWeb.InternalController do
     end
   end
 
+  def computer_session(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.computer_session(gateway_body(params)) |> passthrough(conn)
+
+  def close_computer_session(conn, %{"agent_id" => agent_id, "session_id" => session_id}),
+    do: agent_id |> Sandbox.close_computer_session(session_id) |> passthrough(conn)
+
+  def computer_frame(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.computer_frame(since_seq(params), params["session"]) |> passthrough(conn)
+
+  def computer_state(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.computer_state(params["session"]) |> passthrough(conn)
+
+  def computer_control(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.computer_control(gateway_body(params)) |> passthrough(conn)
+
+  def computer_input(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.computer_input(gateway_body(params)) |> passthrough(conn)
+
+  # Straight gateway passthrough: 204 stays 204 and a gateway status (409 …) is never flattened.
+  defp passthrough({:ok, :no_change}, conn), do: send_resp(conn, 204, "")
+  defp passthrough({:ok, body}, conn), do: json(conn, body)
+  defp passthrough({:error, {:http_error, status, body}}, conn), do: conn |> put_status(status) |> json(error_body(body))
+  defp passthrough({:error, :not_available}, conn), do: conn |> put_status(404) |> json(%{"error" => "not_available"})
+  defp passthrough({:error, :not_configured}, conn), do: conn |> put_status(503) |> json(%{"error" => "not_configured"})
+  defp passthrough({:error, reason}, conn), do: conn |> put_status(502) |> json(%{"error" => inspect(reason)})
+
+  defp error_body(body) when is_map(body), do: body
+
+  defp error_body(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, %{} = decoded} -> decoded
+      _ -> %{"error" => body}
+    end
+  end
+
+  defp error_body(body), do: %{"error" => inspect(body)}
+
+  defp gateway_body(params), do: Map.drop(params, ["agent_id", "session_id"])
+
+  defp since_seq(%{"since" => since}) when is_integer(since) and since >= 0, do: since
+
+  defp since_seq(%{"since" => since}) when is_binary(since) do
+    case Integer.parse(since) do
+      {seq, _rest} when seq >= 0 -> seq
+      _ -> 0
+    end
+  end
+
+  defp since_seq(_params), do: 0
+
   @doc """
   `VibeAgents.Voice.Sessions` is the voice worker's module — resolved dynamically via
   `apply/3` so a missing module is a runtime 503, never a compile-time dependency.

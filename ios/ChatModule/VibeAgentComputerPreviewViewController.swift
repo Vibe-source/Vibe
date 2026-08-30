@@ -1,10 +1,11 @@
 import UIKit
 
-/// Full-screen "computer" preview sheet for an isolated-runtime run (agent-platform-v1 §3.4).
-/// Shows the latest `agent-preview` screenshot and live-updates while the sheet is on screen.
+/// Still-frame "computer" sheet: the latest `agent-preview` screenshot, live-updating while
+/// on screen. Also the fallback when no live session can be created (no gateway, 429).
 final class VibeAgentComputerPreviewViewController: UIViewController {
   private let chatId: String
   private let appearance: VibeAgentKitChatAppearance
+  private let fallbackNote: String?
   private var changeObserver: NSObjectProtocol?
 
   private let imageView: UIImageView = {
@@ -40,9 +41,22 @@ final class VibeAgentComputerPreviewViewController: UIViewController {
     return btn
   }()
 
-  init(chatId: String, appearance: VibeAgentKitChatAppearance) {
+  private let noteLabel: UILabel = {
+    let l = UILabel()
+    l.font = .systemFont(ofSize: 12, weight: .medium)
+    l.textColor = UIColor.white.withAlphaComponent(0.6)
+    l.numberOfLines = 2
+    l.isHidden = true
+    l.translatesAutoresizingMaskIntoConstraints = false
+    return l
+  }()
+
+  init(
+    chatId: String, appearance: VibeAgentKitChatAppearance, fallbackNote: String? = nil
+  ) {
     self.chatId = chatId
     self.appearance = appearance
+    self.fallbackNote = fallbackNote
     super.init(nibName: nil, bundle: nil)
     modalPresentationStyle = .fullScreen
   }
@@ -60,10 +74,19 @@ final class VibeAgentComputerPreviewViewController: UIViewController {
     view.addSubview(imageView)
     view.addSubview(liveDot)
     view.addSubview(labelView)
+    view.addSubview(noteLabel)
     view.addSubview(closeButton)
     closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
 
+    noteLabel.text = fallbackNote
+    noteLabel.isHidden = fallbackNote == nil
+
     NSLayoutConstraint.activate([
+      noteLabel.topAnchor.constraint(equalTo: labelView.bottomAnchor, constant: 2),
+      noteLabel.leadingAnchor.constraint(equalTo: labelView.leadingAnchor),
+      noteLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: closeButton.leadingAnchor, constant: -12),
+
       imageView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 52),
       imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),

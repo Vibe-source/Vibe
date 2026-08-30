@@ -84,6 +84,27 @@ enum AppAppearanceController {
       }
     }
   }
+
+  /// iOS renders the app-switcher snapshot in BOTH interface styles, so backgrounding flips
+  /// userInterfaceStyle across the hierarchy and every theme handler reruns. Pinning the
+  /// window stops that flip at the top instead of paying for it in every view.
+  static func pinCurrentStyleForSnapshot() {
+    guard currentOption == .system else { return }
+    for scene in UIApplication.shared.connectedScenes {
+      guard let windowScene = scene as? UIWindowScene else { continue }
+      for sceneWindow in windowScene.windows
+      where sceneWindow.overrideUserInterfaceStyle == .unspecified {
+        sceneWindow.overrideUserInterfaceStyle = sceneWindow.traitCollection.userInterfaceStyle
+      }
+    }
+  }
+
+  /// Released only once the app is active again, which is what lets a style the user
+  /// changed while we were pinned land through the normal trait path.
+  static func releaseSnapshotStylePin() {
+    guard currentOption == .system else { return }
+    applyStoredPreference()
+  }
 }
 
 enum AppPrivacyChoice: String, CaseIterable, Identifiable {

@@ -511,9 +511,9 @@ defmodule VibeAgents.LLM.Loop do
     payload = %{
       "model" => config.model,
       "max_tokens" => config.max_tokens,
-      "system" => resolve_system_prompt(config.system_prompt, config.state),
-      "tools" => config.tools,
-      "messages" => messages,
+      "system" => cache_system(resolve_system_prompt(config.system_prompt, config.state)),
+      "tools" => cache_tools(config.tools),
+      "messages" => cache_messages(messages),
       "stream" => true
     }
 
@@ -535,6 +535,73 @@ defmodule VibeAgents.LLM.Loop do
   end
 
   defp adaptive_thinking_model?(_model), do: false
+
+  # ── Anthropic prompt caching ────────────────────────────────────────────────
+  # A run re-sends system + tools + the whole transcript on every tool step (up
+  # to :max_steps), so one breakpoint on each turns those repeats into cache
+  # reads at 0.1x input. Three breakpoints, under Anthropic's limit of four.
+
+  @cache_control %{"type" => "ephemeral"}
+
+  defp prompt_cache?, do: Application.get_env(:vibe_agents, :prompt_cache, true)
+
+  defp cache_system(prompt) when is_binary(prompt) and prompt != "" do
+    if prompt_cache?() do
+      [%{"type" => "text", "text" => prompt, "cache_control" => @cache_control}]
+    else
+      prompt
+    end
+  end
+
+  defp cache_system(prompt), do: prompt
+
+  defp cache_tools(tools) when is_list(tools) and tools != [] do
+    if prompt_cache?(), do: mark_last(tools, &Map.put(&1, "cache_control", @cache_control)), else: tools
+  end
+
+  defp cache_tools(tools), do: tools
+
+  # The breakpoint rides the newest message, so each step reads the previous
+  # step's transcript back instead of re-paying for it.
+  defp cache_messages(messages) when is_list(messages) and messages != [] do
+    if prompt_cache?(), do: mark_last(messages, &mark_message/1), else: messages
+  end
+
+  defp cache_messages(messages), do: messages
+
+  defp mark_last(list, fun) do
+    case List.last(list) do
+      %{} = last -> List.replace_at(list, length(list) - 1, fun.(last))
+      _ -> list
+    end
+  end
+
+  # Messages carry string keys from the run state and atom keys when freshly
+  # built, so both are handled; anything else is left alone.
+  defp mark_message(message) do
+    {key, content} =
+      cond do
+        is_map_key(message, "content") -> {"content", message["content"]}
+        is_map_key(message, :content) -> {:content, message.content}
+        true -> {nil, nil}
+      end
+
+    case {key, content} do
+      {nil, _} ->
+        message
+
+      {_, text} when is_binary(text) and text != "" ->
+        Map.put(message, key, [
+          %{"type" => "text", "text" => text, "cache_control" => @cache_control}
+        ])
+
+      {_, blocks} when is_list(blocks) and blocks != [] ->
+        Map.put(message, key, mark_last(blocks, &Map.put(&1, "cache_control", @cache_control)))
+
+      _ ->
+        message
+    end
+  end
 
   @doc false
   def openai_request_payload(messages, %Config{} = config) do

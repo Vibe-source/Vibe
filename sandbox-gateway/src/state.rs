@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use bollard::Docker;
 
 use crate::config::Config;
+use crate::runtime::computer::Registry;
 
 #[derive(Debug, Clone)]
 pub struct SandboxEntry {
@@ -18,6 +19,7 @@ pub struct AppState {
     pub cfg: Config,
     pub docker: Docker,
     pub sandboxes: Mutex<HashMap<String, SandboxEntry>>,
+    pub computer: Registry,
 }
 
 impl AppState {
@@ -26,6 +28,7 @@ impl AppState {
             cfg,
             docker,
             sandboxes: Mutex::new(HashMap::new()),
+            computer: Registry::new(),
         }
     }
 

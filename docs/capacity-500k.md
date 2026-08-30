@@ -26,12 +26,32 @@ guessed.
 | Rate limiter under concurrency | atomic — 310 concurrent `/api/health` → exactly the 300/min bucket allowed, 10× 429 |
 
 **The headline:** steady-state fan-out and delivery are cheap and correct
-(3–93 ms, zero drops). The ceiling is the **connect/join storm**: join runs
+(3–93 ms, zero drops). The ceiling was the **connect/join storm**: join ran
 synchronous DB work, so p99 join latency climbed 32 ms → 2.15 s going 400 →
-3,000 sockets at a fast ramp. At 500k that is the thing that falls over first,
-not memory or delivery — see §3.8. Memory is linear and plannable: ~75 KB ×
+3,000 sockets at a fast ramp. Memory is linear and plannable: ~75 KB ×
 500k ≈ **38 GB** of connection processes, so 500k on one node needs a bumped
 `+P` and ~48–64 GB RAM, or a 2–3 node libcluster split (§3.4, §4).
+
+### Join cost, after the 2026-08-29 fix
+
+Why the cliff was there: at a 400/s ramp, ~4 queries per join is ~1,600
+queries/s, and the pool sustains `POOL_SIZE(20) / 16 ms ≈ 1,250/s`. The ramp
+was *over* the pool ceiling, so joins queued — which is exactly the 2.15 s p99.
+
+`Chat.join_context/2` now returns role and room type in one round trip, and
+`Vibe.Chat.JoinCache` caches the DM agent-shadow lookup per `{chat, user}`.
+Role is deliberately **not** cached: authorization is never served stale.
+
+| Join | Queries before | After (cold) | After (warm) |
+|---|---|---|---|
+| human DM | 4 | 2 | **1** |
+| agent DM | 5 | 3 | **1** |
+| group | 2 | 1 | **1** |
+
+Measured by counting `[:vibe, :repo, :query]` telemetry around the old and new
+paths on the same rows. At 1 query/join the same 400/s ramp is ~400 queries/s —
+**3× under** the pool ceiling instead of over it. Re-run `ws-storm.js` at 3,000
+conns to confirm the p99 cliff is gone; the arithmetic says it should be.
 
 ## 1. What "500k live requests" means
 
@@ -73,14 +93,12 @@ client --TLS/WS--> Caddy --reverse_proxy--> Cowboy acceptor --> VibeWeb.UserSock
   `TokenCache` at `server/lib/vibe/accounts/token_cache.ex:36-37` — 60s TTL,
   no negative caching, per-node table). The socket itself is one Erlang
   process + one port.
-- **Joining `chat:<id>`** (`VibeWeb.ChatChannel.join/3`,
-  `server/lib/vibe_web/channels/chat_channel.ex:21-63`) spawns a **new**
-  process and runs 2-4 **uncached** queries: `Chat.get_user_role/2` and
-  `Chat.get_room_type/1` (`server/lib/vibe/chat.ex:3996-4009`, plain
-  `Repo.one`, no cache) always; for a DM, `Chat.get_participant_ids/1`
-  (`chat.ex:239-246`) plus an agent-shadow lookup per participant. Unlike auth
-  (`TokenCache`) or the chat list (`ChatHomeCache`, §3), **there is no cache
-  here** — every join pays the DB round trip.
+- **Joining `chat:<id>`** (`VibeWeb.ChatChannel.join/3`) spawns a **new**
+  process and, since 2026-08-29, runs **one** query on a warm join:
+  `Chat.join_context/2` returns role and room type together, and the DM
+  agent-shadow lookup comes from `Vibe.Chat.JoinCache` (60 s TTL, keyed per
+  `{chat, user}`). It was 2-5 uncached queries — see §0 for the measured drop.
+  The role check itself is still a live query every time, by design.
 - **Joining `user:<id>`** (a real client always does this;
   `VibeWeb.UserChannel.join/3` + `handle_info(:after_join, ...)`,
   `server/lib/vibe_web/channels/user_channel.ex:10-96`) spawns another
@@ -112,8 +130,9 @@ Ranked by which ceiling a single core replica (today's only topology —
 `CLUSTER_STRATEGY` defaults to `"none"`, see below) hits first as concurrent
 sockets climb toward 500k.
 
-1. **Container file-descriptor ulimit.** `deploy/compose.yml` sets no
-   `ulimits:` key on **any** service — not `core`, not `caddy`. Each socket
+1. **Container file-descriptor ulimit.** *(FIXED 2026-08-29 — `core`, `caddy`
+   and `agent-runtime` now set `nofile` 65536; kept here for the reasoning.)*
+   `deploy/compose.yml` set no `ulimits:` key on **any** service. Each socket
    is 1 FD; the container inherits whatever the engine/host defaults to,
    which is not guaranteed to be high (this dev Mac's shell shows
    `ulimit -n` = 1,048,576, but that is this machine, not the deploy host or
@@ -121,7 +140,9 @@ sockets climb toward 500k.
    '{{.HostConfig.Ulimits}}'` on the real host is the only trustworthy
    answer). This is the single easiest ceiling to hit by accident and the
    cheapest to fix.
-2. **Cowboy/Ranch `max_connections`.** Nothing in `server/config/{dev,prod}.exs`
+2. **Cowboy/Ranch `max_connections`.** *(FIXED 2026-08-29 — both endpoints now
+   set `transport_options`; kept here for the reasoning.)*
+   Nothing in `server/config/{dev,prod}.exs`
    or `server/config/runtime.exs` sets `transport_options` on the endpoint's
    `socket/2` or `http` block (grep confirms no `max_connections` anywhere in
    `server/config`). Ranch's own default (`ranch_conns_sup.erl`,
@@ -204,17 +225,17 @@ sockets climb toward 500k.
 
 | Fix | Where | Value |
 |---|---|---|
-| Set container FD ulimits | `deploy/compose.yml`, `core:` and `caddy:` services | add `ulimits: { nofile: { soft: 65536, hard: 65536 } }` (or higher — size to target concurrent sockets + headroom) |
+| ~~Set container FD ulimits~~ **DONE 2026-08-29** | `deploy/compose.yml` — `core`, `caddy`, `agent-runtime` | `ulimits: { nofile: { soft: 65536, hard: 65536 } }` on all three socket-facing services |
 | Raise BEAM process/port limits | new `server/rel/vm.args.eex`, or `ERL_FLAGS` env in `deploy/env/core.env.example` | `+P 2000000 +Q 1000000` (or via `ERL_FLAGS="+P 2000000 +Q 1000000"`) — size `P` to `target_conns × processes_per_conn` from §2 |
 | Raise BEAM scheduler count if under-provisioned | same `vm.args`/`ERL_FLAGS` | `+S <cores>:<cores>` matches the compose `cpus:` limit (`core:` is capped at `2.0` today — `deploy/compose.yml`) |
 | Raise host + container ulimits at the OS level | `deploy/scripts/vps-bootstrap.sh:setup_sysctl` | add `fs.nr_open` / raise `fs.file-max` past 200,000 if targeting >200k total FDs system-wide (today's value, `vps-bootstrap.sh:97`), and set `LimitNOFILE=` in `deploy/systemd/vibe-stack*.service` (currently absent) |
-| Raise Cowboy's connection cap | `server/config/runtime.exs`, `VibeWeb.Endpoint` `http:` block | add `transport_options: [max_connections: <N>, num_acceptors: <N>]` |
+| ~~Raise Cowboy's connection cap~~ **DONE 2026-08-29** | `server/config/runtime.exs` + `agent-runtime/config/runtime.exs` | `transport_options: [max_connections: …, num_acceptors: 100]`, via `RANCH_MAX_CONNECTIONS` (core 65536 / runtime 16384) |
 | Ecto pool size | `POOL_SIZE` env (`server/config/runtime.exs:184`, `deploy/env/core.env.example:11`) | raise per replica; keep `replica_count × POOL_SIZE ≤` PgBouncer's `default_pool_size` |
 | PgBouncer pool | `deploy/pgbouncer/pgbouncer.ini:14-15` | raise `default_pool_size` (40 today) and `max_client_conn` (500 today) together with replica count |
 | Postgres connections | `deploy/postgres/postgresql.conf:7` | raise `max_connections` (200 today) only if PgBouncer's own pool must exceed it — normally PgBouncer absorbs the growth instead |
 | Enable multi-node | `CLUSTER_STRATEGY` env → `server/lib/vibe/cluster.ex:8-30` | set `gossip` (same-host/LAN) or `dns` (k8s-style) **and load-test the PubSub fan-out cost this introduces** — unexercised today |
 | Keep the rate limiter cluster-wide under a Valkey outage | `deploy/env/core.env.example:21-22`, `server/lib/vibe/rate_limit/valkey.ex` | make the ETS fail-open path alarm (it currently only logs once/min, `valkey.ex:37-43`) so an outage during peak is visible, not silent |
-| Cache chat-channel join reads | `server/lib/vibe/chat.ex:3996-4009` (`get_user_role/2`, `get_room_type/1`) | wrap in `Vibe.Cache.fetch/3` (pattern already used by `ChatHomeCache`/`TokenCache`) — removes 2 uncached queries from every single join, the highest-leverage fix in this list |
+| ~~Cache chat-channel join reads~~ **DONE 2026-08-29** | `Vibe.Chat.join_context/2`, `Vibe.Chat.JoinCache` | one round trip for role+type, agent-shadow lookup cached per `{chat, user}`. 4–5 queries → **1** on a warm join (§0). Role stays uncached on purpose |
 | Soften the reconnect-storm fan-out | `server/lib/vibe_web/channels/user_channel.ex:45-76` | batch/stagger the post-reconnect `Chat.list_chats` + friend-broadcast burst (e.g. jittered delay, or skip the friend-broadcast entirely when `ChatHomeCache` already has a fresh entry) |
 | See live socket/process count | `server/lib/vibe/telemetry/metrics.ex` | add a gauge (`last_value`) for `Registry`/`Presence` size or BEAM process count — today's Prometheus metrics have endpoint duration, repo query time, and VM run-queue length, but nothing that answers "how many sockets are open right now" |
 

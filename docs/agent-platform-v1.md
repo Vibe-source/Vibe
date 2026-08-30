@@ -238,6 +238,10 @@ idle containers stopped after `SANDBOX_IDLE_TTL_SECONDS`, orphans reaped on boot
 Browser actions run through `/opt/vibe/browser.js` inside the container (Playwright,
 persistent profile, CDP on 127.0.0.1) so the gateway never speaks CDP itself.
 
+Making that computer visible, drivable by the owner, and logged into real accounts is
+specified separately in [`agent-computer-v1.md`](agent-computer-v1.md) — it adds routes
+under `/v1/sandboxes/:id/computer/*` and changes nothing above.
+
 ### 3.7 Voice — `vibe.voice.v1`
 
 Core: `POST /api/agents/:id/voice/sessions` (authenticated; participant or owner) →
@@ -311,6 +315,28 @@ green, 22 new tests), iOS frames (generic build green), `deploy/` stack + runboo
 | Team handoffs | `handoff_to_agent` → core `POST /internal/v1/handoffs` → mention dispatch |
 | Sandbox computer | gateway + image + egress proxy built; untested against a live Podman (no daemon on the build machine) |
 | Scoped provider API keys (`vak_…`) | not built (phase 2) |
+| Anthropic prompt caching | added 2026-08-29 on both loops; see below |
+
+### Prompt caching (2026-08-29)
+
+Both Claude loops — `VibeAgents.LLM.Loop` (isolated) and `Vibe.AI.AgentRuntime`
+(embedded) — sent `system`, `tools` and the whole transcript uncached on every
+step. With `max_steps` at 24 that is the same prefix re-billed up to 24 times
+per run, and it was the single largest avoidable cost in the agent path.
+
+Three `cache_control: ephemeral` breakpoints now ride the payload: the last
+tool, the system prompt, and the newest message (so each step reads the
+previous step's transcript back). Anthropic allows four. Cache reads bill at
+0.1× input, writes at 1.25×, and a prefix under ~1024 tokens is simply not
+cached — so short one-shot runs are unaffected either way.
+
+Off switch: `config :vibe_agents, :prompt_cache, false` (runtime) or
+`config :vibe, :prompt_cache, false` (core) restores the old payload exactly.
+
+**Not yet verified against the live API** — the production Anthropic key is out
+of credit, so the two-call write-then-read check could not run. Payload shape is
+covered by `agent-runtime/test/vibe_agents/llm/prompt_cache_test.exs`; confirm
+`cache_read_input_tokens > 0` on a real run once the key is funded.
 
 ## 5. Migration phases
 

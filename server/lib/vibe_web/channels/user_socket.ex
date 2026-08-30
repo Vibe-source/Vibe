@@ -13,6 +13,8 @@ defmodule VibeWeb.UserSocket do
   channel("chat:*", VibeWeb.ChatChannel)
   # AI Agent streaming
   channel("agent:*", VibeWeb.AgentChannel)
+  # Owner-only live view of an agent's browser
+  channel("computer:*", VibeWeb.ComputerChannel)
   # VibeNet peer relay network
   channel("relay:*", VibeWeb.RelayChannel)
 

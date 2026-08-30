@@ -43,22 +43,8 @@ final class VibeSecureSessions {
 
   static let shared = VibeSecureSessions()
 
-  /// Whether outbound DMs are sealed with MLS. **On by default.**
-  ///
-  /// This was off while a `vmls1.` envelope might reach a client too old to
-  /// read it — that does not degrade a conversation, it splits it, and there is
-  /// no recovering from it after the fact. There is no such install base: the
-  /// app has not shipped, so every device that exists understands this format
-  /// and the safe default is the secure one.
-  ///
-  /// The key remains an explicit off switch (`false` disables sealing) so a
-  /// build can be dropped back without a code change if establishment turns out
-  /// to misbehave in the field. Absent key means on — a fresh install must not
-  /// have to opt in to encryption.
-  ///
-  /// Read every time rather than cached, so the switch takes effect without a
-  /// relaunch; the read is a dictionary lookup.
-  static var isSendEnabled: Bool {
+  /// Optional kill switch for experimental group MLS sends; human DMs ignore it.
+  static var isGroupSendEnabled: Bool {
     guard UserDefaults.standard.object(forKey: "vibe.mls.sendEnabled") != nil else { return true }
     return UserDefaults.standard.bool(forKey: "vibe.mls.sendEnabled")
   }
@@ -477,25 +463,8 @@ final class VibeSecureSessions {
     UserDefaults.standard.set(true, forKey: "vibe.mls.ineligible.\(chatId)")
   }
 
-  // ── "the peer has published no key" ─────────────────────────────────────
-  //
-  // Distinct from `isIneligible`, and the difference is the whole point:
-  // ineligible is permanent (the chat is structurally too big for MLS), this
-  // is temporary (the peer simply has not published a KeyPackage yet, because
-  // their device has not run a build that does).
-  //
-  // You cannot encrypt to a device whose public key you do not have. That is
-  // arithmetic, not policy — no amount of gating produces a readable message
-  // for a peer with no published key. So the only real choice is between
-  // sending under the envelope that peer CAN read and not sending at all, and
-  // a message stuck pending forever is not the safer option: people retry
-  // over another app, which is a genuine plaintext leak rather than a
-  // theoretical one.
-  //
-  // Crucially this can never weaken a chat that already works — the send path
-  // consults `isPeerConfirmed` first, and that is one-way. This flag only
-  // decides whether a chat that has NEVER been established waits or sends.
-
+  // A recent missing-KeyPackage response only rate-limits readiness probes.
+  // It never authorizes a different transport.
   private static func peerKeysMissingKey(_ chatId: String) -> String {
     "vibe.mls.peerKeysMissing.\(chatId)"
   }
@@ -910,6 +879,9 @@ final class VibeSecureSessions {
         ]
         if isMine {
           meta["stage"] = "mls-own-expected"
+          // Nothing but the retained plaintext could ever open this, and it is gone —
+          // retaining it later clears the mark, so a resend still recovers the row.
+          markUnrecoverableLocked(messageId: messageId)
           if loggedTombstones.insert("own:" + (messageId ?? String(envelope.suffix(24)))).inserted {
             VibeLog.info("own mls message is not self-openable", category: "crypto", metadata: meta)
           }

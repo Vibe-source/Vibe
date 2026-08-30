@@ -339,6 +339,9 @@ defmodule Vibe.Mls do
       |> Repo.insert()
       |> case do
         {:ok, row} ->
+          # Without this the recipient has no reason to drain: a first-contact DM
+          # gives them neither socket_open nor chat_joined for the new chat.
+          VibeWeb.Endpoint.broadcast("user:#{recipient_id}", "mls_welcome", %{chatId: chat_id})
           {:ok, row}
 
         {:error, reason} ->

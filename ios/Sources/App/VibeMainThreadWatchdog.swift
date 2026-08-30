@@ -1,85 +1,38 @@
 import Foundation
 import UIKit
 
-/// Reports, from outside the main thread, every stretch where the main thread stopped
-/// answering — how long, and what run-loop mode it was in when it happened.
-///
-/// # Why this exists
-///
-/// Everything that measures main-thread cost in this app measures *itself*:
-/// `setRows took 196ms`, `MAIN-THREAD-SYNC-STALL blocked … 109ms`, `ScrollHitch 10ms`.
-/// Each one is a stopwatch inside a function that already suspected it was slow. A
-/// freeze that happens anywhere else — in a path nobody instrumented, or in UIKit, or
-/// spread across a dozen small pieces that are individually under every threshold —
-/// produces no line at all. Device session 2026-08-04: the list felt like it hung on
-/// open, and the entire log for that window contained one `ScrollHitch 10ms`. The
-/// instrumentation said the app was fine while the user was looking at a frozen screen.
-///
-/// This cannot happen here, because this observer is not inside the work. A background
-/// thread watches the main run loop and notices that it stopped advancing. It does not
-/// need to know which function is slow, or to have been added to it.
-///
-/// # How the detection works
-///
-/// A `CFRunLoopObserver` on the main run loop fires on every activity transition. Two
-/// of those activities — `beforeSources` and `afterWaiting` — mean "about to run, or
-/// now running, application code". If the run loop sits in one of them for longer than
-/// the threshold, the main thread is busy and not servicing anything else: no touches,
-/// no frames. That is exactly what a user calls a hang, and it is the same signal a
-/// system watchdog uses before it kills an app.
-///
-/// The observer costs one lock and two stores per run-loop iteration, which is why it
-/// can be left on rather than being something to remember to enable.
-///
-/// # What it prints
-///
-/// A hang in progress reports *while it is still happening*, once a second. That is
-/// deliberate: a hang long enough to be killed produces no "recovered" line, so a
-/// design that only logged on recovery would go silent in precisely the worst case.
-///
-///     [MainHang] STILL BLOCKED 1.0s mode=UITrackingRunLoopMode — main thread has not
-///                advanced; no touches or frames are being serviced
-///     [MainHang] RECOVERED after 1.34s mode=UITrackingRunLoopMode
-///
-/// `mode` is the part that assigns blame without any further work: `UITracking…` means
-/// it happened under the user's finger mid-scroll, `kCFRunLoopDefaultMode` means it did
-/// not. Correlate the recovery timestamp with the surrounding logs to name the function.
+/// Watches the main run loop from a background queue and reports every stretch where the
+/// main thread stopped advancing: how long, which run-loop mode, its run-state and stack.
 final class VibeMainThreadWatchdog {
 
   static let shared = VibeMainThreadWatchdog()
 
-  /// Below this, a busy main thread is ordinary work — a frame at 120Hz has 8ms, and
-  /// a single heavy commit landing at 200ms is already reported by its own stopwatch.
-  /// This is looking for the class of stall a person perceives as the app stopping,
-  /// which starts around a third of a second.
+  /// Below this a busy main thread is ordinary frame work; above it a person perceives
+  /// the app as having stopped.
   private let hangThreshold: CFTimeInterval = 0.35
-  /// How often the watcher samples. Fine enough to time a hang usefully, coarse enough
-  /// to be free.
+  /// How often the watcher samples: fine enough to time a hang, coarse enough to be free.
   private let sampleInterval: CFTimeInterval = 0.05
   /// Repeat interval for the "still blocked" line during one continuous hang.
   private let ongoingReportInterval: CFTimeInterval = 1.0
-  /// A gap between watcher ticks larger than this means the process was suspended.
-  /// Generous relative to the 50ms interval: a `.utility` queue on a loaded device can
-  /// legitimately be late by a wide margin, and the cost of being wrong in this
-  /// direction is one discarded hang report, while being wrong the other way is a
-  /// minute of pocket time logged as a freeze.
+  /// A gap between watcher ticks larger than this means the process was suspended, so
+  /// the busy stamp is pocket time rather than a hang. Generous, since a late tick is cheap.
   private static let suspensionSampleGap: CFTimeInterval = 2.0
+  /// Later than CoreAnimation's commit observer, so a slow commit is still inside the
+  /// measured busy window when the idle observer clears it.
+  private static let idleObserverOrder: CFIndex = 3_000_000
 
   private let queue = DispatchQueue(label: "vibe.mainthread.watchdog", qos: .utility)
   private var timer: DispatchSourceTimer?
-  private var observer: CFRunLoopObserver?
+  private var busyObserver: CFRunLoopObserver?
+  private var idleObserver: CFRunLoopObserver?
 
   // MARK: Shared state
-  //
-  // Written by the run-loop observer on main, read by the watcher off it. Guarded by
-  // the cheapest lock available, because the write side runs on every single run-loop
-  // iteration of the main thread and must not become the thing it is measuring.
 
-  /// Heap-allocated rather than a stored `os_unfair_lock_s`. Taking `&someProperty` of
-  /// a lock yields a pointer Swift is allowed to move, which silently breaks the
-  /// mutual exclusion — a class of bug that would show up here as corrupted timings
-  /// rather than a crash, in the one component whose whole job is to be trustworthy
-  /// about timings.
+  // Written by the observers on main, read by the watcher off it. Guarded by the cheapest
+  // lock available, because the write side runs on every main run-loop iteration.
+
+  /// Heap-allocated: `&property` of an inline lock yields a pointer Swift may move,
+  /// which silently breaks the mutual exclusion.
   private let lock: UnsafeMutablePointer<os_unfair_lock> = {
     let pointer = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
     pointer.initialize(to: os_unfair_lock())
@@ -87,74 +40,77 @@ final class VibeMainThreadWatchdog {
   }()
   private var busySince: CFTimeInterval = 0
   private var busyMode: String = ""
-  /// Longest hang seen, for a one-line summary when the app backgrounds.
+  /// Longest hang seen, for the one-line summary when the app backgrounds.
   private var worstHang: CFTimeInterval = 0
 
   // MARK: Watcher state (watchdog queue only)
 
   private var reportedHangStart: CFTimeInterval = 0
   private var lastOngoingReport: CFTimeInterval = 0
-  /// Captured when the hang is first detected, not at recovery: by the time the main
-  /// thread comes back it has moved on, and the interesting breadcrumb is the one it
-  /// was standing on when it stopped.
+  /// Captured when the hang is detected, not at recovery: by then the main thread has
+  /// moved on, and the interesting breadcrumb is the one it was standing on.
   private var reportedHangActivity = "?"
   private var reportedHangMode = "?"
-  /// The main thread's own stack, sampled at the moment the hang was detected. This is
-  /// the line that names the function; `reportedHangActivity` is only a breadcrumb and
-  /// says `idle` for everything that is not a chat open.
-  private var reportedHangStack: [String] = []
-  /// When the watcher itself last ran. A main-thread hang does not stop this queue —
-  /// that is the entire premise of watching from off the main thread — so a gap here
-  /// means the *process* stopped, not the main thread. See `sample`.
+  /// Scheduler state at detection: `running` means a busy loop, `waiting` a blocking call.
+  private var reportedHangState: MainThreadRunState?
+  /// The main thread's own stack, sampled while it was stopped at detection time.
+  private var reportedHangStack: [StackFrame] = []
+  /// When the watcher itself last ran. A main-thread hang never delays this queue, so a
+  /// gap here means the *process* stopped, not the main thread. See `sample`.
   private var lastSampleAt: CFTimeInterval = 0
 
-  /// The main thread's mach port, captured on `start()`. Suspending and reading a
-  /// thread requires its port, and `pthread_mach_thread_np` must be asked on the thread
-  /// itself — there is no "give me the main thread's port" call from elsewhere.
+  /// The main thread's mach port, captured on `start()`. `pthread_mach_thread_np` must
+  /// be asked on the thread itself and returns a borrowed name that needs no release.
   private var mainThreadPort: mach_port_t = 0
 
   private init() {}
 
-  /// Installs the observer and starts watching. Safe to call once, from the main thread.
+  /// Installs the observers and starts watching. Safe to call once, from the main thread.
   func start() {
-    guard observer == nil else { return }
+    guard busyObserver == nil else { return }
 
-    // Must be read here, on main. `mach_thread_self()` would hand back a send right that
-    // needs deallocating; the pthread form is a borrowed name with no ownership.
     mainThreadPort = pthread_mach_thread_np(pthread_self())
 
-    let activities: CFRunLoopActivity = [.beforeSources, .afterWaiting, .beforeWaiting, .exit]
-    let observer = CFRunLoopObserverCreateWithHandler(
-      kCFAllocatorDefault, activities.rawValue, true, 0
-    ) { [weak self] _, activity in
+    // Order 0: stamps the start of a busy stretch before any other observer has run.
+    let busyActivities: CFRunLoopActivity = [.beforeSources, .afterWaiting]
+    let busy = CFRunLoopObserverCreateWithHandler(
+      kCFAllocatorDefault, busyActivities.rawValue, true, 0
+    ) { [weak self] _, _ in
       guard let self else { return }
-      // `beforeSources` / `afterWaiting` = the main thread is about to run, or is
-      // running, application code. Anything else means it went back to waiting, which
-      // is the run loop being healthy.
-      let isBusy = activity.contains(.beforeSources) || activity.contains(.afterWaiting)
       let now = CACurrentMediaTime()
-      // The mode has to be read here, on the main thread, while the loop is in it —
-      // it is what separates "froze while you were dragging" from "froze on its own".
-      let mode =
-        isBusy
-        ? ((CFRunLoopCopyCurrentMode(CFRunLoopGetMain())?.rawValue as String?) ?? "?") : ""
       os_unfair_lock_lock(self.lock)
-      if isBusy {
-        // Only stamp the START of a busy stretch. Overwriting it each iteration would
-        // restart the clock constantly and no hang would ever be long enough to see.
-        if self.busySince == 0 {
-          self.busySince = now
-          self.busyMode = mode
-        }
-      } else {
-        self.busySince = 0
-        self.busyMode = ""
+      let alreadyBusy = self.busySince != 0
+      os_unfair_lock_unlock(self.lock)
+      // Only the START of a stretch is stamped; restamping each iteration would reset
+      // the clock and no hang would ever be long enough to see.
+      guard !alreadyBusy else { return }
+      // Read here, on main, while the loop is in it: it is what separates "froze while
+      // you were dragging" from "froze on its own".
+      let mode = (CFRunLoopCopyCurrentMode(CFRunLoopGetMain())?.rawValue as String?) ?? "?"
+      os_unfair_lock_lock(self.lock)
+      if self.busySince == 0 {
+        self.busySince = now
+        self.busyMode = mode
       }
       os_unfair_lock_unlock(self.lock)
     }
-    guard let observer else { return }
-    CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
-    self.observer = observer
+    // Late order: the loop counts as idle only once CoreAnimation has committed, so a
+    // slow commit is measured as busy instead of falling between the two observers.
+    let idleActivities: CFRunLoopActivity = [.beforeWaiting, .exit]
+    let idle = CFRunLoopObserverCreateWithHandler(
+      kCFAllocatorDefault, idleActivities.rawValue, true, Self.idleObserverOrder
+    ) { [weak self] _, _ in
+      guard let self else { return }
+      os_unfair_lock_lock(self.lock)
+      self.busySince = 0
+      self.busyMode = ""
+      os_unfair_lock_unlock(self.lock)
+    }
+    guard let busy, let idle else { return }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), busy, .commonModes)
+    CFRunLoopAddObserver(CFRunLoopGetMain(), idle, .commonModes)
+    busyObserver = busy
+    idleObserver = idle
 
     let timer = DispatchSource.makeTimerSource(queue: queue)
     timer.schedule(deadline: .now() + sampleInterval, repeating: sampleInterval)
@@ -167,9 +123,8 @@ final class VibeMainThreadWatchdog {
       hangThreshold * 1000)
   }
 
-  /// One-line summary of the worst hang seen so far. Called when the app leaves the
-  /// foreground, so a session that felt bad leaves a number behind even if nobody was
-  /// reading the stream at the time.
+  /// One-line summary of the worst hang seen so far, so a session that felt bad leaves
+  /// a number behind even if nobody was reading the stream at the time.
   func reportSessionSummary(reason: String) {
     os_unfair_lock_lock(lock)
     let worst = worstHang
@@ -184,16 +139,8 @@ final class VibeMainThreadWatchdog {
     let sampledAt = CACurrentMediaTime()
     let sinceLastSample = lastSampleAt > 0 ? sampledAt - lastSampleAt : 0
     lastSampleAt = sampledAt
-    // The process was frozen, not the main thread. When iOS suspends an app it stops
-    // every thread, including this one; on resume the run loop's `busySince` stamp is
-    // still whatever it was before the freeze, and subtracting it from now measures how
-    // long the app was in the reader's pocket. The first device export reported
-    // `main thread blocked 61.54s` on exactly this — a minute in which nothing was
-    // wrong, filed at the same severity as a real half-second stall.
-    //
-    // The tell is that this watcher missed its own 50ms tick: a genuine main-thread hang
-    // never delays it, because it is not on the main thread. Discard the stale stamp and
-    // start the next window clean rather than reporting a hang that did not happen.
+    // A missed watcher tick means iOS suspended the whole process, so the busy stamp is
+    // stale pocket time rather than a hang. Discard it and start the next window clean.
     if sinceLastSample > Self.suspensionSampleGap {
       os_unfair_lock_lock(lock)
       busySince = 0
@@ -214,9 +161,9 @@ final class VibeMainThreadWatchdog {
       if reportedHangStart > 0 {
         let duration = CACurrentMediaTime() - reportedHangStart
         NSLog("[MainHang] RECOVERED after %.2fs", duration)
-        // Durable copy. `NSLog` exists only while a console is attached, and a hang
-        // that a user notices is by definition one that happened while they were just
-        // using the app. This is the version that is still there afterwards.
+        let fields = Self.runFields(reportedHangState)
+        // Durable copy: `NSLog` exists only while a console is attached, and the stack
+        // is compacted so a diagnostics export keeps the rest of the session.
         VibeLog.warning(
           "main thread blocked \(String(format: "%.2f", duration))s during \(reportedHangActivity)",
           category: "mainhang",
@@ -224,15 +171,15 @@ final class VibeMainThreadWatchdog {
             "seconds": String(format: "%.2f", duration),
             "mode": reportedHangMode,
             "during": reportedHangActivity,
-            // Trimmed to the app's own frames: a diagnostics export is a ring buffer,
-            // and 40 lines of UIKit trampolines per hang would push out the rest of the
-            // session. The full trace is in `NSLog` for anyone with a console attached.
+            "run": fields.run,
+            "cpu": fields.cpu,
             "stack": Self.compactStack(reportedHangStack),
           ])
         VibeOpenTrace.shared.noteHang(
           seconds: duration, mode: reportedHangMode, activity: reportedHangActivity)
         reportedHangStart = 0
         lastOngoingReport = 0
+        reportedHangState = nil
         reportedHangStack = []
       }
       return
@@ -247,41 +194,36 @@ final class VibeMainThreadWatchdog {
     os_unfair_lock_unlock(lock)
 
     if reportedHangStart != since {
-      // A new hang. Announce it as soon as it crosses the threshold rather than
-      // waiting to see how long it runs — a hang that ends in a kill never gets to
-      // report its own length.
+      // A new hang. Announce it as soon as it crosses the threshold rather than waiting
+      // to see how long it runs; a hang that ends in a kill never reports its length.
       reportedHangStart = since
       lastOngoingReport = now
-      // The run-loop mode says *when* ("under the finger" vs "not"), never *what*.
-      // `VibeOpenTrace` keeps the main thread's last recorded stage, which is as close
-      // to a stack as this can get without suspending the thread to walk it.
       reportedHangMode = mode.isEmpty ? "?" : mode
       reportedHangActivity = VibeOpenTrace.shared.activity
-      // The stack is the whole point. `activity` reports `idle` for every stall that is
-      // not a chat open, which is most of them, and a run-loop mode cannot distinguish
-      // a wallpaper rasterize from a synchronous SQLite read. Sampled while the thread
-      // is stopped, so it is the real frame list and not a guess.
+      // Run-state first (read-only), then the stack, which briefly stops the thread.
+      reportedHangState = Self.mainThreadRunState(mainThreadPort)
       reportedHangStack = captureMainThreadStack()
+      let fields = Self.runFields(reportedHangState)
       NSLog(
-        "[MainHang] BLOCKED %.2fs mode=%@ during=%@ — main thread is not advancing; no touches or frames are being serviced",
-        blockedFor, reportedHangMode, reportedHangActivity)
-      for line in reportedHangStack { NSLog("[MainHang]   %@", line) }
+        "[MainHang] BLOCKED %.2fs mode=%@ during=%@ run=%@ cpu=%@ — main thread is not advancing; no touches or frames are being serviced",
+        blockedFor, reportedHangMode, reportedHangActivity, fields.run, fields.cpu)
+      Self.logFrames(reportedHangStack)
       return
     }
 
     if now - lastOngoingReport >= ongoingReportInterval {
       lastOngoingReport = now
-      // Re-sample. One stack says where it started; a second one a second later says
-      // whether it is stuck in one call or grinding through a loop of them, which are
-      // different bugs with different fixes.
+      // Re-sample: one stack says where it started, a later one says whether it is
+      // stuck in one call or grinding through a loop of them.
+      let ongoingState = Self.mainThreadRunState(mainThreadPort)
       let ongoing = captureMainThreadStack()
+      let fields = Self.runFields(ongoingState)
       NSLog(
-        "[MainHang] STILL BLOCKED %.2fs mode=%@ during=%@", blockedFor,
-        mode.isEmpty ? "?" : mode, reportedHangActivity)
-      for line in ongoing { NSLog("[MainHang]   %@", line) }
-      // A hang long enough to repeat is one the reader definitely felt, and it may end
-      // in a kill that never reaches the recovery path. Put this one in the durable log
-      // where a diagnostics export will still find it.
+        "[MainHang] STILL BLOCKED %.2fs mode=%@ during=%@ run=%@ cpu=%@", blockedFor,
+        mode.isEmpty ? "?" : mode, reportedHangActivity, fields.run, fields.cpu)
+      Self.logFrames(ongoing)
+      // A hang long enough to repeat may end in a kill that never reaches the recovery
+      // path, so this one goes to the durable log as well.
       VibeLog.warning(
         "main thread STILL blocked \(String(format: "%.2f", blockedFor))s during \(reportedHangActivity)",
         category: "mainhang",
@@ -289,49 +231,88 @@ final class VibeMainThreadWatchdog {
           "seconds": String(format: "%.2f", blockedFor),
           "mode": mode.isEmpty ? "?" : mode,
           "during": reportedHangActivity,
+          "run": fields.run,
+          "cpu": fields.cpu,
           "stack": Self.compactStack(ongoing),
         ])
     }
   }
 
-  // MARK: Sampling the main thread's stack
-  //
-  // Everything above can say a hang happened, how long it lasted and which run-loop mode
-  // it was in. None of it can say *what ran*. `VibeOpenTrace.activity` was the stand-in,
-  // and it answers `idle` for anything that is not a chat open — so a device export
-  // showing four 0.4-1.0s blocks on the home screen attributed all four to "idle" and
-  // named nothing. This closes that: stop the main thread, read its registers, walk its
-  // frame pointers, resume, and symbolicate afterwards.
-  //
-  // The ordering is not incidental. While the main thread is suspended it may be holding
-  // the malloc lock or the dyld lock, so nothing between `thread_suspend` and
-  // `thread_resume` is allowed to allocate or to call `dladdr` — that is a self-inflicted
-  // deadlock in the one component that exists to diagnose freezes. Only register reads
-  // and `vm_read_overwrite` happen inside the window; symbolication happens after.
-  //
-  // Frames are read with `vm_read_overwrite` rather than dereferenced. A corrupt or
-  // mid-prologue frame pointer is normal — the leaf frame is often half-built — and a
-  // raw load on a bad address crashes the app. `vm_read_overwrite` returns a failure
-  // code instead, which ends the walk with a short stack rather than a crash report.
+  private static func logFrames(_ frames: [StackFrame]) {
+    for (index, frame) in frames.enumerated() {
+      NSLog("[MainHang]   %@", frame.line(index: index))
+    }
+  }
 
-  /// Max frames to walk. Deep enough to cross UIKit and reach app code, bounded so a
-  /// cyclic frame chain cannot spin.
+  // MARK: Probing the main thread's run-state
+
+  /// Read-only snapshot from `thread_info`: whether main is burning CPU or parked.
+  private struct MainThreadRunState {
+    let run: String
+    let cpuUsage: Int32
+    let idle: Bool
+
+    /// `cpu_usage` on the `TH_USAGE_SCALE` scale, as `thread_info` reports it.
+    var cpu: String { "\(cpuUsage)/\(TH_USAGE_SCALE)" }
+  }
+
+  private static func runFields(_ state: MainThreadRunState?) -> (run: String, cpu: String) {
+    (state?.run ?? "?", state?.cpu ?? "?")
+  }
+
+  /// Ported from `AppUIStallWatchdog.mainThreadStateDescription`. Does not suspend the
+  /// thread or walk its stack, so it is safe at any time from the watchdog queue.
+  private static func mainThreadRunState(_ machThread: mach_port_t) -> MainThreadRunState? {
+    guard machThread != 0 else { return nil }
+    var info = thread_basic_info()
+    // THREAD_BASIC_INFO_COUNT is a compound C macro that does not import into Swift;
+    // derive the integer-word count from the struct size instead.
+    var count = mach_msg_type_number_t(
+      MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+        thread_info(machThread, thread_flavor_t(THREAD_BASIC_INFO), rebound, &count)
+      }
+    }
+    guard kr == KERN_SUCCESS else { return nil }
+    let runLabel: String
+    switch Int32(info.run_state) {
+    case TH_STATE_RUNNING: runLabel = "running"
+    case TH_STATE_STOPPED: runLabel = "stopped"
+    case TH_STATE_WAITING: runLabel = "waiting"
+    case TH_STATE_UNINTERRUPTIBLE: runLabel = "uninterruptible"
+    case TH_STATE_HALTED: runLabel = "halted"
+    default: runLabel = "unknown(\(info.run_state))"
+    }
+    let idle = (Int32(info.flags) & TH_FLAGS_IDLE) != 0
+    return MainThreadRunState(run: runLabel, cpuUsage: info.cpu_usage, idle: idle)
+  }
+
+  // MARK: Sampling the main thread's stack
+
+  // While the main thread is suspended it may hold the malloc or dyld lock, so nothing
+  // between `thread_suspend` and `thread_resume` may allocate or call `dladdr`.
+
+  /// Deep enough to cross UIKit into app code; bounded so a cyclic frame chain cannot spin.
   private static let maxStackDepth = 48
 
-  private func captureMainThreadStack() -> [String] {
+  private func captureMainThreadStack() -> [StackFrame] {
     #if arch(arm64)
       let thread = mainThreadPort
-      guard thread != MACH_PORT_NULL else { return ["<no main-thread port>"] }
+      guard thread != MACH_PORT_NULL else { return [.note("<no main-thread port>")] }
 
+      // Everything the suspended window touches is allocated here, before the suspend.
       var addresses: [UInt64] = []
-
-      guard thread_suspend(thread) == KERN_SUCCESS else {
-        return ["<thread_suspend failed>"]
-      }
-
+      addresses.reserveCapacity(Self.maxStackDepth + 2)
       var state = arm_thread_state64_t()
       var count = mach_msg_type_number_t(
         MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+      var slot = (next: UInt64(0), returnAddress: UInt64(0))
+
+      guard thread_suspend(thread) == KERN_SUCCESS else {
+        return [.note("<thread_suspend failed>")]
+      }
+
       let readState = withUnsafeMutablePointer(to: &state) { statePointer in
         statePointer.withMemoryRebound(to: natural_t.self, capacity: Int(count)) { rebound in
           thread_get_state(thread, thread_state_flavor_t(ARM_THREAD_STATE64), rebound, &count)
@@ -339,16 +320,14 @@ final class VibeMainThreadWatchdog {
       }
 
       if readState == KERN_SUCCESS {
-        addresses.append(Self.stripPointerAuth(state.__pc))
-        // Frame records are { saved FP, saved LR } at [fp], [fp+8].
+        // Frame records are { saved FP, saved LR } at [fp], [fp+8]. Only register reads,
+        // `vm_read_overwrite` and appends into reserved capacity happen in this window.
         var frame = state.__fp
         var previousFrame: UInt64 = 0
-        var slot = (next: UInt64(0), returnAddress: UInt64(0))
         while addresses.count < Self.maxStackDepth {
           let framePointer = Self.stripPointerAuth(frame)
-          // Stacks grow down, so each caller's record sits at a HIGHER address than the
-          // callee's. A next-frame that is not strictly above the current one is either
-          // garbage or a cycle; either way the walk is over.
+          // Stacks grow down, so a next frame not strictly above the current one is
+          // either garbage or a cycle; either way the walk is over.
           guard framePointer != 0, framePointer % 8 == 0, framePointer > previousFrame else {
             break
           }
@@ -363,23 +342,29 @@ final class VibeMainThreadWatchdog {
 
       thread_resume(thread)
 
-      guard readState == KERN_SUCCESS else { return ["<thread_get_state failed>"] }
-      return Self.symbolicate(addresses)
+      guard readState == KERN_SUCCESS else { return [.note("<thread_get_state failed>")] }
+      // A frameless leaf has not saved LR to its frame yet, so its caller exists only
+      // in the register; add it unless the walk already found the same address.
+      var ordered: [UInt64] = [Self.stripPointerAuth(state.__pc)]
+      let linkRegister = Self.stripPointerAuth(state.__lr)
+      if linkRegister != 0, linkRegister != addresses.first {
+        ordered.append(linkRegister)
+      }
+      ordered.append(contentsOf: addresses)
+      return Self.symbolicate(ordered)
     #else
-      return ["<stack sampling requires arm64>"]
+      return [.note("<stack sampling requires arm64>")]
     #endif
   }
 
-  /// arm64e signs return addresses and frame pointers. The app itself builds arm64, but
-  /// a frame that passed through a system library can still carry signature bits in the
-  /// high half. Masking to the 47-bit user-space range is what makes those addresses
-  /// resolvable; it is a no-op for unsigned ones.
+  /// arm64e signs return addresses and frame pointers in the high bits. Masking to the
+  /// user-space range makes them resolvable and is a no-op for unsigned ones.
   private static func stripPointerAuth(_ value: UInt64) -> UInt64 {
     value & 0x0000_7FFF_FFFF_FFFF
   }
 
-  /// Reads one frame record out of the suspended thread's stack. Returns false rather
-  /// than trapping when the address is not mapped.
+  /// Reads one frame record out of the suspended thread's stack with `vm_read_overwrite`,
+  /// which returns a failure code instead of trapping on an unmapped address.
   private static func readMemory(
     at address: UInt64, into slot: inout (next: UInt64, returnAddress: UInt64)
   ) -> Bool {
@@ -396,28 +381,77 @@ final class VibeMainThreadWatchdog {
     return result == KERN_SUCCESS && readSize == wanted
   }
 
-  private static func symbolicate(_ addresses: [UInt64]) -> [String] {
-    addresses.enumerated().map { index, address in
-      var info = Dl_info()
-      guard let pointer = UnsafeRawPointer(bitPattern: UInt(address)),
-        dladdr(pointer, &info) != 0
-      else {
-        return String(format: "%2d  ??? 0x%016llx", index, address)
+  // MARK: Symbolication
+
+  /// One symbolicated frame. `image` is empty for a marker such as a failed suspend.
+  private struct StackFrame {
+    let address: UInt64
+    let image: String
+    let symbol: String?
+    /// From the symbol start, or from the image base when there is no symbol.
+    let offset: UInt64
+    let isApp: Bool
+
+    static func note(_ text: String) -> StackFrame {
+      StackFrame(address: 0, image: "", symbol: text, offset: 0, isApp: false)
+    }
+
+    /// `image symbol+off`, with app frames marked `*`. Feeds the durable log.
+    var compact: String {
+      guard !image.isEmpty else { return symbol ?? "?" }
+      let location: String
+      if let symbol {
+        location = "\(symbol)+\(offset)"
+      } else if image == "???" {
+        location = String(format: "0x%llx", address)
+      } else {
+        location = String(format: "?+0x%llx", offset)
       }
-      let image =
-        info.dli_fname.map { (String(cString: $0) as NSString).lastPathComponent } ?? "???"
-      guard let nameCString = info.dli_sname else {
+      return (isApp ? "*" : "") + image + " " + location
+    }
+
+    /// The verbose console form: index, image, symbol and offset.
+    func line(index: Int) -> String {
+      guard !image.isEmpty else { return String(format: "%2d  %@", index, symbol ?? "?") }
+      guard let symbol else {
         return String(format: "%2d  %@ 0x%016llx", index, image, address)
       }
-      let symbol = demangle(String(cString: nameCString))
-      let offset = address &- UInt64(UInt(bitPattern: info.dli_saddr))
       return String(format: "%2d  %@ %@ + %llu", index, image, symbol, offset)
     }
   }
 
-  /// `swift_demangle` lives in the Swift runtime the app is already linked against, but
-  /// it is not exposed to Swift source. Resolving it by name keeps the pretty names
-  /// without a bridging header, and falls back to the mangled form if it ever moves.
+  /// Frames from inside the app bundle (the executable and any embedded framework) are
+  /// the ones a reader can act on, so they are marked in the compact stack.
+  private static let appBundlePath = Bundle.main.bundlePath
+  private static let appExecutableName = Bundle.main.executableURL?.lastPathComponent ?? ""
+
+  private static func symbolicate(_ addresses: [UInt64]) -> [StackFrame] {
+    addresses.map { address in
+      var info = Dl_info()
+      guard let pointer = UnsafeRawPointer(bitPattern: UInt(address)),
+        dladdr(pointer, &info) != 0
+      else {
+        return StackFrame(address: address, image: "???", symbol: nil, offset: 0, isApp: false)
+      }
+      let path = info.dli_fname.map { String(cString: $0) } ?? ""
+      let image = path.isEmpty ? "???" : (path as NSString).lastPathComponent
+      let isApp =
+        !path.isEmpty
+        && (path.hasPrefix(appBundlePath)
+          || (!appExecutableName.isEmpty && image == appExecutableName))
+      guard let nameCString = info.dli_sname else {
+        let base = UInt64(UInt(bitPattern: info.dli_fbase))
+        return StackFrame(
+          address: address, image: image, symbol: nil, offset: address &- base, isApp: isApp)
+      }
+      let symbol = demangle(String(cString: nameCString))
+      let offset = address &- UInt64(UInt(bitPattern: info.dli_saddr))
+      return StackFrame(address: address, image: image, symbol: symbol, offset: offset, isApp: isApp)
+    }
+  }
+
+  /// `swift_demangle` lives in the Swift runtime but is not exposed to Swift source.
+  /// Resolving it by name keeps pretty names without a bridging header.
   private typealias SwiftDemangleFunction = @convention(c) (
     UnsafePointer<CChar>?, Int, UnsafeMutablePointer<CChar>?, UnsafeMutablePointer<Int>?, UInt32
   ) -> UnsafeMutablePointer<CChar>?
@@ -438,20 +472,49 @@ final class VibeMainThreadWatchdog {
     return String(cString: output)
   }
 
-  /// The version that goes in the durable log: this app's own frames, innermost first,
-  /// capped. Everything the reader needs to name the culprit, in one field.
-  private static func compactStack(_ frames: [String]) -> String {
+  // MARK: Compact stack
+
+  /// Innermost entries kept in the durable log, after identical runs are collapsed.
+  private static let compactFrameLimit = 12
+  /// Upper bound on the compact stack's length; the tail is replaced by "…" past it.
+  private static let compactCharacterBudget = 900
+  /// Demangled Swift names can run long; clip each frame so twelve fit the budget.
+  private static let compactFrameCharacterLimit = 140
+
+  /// The version that goes in the durable log: innermost frames first, every image kept,
+  /// app frames marked `*`, runs of one frame shown once with a count.
+  private static func compactStack(_ frames: [StackFrame]) -> String {
     guard !frames.isEmpty else { return "<none>" }
-    let appFrames = frames.filter { $0.contains("Vibe") }
-    let chosen = appFrames.isEmpty ? Array(frames.prefix(4)) : Array(appFrames.prefix(6))
-    return
-      chosen
-      .map { line in
-        // Drop the leading index and the image name — the frames are already in order
-        // and they are all the same image once filtered.
-        line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).last
-          .map(String.init) ?? line
+    // Collapse runs first so a recursion reads as one entry with a count.
+    var entries: [(text: String, count: Int)] = []
+    for frame in frames {
+      let text = clip(frame.compact, to: compactFrameCharacterLimit)
+      if let last = entries.last, last.text == text {
+        entries[entries.count - 1].count += 1
+      } else {
+        entries.append((text: text, count: 1))
       }
-      .joined(separator: " ← ")
+    }
+    var output = ""
+    var emitted = 0
+    for entry in entries.prefix(compactFrameLimit) {
+      let piece = entry.count > 1 ? "\(entry.text) ×\(entry.count)" : entry.text
+      let separator = output.isEmpty ? "" : " ← "
+      guard output.count + separator.count + piece.count + 2 <= compactCharacterBudget else {
+        break
+      }
+      output += separator + piece
+      emitted += 1
+    }
+    if output.isEmpty {
+      output = clip(entries[0].text, to: compactCharacterBudget - 2)
+      emitted = 1
+    }
+    if emitted < entries.count { output += " …" }
+    return output
+  }
+
+  private static func clip(_ text: String, to limit: Int) -> String {
+    text.count <= limit ? text : String(text.prefix(max(limit - 1, 0))) + "…"
   }
 }

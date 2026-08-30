@@ -4,157 +4,158 @@ import AVFoundation
 import PhotosUI
 
 import CoreImage.CIFilterBuiltins
-import CryptoKit
 
 private struct ChatEncryptionVerifyView: View {
   let chatId: String
   let peerUserId: String
+  let peerName: String
   private let pendingSignatureKey: Data?
-  private let pendingTransportKey: Data?
-  private let safetyNumber: String?
   private let safetyCode: String?
-  private let safetyQR: UIImage?
-  private let transportFingerprint: String?
+  private let keyArtHue: CGFloat
+  private let keyArtLevels: [Int]?
   private let identityChanged: Bool
 
   @Environment(\.dismiss) private var dismiss
   @State private var acceptanceFailed = false
 
-  init(chatId: String, peerUserId: String) {
+  init(chatId: String, peerUserId: String, peerName: String) {
     self.chatId = chatId
     self.peerUserId = peerUserId
+    self.peerName = peerName
     // A joiner claims no KeyPackage, so it can reach this screen holding no pin
     // at all; the group's own tree is the missing half.
     VibeSecureSessions.shared.ensurePeerPinned(chatId: chatId, peerUserId: peerUserId)
-    let pending = VibeSecureTrust.pendingChanges(userId: peerUserId)
-    pendingSignatureKey = pending.signatureKey
-    pendingTransportKey = pending.transportKey
-    identityChanged = pending.signatureKey != nil || pending.transportKey != nil
+    let pending = VibeSecureTrust.pendingChange(userId: peerUserId)
+    pendingSignatureKey = pending
+    identityChanged = pending != nil
 
-    let signatureKey = pending.signatureKey ?? VibeSecureTrust.pinnedKey(userId: peerUserId)
-    let resolvedSafetyNumber: String?
-    let resolvedCode: String?
+    let signatureKey = pending ?? VibeSecureTrust.pinnedKey(userId: peerUserId)
     if let mine = VibeSecureSessions.shared.mySignatureKey(), let signatureKey {
-      resolvedSafetyNumber = VibeSecureTrust.safetyNumber(myKey: mine, peerKey: signatureKey)
-      resolvedCode = VibeSecureTrust.safetyCodeHex(myKey: mine, peerKey: signatureKey)
+      safetyCode = VibeSecureTrust.safetyCodeHex(myKey: mine, peerKey: signatureKey)
     } else {
-      resolvedSafetyNumber = nil
-      resolvedCode = nil
+      safetyCode = nil
     }
-    safetyNumber = resolvedSafetyNumber
-    safetyCode = resolvedCode
-    safetyQR = resolvedCode.flatMap { Self.qrImage(for: $0) }
-
-    let transportKey =
-      pending.transportKey ?? VibeSecureTrust.pinnedTransportKey(userId: peerUserId)
-    if pending.transportKey != nil || resolvedSafetyNumber == nil {
-      transportFingerprint = Self.fingerprint(transportKey)
-    } else {
-      transportFingerprint = nil
-    }
+    let art = safetyCode.flatMap { Self.keyArtGrid(for: $0) }
+    keyArtHue = art?.hue ?? 0
+    keyArtLevels = art?.levels
   }
 
   var body: some View {
-    ScrollView {
-        VStack(alignment: .leading, spacing: 24) {
-          if identityChanged {
-            Label("Encryption identity changed", systemImage: "exclamationmark.triangle.fill")
-              .font(.headline)
-              .foregroundStyle(.orange)
-          }
-
-          Text(instructions)
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-
-          if let safetyCode {
-            encryptionKey(
-              title: pendingSignatureKey == nil ? "Encryption key" : "New encryption key",
-              code: safetyCode,
-              readAloud: safetyNumber
-            )
-          }
-
-          if let transportFingerprint {
-            verificationValue(
-              title: pendingTransportKey == nil
-                ? "Transport fingerprint" : "New transport fingerprint",
-              value: transportFingerprint,
-              font: .system(.footnote, design: .monospaced)
-            )
-          }
-
-          if safetyNumber == nil && transportFingerprint == nil {
-            Text("Encryption identity is not available yet.")
-              .foregroundStyle(.secondary)
-          }
-
-          if identityChanged {
-            Button("Accept Identity Change") {
-              let accepted = VibeSecureTrust.acceptPendingChanges(
-                userId: peerUserId,
-                expectedSignatureKey: pendingSignatureKey,
-                expectedTransportKey: pendingTransportKey
-              )
-              if accepted {
-                dismiss()
-              } else {
-                acceptanceFailed = true
-              }
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-
-            if acceptanceFailed {
-              Text("The identity changed again. Close this screen and verify the latest code.")
-                .font(.footnote)
-                .foregroundStyle(.red)
-            }
-          }
-        }
-        .padding(24)
+    VStack(spacing: 0) {
+      if identityChanged {
+        Label("Encryption identity changed", systemImage: "exclamationmark.triangle.fill")
+          .font(.subheadline.weight(.semibold))
+          .foregroundStyle(.orange)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 20)
+          .padding(.vertical, 12)
+          .background(Color.orange.opacity(0.12))
       }
+      qrSurface
+      keyBar
+    }
+    .background(Color(.systemBackground))
     .navigationTitle("Verify Encryption")
     .navigationBarTitleDisplayMode(.inline)
   }
 
-  private var instructions: String {
-    if identityChanged {
-      return "Compare the replacement code with your contact over a trusted channel before accepting it."
+  /// The code itself is the surface — no card, no light backing. It fills the
+  /// band and sits dead centre so the art reads as the screen, not an image on one.
+  private var qrSurface: some View {
+    ZStack {
+      if let keyArtLevels {
+        let side = UIScreen.main.bounds.width
+        let palette = Self.keyArtPalette(hue: keyArtHue).map { Color($0) }
+        // Drawn as vector tiles, not an upscaled bitmap — no resampling blur.
+        Canvas { context, size in
+          let tile = size.width / CGFloat(Self.keyArtDimension)
+          for index in keyArtLevels.indices {
+            let row = CGFloat(index / Self.keyArtDimension)
+            let column = CGFloat(index % Self.keyArtDimension)
+            let rect = CGRect(
+              x: column * tile,
+              y: row * tile,
+              width: tile + 0.5,
+              height: tile + 0.5
+            )
+            context.fill(Path(rect), with: .color(palette[keyArtLevels[index]]))
+          }
+        }
+        .frame(width: side, height: side)
+        .accessibilityHidden(true)
+      } else {
+        Text("Encryption identity is not available yet.")
+          .font(.subheadline)
+          .foregroundStyle(.secondary)
+          .padding(32)
+      }
     }
-    return "Compare this code with your contact over a trusted channel. Matching codes verify the encryption identity."
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// Three views of one fingerprint: QR to scan, hex block to compare on
-  /// screen, digits to read aloud on a call.
-  private func encryptionKey(title: String, code: String, readAloud: String?) -> some View {
-    VStack(alignment: .leading, spacing: 16) {
-      Text(title)
-        .font(.headline)
-      if let safetyQR {
-        Image(uiImage: safetyQR)
-          .interpolation(.none)
-          .resizable()
-          .scaledToFit()
-          .frame(maxWidth: 232)
-          .padding(18)
-          .background(Color.white, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-          .frame(maxWidth: .infinity, alignment: .center)
-          .accessibilityHidden(true)
+  private var keyBar: some View {
+    VStack(spacing: 14) {
+      if let safetyCode {
+        keyBlock(safetyCode)
       }
-      keyBlock(code)
-      if let readAloud {
-        VStack(alignment: .leading, spacing: 4) {
-          Text("Read aloud")
-            .font(.caption)
-            .foregroundStyle(.tertiary)
-          Text(readAloud)
-            .font(.system(.footnote, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .textSelection(.enabled)
+      Text(peerCaption)
+        .font(.footnote.weight(.medium))
+        .multilineTextAlignment(.center)
+        .foregroundStyle(.primary)
+      Text(assurance)
+        .font(.footnote)
+        .multilineTextAlignment(.center)
+        .foregroundStyle(.secondary)
+      if identityChanged {
+        Button("Accept Identity Change") {
+          let accepted = VibeSecureTrust.acceptPendingChange(
+            userId: peerUserId,
+            expectedSignatureKey: pendingSignatureKey
+          )
+          if accepted {
+            dismiss()
+          } else {
+            acceptanceFailed = true
+          }
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.orange)
+
+        if acceptanceFailed {
+          Text("The identity changed again. Close this screen and verify the latest code.")
+            .font(.footnote)
+            .foregroundStyle(.red)
         }
       }
     }
+    .frame(maxWidth: .infinity)
+    .padding(.horizontal, 20)
+    .padding(.top, 18)
+    .padding(.bottom, 28)
+  }
+
+  private var peerCaption: String {
+    let name = peerName.trimmingCharacters(in: .whitespacesAndNewlines)
+    return "This key belongs to your chat with \(name.isEmpty ? peerUserId : name)"
+  }
+
+  /// Code + seeded art for the profile row preview — same source as this sheet.
+  static func rowIdentity(peerUserId: String) -> (code: String, art: UIImage)? {
+    let signatureKey = VibeSecureTrust.pendingChange(userId: peerUserId)
+      ?? VibeSecureTrust.pinnedKey(userId: peerUserId)
+    guard let mine = VibeSecureSessions.shared.mySignatureKey(), let signatureKey else { return nil }
+    let code = VibeSecureTrust.safetyCodeHex(myKey: mine, peerKey: signatureKey)
+    // Rendered at exact device pixels so the row preview never resamples.
+    let side = (26 * UIScreen.main.scale).rounded()
+    guard !code.isEmpty, let art = keyArtImage(for: code, side: side) else { return nil }
+    return (code, art)
+  }
+
+  private var assurance: String {
+    if identityChanged {
+      return "This contact reinstalled or changed device. Until this new code matches theirs, treat the chat as unverified."
+    }
+    return "If your contact sees this exact code, no one else can read this chat — not Vibe, not the server."
   }
 
   /// Four rows of four groups — the shape an eye scans for a mismatch.
@@ -167,7 +168,7 @@ private struct ChatEncryptionVerifyView: View {
     let rows = stride(from: 0, to: groups.count, by: 4).map { offset in
       Array(groups[offset..<min(offset + 4, groups.count)])
     }
-    return VStack(alignment: .leading, spacing: 8) {
+    return VStack(spacing: 8) {
       ForEach(rows.indices, id: \.self) { row in
         HStack(spacing: 14) {
           ForEach(rows[row].indices, id: \.self) { column in
@@ -182,65 +183,64 @@ private struct ChatEncryptionVerifyView: View {
     .textSelection(.enabled)
   }
 
-  /// Encodes the code, not the key pair — the code is already order-independent,
-  /// so both sides render byte-identical images.
-  private static func qrImage(for code: String) -> UIImage? {
-    guard !code.isEmpty else { return nil }
-    let filter = CIFilter.qrCodeGenerator()
-    filter.message = Data(code.utf8)
-    filter.correctionLevel = "M"
-    guard let output = filter.outputImage else { return nil }
-    let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
-    let extent = scaled.extent
+  /// Soft tonal tiles in one seeded tint; both peers derive the same image from
+  /// the order-independent safety code.
+  fileprivate static let keyArtDimension = 12
 
-    // Modules opaque, quiet zone clear, so the ramp paints only the code.
-    let mask = scaled.applyingFilter("CIColorInvert").applyingFilter("CIMaskToAlpha")
-
-    let (near, far) = tint(for: code)
-    let ramp = CIFilter.linearGradient()
-    ramp.point0 = CGPoint(x: extent.minX, y: extent.maxY)
-    ramp.point1 = CGPoint(x: extent.maxX, y: extent.minY)
-    ramp.color0 = CIColor(color: near)
-    ramp.color1 = CIColor(color: far)
-    guard let gradient = ramp.outputImage?.cropped(to: extent) else { return nil }
-
-    let tinted = gradient.applyingFilter(
-      "CISourceInCompositing", parameters: [kCIInputBackgroundImageKey: mask])
-    guard let cg = CIContext().createCGImage(tinted, from: extent) else { return nil }
-    return UIImage(cgImage: cg)
+  /// One tint per identity, in tonal steps off white — no second hue anywhere.
+  fileprivate static func keyArtPalette(hue: CGFloat) -> [UIColor] {
+    [
+      UIColor(hue: hue, saturation: 0.04, brightness: 1.00, alpha: 1),
+      UIColor(hue: hue, saturation: 0.11, brightness: 0.96, alpha: 1),
+      UIColor(hue: hue, saturation: 0.20, brightness: 0.89, alpha: 1),
+      UIColor(hue: hue, saturation: 0.32, brightness: 0.80, alpha: 1),
+    ]
   }
 
-  /// Hue seeded by the code, clamped to the blue–magenta band: each pair looks
-  /// distinct, and every result stays dark enough on white to still scan.
-  private static func tint(for code: String) -> (UIColor, UIColor) {
-    let seed = code.unicodeScalars.reduce(UInt32(0)) { ($0 &* 31) &+ $1.value }
-    let hue = 0.55 + (CGFloat(seed % 1000) / 1000) * 0.33
-    return (
-      UIColor(hue: hue, saturation: 0.90, brightness: 0.44, alpha: 1),
-      UIColor(hue: hue + 0.06, saturation: 0.95, brightness: 0.30, alpha: 1)
-    )
-  }
+  fileprivate static func keyArtGrid(for code: String) -> (hue: CGFloat, levels: [Int])? {
+    let bytes = Array(code.utf8)
+    guard !bytes.isEmpty else { return nil }
 
-  private func verificationValue(title: String, value: String, font: Font) -> some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Text(title)
-        .font(.headline)
-      Text(value)
-        .font(font)
-        .tracking(1.2)
-        .textSelection(.enabled)
+    var seed: UInt32 = 2_166_136_261
+    for byte in bytes {
+      seed = (seed ^ UInt32(byte)) &* 16_777_619
     }
+    var state = seed
+    let count = keyArtDimension * keyArtDimension
+    var levels: [Int] = []
+    levels.reserveCapacity(count)
+    for index in 0..<count {
+      state = state &* 1_664_525 &+ 1_013_904_223 &+ UInt32(bytes[index % bytes.count])
+      levels.append(Int((state >> 30) & 3))
+    }
+    return (CGFloat(seed % 360) / 360, levels)
   }
 
-  private static func fingerprint(_ key: Data?) -> String? {
-    guard let key else { return nil }
-    let hex = SHA256.hash(data: key).map { String(format: "%02X", $0) }.joined()
-    return stride(from: 0, to: hex.count, by: 4).map { offset in
-      let start = hex.index(hex.startIndex, offsetBy: offset)
-      let end = hex.index(start, offsetBy: min(4, hex.count - offset))
-      return String(hex[start..<end])
-    }.joined(separator: " ")
+  /// Bitmap for the small profile-row preview; the full screen draws vectors instead.
+  private static func keyArtImage(for code: String, side: CGFloat) -> UIImage? {
+    guard let grid = keyArtGrid(for: code) else { return nil }
+    let palette = keyArtPalette(hue: grid.hue)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(
+      size: CGSize(width: side, height: side),
+      format: format
+    )
+    let tile = side / CGFloat(keyArtDimension)
+
+    return renderer.image { context in
+      for index in grid.levels.indices {
+        let row = CGFloat(index / keyArtDimension)
+        let column = CGFloat(index % keyArtDimension)
+        context.cgContext.setFillColor(palette[grid.levels[index]].cgColor)
+        context.cgContext.fill(
+          CGRect(x: column * tile, y: row * tile, width: tile + 0.5, height: tile + 0.5)
+        )
+      }
+    }.withRenderingMode(.alwaysOriginal)
   }
+
 }
 
 enum ChatProfileAppearanceMode: String, CaseIterable, Identifiable {
@@ -1002,6 +1002,28 @@ private struct ChatProfileRow {
   let musicArtist: String?
   let musicSource: String?
 
+  /// Prefers bytes already on disk; the remote URL is ciphertext for sealed media,
+  /// so a grid pointed at it decodes nothing and stays on the blur preview.
+  var resolvedMediaURL: String? {
+    if let local = localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !local.isEmpty {
+      let path = URL(string: local).flatMap { $0.isFileURL ? $0.path : nil } ?? local
+      if FileManager.default.fileExists(atPath: path) {
+        return URL(fileURLWithPath: path).absoluteString
+      }
+    }
+    guard let remote = mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !remote.isEmpty
+    else { return mediaUrl }
+    let vault = VibeMediaVault.shared
+    for key in [
+      VibeMediaVault.identity(rawURL: remote, mediaKey: mediaKey),
+      VibeMediaVault.identity(rawURL: remote, mediaKey: nil),
+    ] {
+      if let url = vault.cachedURL(for: key, kind: .image) { return url.absoluteString }
+      if let url = vault.cachedURL(for: key, kind: .document) { return url.absoluteString }
+    }
+    return remote
+  }
+
   static func parse(_ raw: [String: Any]) -> ChatProfileRow? {
     let message = raw["message"] as? [String: Any] ?? raw
     let metadata = message["metadata"] as? [String: Any]
@@ -1434,6 +1456,7 @@ private struct ChatProfileSwiftUIContentItem: Identifiable {
   let payload: [String: Any]
   var kind: String = ""
   var mediaURL: String? = nil
+  var mediaKey: String? = nil
   var thumbnailBase64: String? = nil
   var isVideo: Bool = false
   var duration: CGFloat? = nil
@@ -1598,6 +1621,10 @@ private struct ChatProfileSwiftUIRootView: View {
   @Namespace private var morphNamespace
   @StateObject private var navCoordinator = ChatProfileNavigationCoordinator()
   @State private var localScrollOffset: CGFloat = 0
+  /// A pinned shared-content tab hides the info rows; the identity stays visible.
+  @State private var sharedContentFocused = false
+  @State private var sharedContentFocusArmed = false
+  @State private var sharedContentMeasuredHeight: CGFloat = 0
   @State private var lastReportedScrollOffset: CGFloat = -1
   @State private var newChatTrigger = false
 
@@ -1639,6 +1666,8 @@ private struct ChatProfileSwiftUIRootView: View {
   @State private var workModeLocal = AgentBridgeSelectionStore.selectedWorkMode()
   @State private var showAddMembersSheet = false
   @State private var showUsernameQR = false
+  @State private var encryptionRowArt: UIImage?
+  @State private var encryptionRowCode = ""
   @State private var inlineEditDestination: ChatProfileSwiftUIDestination?
   /// Live channel profile from `GET /api/channel/:id` (admins, settings, actions).
   @State private var channelProfileCache: ChannelProfileService.Profile?
@@ -1841,7 +1870,7 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// Fixed layout height reserved in the scroll content for the identity cluster.
   private var identityClusterLayoutHeight: CGFloat {
-    Self.pixelRound(28 + 3 + 15 + 10 + 52 + 6)
+    Self.pixelRound(28 + 3 + 15 + 10 + 62 + 6)
   }
 
   /// Natural top under the *collapsed* circle only — never driven by hero spacer.
@@ -1853,7 +1882,19 @@ private struct ChatProfileSwiftUIRootView: View {
   /// Pin stop under the status bar / island — keep tight so sticky name sits
   /// near the nav, not mid-screen.
   private var identityStickyTopY: CGFloat {
-    Self.pixelRound(max(6, safeAreaTopInset - 30))
+    Self.pixelRound(max(0, safeAreaTopInset - 46))
+  }
+
+  private var sharedContentPinnedTopY: CGFloat {
+    Self.pixelRound(identityStickyTopY + 44)
+  }
+
+  /// Scroll range the tab jump needs, parked after the last row instead of as a
+  /// gap above it.
+  private var sharedContentTailSpace: CGFloat {
+    guard sharedContentMeasuredHeight > 0 else { return 0 }
+    let needed = UIScreen.main.bounds.height - sharedContentPinnedTopY
+    return max(0, needed - sharedContentMeasuredHeight - 140)
   }
 
   /// How far the cluster can travel before it clamps (no jump — pure clamp).
@@ -1912,11 +1953,27 @@ private struct ChatProfileSwiftUIRootView: View {
 
   /// Soft avatar scroll blend — continuous via identityPinProgress (no cliff).
   /// Scale + fade only; the join blur is a theme material overlay, not in the image.
+  /// Dissolve window once the hero is down: the circle fades out over a short
+  /// scroll rather than riding the page up.
+  private var avatarDissolveProgress: CGFloat {
+    guard effectiveHeroProgress < 0.02 else { return 0 }
+    return min(1, max(0, postHeroCollapseScrollOffset / Self.avatarDissolveTravel))
+  }
+
+  /// Counter-offset that holds the circle in place — it drifts 10pt, not the full scroll.
+  private var avatarDissolveHold: CGFloat {
+    guard effectiveHeroProgress < 0.02 else { return 0 }
+    let travelled = min(max(0, postHeroCollapseScrollOffset), Self.avatarDissolveTravel)
+    return travelled - 10 * avatarDissolveProgress
+  }
+
+  private static let avatarDissolveTravel: CGFloat = 56
+
   private var scrollAvatarScale: CGFloat {
-    1 - 0.08 * identityPinProgress
+    1 - 0.34 * avatarDissolveProgress
   }
   private var scrollAvatarOpacity: CGFloat {
-    1 - 0.34 * identityPinProgress
+    1 - avatarDissolveProgress
   }
 
   // Slightly underdamped ("soft") springs — a touch of settle instead of a hard,
@@ -1957,29 +2014,29 @@ private struct ChatProfileSwiftUIRootView: View {
                   )
                   .frame(height: identityClusterLayoutHeight * (1 - p), alignment: .top)
                   .offset(y: identityRideOffset(p))
-                  .zIndex(1)
+                  .zIndex(20)
                 }
               }
               .offset(y: liveHeroCollapseOffset)
               .padding(.bottom, liveHeroCollapseOffset)
-              .zIndex(2)
+              .zIndex(20)
 
               VStack(spacing: 18) {
                 profileInfoSection
-                if bridgeProvider.isEmpty && !isGroupOrChannel {
-                  encryptionSection
-                }
+                  .opacity(sharedContentFocused ? 0 : 1)
                 if !bridgeProvider.isEmpty {
                   defaultViewSection
                 }
                 if !isGroupOrChannel {
-                  sharedContentSection
-                  if bridgeProvider.isEmpty {
-                    contactActionsSection
+                  VStack(spacing: 0) {
+                    sharedContentScrollAnchor
+                    sharedContentSection
                   }
                 }
                 if !isGroupOrChannel {
                   dangerSection
+                  Color.clear
+                    .frame(height: sharedContentTailSpace)
                 }
               }
               .padding(.horizontal, 22)
@@ -1995,6 +2052,12 @@ private struct ChatProfileSwiftUIRootView: View {
           // whole 0.28s spring while we've frozen the state var at 0, and it all
           // catches up in one jump when the freeze lifts (the "noisy soft jump").
           .onAppear { profileScrollProxy = scrollProxy }
+          .onChange(of: localScrollOffset) { _, offset in
+            guard sharedContentFocused, sharedContentFocusArmed,
+              offset < identityTravelDistance
+            else { return }
+            withAnimation(.easeOut(duration: 0.18)) { sharedContentFocused = false }
+          }
         }
         .ignoresSafeArea(edges: .top)
         .background(Color.clear)
@@ -2084,6 +2147,7 @@ private struct ChatProfileSwiftUIRootView: View {
         selectedRepoNameLocal = selectedRepositoryName
       }
       autoExpandHeroIfPhoto()
+      loadEncryptionRowArt()
     }
     .onChange(of: canExpandHero) { _, _ in autoExpandHeroIfPhoto() }
     .onChange(of: selectedRepositoryName) { _, next in
@@ -2296,7 +2360,7 @@ private struct ChatProfileSwiftUIRootView: View {
           }
         }
       )
-      .blur(radius: 3.5 * identityPinProgress)
+      .blur(radius: 9 * avatarDissolveProgress)
       .frame(
         width: g.size.width,
         height: spacer + stretch,
@@ -2308,7 +2372,7 @@ private struct ChatProfileSwiftUIRootView: View {
             .opacity(Double(p))
         }
       }
-      .offset(y: -pull)
+      .offset(y: -pull + avatarDissolveHold)
       .frame(width: g.size.width, height: spacer + stretch, alignment: .top)
       .contentShape(Rectangle())
       .onTapGesture(count: 2) {
@@ -2402,7 +2466,7 @@ private struct ChatProfileSwiftUIRootView: View {
       let trimmed = username.trimmingCharacters(in: .whitespacesAndNewlines)
       return trimmed.isEmpty ? nil : trimmed
     }()
-    let titleFont = UIFont.systemFont(ofSize: 28, weight: .bold)
+    let titleFont = UIFont.systemFont(ofSize: 28, weight: .medium)
     let subtitleFont = UIFont.systemFont(ofSize: 13, weight: .light)
     let titleWidth = min(
       contentWidth,
@@ -2414,11 +2478,9 @@ private struct ChatProfileSwiftUIRootView: View {
     } ?? 0
     let titleCenterOffset = max(0, (contentWidth - titleWidth) * 0.5)
     let subtitleCenterOffset = max(0, (contentWidth - subtitleWidth) * 0.5)
-    // Height-collapse in Y, exactly like Home's search bar (layoutSearchBar):
-    // height shrinks 1:1 with scroll (top pinned, bottom recedes), content
-    // fades fast in the last 30% of that shrink.
+    // Match Home: height clips 1:1 while only inner content fades over the final 30%.
     let actionCollapseY = collapsedIdentityStickyOffset
-    let actionRowBand: CGFloat = 52
+    let actionRowBand: CGFloat = 62
     let actionBarHeight = max(0, actionRowBand - min(actionCollapseY, actionRowBand))
     let actionContentRatio = actionRowBand > 0 ? actionBarHeight / actionRowBand : 0
     let actionVisibility = max(0, min(1, (actionContentRatio - 0.7) / 0.3))
@@ -2427,7 +2489,7 @@ private struct ChatProfileSwiftUIRootView: View {
       VStack(alignment: .leading, spacing: 3) {
         HStack(spacing: 8) {
           Text(profileName)
-            .font(.system(size: 28, weight: .bold))
+            .font(.system(size: 28, weight: .medium))
             .foregroundStyle(identityPrimary)
             .lineLimit(1)
             .minimumScaleFactor(0.72)
@@ -2448,11 +2510,11 @@ private struct ChatProfileSwiftUIRootView: View {
           .offset(x: subtitleCenterOffset * (1 - p))
       }
       .frame(maxWidth: .infinity, alignment: .leading)
+      .scaleEffect(identityClusterScale, anchor: .top)
       .padding(.horizontal, inset)
 
       // Bottom recedes as height shrinks — same clip Home uses on its bar.
-      actionRow
-        .opacity(Double(actionVisibility))
+      actionRow(contentAlpha: actionVisibility, chipHeight: actionBarHeight)
         .frame(height: actionBarHeight, alignment: .top)
         .clipped()
         .allowsHitTesting(actionBarHeight > actionRowBand * 0.5)
@@ -2492,13 +2554,14 @@ private struct ChatProfileSwiftUIRootView: View {
   /// ONE always-mounted pill row — identical geometry collapsed or expanded, so the
   /// morph never reshapes it and there is never a second copy.
   @ViewBuilder
-  private var actionRow: some View {
+  private func actionRow(contentAlpha: CGFloat, chipHeight: CGFloat) -> some View {
     let chipInk = isDark ? Color.white.opacity(0.84) : Color.black.opacity(0.76)
-    let rowWidth = UIScreen.main.bounds.width - 16
+    // Same left/right edge as the section cards below (body pads 22 a side).
+    let rowWidth = UIScreen.main.bounds.width - 44
     let count: CGFloat = isGroupOrChannel ? 3 : 4
     let spacing: CGFloat = 8
-    let hPad: CGFloat = 10
-    let chipH: CGFloat = 52
+    let hPad: CGFloat = 0
+    let chipH = max(0, chipHeight)
     let chipW = (rowWidth - 2 * hPad - (count - 1) * spacing) / count
 
     HStack(spacing: spacing) {
@@ -2510,7 +2573,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("muteToggle") }
 
         ChatProfileSwiftUIActionButton(
@@ -2520,7 +2584,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("search") }
 
         Menu {
@@ -2552,6 +2617,7 @@ private struct ChatProfileSwiftUIRootView: View {
               .font(.system(size: 10, weight: .medium))
           }
           .foregroundStyle(chipInk)
+          .opacity(Double(contentAlpha))
           .frame(width: chipW, height: chipH)
           .background {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -2572,7 +2638,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("audio") }
 
         ChatProfileSwiftUIActionButton(
@@ -2582,7 +2649,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("video") }
 
         ChatProfileSwiftUIActionButton(
@@ -2592,7 +2660,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("search") }
 
         ChatProfileSwiftUIActionButton(
@@ -2602,7 +2671,8 @@ private struct ChatProfileSwiftUIRootView: View {
           ink: chipInk,
           isDark: isDark,
           chipWidth: chipW,
-          chipHeight: chipH
+          chipHeight: chipH,
+          contentAlpha: contentAlpha
         ) { onAction("muteToggle") }
       }
     }
@@ -2610,20 +2680,47 @@ private struct ChatProfileSwiftUIRootView: View {
     .frame(width: rowWidth, height: chipH)
   }
 
-  private var encryptionSection: some View {
-    ChatProfileSwiftUISection(fill: rowFill) {
-      Button { navCoordinator.path.append(.encryption) } label: {
-        ChatProfileSwiftUIRow(
-          title: "Verify encryption",
-          subtitle: "Safety number and identity key",
-          trailingSystemImage: "lock.shield",
-          showsChevron: true,
-          separatorColor: separatorColor,
-          isLast: true
-        )
+  /// Last row of the identity card: the key itself plus its seeded art, no lock glyph.
+  private var encryptionKeyRow: some View {
+    Button { navCoordinator.path.append(.encryption) } label: {
+      HStack(spacing: 10) {
+        Text("Encryption key")
+          .font(.system(size: 17, weight: .regular))
+          .foregroundStyle(.primary)
+        Spacer(minLength: 12)
+        if let encryptionRowArt {
+          Image(uiImage: encryptionRowArt)
+            .resizable()
+            .interpolation(.none)
+            .frame(width: 26, height: 26)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        } else {
+          Color.clear
+            .frame(width: 26, height: 26)
+        }
+        Image(systemName: "chevron.right")
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(.tertiary)
       }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.leading, 22)
+      .padding(.trailing, 18)
+      .padding(.vertical, 11)
+      .contentShape(Rectangle())
     }
+    .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+  }
+
+
+
+  /// Art render is a CIFilter plus a gradient pass — done once, never in a body getter.
+  private func loadEncryptionRowArt() {
+    guard encryptionRowArt == nil, bridgeProvider.isEmpty, !isGroupOrChannel else { return }
+    guard let peer = ChatEngine.shared.peerUserId(chatId: chatId), !peer.isEmpty else { return }
+    VibeSecureSessions.shared.ensurePeerPinned(chatId: chatId, peerUserId: peer)
+    guard let identity = ChatEncryptionVerifyView.rowIdentity(peerUserId: peer) else { return }
+    encryptionRowCode = identity.code
+    encryptionRowArt = identity.art
   }
 
   @ViewBuilder
@@ -2660,7 +2757,8 @@ private struct ChatProfileSwiftUIRootView: View {
         groupPermissionsSection
         groupConfigurationSection
       }
-    } else if !username.isEmpty || !note.isEmpty {
+    } else {
+      // One room: identity, the contact actions and the encryption key share a card.
       ChatProfileSwiftUISection(fill: rowFill) {
         if !username.isEmpty {
           HStack(spacing: 0) {
@@ -2696,12 +2794,10 @@ private struct ChatProfileSwiftUIRootView: View {
             .accessibilityLabel("Show username QR code")
           }
           .overlay(alignment: .bottom) {
-            if !note.isEmpty {
-              Rectangle()
-                .fill(separatorColor)
-                .frame(height: 1 / UIScreen.main.scale)
-                .padding(.leading, 22)
-            }
+            Rectangle()
+              .fill(separatorColor)
+              .frame(height: 1 / UIScreen.main.scale)
+              .padding(.leading, 22)
           }
         }
 
@@ -2712,9 +2808,31 @@ private struct ChatProfileSwiftUIRootView: View {
             trailingSystemImage: nil,
             showsChevron: false,
             separatorColor: separatorColor,
-            isLast: true
+            isLast: false
           )
         }
+
+        Button { onAction("addContact") } label: {
+          ChatProfileSwiftUIRow(
+            title: "Add to Contacts",
+            titleColor: themeAccent,
+            separatorColor: separatorColor,
+            isLast: false
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+        Button(role: .destructive) { onAction("block") } label: {
+          ChatProfileSwiftUIRow(
+            title: "Block User",
+            titleColor: .red,
+            separatorColor: separatorColor,
+            isLast: false
+          )
+        }
+        .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+
+        encryptionKeyRow
       }
     }
   }
@@ -3506,6 +3624,8 @@ private struct ChatProfileSwiftUIRootView: View {
   @ViewBuilder
   private var sharedContentSection: some View {
     if !tabSummaries.isEmpty {
+      let viewportHeight = max(1, UIScreen.main.bounds.height)
+      let pinnedTop = sharedContentPinnedTopY
       ChatProfileSwiftUIExpandedContentView(
         title: "Shared Content",
         items: [],
@@ -3515,34 +3635,49 @@ private struct ChatProfileSwiftUIRootView: View {
         tabs: tabSummaries,
         tabItems: tabItems,
         initialTab: tabSummaries.first?.tab,
-        embedded: true
+        embedded: true,
+        onTabPressed: {
+          let headerAnchor = UnitPoint(
+            x: 0.5,
+            y: min(0.35, pinnedTop / viewportHeight)
+          )
+          sharedContentFocusArmed = false
+          withAnimation(.easeOut(duration: 0.34)) {
+            sharedContentFocused = true
+            profileScrollProxy?.scrollTo(Self.sharedContentAnchorID, anchor: headerAnchor)
+          }
+          // Re-align after the shrinking identity cluster changes content geometry.
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) {
+            withAnimation(.easeOut(duration: 0.18)) {
+              profileScrollProxy?.scrollTo(Self.sharedContentAnchorID, anchor: headerAnchor)
+            }
+            sharedContentFocusArmed = true
+          }
+        }
       )
+      .background {
+        GeometryReader { geo in
+          Color.clear
+            .onAppear { sharedContentMeasuredHeight = geo.size.height }
+            .onChange(of: geo.size.height) { _, next in
+              sharedContentMeasuredHeight = next
+            }
+        }
+      }
     }
   }
 
-  private var contactActionsSection: some View {
-    ChatProfileSwiftUISection(fill: rowFill) {
-      Button { onAction("addContact") } label: {
-        ChatProfileSwiftUIRow(
-          title: "Add to Contacts",
-          titleColor: themeAccent,
-          separatorColor: separatorColor,
-          isLast: false
-        )
-      }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
+  static let sharedContentAnchorID = "profileSharedContentTop"
 
-      Button(role: .destructive) { onAction("block") } label: {
-        ChatProfileSwiftUIRow(
-          title: "Block User",
-          titleColor: .red,
-          separatorColor: separatorColor,
-          isLast: true
-        )
-      }
-      .buttonStyle(ChatProfileSwiftUIRowButtonStyle())
-    }
+  /// Marker the tab strip scrolls to: tall enough to leave the header clear,
+  /// then negated so it costs no layout space.
+  private var sharedContentScrollAnchor: some View {
+    Color.clear
+      .frame(height: 1)
+      .id(Self.sharedContentAnchorID)
   }
+
+  // Contact actions moved into profileInfoSection — identity and its actions are one card.
 
   private var emergencySection: some View {
     ChatProfileSwiftUISection(fill: rowFill) {
@@ -3677,7 +3812,19 @@ private struct ChatProfileSwiftUIRootView: View {
       )
     case .encryption:
       if let peerUserId = ChatEngine.shared.peerUserId(chatId: chatId), !peerUserId.isEmpty {
-        ChatEncryptionVerifyView(chatId: chatId, peerUserId: peerUserId)
+        ChatEncryptionVerifyView(
+          chatId: chatId,
+          peerUserId: peerUserId,
+          peerName: {
+            let name = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, name.caseInsensitiveCompare(peerUserId) != .orderedSame {
+              return name
+            }
+            let handle = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !handle.isEmpty else { return "" }
+            return handle.hasPrefix("@") ? handle : "@\(handle)"
+          }()
+        )
       } else {
         Text("Encryption identity is not available yet.")
           .foregroundStyle(.secondary)
@@ -5569,6 +5716,7 @@ private struct ChatProfileSwiftUIMaterialBackground: UIViewRepresentable {
   }
 }
 
+
 private struct ChatProfileSwiftUISection<Content: View>: View {
   @Environment(\.colorScheme) private var colorScheme
 
@@ -5678,6 +5826,7 @@ private struct ChatProfileSwiftUIActionButton: View {
   var isDark: Bool = true
   var chipWidth: CGFloat = 56
   var chipHeight: CGFloat = 70
+  var contentAlpha: CGFloat = 1
   let action: () -> Void
 
   @State private var iconAnimating = false
@@ -5716,6 +5865,7 @@ private struct ChatProfileSwiftUIActionButton: View {
           .minimumScaleFactor(0.75)
       }
       .foregroundStyle(ink)
+      .opacity(Double(contentAlpha))
       .frame(width: chipWidth, height: chipHeight)
       .background {
         let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
@@ -5743,6 +5893,8 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
   var tabItems: [ChatProfileTab: [ChatProfileSwiftUIContentItem]] = [:]
   var initialTab: ChatProfileTab? = nil
   var embedded = false
+  /// Fires after a tab switch so the host can bring the strip up near the header.
+  var onTabPressed: (() -> Void)? = nil
 
   @State private var selectedTab: ChatProfileTab?
 
@@ -5818,34 +5970,53 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
     }
   }
 
+  /// Sized by its chips — only a strip too wide for the row falls back to scrolling.
   private var tabStrip: some View {
-    ScrollView(.horizontal, showsIndicators: false) {
-      HStack(spacing: 4) {
-        ForEach(tabs) { summary in
-          Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-              selectedTab = summary.tab
-            }
-          } label: {
-            Text(summary.title)
-              .font(.system(size: 15, weight: activeTab == summary.tab ? .semibold : .medium))
-              .foregroundStyle(activeTab == summary.tab ? Color.primary : Color.secondary)
-              .padding(.horizontal, 16)
-              .frame(height: 38)
-              .background {
-                if activeTab == summary.tab {
-                  Capsule().fill(Color.primary.opacity(0.13))
-                }
-              }
-              .contentShape(Capsule())
-          }
-          .buttonStyle(.plain)
+    HStack(spacing: 0) {
+      Spacer(minLength: 0)
+      ViewThatFits(in: .horizontal) {
+        tabChips
+        ScrollView(.horizontal, showsIndicators: false) { tabChips }
+      }
+      .background {
+        if #available(iOS 26.0, *) {
+          Capsule(style: .continuous)
+            .fill(.clear)
+            .glassEffect(.regular.interactive(true), in: .capsule)
+        } else {
+          Capsule(style: .continuous)
+            .fill(.bar)
         }
       }
-      .padding(3)
+      Spacer(minLength: 0)
     }
-    .background(.ultraThinMaterial, in: Capsule())
-    .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: 1))
+  }
+
+  private var tabChips: some View {
+    HStack(spacing: 4) {
+      ForEach(tabs) { summary in
+        Button {
+          withAnimation(.easeInOut(duration: 0.18)) {
+            selectedTab = summary.tab
+          }
+          onTabPressed?()
+        } label: {
+          Text(summary.title)
+            .font(.system(size: 15, weight: activeTab == summary.tab ? .semibold : .medium))
+            .foregroundStyle(activeTab == summary.tab ? Color.primary : Color.secondary)
+            .padding(.horizontal, 16)
+            .frame(height: 38)
+            .background {
+              if activeTab == summary.tab {
+                Capsule().fill(Color.primary.opacity(0.13))
+              }
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+      }
+    }
+    .padding(3)
   }
 
   @ViewBuilder
@@ -5878,6 +6049,7 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
           urlString: item.mediaURL,
           isVideo: item.isVideo,
           thumbnailBase64: item.thumbnailBase64,
+          mediaKey: item.mediaKey,
           onPressed: { sourceView in
             var payload = item.payload
             payload["sourceView"] = sourceView
@@ -6031,6 +6203,7 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
     let urlString: String?
     let isVideo: Bool
     let thumbnailBase64: String?
+    var mediaKey: String? = nil
     var onPressed: ((UIView) -> Void)? = nil
 
     final class Coordinator: NSObject {
@@ -6065,7 +6238,8 @@ private struct ChatProfileSwiftUIExpandedContentView: View {
       view.configure(
         urlString: urlString,
         isVideo: isVideo,
-        thumbnailBase64: thumbnailBase64
+        thumbnailBase64: thumbnailBase64,
+        mediaKey: mediaKey
       )
       view.applyTheme(
         placeholderTintColor: ChatListAppearance.current.timeColorThem,
@@ -8188,8 +8362,19 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
     ]
     if let explicitURL, !explicitURL.isEmpty {
       payload["url"] = explicitURL
-    } else if let mediaUrl = row.mediaUrl, !mediaUrl.isEmpty {
-      payload["url"] = mediaUrl
+    } else if let mediaURL = row.resolvedMediaURL, !mediaURL.isEmpty {
+      payload["url"] = mediaURL
+    }
+    if let mediaKey = row.mediaKey, !mediaKey.isEmpty {
+      payload["mediaKey"] = mediaKey
+    }
+    let displayName = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let senderName =
+      !displayName.isEmpty && !Self.looksLikeUUID(displayName)
+        && displayName.caseInsensitiveCompare("User") != .orderedSame
+      ? displayName : resolvedIdentifierRawValue()
+    if !senderName.isEmpty {
+      payload["senderName"] = senderName
     }
 
     return ChatProfileSwiftUIContentItem(
@@ -8199,7 +8384,8 @@ final class ChatProfileMainView: UIView, UITableViewDataSource, UITableViewDeleg
       systemImage: swiftUIContentSystemImage(for: tab, row: row),
       payload: payload,
       kind: row.type,
-      mediaURL: row.mediaUrl,
+      mediaURL: row.resolvedMediaURL,
+      mediaKey: row.mediaKey,
       thumbnailBase64: row.thumbnailBase64,
       isVideo: row.type == "video",
       duration: row.duration,

@@ -111,6 +111,17 @@ defmodule Vibe.Cache do
     {:noreply, state}
   end
 
+  # Same relay for the join cache (agent-shadow resolution).
+  def handle_info({:chat_join_cache_invalidate, chat_id}, state) do
+    Vibe.Chat.JoinCache.invalidate_local(chat_id)
+    {:noreply, state}
+  end
+
+  def handle_info(:chat_join_cache_invalidate_all, state) do
+    Vibe.Chat.JoinCache.invalidate_all_local()
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # Owned by this GenServer so a crash-restart recreates it; safe to call from

@@ -255,7 +255,13 @@ private struct ChatEmojiSection {
 
 private final class ChatGifRecentCell: UICollectionViewCell {
     static let reuseIdentifier = "ChatGifRecentCell"
+    static let imageCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 60
+        return cache
+    }()
     let imageView = UIImageView()
+    var representedKey: String?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -276,6 +282,7 @@ private final class ChatGifRecentCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         imageView.image = nil
+        representedKey = nil
     }
 }
 
@@ -353,11 +360,10 @@ final class ChatGifPanelView: UIView {
     private(set) var isSearchExpanded = false
 
     /// Space above floating tab bar for scroll content (tighter — closer to content).
-    private let bottomFloatingInset: CGFloat = 40
-    private let bottomFloatingControlHeight: CGFloat = 34
+    private let bottomFloatingControlHeight: CGFloat = 38
     /// Not from the safe area — that reserves the home-indicator strip inside the chrome
     /// and pushes it out of view.
-    private let bottomFloatingEdgeInset: CGFloat = 12
+    private let bottomFloatingEdgeInset: CGFloat = 14
     private let topControlsSpacing: CGFloat = 4
     private let searchHeight: CGFloat = 30
     /// Chips ride inside the search capsule, so they clear its rounded ends.
@@ -409,10 +415,11 @@ final class ChatGifPanelView: UIView {
     /// GIFs the user has sent, above the browse grid. Local files, no network.
     private lazy var recentsCollectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
-        layout.scrollDirection = .horizontal
+        layout.scrollDirection = .vertical
         layout.minimumLineSpacing = 6
+        layout.minimumInteritemSpacing = 6
         layout.itemSize = CGSize(width: 96, height: 96)
-        layout.sectionInset = UIEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        layout.sectionInset = UIEdgeInsets(top: 6, left: 10, bottom: 0, right: 10)
         let view = UICollectionView(frame: .zero, collectionViewLayout: layout)
         view.backgroundColor = .clear
         view.showsHorizontalScrollIndicator = false
@@ -528,6 +535,13 @@ final class ChatGifPanelView: UIView {
 
         if visible {
             reloadRecentGifs()
+            // Recents open first when there are any — one category among the others now,
+            // just with no network behind it.
+            headerView.transform = .identity
+            headerView.alpha = 1
+            if selectedGifFilterID == nil, !recentGifEntries.isEmpty {
+                selectedGifFilterID = Self.recentFilterID
+            }
             applyActiveTabState(animated: false)
             if activeTab != .emoji {
                 installEmbeddedPickerIfNeeded(for: activeTab)
@@ -757,8 +771,10 @@ final class ChatGifPanelView: UIView {
         // Compact floating chrome flush to panel bottom (small edge inset only).
         NSLayoutConstraint.activate([
             bottomTabBarContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
+            // Safe area, not the raw edge: pinned to the bottom the capsule and the close
+            // button sat in the home-indicator strip, which is what made them hard to hit.
             bottomTabBarContainer.bottomAnchor.constraint(
-                equalTo: bottomAnchor, constant: -bottomFloatingEdgeInset),
+                equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -bottomFloatingEdgeInset),
             bottomTabBarContainer.heightAnchor.constraint(
                 equalToConstant: bottomFloatingControlHeight),
 
@@ -808,14 +824,21 @@ final class ChatGifPanelView: UIView {
     }
 
     private func updateContentInsets() {
+        // Clearance for the floating chrome. It rides the safe area now, so the reserve
+        // has to follow it instead of being one constant.
+        let floatingClearance =
+            safeAreaInsets.bottom + bottomFloatingControlHeight + bottomFloatingEdgeInset + 8
         applyContentInsets(
             UIEdgeInsets(
-                top: headerZoneHeight, left: 0, bottom: bottomFloatingInset, right: 0),
+                top: headerZoneHeight, left: 0, bottom: floatingClearance, right: 0),
             to: emojiCollectionView)
+        applyContentInsets(
+            UIEdgeInsets(top: 0, left: 0, bottom: floatingClearance, right: 0),
+            to: recentsCollectionView)
         // Giphy pages carry their top padding in the container frame; only the floating
         // toolbar still needs reserving, and that has to be re-asserted after every load.
         #if canImport(GiphyUISDK)
-            let gridInsets = UIEdgeInsets(top: 0, left: 0, bottom: bottomFloatingInset, right: 0)
+            let gridInsets = UIEdgeInsets(top: 0, left: 0, bottom: floatingClearance, right: 0)
             for picker in embeddedPickers.values {
                 guard let sv = findScrollView(in: picker.view) else { continue }
                 applyContentInsets(gridInsets, to: sv)
@@ -871,23 +894,30 @@ final class ChatGifPanelView: UIView {
         pagesScrollView.frame = bounds
         pagesScrollView.contentSize = CGSize(width: w * 3, height: h)
 
-        // Recents ride just under the header on the GIF page. Pinned to the panel, not to a
-        // page, so the grid below can own its whole container.
-        if recentsCollectionView.superview !== self {
-            addSubview(recentsCollectionView)
-        }
-        let recentsHeight: CGFloat = 96
-        let showRecents =
-            activeTab == .gifs && !recentGifEntries.isEmpty && currentSearchText().isEmpty
-        recentsCollectionView.isHidden = !showRecents
-        recentsCollectionView.frame = CGRect(
-            x: 0, y: headerZoneHeight, width: w, height: showRecents ? recentsHeight : 0)
-
         // Page 0 GIFs · 1 Stickers · 2 Emoji. The two Giphy pages START below the chrome
         // rather than reserving it with `contentInset` — the SDK rewrites its grid's insets
         // on every content load, which is what let rows slide under the search row.
-        let gifTop = headerZoneHeight + (showRecents ? recentsHeight : 0)
+        let gifTop = headerZoneHeight
         mediaContainerView.frame = CGRect(x: 0, y: gifTop, width: w, height: max(0, h - gifTop))
+
+        // Recents fill the GIF page like any browse grid. As a page subview they travel with
+        // the pager instead of floating over the sticker page mid-swipe.
+        if recentsCollectionView.superview !== mediaContainerView {
+            recentsCollectionView.removeFromSuperview()
+            mediaContainerView.addSubview(recentsCollectionView)
+        }
+        recentsCollectionView.isHidden = !isRecentGifCategorySelected
+        recentsCollectionView.frame = mediaContainerView.bounds
+        if let recentsLayout = recentsCollectionView.collectionViewLayout
+            as? UICollectionViewFlowLayout
+        {
+            let columns = max(3, floor((w - 20) / 118))
+            let side = floor((w - 20 - 6 * (columns - 1)) / columns)
+            if side > 0, abs(recentsLayout.itemSize.width - side) > 0.5 {
+                recentsLayout.itemSize = CGSize(width: side, height: side)
+                recentsLayout.invalidateLayout()
+            }
+        }
         stickerContainerView.frame = CGRect(
             x: w, y: headerZoneHeight, width: w, height: max(0, h - headerZoneHeight))
         emojiCollectionView.frame = CGRect(x: w * 2, y: 0, width: w, height: h)
@@ -920,7 +950,7 @@ final class ChatGifPanelView: UIView {
         CATransaction.commit()
 
         // Z-order: content → recents → bottom mask → floating controls → header
-        bringSubviewToFront(recentsCollectionView)
+        mediaContainerView.bringSubviewToFront(recentsCollectionView)
         bringSubviewToFront(bottomMaskView)
         bringSubviewToFront(bottomTabBarContainer)
         bringSubviewToFront(closeChromeView)
@@ -1008,7 +1038,7 @@ final class ChatGifPanelView: UIView {
             // Both pages are Giphy searches, so they take the same chips.
             let activeFilterID =
                 activeTab == .stickers ? selectedStickerFilterID : selectedGifFilterID
-            for (index, filter) in gifQuickFilters.enumerated() {
+            for (index, filter) in stripFilters.enumerated() {
                 let button = makeStripButton(
                     symbolName: filter.symbolName,
                     selected: activeFilterID == filter.id,
@@ -1119,6 +1149,12 @@ final class ChatGifPanelView: UIView {
             rebuildEmojiSections()
         case .gifs, .stickers:
             stateLabel.isHidden = true
+            if isRecentGifCategorySelected {
+                hideGifGrids()
+                loadingSpinner.stopAnimating()
+                loadingView.isHidden = true
+                break
+            }
             if panelVisible {
                 installEmbeddedPickerIfNeeded(for: activeTab)
             }
@@ -1173,8 +1209,9 @@ final class ChatGifPanelView: UIView {
     }
 
     @objc private func gifQuickFilterTapped(_ sender: UIButton) {
-        guard sender.tag >= 0, sender.tag < gifQuickFilters.count else { return }
-        let filter = gifQuickFilters[sender.tag]
+        let filters = stripFilters
+        guard sender.tag >= 0, sender.tag < filters.count else { return }
+        let filter = filters[sender.tag]
         selectionFeedback.selectionChanged()
         if activeTab == .stickers {
             selectedStickerFilterID = filter.id
@@ -1183,7 +1220,7 @@ final class ChatGifPanelView: UIView {
         }
         updateCurrentSearchText(filter.query, synchronizeField: true, clearPresetSelection: false)
         searchField.resignFirstResponder()
-        rebuildTopStripButtons()
+        applyActiveTabState(animated: false)
     }
 
     @objc private func emojiCategoryTapped(_ sender: UIButton) {
@@ -1253,6 +1290,12 @@ final class ChatGifPanelView: UIView {
     }
 
     private func setSearchExpanded(_ expanded: Bool) {
+        if expanded, headerView.transform != .identity {
+            UIView.animate(withDuration: 0.2) {
+                self.headerView.transform = .identity
+                self.headerView.alpha = 1
+            }
+        }
         guard expanded != isSearchExpanded else { return }
         isSearchExpanded = expanded
         // Chips yield to the field while typing; height stays fixed (host lifts the bar).
@@ -1553,6 +1596,9 @@ final class ChatGifPanelView: UIView {
             for (otherKey, picker) in embeddedPickers where otherKey.tab == key.tab {
                 picker.view.isHidden = otherKey != key
             }
+            // Recents own the GIF page while their chip is picked; a grid load must not
+            // paint through the gaps behind them.
+            if isRecentGifCategorySelected { hideGifGrids() }
             gridRecency.removeAll { $0 == key }
             gridRecency.append(key)
         }
@@ -1714,6 +1760,31 @@ final class ChatGifPanelView: UIView {
         .init(id: "neutral", symbolName: "minus.circle", query: "neutral"),
     ]
 
+    static let recentFilterID = "recent"
+
+    /// Recents are one chip in the same strip as the browse categories — they used to be a
+    /// separate 96pt row pinned under the header with the grid squeezed below it.
+    private var stripFilters: [ChatGifQuickFilter] {
+        guard activeTab == .gifs, !recentGifEntries.isEmpty else { return gifQuickFilters }
+        return [
+            .init(id: Self.recentFilterID, symbolName: "clock.arrow.circlepath", query: "")
+        ] + gifQuickFilters
+    }
+
+    /// True while the recents category owns the GIF page. No Giphy grid backs it.
+    var isRecentGifCategorySelected: Bool {
+        activeTab == .gifs && selectedGifFilterID == Self.recentFilterID
+            && !recentGifEntries.isEmpty
+    }
+
+    func hideGifGrids() {
+        #if canImport(GiphyUISDK)
+            for (key, picker) in embeddedPickers where key.tab == .gifs {
+                picker.view.isHidden = true
+            }
+        #endif
+    }
+
     /// Was a hand-typed list of ~90; now the full set.
     private lazy var emojiCatalog: [ChatEmojiEntry] = ChatEmojiCatalogBuilder.build()
 }
@@ -1802,8 +1873,23 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
             else { return UICollectionViewCell() }
             let entry = recentGifEntries[indexPath.item]
             let url = ChatGifRecentsStore.shared.fileURL(for: entry)
-            if let data = try? Data(contentsOf: url) {
-                cell.imageView.image = chatMediaDecodedImagePublic(from: data, shouldAnimate: true)
+            let key = url.path as NSString
+            if let cached = ChatGifRecentCell.imageCache.object(forKey: key) {
+                cell.imageView.image = cached
+                return cell
+            }
+            // A grid of recents is a dozen visible GIFs; reading and decoding them on main
+            // is the hang this cache and hop exist to avoid.
+            cell.representedKey = key as String
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let data = try? Data(contentsOf: url),
+                    let image = chatMediaDecodedImagePublic(from: data, shouldAnimate: true)
+                else { return }
+                DispatchQueue.main.async {
+                    ChatGifRecentCell.imageCache.setObject(image, forKey: key)
+                    guard cell.representedKey == key as String else { return }
+                    cell.imageView.image = image
+                }
             }
             return cell
         }
@@ -1918,7 +2004,20 @@ extension ChatGifPanelView: UICollectionViewDataSource, UICollectionViewDelegate
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        if scrollView === emojiCollectionView {
+            // Only while the finger owns the scroll: a reload resets contentOffset, and that
+            // reset is what used to snap the search row back mid-gesture.
+            guard scrollView.isDragging || scrollView.isDecelerating else { return }
+            let travel = min(
+                headerZoneHeight,
+                max(0, scrollView.contentOffset.y + scrollView.contentInset.top))
+            headerView.transform = CGAffineTransform(translationX: 0, y: -travel)
+            headerView.alpha = 1 - (travel / max(1, headerZoneHeight)) * 0.9
+            return
+        }
         if scrollView === pagesScrollView {
+            headerView.transform = .identity
+            headerView.alpha = 1
             guard !isProgrammaticPageScroll, pagesScrollView.bounds.width > 1 else { return }
             let page = Int(round(pagesScrollView.contentOffset.x / pagesScrollView.bounds.width))
             guard let tab = ChatGifPanelTab(rawValue: page), tab != activeTab else { return }

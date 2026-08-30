@@ -1,6 +1,7 @@
 //! Router assembly: `/healthz` is public, every `/v1/*` route requires `x-sandbox-token`.
 //! A request-id span wraps everything (outermost layer) so even a 401 gets logged with an id.
 mod browser;
+mod computer;
 mod files;
 mod sandboxes;
 
@@ -11,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tracing::Instrument;
 
@@ -47,6 +48,18 @@ pub fn build(state: Arc<AppState>) -> Router {
             "/v1/sandboxes/:id/browser/screenshot",
             get(browser::screenshot),
         )
+        .route(
+            "/v1/sandboxes/:id/computer/session",
+            post(computer::open_session),
+        )
+        .route(
+            "/v1/sandboxes/:id/computer/session/:sessionId",
+            delete(computer::close_session),
+        )
+        .route("/v1/sandboxes/:id/computer/frame", get(computer::frame))
+        .route("/v1/sandboxes/:id/computer/state", get(computer::page_state))
+        .route("/v1/sandboxes/:id/computer/control", post(computer::control))
+        .route("/v1/sandboxes/:id/computer/input", post(computer::input))
         .route("/v1/sandboxes/:id/stop", post(sandboxes::stop))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

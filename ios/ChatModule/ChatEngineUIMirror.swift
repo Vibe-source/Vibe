@@ -154,6 +154,10 @@ final class ChatEngineUIMirror: @unchecked Sendable {
   private var receiptIndex: [String: [String: String]] = [:]
   private var localStatusIndex: [String: [String: String]] = [:]
 
+  /// Chats holding an outgoing message that cannot leave until the peer's MLS session is
+  /// confirmed. Drives the one line above the composer; empty in the ordinary case.
+  private var secureWaitChatIds: Set<String> = []
+
   /// Until the first publish the mirror cannot distinguish "nothing is
   /// happening" from "nobody has told me yet", so readers fall back to the
   /// queue. One publish lands on the first engine notification.
@@ -180,7 +184,8 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     agentTurnRunningAtMsByChatId: [String: Int64] = [:],
     agentAskChatIds: Set<String> = [],
     receiptIndex: [String: [String: String]] = [:],
-    localStatusIndex: [String: [String: String]] = [:]
+    localStatusIndex: [String: [String: String]] = [:],
+    secureWaitChatIds: Set<String> = []
   ) {
     lock.lock()
     defer { lock.unlock() }
@@ -193,6 +198,7 @@ final class ChatEngineUIMirror: @unchecked Sendable {
     self.agentAskChatIds = agentAskChatIds
     self.receiptIndex = receiptIndex
     self.localStatusIndex = localStatusIndex
+    self.secureWaitChatIds = secureWaitChatIds
     hasPublished = true
     publishes += 1
   }
@@ -217,6 +223,11 @@ final class ChatEngineUIMirror: @unchecked Sendable {
   }
 
   /// Inputs `ChatEngine.resolveDisplayStatus` needs for one outgoing row; outer `nil` = unpublished.
+  /// Whether this chat is holding an outgoing message until the peer joins; outer `nil` = unpublished.
+  func isWaitingForSecureSession(chatId: String) -> Bool? {
+    read { secureWaitChatIds.contains(chatId) }
+  }
+
   func displayStatusInputs(chatId: String, messageId: String, peerUserId: String?)
     -> (receipt: String?, local: String?, peerOnline: Bool)?
   {

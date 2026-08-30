@@ -70,6 +70,17 @@ defmodule Vibe.AgentGatewayTest do
     refute_receive {:gateway_request, _, _, _, _}
   end
 
+  test "computer_frame: 204 is :no_change, 200 is the frame", %{agent: agent} do
+    Application.put_env(:vibe, :agent_gateway_http, fn :get, url, _headers, _body ->
+      if String.contains?(url, "since=7"),
+        do: {:ok, %{status: 204, body: ""}},
+        else: {:ok, %{status: 200, body: Jason.encode!(%{"seq" => 3, "imageBase64" => "AAA"})}}
+    end)
+
+    assert {:ok, :no_change} = AgentGateway.computer_frame(agent.id, since: 7)
+    assert {:ok, %{"seq" => 3}} = AgentGateway.computer_frame(agent.id, since: 0)
+  end
+
   test "disabled without a runtime URL" do
     System.delete_env("VIBE_AGENT_RUNTIME_URL")
     refute AgentGateway.enabled?()

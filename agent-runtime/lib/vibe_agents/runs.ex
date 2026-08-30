@@ -46,7 +46,8 @@ defmodule VibeAgents.Runs do
     }
 
     with {:ok, run} <- %AgentRun{} |> AgentRun.create_changeset(attrs) |> Repo.insert() do
-      {:ok, _pid} = DynamicSupervisor.start_child(VibeAgents.Runs.Supervisor, {Server, run_id: run.id})
+      # Over the concurrency cap the run stays `queued`; the Dispatcher starts it.
+      _ = VibeAgents.Runs.Dispatcher.start_or_queue(run.id)
       {:ok, run}
     end
   end

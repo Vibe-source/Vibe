@@ -7,7 +7,7 @@ defmodule VibeAgents.Runs.Loop do
   blocks synchronously inside `VibeAgents.Tools.Executor` and returns here normally.
   """
   require Logger
-  alias VibeAgents.{Budget, CoreClient, Policy, Repo}
+  alias VibeAgents.{Budget, CoreClient, Policy, Repo, Sandbox}
   alias VibeAgents.Runs.{Decisions, Events}
   alias VibeAgents.Schemas.AgentRun
   alias VibeAgents.Tools.{Catalog, Executor}
@@ -88,7 +88,8 @@ defmodule VibeAgents.Runs.Loop do
   defp finish_completed(run, input_messages, text, final_state) do
     input_tokens = Budget.estimate_tokens(inspect(input_messages))
     output_tokens = Budget.estimate_tokens(text)
-    cost_cents = Budget.record_usage(run, input_tokens, output_tokens)
+    sandbox_seconds = sandbox_seconds_for(run)
+    cost_cents = Budget.record_usage(run, input_tokens, output_tokens, sandbox_seconds)
 
     usage = %{
       "inputTokens" => Map.get(run.usage || %{}, "inputTokens", 0) + input_tokens,
@@ -114,7 +115,23 @@ defmodule VibeAgents.Runs.Loop do
         steps: (run.steps || 0) + 1
       })
 
-    Events.emit(run, "run.completed", %{"summary" => summary, "usage" => usage, "costCents" => total_cost})
+    Events.emit(run, "run.completed", %{
+      "summary" => summary,
+      "usage" => usage,
+      "costCents" => total_cost,
+      "sandboxSeconds" => sandbox_seconds
+    })
+  end
+
+  # Sandbox time only counts when a computer/browser capability was granted and actually used.
+  defp sandbox_seconds_for(run) do
+    used_capability = (run.capabilities || %{})["computer"] || (run.capabilities || %{})["browser"]
+
+    if used_capability && run.started_at && Sandbox.used_since?(run.agent_id, run.started_at) do
+      max(DateTime.diff(DateTime.utc_now(), run.started_at), 0)
+    else
+      0
+    end
   end
 
   defp finish_waiting_ask(run, final_state) do

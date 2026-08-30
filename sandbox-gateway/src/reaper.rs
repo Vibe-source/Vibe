@@ -27,6 +27,9 @@ pub async fn run(state: Arc<AppState>, shutdown: CancellationToken) {
 }
 
 async fn sweep(state: &AppState) {
+    // Same tick, not a second timer: expires computer viewers and any stale control grant.
+    state.computer.sweep(&state.cfg, now_unix());
+
     let containers = match list_labelled(&state.docker).await {
         Ok(c) => c,
         Err(e) => {

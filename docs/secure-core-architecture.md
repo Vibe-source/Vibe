@@ -430,10 +430,10 @@ hybrid envelope, and can reuse the Welcome relay's shape).
 **Until that lands, channels and any chat over the 256-member cap still send
 plaintext to the server, and the UI must not claim otherwise.**
 
-**Sending is on by default** (`VibeSecureSessions.isSendEnabled`). The gate
-existed to avoid splitting a conversation across clients that cannot read
-`vmls1.`; there is no such install base, so the secure default is the correct
-one. The key remains as an explicit off switch.
+**Human DMs are MLS-only.** There is no fallback envelope: a DM either seals
+under a confirmed MLS session or stays queued locally until the peer joins and
+acknowledges the Welcome. `VibeSecureSessions.isGroupSendEnabled` is a
+group-only off switch; human DMs ignore it.
 
 **A first-contact race exists and is resolved deterministically.** Two devices
 can both establish the same chat at once; each then holds a different group.

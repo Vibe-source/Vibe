@@ -2646,6 +2646,11 @@ private final class ChatsViewModel: ObservableObject {
     }
     if matches(["approval", "awaiting", "permission"]) { return "waiting for approval" }
     if matches(["error", "fail"]) { return "working on an error" }
+    // Must precede the reading bucket: a host like "research.com" contains "search".
+    if matches(["brows", "computer"]) {
+      let host = rawLabel?.split(separator: " ").last.map(String.init) ?? ""
+      return host.contains(".") ? "browsing \(host)" : "browsing…"
+    }
     if matches(["read", "grep", "glob", "search", "fetch", "look"]) { return "reading…" }
     if matches(["write", "edit", "patch", "notebook"]) { return "editing…" }
     if matches(["think", "reason", "plan"]) { return "thinking…" }
@@ -2984,7 +2989,17 @@ private final class ChatsViewModel: ObservableObject {
     ChatListView.prewarmReopenSnapshotRasters(chatIds: prewarmChatIds)
     // Same set, the other half of a fast open: the prepared-height store is memory-only,
     // so without this the first open of every session measures its whole seed.
-    ChatEngine.shared.prepareTimelinesAfterLaunch(chatIds: prewarmChatIds)
+    // Recently-opened first: the store keeps three chats, and Home's order can rank
+    // the chat the user was just in below that line.
+    let mruRank = Dictionary(
+      ChatListView.recentlyOpenedChatIds.enumerated().map { ($1, $0) },
+      uniquingKeysWith: { first, _ in first })
+    let prepareChatIds = prewarmChatIds.enumerated().sorted { lhs, rhs in
+      let lhsRank = mruRank[lhs.element] ?? Int.max
+      let rhsRank = mruRank[rhs.element] ?? Int.max
+      return lhsRank == rhsRank ? lhs.offset < rhs.offset : lhsRank < rhsRank
+    }.map(\.element)
+    ChatEngine.shared.prepareTimelinesAfterLaunch(chatIds: prepareChatIds)
     ChatListCell.prewarmRealization()
 
     guard shouldFetchHistory else { return }

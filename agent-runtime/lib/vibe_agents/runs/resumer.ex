@@ -45,11 +45,19 @@ defmodule VibeAgents.Runs.Resumer do
 
   defp rearm_waiting do
     AgentRun
-    |> where([r], r.status in ^AgentRun.waiting_statuses())
+    |> where([r], r.status in ^(AgentRun.waiting_statuses() ++ ["queued"]))
     |> Repo.all()
     |> Enum.each(fn run ->
-      case DynamicSupervisor.start_child(VibeAgents.Runs.Supervisor, {VibeAgents.Runs.Server, run_id: run.id}) do
+      # Waiting runs are idle and must be live to accept a decision, so they always
+      # re-arm; a queued run consumes a loop slot and goes through admission instead.
+      result =
+        if run.status == "queued",
+          do: VibeAgents.Runs.Dispatcher.start_or_queue(run.id),
+          else: VibeAgents.Runs.Dispatcher.start_run(run.id)
+
+      case result do
         {:ok, _pid} -> :ok
+        :queued -> :ok
         {:error, reason} -> Logger.error("[VibeAgents.Runs.Resumer] could not re-arm run #{run.id}: #{inspect(reason)}")
       end
     end)

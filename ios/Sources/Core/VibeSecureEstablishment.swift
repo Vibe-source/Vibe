@@ -167,7 +167,11 @@ enum VibeSecureEstablishment {
     completion: @escaping (Bool) -> Void
   ) {
     establishmentQueue.async {
-      guard !inFlight.contains(chatId) else { return }
+      // Dropping the completion here would stall the caller's readiness loop forever.
+      guard !inFlight.contains(chatId) else {
+        completion(false)
+        return
+      }
       if VibeSecureSessions.shared.hasSession(chatId: chatId) {
         // A local session is NOT the same thing as an established chat, and treating it
         // as one is why a chat can sit at "not sealing yet — welcomes pending=0
@@ -196,7 +200,7 @@ enum VibeSecureEstablishment {
               "chat": String(chatId.prefix(12)),
               "peer": String(peerUserId.prefix(12)),
               "state": "orphaned-group",
-              "effect": "sends fall back to the hybrid envelope",
+              "effect": "outbound messages remain queued",
             ])
         }
         completion(true)
@@ -234,15 +238,11 @@ enum VibeSecureEstablishment {
           let encoded = object?["keyPackage"] as? String,
           let keyPackage = Data(base64Encoded: encoded)
         else {
-          // The peer's device has never published a key, so there is nothing
-          // to encrypt to — waiting cannot conjure one. See
-          // `VibeSecureSessions.markPeerKeysUnavailable`: `true` re-evaluates
-          // the send rather than leaving it pending forever, and it cannot
-          // downgrade an established chat because the send path checks
-          // `isPeerConfirmed` first.
+          // No peer key means no secure transport. Keep the optimistic draft local
+          // and retry establishment without changing encryption schemes.
           VibeLog.info("[VibeSecure] no KeyPackage available for peer in \(chatId)")
           VibeSecureSessions.shared.markPeerKeysUnavailable(chatId: chatId)
-          finish(true)
+          finish(false)
           return
         }
         VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: chatId)
@@ -361,7 +361,10 @@ enum VibeSecureEstablishment {
     completion: @escaping (Bool) -> Void
   ) {
     establishmentQueue.async {
-      guard !inFlight.contains(chatId) else { return }
+      guard !inFlight.contains(chatId) else {
+        completion(false)
+        return
+      }
       if VibeSecureSessions.shared.hasSession(chatId: chatId) {
         completion(true)
         return
@@ -701,9 +704,20 @@ enum VibeSecureEstablishment {
   ///
   /// Cheap and idempotent, so it can hang off chat join beside the rest of
   /// provisioning. Once confirmed it never asks again.
-  static func refreshPeerConfirmation(chatId: String, apiBase: URL, token: String?) {
-    guard !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) else { return }
-    guard VibeSecureSessions.shared.groupId(chatId: chatId) != nil else { return }
+  static func refreshPeerConfirmation(
+    chatId: String,
+    apiBase: URL,
+    token: String?,
+    completion: ((Bool) -> Void)? = nil
+  ) {
+    guard !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) else {
+      completion?(true)
+      return
+    }
+    guard VibeSecureSessions.shared.groupId(chatId: chatId) != nil else {
+      completion?(false)
+      return
+    }
 
     establishmentQueue.async {
       request(
@@ -713,47 +727,46 @@ enum VibeSecureEstablishment {
         token: token,
         body: nil
       ) { object in
-        guard let object else { return }
+        guard let object else {
+          completion?(false)
+          return
+        }
         let pending = (object["pending"] as? Int) ?? 0
         let delivered = (object["delivered"] as? Int) ?? 0
         let incomingPending = (object["incomingPending"] as? Int) ?? 0
         let incomingDelivered = (object["incomingDelivered"] as? Int) ?? 0
-        // A joiner never posts a Welcome, so sent pending/delivered stay 0.
-        // incoming* is how we tell that apart from an initiator whose POST never landed.
-        if incomingDelivered > 0 {
+        if incomingDelivered > 0 || (delivered > 0 && pending == 0) {
           VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
-          return
-        }
-        // incomingPending is often a competing group we refuse; don't let it
-        // block confirmation of a Welcome we sent that the peer already applied.
-        if delivered > 0, pending == 0 {
-          VibeSecureSessions.shared.markPeerConfirmed(chatId: chatId)
+          completion?(true)
           return
         }
         if incomingPending > 0 {
+          completion?(false)
           return
         }
 
-        // True initiator orphan: we created a group and the server has no Welcome
-        // we sent or received. Joiners must not enter this arm.
+        // No sent or received Welcome means this initiator session is orphaned.
         if delivered == 0, pending == 0 {
           let age = VibeSecureSessions.shared.groupAge(chatId: chatId) ?? 0
-          guard age > orphanGraceSeconds else { return }
-          VibeLog.notice(
-            "discarding initiator mls group with no server welcome",
-            category: "crypto",
-            metadata: [
-              "chat": String(chatId.prefix(12)),
-              "stage": "orphan-discard",
-              "age": "\(Int(age))",
-            ])
-          VibeSecureSessions.shared.discard(chatId: chatId)
+          if age > orphanGraceSeconds {
+            VibeLog.notice(
+              "discarding initiator mls group with no server welcome",
+              category: "crypto",
+              metadata: [
+                "chat": String(chatId.prefix(12)),
+                "stage": "orphan-discard",
+                "age": "\(Int(age))",
+              ])
+            VibeSecureSessions.shared.discard(chatId: chatId)
+          }
+          completion?(false)
           return
         }
 
         VibeLog.info(
-          "[VibeSecure] \(chatId) not sealing yet — welcomes pending=\(pending)"
+          "[VibeSecure] \(chatId) waiting for Welcome acknowledgement — pending=\(pending)"
             + " delivered=\(delivered)")
+        completion?(false)
       }
     }
   }

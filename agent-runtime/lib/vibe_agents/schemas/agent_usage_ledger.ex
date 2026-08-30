@@ -11,6 +11,7 @@ defmodule VibeAgents.Schemas.AgentUsageLedger do
     field :day, :date
     field :input_tokens, :integer, default: 0
     field :output_tokens, :integer, default: 0
+    field :sandbox_seconds, :integer, default: 0
     field :cost_cents, :integer, default: 0
 
     timestamps(updated_at: false)
@@ -18,7 +19,7 @@ defmodule VibeAgents.Schemas.AgentUsageLedger do
 
   def changeset(entry, attrs) do
     entry
-    |> cast(attrs, [:agent_id, :run_id, :day, :input_tokens, :output_tokens, :cost_cents])
+    |> cast(attrs, [:agent_id, :run_id, :day, :input_tokens, :output_tokens, :sandbox_seconds, :cost_cents])
     |> validate_required([:agent_id, :day])
   end
 end

@@ -78,6 +78,18 @@ defmodule Vibe.AgentRelay do
           "ts" => event["ts"]
         })
 
+      k when k in ["run.computer.state", "run.computer.control"] ->
+        VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-computer", %{
+          "chatId" => chat_id,
+          "runId" => run_id,
+          "agentUserId" => event["agentUserId"],
+          "url" => payload["url"],
+          "title" => payload["title"],
+          "live" => payload["live"],
+          "holder" => payload["holder"],
+          "ts" => event["ts"]
+        })
+
       "run.handoff" ->
         :ok
 

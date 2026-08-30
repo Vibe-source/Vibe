@@ -232,6 +232,7 @@ extension ChatListView: VibeMessageListHost {
   ///   how a settled turn collapses mid-read
   func coreFrozenHeight(for row: ChatListRow) -> CGFloat? {
     guard coreState.driver != nil, !coreState.frozenGeometry.isEmpty else { return nil }
+    guard bubblePreviewCandidateURL(for: row) == nil else { return nil }
     // `key` first, and that order is not cosmetic. The driver identifies rows with
     // `VibeCoreListDriver.messageId(from:)`, which prefers the payload's **top-level
     // `key`** — so that is what the core stores heights under. Looking up by

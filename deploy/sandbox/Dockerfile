@@ -7,9 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv \
         nodejs npm \
         chromium fonts-liberation \
+        xvfb dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+# Chromium runs headed on this display: headless is refused by Google sign-in.
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+    DISPLAY=:99 \
+    XVFB_SCREEN=1280x800x24
 
 RUN useradd --create-home --home-dir /home/agent --uid 1000 --shell /bin/bash agent
 
@@ -18,7 +22,10 @@ COPY browser.js /opt/vibe/browser.js
 RUN cd /opt/vibe && npm install --omit=dev --no-audit --no-fund \
     && chown -R agent:agent /opt/vibe
 
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
 # No setuid/setgid binaries anywhere: this image should never be able to escalate privilege.
+# dbus-x11 ships a setuid helper, so this must stay after every apt install.
 RUN find / -xdev -perm -4000 -exec chmod u-s {} + 2>/dev/null || true \
     && find / -xdev -perm -2000 -exec chmod g-s {} + 2>/dev/null || true
 

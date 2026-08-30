@@ -2144,7 +2144,8 @@ defmodule Vibe.Chat do
 
     result =
       %Participant{}
-      |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: role})
+      |> Participant.changeset(%{chat_id: chat_id, user_id: user_id})
+      |> Participant.role_changeset(role)
       |> Repo.insert(on_conflict: :nothing)
 
     case result do
@@ -2254,7 +2255,7 @@ defmodule Vibe.Chat do
         {:error, :invalid_role}
 
       true ->
-        case target |> Participant.changeset(%{role: role}) |> Repo.update() do
+        case target |> Participant.role_changeset(role) |> Repo.update() do
           {:ok, updated} ->
             invalidate_chat_home_cache(chat_id)
             ChatHomeCache.invalidate_user(target_id)
@@ -3539,7 +3540,8 @@ defmodule Vibe.Chat do
 
   defp insert_channel_subscriber(chat_id, user_id) do
     %Participant{}
-    |> Participant.changeset(%{chat_id: chat_id, user_id: user_id, role: "subscriber"})
+    |> Participant.changeset(%{chat_id: chat_id, user_id: user_id})
+    |> Participant.role_changeset("subscriber")
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:chat_id, :user_id])
   end
 
@@ -4004,6 +4006,43 @@ defmodule Vibe.Chat do
     )
   end
 
+  @doc """
+  Role and room type for a channel join, in one round trip instead of two.
+  `nil` when the user is not a live participant; type is nil-able, caller defaults it.
+  """
+  def join_context(chat_id, user_id) do
+    Repo.one(
+      from(p in Participant,
+        left_join: r in Room,
+        on: r.id == p.chat_id,
+        where:
+          p.chat_id == ^chat_id and p.user_id == ^user_id and
+            (is_nil(p.deleted) or p.deleted == false),
+        select: {p.role, r.type}
+      )
+    )
+  end
+
+  @doc """
+  The agent-shadow participant on the other side of a DM, or nil.
+  One query where the caller previously listed participants then looked up each.
+  """
+  def dm_standalone_agent(chat_id, user_id) do
+    query =
+      from(p in Participant,
+        join: a in Agent,
+        on: a.agent_user_id == p.user_id,
+        where: p.chat_id == ^chat_id and p.user_id != ^user_id,
+        select: a,
+        limit: 1
+      )
+
+    case Repo.one(query) do
+      %Agent{} = agent -> Repo.preload(agent, :agent_user)
+      _ -> nil
+    end
+  end
+
   def get_room_type(chat_id) do
     Repo.one(from(r in Room, where: r.id == ^chat_id, select: r.type))
   end
@@ -4040,9 +4079,22 @@ defmodule Vibe.Chat do
     Repo.get(ScheduledPost, id)
   end
 
-  def mark_post_as_posted(post_id) do
+  @doc "Atomic pending→posted claim; only the winning node delivers (multi-node safe)."
+  def claim_scheduled_post(post_id) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    from(sp in ScheduledPost, where: sp.id == ^post_id and sp.status == "pending", select: sp)
+    |> Repo.update_all(set: [status: "posted", posted_at: now])
+    |> case do
+      {1, [post]} -> {:ok, post}
+      _ -> :already_claimed
+    end
+  end
+
+  @doc "Reverts a claim whose delivery failed so a later boot retries it."
+  def reopen_scheduled_post(post_id) do
     from(sp in ScheduledPost, where: sp.id == ^post_id)
-    |> Repo.update_all(set: [status: "posted", posted_at: DateTime.utc_now()])
+    |> Repo.update_all(set: [status: "pending", posted_at: nil])
   end
 
   def cancel_scheduled_post(post_id, user_id) do

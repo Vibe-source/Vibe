@@ -76,6 +76,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     appDelegateUITrace("AppDelegate didBecomeActive")
+    AppAppearanceController.releaseSnapshotStylePin()
     // Resume the main-thread stall watchdog and reset its baseline so the time the
     // process spent suspended in the background is NOT counted as a stall.
     AppUIStallWatchdog.shared.setActive(true, context: "foreground")
@@ -83,6 +84,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
 
   func applicationWillResignActive(_ application: UIApplication) {
     appDelegateUITrace("AppDelegate willResignActive")
+    AppAppearanceController.pinCurrentStyleForSnapshot()
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {

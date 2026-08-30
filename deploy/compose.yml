@@ -55,6 +55,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # Caddy holds a client FD and an upstream FD per connection — one hop before core.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     deploy:
       resources:
         limits:
@@ -91,6 +96,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # One FD per socket; the engine default can be as low as 1024. Set explicitly.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     deploy:
       resources:
         limits:
@@ -126,6 +136,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     deploy:
       resources:
         limits:
@@ -220,8 +234,10 @@ services:
     # nothing downstream depends on pgbouncer's service_healthy condition.
     read_only: true
     tmpfs:
+      # mode=1777: the image runs as `postgres`, and a default tmpfs is root-owned,
+      # so entrypoint.sh's `mkdir /run/pgbouncer` fails without it.
       - /tmp
-      - /run
+      - /run:mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -262,6 +278,8 @@ services:
           cpus: "1.0"
           memory: 384M
 
+  # 1 GB, not 512M: a 5k-row export measured 690-770 MiB and merely thrashes at
+  # 512 instead of failing. A limit is a ceiling — a typical render still uses ~200M.
   doc-renderer:
     image: vibe-doc-renderer:latest
     build:
@@ -287,7 +305,7 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 512M
+          memory: 1024M
 
   backup:
     image: vibe-backup:latest

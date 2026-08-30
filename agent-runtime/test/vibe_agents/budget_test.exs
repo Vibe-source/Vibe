@@ -1,9 +1,11 @@
 defmodule VibeAgents.BudgetTest do
   use ExUnit.Case, async: false
 
+  import Ecto.Query
   import VibeAgents.Test.Fixtures
 
   alias VibeAgents.{Budget, Repo}
+  alias VibeAgents.Schemas.AgentUsageLedger
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
@@ -31,5 +33,20 @@ defmodule VibeAgents.BudgetTest do
 
   test "token estimate is ~4 chars per token" do
     assert Budget.estimate_tokens(String.duplicate("a", 400)) == 100
+  end
+
+  test "sandbox seconds add cost cents and land in the ledger row" do
+    run = insert_run!()
+    cost = Budget.record_usage(run, 0, 0, 90)
+    assert cost == 2
+
+    ledger = Repo.one(from l in AgentUsageLedger, where: l.run_id == ^run.id)
+    assert ledger.sandbox_seconds == 90
+    assert ledger.cost_cents == 2
+  end
+
+  test "model cost still prices via VibeContracts.ModelRates after the delegation" do
+    run = insert_run!()
+    assert Budget.record_usage(run, 1000, 1000) == 2
   end
 end

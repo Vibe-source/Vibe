@@ -209,8 +209,14 @@ defmodule Vibe.Agents do
           |> Repo.update!()
         end)
         |> case do
-          {:ok, updated} -> {:ok, Repo.preload(updated, :agent_user)}
-          {:error, reason} -> {:error, reason}
+          {:ok, updated} ->
+            # Joined chats cache this agent; an edit (e.g. the incoming-chat
+            # toggle) must not wait out the TTL to take effect.
+            Vibe.Chat.JoinCache.invalidate_all()
+            {:ok, Repo.preload(updated, :agent_user)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
       end
     end

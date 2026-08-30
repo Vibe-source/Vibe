@@ -18,6 +18,22 @@ private let chatMediaImageCache: NSCache<NSString, UIImage> = {
 }()
 private let chatMediaNaturalSizeCache = NSCache<NSString, NSValue>()
 private let chatMediaAudioAvailabilityCache = NSCache<NSString, NSNumber>()
+/// Memo entries whose size is the blur thumb's shape, not the media's pixels.
+private let chatMediaThumbDerivedSizeKeys = NSCache<NSString, NSNumber>()
+
+/// Bytes a decoded image holds (every frame of an animated one), for the cache's cost limit.
+func chatMediaImageCost(_ image: UIImage) -> Int {
+  (image.images ?? [image]).reduce(0) { total, frame in
+    if let cgImage = frame.cgImage { return total + cgImage.bytesPerRow * cgImage.height }
+    let pixels = frame.size.width * frame.size.height * frame.scale * frame.scale
+    return total + Int(pixels * 4.0)
+  }
+}
+
+/// Every insert carries its byte cost so `totalCostLimit` evicts LRU under pressure.
+private func chatMediaImageCacheStore(_ image: UIImage, forKey key: String) {
+  chatMediaImageCache.setObject(image, forKey: key as NSString, cost: chatMediaImageCost(image))
+}
 
 /// BubbleShape still carries the legacy 18pt geometry from the row payload. Rebase each
 /// corner onto the appearance radius so grouped corners retain their relative tightening.
@@ -46,6 +62,7 @@ private func chatAppearanceBubbleShape(
 func chatMediaImageCachePurgeForMemoryWarning() {
   chatMediaImageCache.removeAllObjects()
   chatMediaNaturalSizeCache.removeAllObjects()
+  chatMediaThumbDerivedSizeKeys.removeAllObjects()
   chatMediaAudioAvailabilityCache.removeAllObjects()
 }
 
@@ -151,6 +168,22 @@ private func chatMediaCacheKey(_ urlString: String, mediaKey: String?) -> String
   VibeMediaVault.identity(rawURL: urlString, mediaKey: mediaKey)
 }
 
+/// Vault identity of the row's REMOTE media, or nil while it only names a local file.
+private func chatMediaRemoteIdentity(_ row: ChatListRow) -> String? {
+  guard let raw = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+    let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+    scheme == "http" || scheme == "https"
+  else { return nil }
+  return VibeMediaVault.identity(rawURL: raw, mediaKey: nil)
+}
+
+/// Same bytes unless both rows name a remote and the remotes differ.
+private func chatMediaRowsShareRemoteIdentity(_ a: ChatListRow, _ b: ChatListRow) -> Bool {
+  guard let identityA = chatMediaRemoteIdentity(a), let identityB = chatMediaRemoteIdentity(b)
+  else { return true }
+  return identityA == identityB
+}
+
 /// The pre-vault key: the URL with its query intact. Kept only so a file an older build already
 /// downloaded can still be found once, and moved into the vault under its stable identity,
 /// instead of being re-fetched from an origin that may no longer have it.
@@ -214,32 +247,83 @@ private func chatMediaAnimatedFrameDuration(
   return frameDuration < 0.011 ? 0.1 : frameDuration
 }
 
-private func chatMediaAnimatedImage(from data: Data) -> UIImage? {
-  guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-    return nil
+/// Decode bounds: a bubble never shows more than the screen, and a GIF keeps every frame alive.
+private let chatMediaDefaultDecodeMaxPixelSize = 1600
+private let chatMediaAnimatedMaxFrames = 40
+private let chatMediaAnimatedMaxPixelSize = 480
+
+private var chatMediaBubbleMaxPixelSizeMemo = 0
+
+/// Longest side, in pixels, a bubble can ever display. Never below 512. Off main it answers
+/// from the last main-thread value, so UIScreen is only touched where UIKit allows.
+func chatMediaBubbleDecodeMaxPixelSize(screen: UIScreen? = nil) -> Int {
+  guard Thread.isMainThread else {
+    return chatMediaBubbleMaxPixelSizeMemo > 0 ? chatMediaBubbleMaxPixelSizeMemo : 1290
   }
+  let screen = screen ?? UIScreen.main
+  let longest = max(screen.bounds.width, 380.0) * max(1.0, screen.scale)
+  let value = max(512, Int(longest.rounded(.up)))
+  chatMediaBubbleMaxPixelSizeMemo = value
+  return value
+}
 
-  let frameCount = CGImageSourceGetCount(source)
-  guard frameCount > 1 else {
-    return UIImage(data: data)
-  }
+private func chatMediaThumbnailOptions(maxPixelSize: Int) -> CFDictionary {
+  let options: [CFString: Any] = [
+    kCGImageSourceCreateThumbnailFromImageAlways: true,
+    kCGImageSourceCreateThumbnailWithTransform: true,
+    kCGImageSourceShouldCacheImmediately: true,
+    kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize),
+  ]
+  return options as CFDictionary
+}
 
-  var frames: [UIImage] = []
-  frames.reserveCapacity(frameCount)
-  var totalDuration: TimeInterval = 0.0
-
-  for index in 0..<frameCount {
-    guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else {
-      continue
+/// One frame, at most `maxPixelSize` on its longest side, display-ready. The UIImage keeps the
+/// source's point size, so natural-size reporting does not change with the downsample.
+private func chatMediaDisplayReadyFrame(
+  source: CGImageSource, index: Int, maxPixelSize: Int
+) -> UIImage? {
+  guard
+    let cgImage = CGImageSourceCreateThumbnailAtIndex(
+      source, index, chatMediaThumbnailOptions(maxPixelSize: maxPixelSize))
+  else { return nil }
+  var scale: CGFloat = 1.0
+  if let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+    let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+    let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+    width > 0.0, height > 0.0
+  {
+    let sourceLongest = max(width, height)
+    let decodedLongest = Double(max(cgImage.width, cgImage.height))
+    if decodedLongest > 0.0, sourceLongest > decodedLongest {
+      scale = CGFloat(decodedLongest / sourceLongest)
     }
-    frames.append(UIImage(cgImage: cgImage))
+  }
+  let image = UIImage(cgImage: cgImage, scale: scale, orientation: .up)
+  guard let prepared = image.preparingForDisplay() else { return image }
+  if abs(prepared.scale - scale) < 0.001 { return prepared }
+  guard let preparedCG = prepared.cgImage else { return prepared }
+  return UIImage(cgImage: preparedCG, scale: scale, orientation: .up)
+}
+
+/// Frames capped and downsampled; the total duration still covers every source frame.
+private func chatMediaAnimatedImage(from source: CGImageSource, maxPixelSize: Int) -> UIImage? {
+  let frameCount = CGImageSourceGetCount(source)
+  guard frameCount > 1 else { return nil }
+  let stride = max(
+    1, Int((Double(frameCount) / Double(chatMediaAnimatedMaxFrames)).rounded(.up)))
+  let frameMax = min(maxPixelSize, chatMediaAnimatedMaxPixelSize)
+  var frames: [UIImage] = []
+  frames.reserveCapacity(min(frameCount, chatMediaAnimatedMaxFrames + 1))
+  var totalDuration: TimeInterval = 0.0
+  for index in 0..<frameCount {
     totalDuration += chatMediaAnimatedFrameDuration(at: index, source: source)
+    guard index % stride == 0,
+      let frame = chatMediaDisplayReadyFrame(
+        source: source, index: index, maxPixelSize: frameMax)
+    else { continue }
+    frames.append(frame)
   }
-
-  guard !frames.isEmpty else {
-    return nil
-  }
-
+  guard !frames.isEmpty else { return nil }
   return UIImage.animatedImage(with: frames, duration: max(totalDuration, 0.1))
 }
 
@@ -252,16 +336,38 @@ private func chatCellDebugLog(_ enabled: Bool, _ format: String, _ args: CVarArg
 
 /// Animated-aware decode for callers outside this file (GIF recents).
 func chatMediaDecodedImagePublic(from data: Data, shouldAnimate: Bool) -> UIImage? {
-  chatMediaDecodedImage(from: data, shouldAnimate: shouldAnimate)
+  chatMediaDecodeImageCore(
+    from: data, shouldAnimate: shouldAnimate, maxPixelSize: chatMediaDefaultDecodeMaxPixelSize)
 }
 
+/// The one decode funnel for bubble media. Off main only: it decodes and prepares pixels.
 private func chatMediaDecodedImage(
-  from data: Data, shouldAnimate: Bool
+  from data: Data, shouldAnimate: Bool, maxPixelSize: Int = chatMediaDefaultDecodeMaxPixelSize
 ) -> UIImage? {
-  if shouldAnimate, let animatedImage = chatMediaAnimatedImage(from: data) {
-    return animatedImage
+  #if DEBUG
+    dispatchPrecondition(condition: .notOnQueue(.main))
+  #endif
+  return chatMediaDecodeImageCore(
+    from: data, shouldAnimate: shouldAnimate, maxPixelSize: maxPixelSize)
+}
+
+private func chatMediaDecodeImageCore(
+  from data: Data, shouldAnimate: Bool, maxPixelSize: Int
+) -> UIImage? {
+  let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+  guard
+    let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary),
+    CGImageSourceGetCount(source) > 0
+  else {
+    guard let fallback = UIImage(data: data) else { return nil }
+    return fallback.preparingForDisplay() ?? fallback
   }
-  return UIImage(data: data)
+  if shouldAnimate,
+    let animated = chatMediaAnimatedImage(from: source, maxPixelSize: maxPixelSize)
+  {
+    return animated
+  }
+  return chatMediaDisplayReadyFrame(source: source, index: 0, maxPixelSize: maxPixelSize)
 }
 
 private func chatMediaImage(fromBase64 value: String?) -> UIImage? {
@@ -521,10 +627,46 @@ private func chatMediaHeaderSummary(from data: Data) -> String {
 }
 
 private func chatMediaFileHeaderSummary(at path: String) -> String {
-  guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe]) else {
-    return "none"
-  }
+  guard let handle = FileHandle(forReadingAtPath: path) else { return "none" }
+  defer { try? handle.close() }
+  let data = (try? handle.read(upToCount: 16)) ?? Data()
   return chatMediaHeaderSummary(from: data)
+}
+
+/// The poster JPEG for a video identity has its own slot beside the bytes.
+private func chatMediaPosterIdentity(_ identity: String) -> String { identity + "#poster" }
+
+/// A poster this device already extracted, decoded at the bubble's size. Off main only.
+private func chatMediaStoredVideoPoster(identity: String, maxPixelSize: Int) -> UIImage? {
+  guard
+    let url = VibeMediaVault.shared.cachedURL(
+      for: chatMediaPosterIdentity(identity), kind: .videoPreview),
+    let data = try? Data(contentsOf: url, options: [.mappedIfSafe])
+  else { return nil }
+  return chatMediaDecodedImage(from: data, shouldAnimate: false, maxPixelSize: maxPixelSize)
+}
+
+/// Extracts one frame, persists it as JPEG so extraction happens once per device, and
+/// returns it display-ready. Off main only.
+private func chatMediaExtractedVideoPoster(
+  fileURL: URL, identity: String?, maxPixelSize: Int
+) -> UIImage? {
+  let extractSide = CGFloat(max(1024, maxPixelSize))
+  guard
+    let cgImage = chatMediaCopyVideoPreviewImage(
+      from: AVURLAsset(url: fileURL), maxSize: CGSize(width: extractSide, height: extractSide))
+  else { return nil }
+  let frame = UIImage(cgImage: cgImage)
+  if let identity, let jpeg = frame.jpegData(compressionQuality: 0.85) {
+    VibeMediaVault.shared.store(
+      jpeg, for: chatMediaPosterIdentity(identity), kind: .videoPreview, fileExtension: "jpg")
+    if let decoded = chatMediaDecodedImage(
+      from: jpeg, shouldAnimate: false, maxPixelSize: maxPixelSize)
+    {
+      return decoded
+    }
+  }
+  return frame.preparingForDisplay() ?? frame
 }
 
 private func chatMediaVideoThumbnail(
@@ -532,8 +674,12 @@ private func chatMediaVideoThumbnail(
   cacheKey: String,
   urlString: String,
   fileName: String?,
-  messageType: String
+  messageType: String,
+  maxPixelSize: Int
 ) -> UIImage? {
+  if let poster = chatMediaStoredVideoPoster(identity: cacheKey, maxPixelSize: maxPixelSize) {
+    return poster
+  }
   let ext = chatMediaResolvedVideoExtension(
     urlString: urlString,
     fileName: fileName,
@@ -547,32 +693,33 @@ private func chatMediaVideoThumbnail(
     let fileURL = cached
       ?? vault.store(data, for: cacheKey, kind: .videoPreview, fileExtension: ext)
   else { return nil }
-  let asset = AVURLAsset(url: fileURL)
-  if let cgImage = chatMediaCopyVideoPreviewImage(
-    from: asset, maxSize: CGSize(width: 1600.0, height: 1600.0))
+  if let poster = chatMediaExtractedVideoPoster(
+    fileURL: fileURL, identity: cacheKey, maxPixelSize: maxPixelSize)
   {
-    return UIImage(cgImage: cgImage)
+    return poster
   }
   // A cached file that yields no frame is unusable — the one case where the vault drops a file
   // on its own. Write the bytes we were just handed and try once more.
   guard cached != nil else { return nil }
   vault.forget(cacheKey, kind: .videoPreview)
-  guard
-    let fresh = vault.store(data, for: cacheKey, kind: .videoPreview, fileExtension: ext),
-    let cgImage = chatMediaCopyVideoPreviewImage(
-      from: AVURLAsset(url: fresh), maxSize: CGSize(width: 1600.0, height: 1600.0))
+  guard let fresh = vault.store(data, for: cacheKey, kind: .videoPreview, fileExtension: ext)
   else { return nil }
-  return UIImage(cgImage: cgImage)
+  return chatMediaExtractedVideoPoster(
+    fileURL: fresh, identity: cacheKey, maxPixelSize: maxPixelSize)
 }
 
+/// Off main only: `duration` and `copyCGImage` both block on the asset.
 private func chatMediaCopyVideoPreviewImage(
   from asset: AVAsset,
   maxSize: CGSize
 ) -> CGImage? {
+  #if DEBUG
+    dispatchPrecondition(condition: .notOnQueue(.main))
+  #endif
   let generator = AVAssetImageGenerator(asset: asset)
   generator.appliesPreferredTrackTransform = true
   generator.maximumSize = maxSize
-  let rawCandidates: [Double] = [0.0, 0.04, 0.12, 0.24, 0.5, 1.0]
+  let rawCandidates: [Double] = [0.0, 0.12]
   let durationSeconds = CMTimeGetSeconds(asset.duration)
   let effectiveDuration = durationSeconds.isFinite ? max(0.0, durationSeconds) : 0.0
   let requestedSeconds = rawCandidates
@@ -597,9 +744,12 @@ private func chatMediaPreviewImage(
   urlString: String,
   fileName: String?,
   messageType: String,
-  preferVideoPreview: Bool
+  preferVideoPreview: Bool,
+  maxPixelSize: Int = chatMediaDefaultDecodeMaxPixelSize
 ) -> UIImage? {
-  if let image = chatMediaDecodedImage(from: data, shouldAnimate: shouldAnimate) {
+  if let image = chatMediaDecodedImage(
+    from: data, shouldAnimate: shouldAnimate, maxPixelSize: maxPixelSize)
+  {
     return image
   }
   guard preferVideoPreview else {
@@ -610,26 +760,42 @@ private func chatMediaPreviewImage(
     cacheKey: cacheKey,
     urlString: urlString,
     fileName: fileName,
-    messageType: messageType
+    messageType: messageType,
+    maxPixelSize: maxPixelSize
   )
 }
 
+/// Image or video file → display-ready image. Off main only; a video poster is persisted
+/// under `posterIdentity` so the frame is extracted once per device.
 private func chatMediaLoadImageFromFile(
-  at path: String, shouldAnimate: Bool
+  at path: String, shouldAnimate: Bool,
+  maxPixelSize: Int = chatMediaDefaultDecodeMaxPixelSize,
+  posterIdentity: String? = nil
 ) -> UIImage? {
+  let isVideoFile = chatMediaVideoExtensions.contains(
+    (path as NSString).pathExtension.lowercased())
+  if isVideoFile, let posterIdentity,
+    let poster = chatMediaStoredVideoPoster(identity: posterIdentity, maxPixelSize: maxPixelSize)
+  {
+    return poster
+  }
   guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
   else {
     return nil
   }
-  if let image = chatMediaDecodedImage(from: data, shouldAnimate: shouldAnimate) {
+  if !isVideoFile,
+    let image = chatMediaDecodedImage(
+      from: data, shouldAnimate: shouldAnimate, maxPixelSize: maxPixelSize)
+  {
     return image
   }
-  // Try video thumbnail generation as fallback.
-  let url = URL(fileURLWithPath: path)
-  let asset = AVURLAsset(url: url)
-  guard let cgImage = chatMediaCopyVideoPreviewImage(from: asset, maxSize: CGSize(width: 1600.0, height: 1600.0))
-  else { return nil }
-  return UIImage(cgImage: cgImage)
+  if let posterIdentity,
+    let poster = chatMediaStoredVideoPoster(identity: posterIdentity, maxPixelSize: maxPixelSize)
+  {
+    return poster
+  }
+  return chatMediaExtractedVideoPoster(
+    fileURL: URL(fileURLWithPath: path), identity: posterIdentity, maxPixelSize: maxPixelSize)
 }
 
 private func chatMediaDecryptedDataIfNeeded(_ data: Data, mediaKey: String?) -> Data? {
@@ -653,13 +819,16 @@ func chatMediaDiskCacheSave(_ data: Data, forKey cacheKey: String) {
 func chatMediaSeedRemoteCacheFromLocalFile(localURI: String, remoteURL: String, mediaKey: String?) {
   let trimmedRemote = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
   guard !trimmedRemote.isEmpty else { return }
+  let relocated = chatExistingLocalMediaPath(localURI)
   let path: String
-  if let parsed = URL(string: localURI), parsed.isFileURL {
+  if let relocated {
+    path = relocated
+  } else if let parsed = URL(string: localURI), parsed.isFileURL {
     path = parsed.path
   } else {
     path = localURI
   }
-  let exists = FileManager.default.fileExists(atPath: path)
+  let exists = relocated != nil
   let attrs = try? FileManager.default.attributesOfItem(atPath: path)
   let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
   guard exists, bytes > 0, bytes <= 25 * 1024 * 1024 else {
@@ -686,45 +855,43 @@ func chatMediaSeedRemoteCacheFromLocalFile(localURI: String, remoteURL: String, 
   )
 }
 
-/// On-disk file for this row: surviving local path, or vault copy keyed by remote URL.
+/// On-disk file for this row: surviving local path (relocated to the current container), or
+/// the vault copy keyed by remote URL — adopting the keyed legacy slot on a miss.
 func chatOnDiskMediaFileURL(for row: ChatListRow) -> URL? {
-  if let local = row.localMediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
-    !local.isEmpty
-  {
-    let path: String
-    if let parsed = URL(string: local), parsed.isFileURL {
-      path = parsed.path
-    } else {
-      path = local
-    }
-    if FileManager.default.fileExists(atPath: path) {
-      return URL(fileURLWithPath: path)
-    }
+  if let local = chatExistingLocalMediaPath(row.localMediaUrl) {
+    return URL(fileURLWithPath: local)
   }
   guard let remote = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
     !remote.isEmpty
   else { return nil }
   let vault = VibeMediaVault.shared
-  let keys = [
-    VibeMediaVault.identity(rawURL: remote, mediaKey: row.mediaKey),
-    VibeMediaVault.identity(rawURL: remote, mediaKey: nil),
-  ]
-  for key in keys {
-    if let url = vault.cachedURL(for: key, kind: .image) { return url }
-    if let url = vault.cachedURL(for: key, kind: .document) { return url }
+  let key = VibeMediaVault.identity(rawURL: remote, mediaKey: row.mediaKey)
+  let remoteURL = URL(string: remote).flatMap { $0.scheme == nil ? nil : $0 }
+  for kind in [VibeMediaKind.image, .document] {
+    if let url = vault.cachedURL(for: key, kind: kind) { return url }
+    if let remoteURL,
+      let adopted = vault.adoptLegacyKeyed(remoteURL: remoteURL, mediaKey: row.mediaKey, kind: kind)
+    {
+      return adopted
+    }
   }
   return nil
 }
 
 /// Bytes for a media key, from disk only. `legacyRawKey` is the pre-vault key for the same
 /// media; pass it wherever the raw URL is still in hand so an already-downloaded file is
-/// adopted into the vault rather than re-fetched.
-func chatMediaDiskCacheLoad(_ cacheKey: String, legacyRawKey: String? = nil) -> Data? {
+/// adopted into the vault rather than re-fetched. `mediaKey` reaches the keyed legacy slot.
+func chatMediaDiskCacheLoad(
+  _ cacheKey: String, legacyRawKey: String? = nil, remoteURL: String? = nil,
+  mediaKey: String? = nil
+) -> Data? {
   let legacy = legacyRawKey.map(chatMediaLegacyDiskCandidates) ?? []
-  guard
-    let fileURL = VibeMediaVault.shared.cachedURL(
-      for: cacheKey, kind: .image, legacyCandidates: legacy)
-  else { return nil }
+  let vault = VibeMediaVault.shared
+  var fileURL = vault.cachedURL(for: cacheKey, kind: .image, legacyCandidates: legacy)
+  if fileURL == nil, let remoteURL, let parsed = URL(string: remoteURL), parsed.scheme != nil {
+    fileURL = vault.adoptLegacyKeyed(remoteURL: parsed, mediaKey: mediaKey, kind: .image)
+  }
+  guard let fileURL else { return nil }
   return try? Data(contentsOf: fileURL, options: [.mappedIfSafe])
 }
 
@@ -821,6 +988,9 @@ let chatRecoveredAudioTags = ChatRecoveredAudioTags()
 /// Resolves a music album cover (mem → disk → network), populating both caches, and
 /// calls `completion` on the main thread with the decoded image. Returns the network
 /// task, if one was started, so the caller can cancel it on cell reuse.
+private let chatMusicCoverInFlightLock = NSLock()
+private var chatMusicCoverInFlight: [String: [(UIImage) -> Void]] = [:]
+
 @discardableResult
 func chatLoadMusicCover(urlString: String?, completion: @escaping (UIImage) -> Void)
   -> URLSessionDataTask?
@@ -835,23 +1005,57 @@ func chatLoadMusicCover(urlString: String?, completion: @escaping (UIImage) -> V
     DispatchQueue.main.async { completion(cached) }
     return nil
   }
-  guard let url = URL(string: trimmed) else { return nil }
+
+  chatMusicCoverInFlightLock.lock()
+  if chatMusicCoverInFlight[key] != nil {
+    chatMusicCoverInFlight[key]?.append(completion)
+    chatMusicCoverInFlightLock.unlock()
+    return nil
+  }
+  chatMusicCoverInFlight[key] = [completion]
+  chatMusicCoverInFlightLock.unlock()
+
+  let finish: (UIImage?) -> Void = { image in
+    chatMusicCoverInFlightLock.lock()
+    let callbacks = chatMusicCoverInFlight.removeValue(forKey: key) ?? []
+    chatMusicCoverInFlightLock.unlock()
+    guard let image else { return }
+    DispatchQueue.main.async {
+      callbacks.forEach { $0(image) }
+    }
+  }
+
+  guard let url = URL(string: trimmed) else {
+    finish(nil)
+    return nil
+  }
   let task = VibeHTTP.shared.dataTask(with: url) { data, _, _ in
-    guard let data, !data.isEmpty, let image = UIImage(data: data) else { return }
-    chatMediaImageCache.setObject(image, forKey: key as NSString)
-    chatMediaDiskCacheSave(data, forKey: key)
-    DispatchQueue.main.async { completion(image) }
+    guard let data, !data.isEmpty else {
+      finish(nil)
+      return
+    }
+    chatMediaDiskCacheQueue.async {
+      guard let image = chatMediaDecodedImage(from: data, shouldAnimate: false) else {
+        finish(nil)
+        return
+      }
+      chatMediaImageCacheStore(image, forKey: key)
+      chatMediaDiskCacheSave(data, forKey: key)
+      finish(image)
+    }
   }
   // Check disk off-main first; only hit the network on a miss.
   chatMediaDiskCacheQueue.async {
-    if let diskData = chatMediaDiskCacheLoad(key), let image = UIImage(data: diskData) {
-      chatMediaImageCache.setObject(image, forKey: key as NSString)
-      DispatchQueue.main.async { completion(image) }
+    if let diskData = chatMediaDiskCacheLoad(key),
+      let image = chatMediaDecodedImage(from: diskData, shouldAnimate: false)
+    {
+      chatMediaImageCacheStore(image, forKey: key)
+      finish(image)
     } else {
       task.resume()
     }
   }
-  return task
+  return nil
 }
 
 /// Pre-fetches a media URL into the in-memory + disk cache so the cell can
@@ -865,20 +1069,28 @@ func chatMediaPrefetch(urlString: String, animated: Bool) {
     !chatMediaFailedURLs.contains(rawURLKey),
     let url = URL(string: urlString)
   else { return }
-  // Check disk cache first
-  if let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey),
-    let diskImage = chatMediaDecodedImage(from: diskData, shouldAnimate: animated)
-  {
-    chatMediaImageCache.setObject(diskImage, forKey: cacheKey as NSString)
-    return
+  let maxPixelSize = chatMediaBubbleDecodeMaxPixelSize()
+  // Disk first, off main; only hit the network on a miss.
+  chatMediaDiskCacheQueue.async {
+    if let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey),
+      let diskImage = chatMediaDecodedImage(
+        from: diskData, shouldAnimate: animated, maxPixelSize: maxPixelSize)
+    {
+      chatMediaImageCacheStore(diskImage, forKey: cacheKey)
+      return
+    }
+    VibeHTTP.shared.dataTask(with: url) { data, _, error in
+      guard error == nil, let data, !data.isEmpty else { return }
+      chatMediaDiskCacheQueue.async {
+        guard
+          let image = chatMediaDecodedImage(
+            from: data, shouldAnimate: animated, maxPixelSize: maxPixelSize)
+        else { return }
+        chatMediaImageCacheStore(image, forKey: cacheKey)
+        chatMediaDiskCacheSave(data, forKey: cacheKey)
+      }
+    }.resume()
   }
-  VibeHTTP.shared.dataTask(with: url) { data, _, error in
-    guard error == nil, let data, !data.isEmpty,
-      let image = chatMediaDecodedImage(from: data, shouldAnimate: animated)
-    else { return }
-    chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
-    chatMediaDiskCacheSave(data, forKey: cacheKey)
-  }.resume()
 }
 
 final class ChatCollectionFlowLayout: UICollectionViewFlowLayout {
@@ -3187,6 +3399,7 @@ private func cacheNaturalMediaSize(_ size: CGSize, for mediaUrl: String?) {
   guard let mediaUrl, !mediaUrl.isEmpty else { return }
   guard size.width > 1.0, size.height > 1.0 else { return }
   chatMediaNaturalSizeCache.setObject(NSValue(cgSize: size), forKey: mediaUrl as NSString)
+  chatMediaThumbDerivedSizeKeys.removeObject(forKey: mediaUrl as NSString)
   // Every existing caller of this function now also teaches the durable store, so a photo the
   // user has seen ONCE is sized exactly on every later launch.
   if let identity = chatMediaNaturalSizeIdentity(mediaUrl) {
@@ -3250,17 +3463,36 @@ private func probeLocalMediaSize(for mediaUrl: String?) -> CGSize? {
   return CGSize(width: w, height: h)
 }
 
-private func probeLocalVideoHasAudio(for mediaUrl: String?) -> Bool? {
+private let chatVideoAudioProbeLock = NSLock()
+private var chatVideoAudioProbesInFlight = Set<String>()
+
+/// Answers from the memo only; a miss starts one async track load per url and calls
+/// `completion` on main once the memo is filled.
+private func probeLocalVideoHasAudio(
+  for mediaUrl: String?, completion: (() -> Void)? = nil
+) -> Bool? {
   if let cached = cachedVideoHasAudio(for: mediaUrl) {
     return cached
   }
-  guard let resolvedPath = resolvedLocalMediaPath(mediaUrl) else { return nil }
-  let fileURL = URL(fileURLWithPath: resolvedPath)
-  let asset = AVURLAsset(url: fileURL)
-  guard !asset.tracks(withMediaType: .video).isEmpty else { return nil }
-  let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
-  cacheVideoHasAudio(hasAudio, for: mediaUrl)
-  return hasAudio
+  guard let mediaUrl, let resolvedPath = resolvedLocalMediaPath(mediaUrl) else { return nil }
+  chatVideoAudioProbeLock.lock()
+  let started = chatVideoAudioProbesInFlight.insert(mediaUrl).inserted
+  chatVideoAudioProbeLock.unlock()
+  guard started else { return nil }
+  let asset = AVURLAsset(url: URL(fileURLWithPath: resolvedPath))
+  Task.detached(priority: .utility) {
+    let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+    let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+    chatVideoAudioProbeLock.lock()
+    chatVideoAudioProbesInFlight.remove(mediaUrl)
+    chatVideoAudioProbeLock.unlock()
+    guard !videoTracks.isEmpty else { return }
+    await MainActor.run {
+      cacheVideoHasAudio(!audioTracks.isEmpty, for: mediaUrl)
+      completion?()
+    }
+  }
+  return nil
 }
 
 private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
@@ -3293,6 +3525,7 @@ private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
   {
     chatMediaNaturalSizeCache.setObject(
       NSValue(cgSize: stored), forKey: (row.mediaUrl ?? "") as NSString)
+    chatMediaThumbDerivedSizeKeys.removeObject(forKey: (row.mediaUrl ?? "") as NSString)
     return stored
   }
   if let local = probeLocalMediaSize(for: row.mediaUrl) {
@@ -3322,9 +3555,17 @@ private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
     // In-memory ONLY. This is the thumb's shape, not the media's true pixel size, and must
     // never reach the durable store — the real size overwrites it once the full image decodes.
     chatMediaNaturalSizeCache.setObject(NSValue(cgSize: derived), forKey: raw as NSString)
+    chatMediaThumbDerivedSizeKeys.setObject(NSNumber(value: true), forKey: raw as NSString)
     return derived
   }
   return nil
+}
+
+/// True while the memo's size for this url is the blur thumb's shape (route 5), so a height
+/// built on it stays provisional and is never persisted as exact.
+func chatMediaNaturalSizeIsThumbDerived(for mediaUrl: String?) -> Bool {
+  guard let mediaUrl, !mediaUrl.isEmpty else { return false }
+  return chatMediaThumbDerivedSizeKeys.object(forKey: mediaUrl as NSString) != nil
 }
 
 /// Is the media's real aspect ratio known RIGHT NOW, without touching the disk? Payload
@@ -3334,12 +3575,23 @@ private func resolvedMediaNaturalSize(for row: ChatListRow) -> CGSize? {
 /// The decode that resolves an image fills the memo, so this flips true exactly then.
 func chatMediaNaturalAspectIsKnownInMemory(for row: ChatListRow) -> Bool {
   if let mw = row.mediaWidth, let mh = row.mediaHeight, mw > 1.0, mh > 1.0 { return true }
-  if cachedNaturalMediaSize(for: row.mediaUrl) != nil { return true }
+  // A memo entry that is only the thumb's shape is still a guess.
+  if cachedNaturalMediaSize(for: row.mediaUrl) != nil,
+    !chatMediaNaturalSizeIsThumbDerived(for: row.mediaUrl)
+  {
+    return true
+  }
   // The local url the cell rendered from, when it differs from the row's. Same reason
   // `reportNaturalMediaSizeIfNeeded` records under both — the two addresses for one photo
   // are the whole bug, and a memo that answers for one of them must answer for the row.
   if let local = row.localMediaUrl, !local.isEmpty,
     cachedNaturalMediaSize(for: local) != nil
+  {
+    return true
+  }
+  // The durable store is loaded at launch, so sizing and staleness agree on a cold open.
+  if let identity = chatMediaNaturalSizeIdentity(row.mediaUrl),
+    ChatMediaNaturalSizeStore.shared.contains(identity)
   {
     return true
   }
@@ -3558,15 +3810,15 @@ private let bubbleLinkPreviewMinWidth: CGFloat = 220.0
 //   [ Title ]
 //   [ Artist ]
 //   [ time ✓ bottom-trailing ]
-private let bubbleMusicLinkArtTop: CGFloat = 10.0
-private let bubbleMusicLinkArtBottomGap: CGFloat = 10.0
-private let bubbleMusicLinkTextBlockHeight: CGFloat = 62.0  // site + title + artist
-private let bubbleMusicLinkBottomPad: CGFloat = 10.0
+private let bubbleMusicLinkArtTop: CGFloat = 8.0
+private let bubbleMusicLinkArtBottomGap: CGFloat = 8.0
+private let bubbleMusicLinkTextBlockHeight: CGFloat = 58.0  // site + title + artist
+private let bubbleMusicLinkBottomPad: CGFloat = 8.0
 private let bubbleMusicLinkArtworkHeight: CGFloat = 236.0
 private let bubbleMusicLinkPreviewHeight: CGFloat =
   bubbleMusicLinkArtTop + bubbleMusicLinkArtworkHeight + bubbleMusicLinkArtBottomGap
   + bubbleMusicLinkTextBlockHeight + bubbleMusicLinkBottomPad
-private let bubbleMusicLinkPreviewMinWidth: CGFloat = 480.0
+private let bubbleMusicLinkPreviewMinWidth: CGFloat = 270.0
 // Gap between rich-text blocks (prose ↔ code card ↔ runtime summary). A touch more
 // air keeps multi-block agent answers from stacking into one dense column.
 private let bubbleRichTextBlockSpacing: CGFloat = 10.0
@@ -3891,7 +4143,7 @@ private func bubbleCanPreviewURL(_ url: URL) -> Bool {
   return bubbleInternalChatId(from: url) == nil
 }
 
-private func bubblePreviewURL(for row: ChatListRow) -> URL? {
+func bubblePreviewCandidateURL(for row: ChatListRow) -> URL? {
   guard row.kind == .message, row.visualKind == .text, row.messageType != "typing",
     !hasInlineAttachment(row), !row.isAgentMessage, !row.isAgentMention
   else {
@@ -3915,6 +4167,13 @@ private func bubblePreviewURL(for row: ChatListRow) -> URL? {
     return url
   }
   return nil
+}
+
+private func bubblePreviewURL(for row: ChatListRow) -> URL? {
+  guard let url = bubblePreviewCandidateURL(for: row), bubbleIsMusicPreviewURL(url) else {
+    return nil
+  }
+  return url
 }
 
 /// Music page hosts get the tall Telegram-style artwork card instead of the
@@ -4260,22 +4519,36 @@ private final class BubbleLinkPreviewStore {
   static let shared = BubbleLinkPreviewStore()
 
   private var cached: [String: BubbleLinkPreviewData] = [:]
-  private var inFlight: [String: [(BubbleLinkPreviewData) -> Void]] = [:]
+  private var inFlight: [String: [(BubbleLinkPreviewData?) -> Void]] = [:]
   private var activeProviders: [String: LPMetadataProvider] = [:]
+  private let availabilityLock = NSLock()
+  private var unavailable: Set<String> = []
 
   private init() {}
 
   /// Disk keys for one preview URL. The image rides the shared chat-media disk cache
   /// (same eviction//clear plumbing as every other cached image); the text fields ride
   /// UserDefaults because they are two short strings.
-  private static func imageDiskKey(_ url: String) -> String { "linkpreview|\(url)" }
-  private static func textDefaultsKey(_ url: String) -> String { "linkpreview.meta|\(url)" }
+  private static func imageDiskKey(_ url: String) -> String { "linkpreview.v2|\(url)" }
+  private static func textDefaultsKey(_ url: String) -> String { "linkpreview.meta.v2|\(url)" }
 
-  func fetch(url: URL, completion: @escaping (BubbleLinkPreviewData) -> Void) {
+  func isUnavailable(url: URL) -> Bool {
+    availabilityLock.lock()
+    defer { availabilityLock.unlock() }
+    return unavailable.contains(url.absoluteString)
+  }
+
+  func fetch(url: URL, completion: @escaping (BubbleLinkPreviewData?) -> Void) {
     let key = url.absoluteString
     if let cachedData = cached[key] {
       DispatchQueue.main.async {
         completion(cachedData)
+      }
+      return
+    }
+    if isUnavailable(url: url) {
+      DispatchQueue.main.async {
+        completion(nil)
       }
       return
     }
@@ -4292,7 +4565,9 @@ private final class BubbleLinkPreviewStore {
     chatMediaDiskCacheQueue.async { [weak self] in
       guard let self else { return }
       let meta = UserDefaults.standard.stringArray(forKey: Self.textDefaultsKey(key))
-      guard let meta, meta.count == 2 else {
+      guard let meta, meta.count == 2,
+        !meta[0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      else {
         DispatchQueue.main.async { self.startRemoteFetch(url: url, key: key) }
         return
       }
@@ -4300,7 +4575,7 @@ private final class BubbleLinkPreviewStore {
       if let cachedImage = chatMediaImageCache.object(forKey: imageKey as NSString) {
         image = cachedImage
       } else if let data = chatMediaDiskCacheLoad(imageKey), let decoded = UIImage(data: data) {
-        chatMediaImageCache.setObject(decoded, forKey: imageKey as NSString)
+        chatMediaImageCacheStore(decoded, forKey: imageKey)
         image = decoded
       }
       self.finish(
@@ -4313,25 +4588,26 @@ private final class BubbleLinkPreviewStore {
 
   private func startRemoteFetch(url: URL, key: String) {
     let provider = LPMetadataProvider()
-  activeProviders[key] = provider
+    activeProviders[key] = provider
     provider.startFetchingMetadata(for: url) { [weak self] metadata, _ in
-      guard let self else { return }
-      let resolvedURL = metadata?.originalURL ?? metadata?.url ?? url
-      let trimmedTitle = metadata?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      let fallback = BubbleLinkPreviewData(
-        url: resolvedURL,
-        title: trimmedTitle.isEmpty ? bubblePreviewTitleFallback(for: resolvedURL) : trimmedTitle,
-        site: bubblePreviewSiteLabel(for: resolvedURL),
-        icon: nil
-      )
+      guard let self, let metadata else {
+        self?.finishUnavailable(key: key)
+        return
+      }
+      let resolvedURL = metadata.originalURL ?? metadata.url ?? url
+      let title = metadata.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard !title.isEmpty else {
+        self.finishUnavailable(key: key)
+        return
+      }
 
       self.loadPreviewImage(from: metadata) { image in
         self.finish(
           key: key,
           data: BubbleLinkPreviewData(
-            url: fallback.url,
-            title: fallback.title,
-            site: fallback.site,
+            url: resolvedURL,
+            title: title,
+            site: bubblePreviewSiteLabel(for: resolvedURL),
             icon: image
           )
         )
@@ -4358,8 +4634,22 @@ private final class BubbleLinkPreviewStore {
     }
   }
 
+  private func finishUnavailable(key: String) {
+    DispatchQueue.main.async {
+      self.availabilityLock.lock()
+      self.unavailable.insert(key)
+      self.availabilityLock.unlock()
+      self.activeProviders.removeValue(forKey: key)
+      let callbacks = self.inFlight.removeValue(forKey: key) ?? []
+      callbacks.forEach { $0(nil) }
+    }
+  }
+
   private func finish(key: String, data: BubbleLinkPreviewData, persist: Bool = true) {
     DispatchQueue.main.async {
+      self.availabilityLock.lock()
+      self.unavailable.remove(key)
+      self.availabilityLock.unlock()
       self.cached[key] = data
       self.activeProviders.removeValue(forKey: key)
       let callbacks = self.inFlight.removeValue(forKey: key) ?? []
@@ -4370,7 +4660,7 @@ private final class BubbleLinkPreviewStore {
     guard persist else { return }
     let imageKey = Self.imageDiskKey(key)
     if let icon = data.icon {
-      chatMediaImageCache.setObject(icon, forKey: imageKey as NSString)
+      chatMediaImageCacheStore(icon, forKey: imageKey)
     }
     chatMediaDiskCacheQueue.async {
       UserDefaults.standard.set([data.title, data.site], forKey: Self.textDefaultsKey(key))
@@ -4675,10 +4965,12 @@ final class BubbleLinkPreviewView: UIView {
   private let playGlyphView = UIImageView()
   private let descLabel = UILabel()
   private var isMusicCard = false
+  private var hasUsablePreviewData = false
   private var currentArtworkURLString: String?
   private var currentURL: URL?
   private var currentAppearance = ChatListAppearance.current
   private var currentIsMe = false
+  var onPreviewAvailabilityChange: (() -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -4745,6 +5037,7 @@ final class BubbleLinkPreviewView: UIView {
     descLabel.text = nil
     artworkView.image = nil
     isMusicCard = false
+    hasUsablePreviewData = false
     artworkView.isHidden = true
     playBadgeView.isHidden = true
     descLabel.isHidden = true
@@ -4780,12 +5073,23 @@ final class BubbleLinkPreviewView: UIView {
   }
 
   func configure(url: URL, appearance: ChatListAppearance, isMe: Bool) {
+    let sameURL = currentURL?.absoluteString == url.absoluteString
+    if !sameURL {
+      currentArtworkURLString = nil
+      artworkView.image = nil
+      siteLabel.text = nil
+      titleLabel.text = nil
+      descLabel.text = nil
+      hasUsablePreviewData = false
+    }
     currentURL = url
     isMusicCard = bubbleIsMusicPreviewURL(url)
     applyAppearance(appearance, isMe: isMe)
 
     if isMusicCard {
-      configureMusicCard(url: url, appearance: appearance, isMe: isMe)
+      isHidden = false
+      hasUsablePreviewData = true
+      configureMusicCard(url: url, appearance: appearance, isMe: isMe, sameURL: sameURL)
       return
     }
 
@@ -4794,28 +5098,48 @@ final class BubbleLinkPreviewView: UIView {
     playBadgeView.isHidden = true
     descLabel.isHidden = true
     titleLabel.numberOfLines = 2
-    siteLabel.text = bubblePreviewSiteLabel(for: url)
-    titleLabel.text = bubblePreviewTitleFallback(for: url)
-    iconView.image = UIImage(systemName: "globe")
+    if !sameURL {
+      iconView.image = UIImage(systemName: "globe")
+      iconView.contentMode = .scaleAspectFit
+    }
     iconView.tintColor = (isMe
       ? (appearance.bubbleMeGradient.first ?? appearance.bubbleThemColor)
       : appearance.bubbleThemColor).withAlphaComponent(0.96)
-    iconView.backgroundColor = iconView.tintColor.withAlphaComponent(appearance.isDark ? 0.14 : 0.10)
-    iconView.contentMode = .scaleAspectFit
+    if iconView.contentMode != .scaleAspectFill {
+      iconView.backgroundColor = iconView.tintColor.withAlphaComponent(appearance.isDark ? 0.14 : 0.10)
+    }
+    isHidden = !hasUsablePreviewData
 
     BubbleLinkPreviewStore.shared.fetch(url: url) { [weak self] data in
       guard let self, self.currentURL?.absoluteString == url.absoluteString else { return }
+      guard let data else {
+        self.hasUsablePreviewData = false
+        self.isHidden = true
+        self.onPreviewAvailabilityChange?()
+        return
+      }
       self.siteLabel.text = data.site
       self.titleLabel.text = data.title
       if let icon = data.icon {
         self.iconView.image = icon
         self.iconView.backgroundColor = .clear
         self.iconView.contentMode = .scaleAspectFill
+      } else {
+        self.iconView.image = UIImage(systemName: "globe")
+        self.iconView.contentMode = .scaleAspectFit
       }
+      self.hasUsablePreviewData = true
+      self.isHidden = false
+      self.setNeedsLayout()
     }
   }
 
-  private func configureMusicCard(url: URL, appearance: ChatListAppearance, isMe: Bool) {
+  private func configureMusicCard(
+    url: URL,
+    appearance: ChatListAppearance,
+    isMe: Bool,
+    sameURL: Bool
+  ) {
     iconView.isHidden = true
     artworkView.isHidden = false
     playBadgeView.isHidden = false
@@ -4823,7 +5147,6 @@ final class BubbleLinkPreviewView: UIView {
     titleLabel.numberOfLines = 1
     // Keep existing artwork when re-configuring the same link (avoids empty-then-pop
     // on every cell rebind / setRows while OG metadata is still warm).
-    let sameURL = currentURL?.absoluteString == url.absoluteString
     if !sameURL {
       artworkView.image = nil
       currentArtworkURLString = nil
@@ -5128,6 +5451,29 @@ func agentTurnSingleStepHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -
   return min(maxContentWidth, max(bubbleMinWidth, hug))
 }
 
+/// Live-computer band under an agent turn: fixed one line, so it is a plain constant in
+/// every height path (docs/row-height-formulas.md §1.5). Never let it wrap.
+let agentTurnComputerBandHeight: CGFloat = 26.0
+let agentTurnComputerBandTopGap: CGFloat = 8.0
+
+/// The chat's live computer, but only on the turn that is actually running — so a computer
+/// going live changes one row's height, not every settled turn in the transcript.
+func agentTurnComputerBandState(_ row: ChatListRow) -> ChatEngine.AgentComputerState? {
+  guard bubbleUsesAgentTurnContent(row),
+    row.isStreamingText || agentTurnRowCouldBeLive(row),
+    let state = ChatEngine.shared.latestAgentComputer(chatId: row.chatId),
+    state.live, !state.host.isEmpty
+  else { return nil }
+  return state
+}
+
+/// Constant the computer band adds to this row's bubble. Applied identically by
+/// `measureMessageBubbleLayout` and `ChatListView.presentationSeedMessageHeight`.
+func agentTurnComputerBandReserve(_ row: ChatListRow) -> CGFloat {
+  agentTurnComputerBandState(row) == nil
+    ? 0.0 : agentTurnComputerBandTopGap + agentTurnComputerBandHeight
+}
+
 /// Single width decision for agent-turn bubbles (measure == render).
 ///
 /// - Full `maxContentWidth` when the row genuinely needs the workspace (bridge/stream/lan
@@ -5238,8 +5584,20 @@ func measureMessageBubbleLayout(
     )
   }
 
-  let maxBubbleWidth = floor(rowWidth * bubbleMaxWidthFactor)
+  let previewCandidateURL = bubblePreviewCandidateURL(for: row)
+  let usesMusicLinkPreview = previewCandidateURL.map { bubbleIsMusicPreviewURL($0) } ?? false
+  let usesExpandedURLWidth = previewCandidateURL != nil && !usesMusicLinkPreview
+  let widthFactor = usesExpandedURLWidth ? bubbleURLOnlyMaxWidthFactor : bubbleMaxWidthFactor
+  let maxBubbleWidth = floor(rowWidth * widthFactor)
   let maxContentWidth = max(1.0, maxBubbleWidth - (bubbleHorizontalPadding * 2.0))
+  let messageContentWidthLimit =
+    usesMusicLinkPreview
+    ? min(
+      maxContentWidth,
+      max(
+        1.0,
+        floor(rowWidth * bubbleMusicPreviewMaxWidthFactor) - (bubbleHorizontalPadding * 2.0)))
+    : maxContentWidth
   let meta = bubbleMetaWidths(for: row)
 
   if bubbleUsesAgentTurnContent(row) {
@@ -5304,10 +5662,12 @@ func measureMessageBubbleLayout(
     // top-aligned at `bubbleFrame.minY + agentTurnVerticalPadding` and keeps its own
     // measured `textHeight`, so pre-expanding the plate never moves text that is already
     // on screen — the next tokens simply fill space that is already there.
+    // Band reserve rides OUTSIDE the streaming quantization so it stays an exact constant
+    // instead of being swallowed by the 48pt block.
     let bubbleHeight =
-      isLiveStreaming
-      ? agentTurnStreamingReservedHeight(settledBubbleHeight)
-      : settledBubbleHeight
+      (isLiveStreaming
+        ? agentTurnStreamingReservedHeight(settledBubbleHeight)
+        : settledBubbleHeight) + agentTurnComputerBandReserve(row)
     // DIAGNOSTIC (live-turn empty-bubble): compare what the sizing pass measured against
     // what the render pass draws. An empty on-screen bubble with items>0 here means the
     // content exists but is clipped/misplaced; h≈44 with items>0 means the measurement
@@ -5391,6 +5751,18 @@ func measureMessageBubbleLayout(
     var targetWidth: CGFloat
     var mediaHeight: CGFloat
     var mediaAspectWasUnknown = false
+    let limitsMediaWidth = row.visualKind == .video || row.visualKind == .media
+    let isFullBleed = usesFullBleedMediaLayout(row)
+    let mediaBubbleWidthLimit =
+      limitsMediaWidth
+      ? min(maxBubbleWidth, floor(rowWidth * bubbleMediaMaxWidthFactor))
+      : maxBubbleWidth
+    let mediaContentWidthLimit =
+      limitsMediaWidth
+      ? max(
+        1.0,
+        mediaBubbleWidthLimit - (isFullBleed ? 0.0 : bubbleHorizontalPadding * 2.0))
+      : maxContentWidth
     switch row.visualKind {
     case .voice:
       if usesAudioMetadataVoiceLayout(row) {
@@ -5439,14 +5811,18 @@ func measureMessageBubbleLayout(
     case .video, .media, .sticker:
       let gridCount = chatMediaGridImageCount(row)
       if gridCount > 1 {
-        targetWidth = maxContentWidth
+        targetWidth = mediaContentWidthLimit
         mediaHeight = chatMediaStackHeight(for: row, width: targetWidth)
       } else if let naturalSize = resolvedMediaNaturalSize(for: row),
         naturalSize.width > 1.0,
         naturalSize.height > 1.0
       {
+        // A size from the blur thumb (route 5) keeps the height provisional, never exact.
+        mediaAspectWasUnknown =
+          row.mediaUrl?.isEmpty == false && chatMediaNaturalSizeIsThumbDerived(for: row.mediaUrl)
         let ratio = max(0.2, min(5.0, naturalSize.height / naturalSize.width))
-        let sizeLimit: CGFloat = row.visualKind == .sticker ? stickerMaxDisplayWidth : maxContentWidth
+        let sizeLimit: CGFloat =
+          row.visualKind == .sticker ? stickerMaxDisplayWidth : mediaContentWidthLimit
         let minWidth: CGFloat = row.visualKind == .sticker ? stickerMinDisplaySide : 120.0
         let minHeight: CGFloat = row.visualKind == .sticker ? stickerMinDisplaySide : 84.0
         targetWidth = max(minWidth, min(sizeLimit, naturalSize.width))
@@ -5486,7 +5862,7 @@ func measureMessageBubbleLayout(
         // answer), this media can resolve, and a stale guess that is never corrected is a
         // permanently mis-shaped photo. The goal here is to make the correction small
         // enough not to be seen, not to abandon it.
-        targetWidth = max(120.0, maxContentWidth)
+        targetWidth = max(120.0, mediaContentWidthLimit)
         mediaHeight = max(84.0, min(380.0, targetWidth * 0.75))
         mediaAspectWasUnknown = row.mediaUrl?.isEmpty == false
       }
@@ -5496,9 +5872,8 @@ func measureMessageBubbleLayout(
     }
 
     let isTransparentSticker = isTransparentStickerMessage(row)
-    let isFullBleed = usesFullBleedMediaLayout(row)
     let metaTopSpacing = effectiveMetaTopSpacing(for: row)
-    let contentWidth = min(maxContentWidth, targetWidth)
+    let contentWidth = min(mediaContentWidthLimit, targetWidth)
     let hasMediaCaption = hasMediaCaptionLayout(row) && !isTransparentSticker
     let isEdgeCaption = usesEdgeMediaCaptionLayout(row)
     let captionAttributedText =
@@ -5576,7 +5951,7 @@ func measureMessageBubbleLayout(
           bodyHeight + topPad + bottomPad
             + reactionStripHeightOffset(reactionSize, bottomPadding: bottomPad))
     }
-    bubbleWidth = min(maxBubbleWidth, max(bubbleWidth, reactionSize.width + 12.0))
+    bubbleWidth = min(mediaBubbleWidthLimit, max(bubbleWidth, reactionSize.width + 12.0))
     var metrics = ChatMessageBubbleLayoutMetrics(
       bubbleWidth: bubbleWidth,
       bubbleHeight: bubbleHeight,
@@ -5634,8 +6009,8 @@ func measureMessageBubbleLayout(
   }
   let textMaxWidth: CGFloat =
     showsInlineAttachment || usesBottomMetaLayout
-    ? maxContentWidth
-    : max(1.0, maxContentWidth - meta.total - bubbleMetaInlineSpacing)
+    ? messageContentWidthLimit
+    : max(1.0, messageContentWidthLimit - meta.total - bubbleMetaInlineSpacing)
   var (textWidth, fullTextHeight) = measureText(textMaxWidth)
   // One shared tall-content rule for user AND agent text bubbles: past the trigger the
   // bubble collapses to the cap and gains a leading meta-row double-chevron (see the
@@ -5651,7 +6026,7 @@ func measureMessageBubbleLayout(
     // width that layout grants the text (the collapse decision can't flip: the trigger
     // dwarfs the few points of width difference).
     usesBottomMetaLayout = true
-    (textWidth, fullTextHeight) = measureText(maxContentWidth)
+    (textWidth, fullTextHeight) = measureText(messageContentWidthLimit)
   }
   let tallCollapsed = tallToggleVisible && !agentTurnState.tallExpanded
   // Content always lays out at full height so expand is pure Y reveal (no reflow).
@@ -5672,7 +6047,7 @@ func measureMessageBubbleLayout(
     let textWidth = measuredTextWidth(
       replyPreviewText(for: row), font: UIFont.systemFont(ofSize: 13, weight: .regular))
     replyPreviewWidth = min(
-      maxContentWidth,
+      messageContentWidthLimit,
       max(bubbleReplyPreviewMinWidth, max(titleWidth, textWidth) + 24.0)
     )
   } else {
@@ -5682,7 +6057,7 @@ func measureMessageBubbleLayout(
     let attachmentTitle = inlineAttachmentTitle(for: row)
     let attachmentWidth =
       min(
-        maxContentWidth,
+        messageContentWidthLimit,
         max(
           168.0,
           measuredTextWidth(attachmentTitle, font: UIFont.systemFont(ofSize: 13, weight: .semibold))
@@ -5705,7 +6080,8 @@ func measureMessageBubbleLayout(
     desiredContentWidth = max(textWidth + bubbleMetaInlineSpacing + meta.total, replyPreviewWidth)
   }
   let reactionSize = reactionStripMeasuredSize(
-    row.reactions, maxWidth: max(1.0, maxBubbleWidth - 12.0),
+    row.reactions,
+    maxWidth: max(1.0, messageContentWidthLimit + (bubbleHorizontalPadding * 2.0) - 12.0),
     showsCount: row.isGroupOrChannel)
   // Timestamp rides the reaction row (LTR and RTL) when there is no link preview.
   let metaRidesReactionRow =
@@ -5716,7 +6092,7 @@ func measureMessageBubbleLayout(
     : reactionSize.width
   let contentWidth = max(
     meta.total,
-    min(maxContentWidth, max(desiredContentWidth, reactionRowWidth)))
+    min(messageContentWidthLimit, max(desiredContentWidth, reactionRowWidth)))
   let appliedRTLTailSideReserve =
     usesRTLColumn && row.isMe
     ? min(bubbleRTLTailSideReserve, max(0.0, contentWidth - max(textWidth, meta.total, replyPreviewWidth)))
@@ -10228,6 +10604,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     _agentTurnContentView = view
     return view
   }
+  /// Built the first time a turn shows a live computer — same lazy contract as above.
+  private var _agentComputerBandView: AgentComputerBandView?
+  private var agentComputerBandView: AgentComputerBandView {
+    if let existing = _agentComputerBandView { return existing }
+    let view = AgentComputerBandView()
+    view.addTarget(self, action: #selector(agentComputerBandTapped), for: .touchUpInside)
+    contentView.insertSubview(view, aboveSubview: agentTurnContentView)
+    _agentComputerBandView = view
+    return view
+  }
   private var agentTurnState = AgentTurnBubbleState()
   // Reconfigure gate for agentTurnContentView: `layoutSubviews` runs on every scroll
   // tick / pin adjustment, but `configure(row:)` re-parses the FULL progress payload
@@ -10252,6 +10638,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var linkPreviewView: BubbleLinkPreviewView {
     if let existing = _linkPreviewView { return existing }
     let view = BubbleLinkPreviewView()
+    view.onPreviewAvailabilityChange = { [weak self] in
+      self?.setNeedsLayout()
+    }
     view.applyAppearance(appearance, isMe: row?.isMe ?? false)
     // Directly above the reply preview, matching the eager initializer's subview order.
     contentView.insertSubview(view, aboveSubview: replyPreviewView)
@@ -10403,6 +10792,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private static let bridgeGridImageCache = NSCache<NSString, UIImage>()
   private static let bridgeGridDecodeQueue = DispatchQueue(
     label: "chat.media.grid-decode", qos: .userInitiated)
+  /// Serial, so category and activation stay ordered while both stay off the main thread.
+  private static let audioSessionQueue = DispatchQueue(
+    label: "chat.media.audio-session", qos: .utility)
   private let mediaProgressSpinner = UIActivityIndicatorView(style: .medium)
   private let mediaProgressSizeLabel = UILabel()
   /// Everything above: the whole media cluster — image/video host, blur, Lottie, voice
@@ -10529,6 +10921,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var cachedLayoutMetrics: ChatMessageBubbleLayoutMetrics?
   private var cachedLayoutWidth: CGFloat = 0
   private var mediaImageTask: URLSessionDataTask?
+  /// Cache key the in-flight fetch was started for; only a different key cancels it.
+  private var mediaImageTaskKey: String?
+  /// Cache key of the off-main decode in flight, so a reconfigure does not start a second.
+  private var mediaDecodeInFlightKey: String?
   private var musicCoverTask: URLSessionDataTask?
   /// Built the first time a row plays inline video — see ``mediaVideoPlayerLayer``.
   private var _mediaVideoPlayerLayer: AVPlayerLayer?
@@ -10553,6 +10949,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   private var mediaVideoStatusObserver: NSKeyValueObservation?
   private var mediaVideoTimeObserver: Any?
   private var mediaVideoPlayerURLKey: String?
+  /// Vault identity (or canonical file path) behind the player, so a local-url patch to the
+  /// same bytes does not rebuild it.
+  private var mediaVideoPlayerIdentityKey: String?
+  /// Set by an explicit user play/unmute; only then does the audio session get configured.
+  private var mediaVideoUserInitiatedPlay = false
   private var mediaVideoPlaybackActive = false
   private var mediaVideoHasCompletedOnce = false
   private var mediaVideoUserPaused = false
@@ -11139,7 +11540,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   @objc private func handleInlineVideoPlayTap() {
-    guard let row, row.visualKind == .video || row.visualKind == .videoNote else { return }
+    // Notes are toggled by the list (scale + expanded playback), never by this glyph.
+    guard let row, row.visualKind == .video else { return }
     guard !row.shouldShowUploadOverlay, !mediaIsDownloading else { return }
     toggleInlineVideoPlayback()
   }
@@ -11159,6 +11561,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaVideoUserPaused = false
       mediaVideoHasCompletedOnce = false
       mediaVideoPlaybackActive = true
+      mediaVideoUserInitiatedPlay = true
       if mediaVideoReady, mediaVideoPlayer != nil {
         configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
         mediaVideoPlayer?.play()
@@ -11183,15 +11586,23 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaPrimaryIconView.isHidden = true
       return
     }
+    let isNote = row.visualKind == .videoNote
+    // An expanded note plays under a progress ring; the glyph would sit on top of it.
+    if isNote, videoNoteExpandedPlayback {
+      mediaPrimaryIconView.isHidden = true
+      return
+    }
     let playing = isInlineVideoPlayingNow() && !mediaVideoUserPaused
     let symbol = playing ? "pause.fill" : "play.fill"
-    let point: CGFloat = row.visualKind == .videoNote ? 22 : 24
+    let point: CGFloat = isNote ? 22 : 24
     mediaPrimaryIconView.image = UIImage(systemName: symbol)?.withConfiguration(
       UIImage.SymbolConfiguration(pointSize: point, weight: .bold))
     mediaPrimaryIconView.isHidden = false
+    mediaPrimaryIconView.alpha = 1.0
     mediaPrimaryIconView.tintColor = .white
     mediaPrimaryIconView.backgroundColor = UIColor.black.withAlphaComponent(playing ? 0.28 : 0.42)
-    mediaPrimaryIconView.isUserInteractionEnabled = true
+    // A note glyph must not eat the tap — the scale lives on the list's row selection.
+    mediaPrimaryIconView.isUserInteractionEnabled = !isNote
     mediaContainerView.bringSubviewToFront(mediaPrimaryIconView)
   }
 
@@ -11205,6 +11616,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   func beginVideoNoteExpandedPlayback() {
     noteVideoNoteExpandSession()
     mediaVideoPlaybackActive = true
+    mediaVideoUserInitiatedPlay = true
     if let player = mediaVideoPlayer {
       configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
       player.seek(to: .zero)
@@ -11216,6 +11628,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
 
   func setVideoNoteExpandedPlayback(_ expanded: Bool) {
     guard row?.visualKind == .videoNote else { return }
+    videoNoteExpandedPlayback = expanded
     UIView.animate(
       withDuration: 0.2,
       delay: 0,
@@ -11232,6 +11645,14 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   }
 
   private var videoNoteScaleInFlight = false
+  private var videoNoteExpandedPlayback = false
+  private var videoNoteScaleOriginFrame: CGRect?
+
+  /// Where the circle is right now, in window space, before the row is re-laid out.
+  func captureVideoNoteScaleOrigin() {
+    guard row?.visualKind == .videoNote, let host = mediaContainerView.superview else { return }
+    videoNoteScaleOriginFrame = host.convert(mediaContainerView.frame, to: nil)
+  }
 
   func prepareVideoNoteScale(from fromSide: CGFloat, to toSide: CGFloat) {
     guard row?.visualKind == .videoNote else { return }
@@ -11242,7 +11663,18 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     contentView.clipsToBounds = false
     superview?.bringSubviewToFront(self)
     setVideoNoteScaleAnchor(CGPoint(x: 0.5, y: 1.0), on: view)
-    view.transform = CGAffineTransform(scaleX: s, y: s)
+    // Start from where the circle actually was: a collapsed note is side-aligned and an
+    // expanded one is centred, so scaling alone would begin at the wrong x.
+    var dx: CGFloat = 0.0
+    var dy: CGFloat = 0.0
+    if let origin = videoNoteScaleOriginFrame, let host = view.superview {
+      let target = host.convert(view.frame, to: nil)
+      if target.width > 0.0, target.height > 0.0 {
+        dx = origin.midX - target.midX
+        dy = origin.maxY - target.maxY
+      }
+    }
+    view.transform = CGAffineTransform(translationX: dx, y: dy).scaledBy(x: s, y: s)
   }
 
   func settleVideoNoteScale() {
@@ -11254,6 +11686,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     view.transform = .identity
     setVideoNoteScaleAnchor(CGPoint(x: 0.5, y: 0.5), on: view)
     videoNoteScaleInFlight = false
+    videoNoteScaleOriginFrame = nil
   }
 
   private func setVideoNoteScaleAnchor(_ point: CGPoint, on view: UIView) {
@@ -11445,19 +11878,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // Status, roster, foreground, and selection updates reconfigure the same visible
     // cell. Keep its decoded pixels through that synchronous pass so an image never
     // flashes to the placeholder while the identical cache entry is looked up again.
+    // Message-scoped: a local→remote promotion or a patched local url is the same picture,
+    // so its pixels and quality stamp survive. Only a different remote identity is new media.
     let isSameMediaIdentity = previousRow.map {
-      ($0.messageId ?? $0.key) == (row.messageId ?? row.key)
+      isSameMessageIdentity
         && $0.visualKind == row.visualKind
-        && $0.mediaUrl == row.mediaUrl
-        && $0.localMediaUrl == row.localMediaUrl
-        && $0.mediaKey == row.mediaKey
+        && chatMediaRowsShareRemoteIdentity($0, row)
     } ?? false
+    let mediaKindChanged = previousRow.map { $0.visualKind != row.visualKind } ?? true
     let preservedMediaImage = isSameMediaIdentity ? mediaImageView.image : nil
-    if !isSameMediaIdentity {
+    if !isSameMessageIdentity || mediaKindChanged {
       mediaPixelQuality = .none
       documentPageCount = nil
       documentByteSize = nil
-    } else if preservedMediaImage != nil, mediaPixelQuality == .none {
+    } else if mediaImageView.image != nil, mediaPixelQuality == .none {
       // Reused cell with pixels but no quality stamp (old path) — treat as full so
       // a late micro-thumb cannot downgrade a sharp image.
       mediaPixelQuality = .full
@@ -12008,7 +12442,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         for: row,
         textColor: textColor,
         metaColor: metaColor,
-        preservedMediaImage: preservedMediaImage
+        preservedMediaImage: preservedMediaImage,
+        isSameMessage: isSameMessageIdentity,
+        mediaKindChanged: mediaKindChanged
       )
       if !inlineAttachmentView.isHidden {
         inlineAttachmentView.backgroundColor = UIColor(white: 0.0, alpha: 0.20)
@@ -12076,6 +12512,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     stopTypingShimmer()
     stopInlineVideoPlayback(resetMutedState: true)
     stopVideoNoteProgressRing()
+    videoNoteExpandedPlayback = false
+    mediaPrimaryIconView.alpha = 1.0
     resetStickerAnimation()
     lastTouchPointInCell = nil
     resetTallBubbleInnerContentAnimation()
@@ -12191,9 +12629,13 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     hasSavedExtractionState = false
     mediaImageTask?.cancel()
     mediaImageTask = nil
+    mediaImageTaskKey = nil
+    mediaDecodeInFlightKey = nil
+    mediaVideoUserInitiatedPlay = false
     musicCoverTask?.cancel()
     musicCoverTask = nil
     mediaImageView.image = nil
+    mediaVoiceButtonView.setArtworkImage(nil)
     mediaPixelQuality = .none
     mediaContainerView.transform = .identity
     bubbleView.transform = .identity
@@ -12228,6 +12670,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     lastAgentTurnConfiguredWidth = -1.0
     lastAgentTurnConfiguredState = nil
     lastAgentTurnConfiguredStyle = .unspecified
+  }
+
+  @objc private func agentComputerBandTapped() {
+    guard let messageId = row?.messageId else { return }
+    onAgentAction?(["type": "openAgentComputer", "messageId": messageId])
   }
 
   private func startTypingShimmer() {
@@ -12277,6 +12724,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // Agent turns: ALWAYS clip. A stale layout height (common after live→settle or
     // bridge-restart history upsert) must never paint the body over the next cell.
     _agentTurnContentView?.clipsToBounds = true
+    // Only the agent-turn arm below re-shows the computer band; every other path leaves it off.
+    _agentComputerBandView?.isHidden = true
+    _agentComputerBandView?.frame = .zero
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
@@ -12557,8 +13007,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       // IMPORTANT: tailView has a rotation+flip transform applied, so we MUST NOT
       // set .frame (undefined behavior per Apple docs). Use bounds + center instead.
       let tailSize: CGFloat = 29
-      let tailX = row.isMe ? bubbleFrame.maxX - 2 : bubbleFrame.minX - 27
-      let tailY = bubbleFrame.maxY - tailSize + 1.0
+      let tailX = row.isMe ? bubbleFrame.maxX - 1.0 : bubbleFrame.minX - tailSize + 1.0
+      let tailY = bubbleFrame.maxY - tailSize + 3.0
       tailView.bounds = CGRect(origin: .zero, size: CGSize(width: tailSize, height: tailSize))
       tailView.center = CGPoint(x: tailX + tailSize * 0.5, y: tailY + tailSize * 0.5)
       let img = mediaImageView.image
@@ -12752,9 +13202,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         }
         // Prefer fitting the morphing plate: when the cell is mid expand/collapse the
         // available body height is the interpolating bubble, not the settled metrics.
+        let computerBand = agentTurnComputerBandState(row)
+        let computerBandReserve = agentTurnComputerBandReserve(row)
         let agentBodyMaxHeight = max(
           1.0,
-          bubbleFrame.height - (agentTurnVerticalPadding * 2.0)
+          bubbleFrame.height - (agentTurnVerticalPadding * 2.0) - computerBandReserve
         )
         // Frame height = visible plate slice; full content is measured taller and soft-
         // masked when collapsed so expand only grows Y.
@@ -12776,6 +13228,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           && (metrics.tallCollapsed || isTallHeightMorphing)
           && metrics.textHeight > agentBodyHeight + 1.0
         applyTallCollapseFadeMask(to: agentTurnContentView, enabled: agentNeedsFade)
+        if let computerBand {
+          let band = agentComputerBandView
+          band.isHidden = false
+          band.configure(
+            host: computerBand.host, title: computerBand.title, live: computerBand.live,
+            appearance: VibeAgentKitMap.appearance(for: traitCollection))
+          band.frame = pixelAlignedRect(
+            CGRect(
+              x: contentX,
+              y: agentTurnContentView.frame.maxY + agentTurnComputerBandTopGap,
+              width: metrics.messageWidth,
+              height: agentTurnComputerBandHeight
+            ))
+        }
 
       } else if metrics.hasInlineAttachment {
         _agentTurnContentView?.frame = .zero
@@ -13372,18 +13838,36 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     return remoteURL
   }
 
-  /// Sets the audio session so muted inline video won't interrupt the music player.
+  /// Session for user-started inline audio. Never on main and never for autoplay: the
+  /// call crosses to the media daemon, and a main-thread round-trip has hung this app.
   private func configureInlineVideoAudioSession(muted: Bool) {
-    let session = AVAudioSession.sharedInstance()
-    do {
-      if muted {
-        try session.setCategory(.playback, mode: .default, options: .mixWithOthers)
-      } else {
-        try session.setCategory(.playback, mode: .default)
+    ChatListCell.audioSessionQueue.async {
+      let session = AVAudioSession.sharedInstance()
+      do {
+        if muted {
+          try session.setCategory(.playback, mode: .default, options: .mixWithOthers)
+        } else {
+          try session.setCategory(.playback, mode: .default)
+        }
+        try session.setActive(true)
+      } catch {
+        // Best-effort; inline video is cosmetic.
       }
-      try session.setActive(true)
-    } catch {
-      // Best-effort; inline video is cosmetic.
+    }
+  }
+
+  /// Whether the playing item carries audio, resolved off main. The icon and the mute
+  /// state follow once it answers; until then the video plays silently.
+  private func loadInlineVideoAudioAvailability(from asset: AVAsset) {
+    let identityKey = mediaVideoPlayerIdentityKey
+    Task.detached(priority: .utility) { [weak self] in
+      let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+      await MainActor.run {
+        guard let self, self.mediaVideoPlayerIdentityKey == identityKey else { return }
+        self.mediaVideoHasAudio = !audioTracks.isEmpty
+        self.mediaVideoPlayer?.isMuted = self.mediaVideoIsMuted || !self.mediaVideoHasAudio
+        self.updateInlineVideoAudioIcon()
+      }
     }
   }
 
@@ -13409,6 +13893,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     _mediaVideoPlayerLayer?.opacity = 0.0
     mediaVideoPlayerHostView.isHidden = true
     mediaVideoPlayerURLKey = nil
+    mediaVideoPlayerIdentityKey = nil
     mediaVideoReady = false
     mediaVideoCurrentTime = 0.0
     if resetMutedState {
@@ -13501,6 +13986,27 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaPlaceholderTintView.backgroundColor = UIColor(white: white, alpha: alpha)
   }
 
+  /// The best thumb this row can produce without the network: the decoded thumb caches
+  /// first, then the durable base64 the message carries.
+  private func lastResortMicroThumb(for row: ChatListRow) -> UIImage? {
+    let key = "thumb-\(row.key)"
+    if let decoded = chatMicroThumbDecodedCache.object(forKey: key as NSString) {
+      return decoded
+    }
+    if let warm = chatMediaImageCache.object(forKey: key as NSString) {
+      return warm
+    }
+    let source = row.thumbnailBase64 ?? row.attachmentThumbnailsB64.first
+    return chatDecodedMicroThumbnail(fromBase64: source, cacheKey: key)
+  }
+
+  /// Drops the hero image only when nothing of value is in it. Artwork paths used to
+  /// blank a good picture on their way to the play plate.
+  private func clearMediaImageIfNoBetterPixels() {
+    guard mediaPixelQuality == .none else { return }
+    mediaImageView.image = nil
+  }
+
   private func updateMediaPlaceholderVisibility() {
     guard let row else {
       setMediaPlaceholderHidden(true)
@@ -13528,7 +14034,17 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       setMediaPlaceholderHidden(true)
       return
     }
-    let hasPixels = mediaImageView.image != nil
+    var hasPixels = mediaImageView.image != nil
+    // Last chance before the dark plate: a thumb this row already decoded, or the one on
+    // the wire. The scrim is only honest when nothing at all exists.
+    if !hasPixels, !mediaImageView.isHidden, row.visualKind != .document,
+      !shouldShowViewOnceShineCover(row),
+      let recovered = lastResortMicroThumb(for: row)
+    {
+      mediaImageView.image = recovered
+      mediaPixelQuality = .microThumb
+      hasPixels = true
+    }
     if row.visualKind == .document {
       let resolvedPage = mediaPixelQuality == .full
       setMediaPlaceholderHidden(resolvedPage)
@@ -13604,10 +14120,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
 
     let playbackKey = playbackURL.absoluteString
+    // Keyed on the media's identity, not the resolved path: patching `localMediaUrl` to the
+    // same bytes used to tear the player down and hide the host until readyToPlay again.
+    let identityKey = chatMediaRemoteIdentity(row) ?? playbackKey
+    let playerFileStillThere =
+      mediaVideoPlayerURLKey.map {
+        !$0.hasPrefix("file:") || FileManager.default.fileExists(atPath: URL(string: $0)?.path ?? "")
+      } ?? false
+    let reusesPlayer =
+      mediaVideoPlayer != nil && mediaVideoPlayerIdentityKey == identityKey && playerFileStillThere
     inlineVideoLog(
-      "refresh start url=\(playbackKey) ready=\(mediaVideoReady ? "Y" : "N") reuse=\(mediaVideoPlayerURLKey == playbackKey ? "Y" : "N")"
+      "refresh start url=\(playbackKey) ready=\(mediaVideoReady ? "Y" : "N") reuse=\(reusesPlayer ? "Y" : "N")"
     )
-    if mediaVideoPlayerURLKey != playbackKey {
+    if !reusesPlayer {
       stopInlineVideoPlayback(resetMutedState: false)
       let playerItem = AVPlayerItem(url: playbackURL)
       let player = AVPlayer(playerItem: playerItem)
@@ -13617,6 +14142,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaVideoPlayer = player
       mediaVideoPlayerLayer.player = player
       mediaVideoPlayerURLKey = playbackKey
+      mediaVideoPlayerIdentityKey = identityKey
       mediaVideoPlayerHostView.isHidden = false
       mediaVideoReady = false
       mediaVideoHasAudio = false
@@ -13666,14 +14192,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             if duration.isFinite, duration > 0.0 {
               self.mediaVideoTotalDuration = duration
             }
-            self.mediaVideoHasAudio = !item.asset.tracks(withMediaType: .audio).isEmpty
+            // Track loading is async: a sync `tracks(withMediaType:)` blocks main until the
+            // asset's format is parsed. Playback starts muted and the icon updates after.
+            self.loadInlineVideoAudioAvailability(from: item.asset)
             self.mediaVideoPlayer?.isMuted = self.mediaVideoIsMuted || !self.mediaVideoHasAudio
             self._mediaVideoPlayerLayer?.opacity = 1.0
             self.mediaVideoPlayerHostView.isHidden = false
             if self.mediaVideoHasCompletedOnce || self.mediaVideoUserPaused {
               self.mediaVideoPlayer?.pause()
             } else {
-              self.configureInlineVideoAudioSession(muted: self.mediaVideoIsMuted || !self.mediaVideoHasAudio)
+              // Autoplay never touches the audio session — only an explicit play/unmute does.
+              if self.mediaVideoUserInitiatedPlay {
+                self.configureInlineVideoAudioSession(
+                  muted: self.mediaVideoIsMuted || !self.mediaVideoHasAudio)
+              }
               self.mediaVideoPlayer?.play()
             }
             self.updateInlineVideoTimeBadge()
@@ -13708,7 +14240,10 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       if mediaVideoHasCompletedOnce || mediaVideoUserPaused {
         mediaVideoPlayer?.pause()
       } else {
-        configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
+        // Silent autoplay needs no session change; only a user play/unmute does.
+        if mediaVideoUserInitiatedPlay {
+          configureInlineVideoAudioSession(muted: mediaVideoIsMuted || !mediaVideoHasAudio)
+        }
         mediaVideoPlayer?.play()
       }
       inlineVideoLog(
@@ -14226,7 +14761,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     for row: ChatListRow,
     textColor: UIColor,
     metaColor: UIColor,
-    preservedMediaImage: UIImage?
+    preservedMediaImage: UIImage?,
+    isSameMessage: Bool,
+    mediaKindChanged: Bool
   ) {
     let isTransparentSticker = isTransparentStickerMessage(row)
     if row.visualKind != .sticker {
@@ -14243,17 +14780,33 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     mediaDurationBadge.isHidden = true
     mediaImageView.isHidden = true
     _mediaStickerAnimationView?.isHidden = true
-    mediaImageView.image = preservedMediaImage
-    mediaImageTask?.cancel()
-    mediaImageTask = nil
+    // Pixels are only ever cleared for a different message or a different kind. The
+    // ladder below promotes; a reconfigure of the same bubble must never blank it.
+    if let preservedMediaImage {
+      if mediaImageView.image !== preservedMediaImage {
+        mediaImageView.image = preservedMediaImage
+      }
+    } else if !isSameMessage || mediaKindChanged {
+      mediaImageView.image = nil
+    }
+    // Only new media cancels an in-flight fetch/decode. A status or selection reconfigure
+    // of the same bubble used to restart the download on every pass.
+    if !isSameMessage || mediaKindChanged {
+      mediaImageTask?.cancel()
+      mediaImageTask = nil
+      mediaImageTaskKey = nil
+      mediaDecodeInFlightKey = nil
+    }
     musicCoverTask?.cancel()
     musicCoverTask = nil
     mediaPrimaryIconView.image = nil
     mediaTitleLabel.text = nil
     mediaDetailLabel.text = nil
     mediaDurationBadge.text = nil
-    mediaWaveformView.setWaveform(nil)
-    mediaVoiceButtonView.setArtworkImage(nil)
+    if mediaKindChanged {
+      mediaWaveformView.setWaveform(nil)
+      mediaVoiceButtonView.setArtworkImage(nil)
+    }
     if row.visualKind != .voice {
       mediaVoiceButtonView.setUploadState(isUploading: false, progress: nil)
       mediaVoiceButtonView.setDownloadState(
@@ -14362,9 +14915,11 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         mediaDetailLabel.textAlignment = .left
         mediaDetailLabel.lineBreakMode = .byTruncatingTail
         applyCompactMusicTextLabels(for: row)
-        // Cover on the play plate (not a tall art card).
-        let warm = chatMusicArtworkImage(for: row)
-        mediaVoiceButtonView.setArtworkImage(warm)
+        // Cover on the play plate (not a tall art card). A cold cache means "not yet",
+        // so it never wipes a cover this cell is already showing for the same track.
+        if let warm = chatMusicArtworkImage(for: row) {
+          mediaVoiceButtonView.setArtworkImage(warm)
+        }
         loadMusicCoverArtwork(for: row)
         // Plate background follows the theme (deep in dark, soft light in light) so it reads
         // behind the cover + VAD halo; white glyph/ring on play; accent-tinted download badge.
@@ -14453,12 +15008,16 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       mediaPrimaryIconView.tintColor = .white
       mediaPrimaryIconView.contentMode = .center
       mediaPrimaryIconView.backgroundColor = documentPlateColor(for: row, appearance: appearance)
-      if !hasPagePixels, let placeholder = chatMediaImage(fromBase64: row.thumbnailBase64) {
+      // Clamped + memoized thumb decode, so a legacy full-res base64 never decodes at
+      // full size on main; pixels already on screen are never dropped for the scrim.
+      if !hasPagePixels,
+        let placeholder = chatDecodedMicroThumbnail(
+          fromBase64: row.thumbnailBase64, cacheKey: "thumb-\(row.key)")
+      {
         mediaImageView.image = placeholder
         mediaPixelQuality = .microThumb
         setMediaPlaceholderHidden(false)
       } else if !hasPagePixels {
-        mediaImageView.image = nil
         setMediaPlaceholderHidden(false)
       }
 
@@ -14616,28 +15175,50 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     if forceImageLoad {
       mediaImageView.isHidden = false
     }
+    // Set once this pass owns the on-disk file, so the ladder below does not decode the
+    // same picture a second time.
+    var resolvedFromDiskFile = false
     if forceImageLoad,
       mediaPixelQuality.rawValue < ChatMediaPreviewQuality.full.rawValue,
       let diskURL = chatOnDiskMediaFileURL(for: row)
     {
       let shouldAnimate = chatMediaShouldAnimate(
         urlString: diskURL.absoluteString, messageType: row.messageType)
-      if let image = chatMediaLoadImageFromFile(at: diskURL.path, shouldAnimate: shouldAnimate) {
-        chatMediaImageCache.setObject(
-          image, forKey: chatMediaCacheKey(diskURL.absoluteString, mediaKey: nil) as NSString)
-        if let remote = row.mediaUrl {
-          chatMediaImageCache.setObject(
-            image, forKey: chatMediaCacheKey(remote, mediaKey: row.mediaKey) as NSString)
-        }
-        applyResolvedMediaPreviewImage(
-          image, for: row, mediaURL: row.mediaUrl ?? diskURL.absoluteString)
+      let diskKey = chatMediaCacheKey(diskURL.absoluteString, mediaKey: nil)
+      let remoteKey = row.mediaUrl.map { chatMediaCacheKey($0, mediaKey: row.mediaKey) }
+      let naturalSizeURL = row.mediaUrl ?? diskURL.absoluteString
+      // Memory stays synchronous — that is what makes a second open instant. Only the file
+      // read, the decode and any poster extraction leave the main thread.
+      if let warm = chatMediaImageCache.object(forKey: diskKey as NSString)
+        ?? remoteKey.flatMap({ chatMediaImageCache.object(forKey: $0 as NSString) })
+      {
+        applyResolvedMediaPreviewImage(warm, for: row, mediaURL: naturalSizeURL)
         mediaPrimaryIconView.isHidden = true
         preferredLocalMediaURL = diskURL.absoluteString
+        resolvedFromDiskFile = true
       } else {
-        ChatMediaWatchdog.once(
-          key: "disk-unreadable:\(row.messageId ?? row.key)",
-          "disk-unreadable msgId=\(row.messageId ?? row.key) path=\(diskURL.path) remote=\(row.mediaUrl ?? "-")"
+        let path = diskURL.path
+        let posterIdentity = chatMediaRemoteIdentity(row) ?? remoteKey ?? diskKey
+        resolveMediaImageOffMain(
+          for: row,
+          cacheKey: remoteKey ?? diskKey,
+          naturalSizeURL: naturalSizeURL,
+          storeKeys: row.viewOnce ? [] : ([diskKey] + (remoteKey.map { [$0] } ?? [])),
+          decode: { maxPixelSize in
+            chatMediaLoadImageFromFile(
+              at: path, shouldAnimate: shouldAnimate, maxPixelSize: maxPixelSize,
+              posterIdentity: posterIdentity)
+          },
+          onMiss: { [weak self] in
+            ChatMediaWatchdog.once(
+              key: "disk-unreadable:\(row.messageId ?? row.key)",
+              "disk-unreadable msgId=\(row.messageId ?? row.key) path=\(path) remote=\(row.mediaUrl ?? "-")"
+            )
+            self?.loadUnreadableDiskMediaFromRemote(for: row)
+          }
         )
+        preferredLocalMediaURL = diskURL.absoluteString
+        resolvedFromDiskFile = true
       }
     }
     // PDF pixels come only from PDFKit's page renderer in ChatListView. Keeping this
@@ -14674,7 +15255,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             fromBase64: thumbSource,
             cacheKey: thumbCacheKey
           ) {
-            chatMediaImageCache.setObject(thumbnailImage, forKey: thumbCacheKey as NSString)
+            chatMediaImageCacheStore(thumbnailImage, forKey: thumbCacheKey)
             applyResolvedMediaPreviewImage(
               thumbnailImage,
               for: row,
@@ -14685,7 +15266,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
             chatRequestMicroThumbBlur(
               sharp: thumbnailImage, cacheKey: thumbCacheKey
             ) { [weak self] blurred in
-              chatMediaImageCache.setObject(blurred, forKey: thumbCacheKey as NSString)
+              chatMediaImageCacheStore(blurred, forKey: thumbCacheKey)
               guard let self, (self.row?.messageId ?? self.row?.key) == blurRowKey else { return }
               self.applyResolvedMediaPreviewImage(
                 blurred,
@@ -14736,7 +15317,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         guard FileManager.default.fileExists(atPath: localPath) else { return nil }
         return localMediaUrl
       }()
-      if let urlStr = preferredLocalMediaURL ?? row.mediaUrl {
+      if !resolvedFromDiskFile, let urlStr = preferredLocalMediaURL ?? row.mediaUrl {
         let effectiveMediaKey = preferredLocalMediaURL == nil ? row.mediaKey : nil
         let cacheKey = chatMediaCacheKey(urlStr, mediaKey: effectiveMediaKey)
         let shortUrl = urlStr.count > 80 ? String(urlStr.prefix(77)) + "..." : urlStr
@@ -14748,197 +15329,92 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         )
         let naturalSizeURL = row.mediaUrl ?? urlStr
         if let url = URL(string: urlStr) ?? URL(string: encodedUrlStr) {
-          let inMemory = chatMediaImageCache.object(forKey: cacheKey as NSString) != nil
           let isLocal = url.isFileURL || urlStr.hasPrefix("/")
           let rawURLKey = chatMediaLegacyCacheKey(urlStr, mediaKey: effectiveMediaKey)
-          let onDisk: Bool = {
-            guard !isLocal else { return false }
-            return VibeMediaVault.shared.contains(cacheKey, kind: .image)
-          }()
-          let isFailed = chatMediaFailedURLs.contains(rawURLKey)
-          chatCellDebugLog(
-            chatCellMediaDebugLogs,
-            "[ChatMediaLoad] RESOLVE msgId=%@ inMemory=%@ isLocal=%@ onDisk=%@ isFailed=%@ animate=%@ url=%@",
-            row.messageId ?? "-",
-            inMemory ? "Y" : "N",
-            isLocal ? "Y" : "N",
-            onDisk ? "Y" : "N",
-            isFailed ? "Y" : "N",
-            shouldAnimateMedia ? "Y" : "N",
-            shortUrl
-          )
-          if let cachedImage = chatMediaImageCache.object(forKey: cacheKey as NSString) {
-            applyResolvedMediaPreviewImage(cachedImage, for: row, mediaURL: naturalSizeURL)
-          } else if url.isFileURL || urlStr.hasPrefix("/") {
-            let path = url.isFileURL ? url.path : urlStr
-            if let image = chatMediaLoadImageFromFile(at: path, shouldAnimate: shouldAnimateMedia) {
-              chatCellDebugLog(
-                chatCellMediaDebugLogs,
-                "[ChatMediaLoad] local file OK msgId=%@ url=%@",
-                row.messageId ?? "-",
-                shortUrl
-              )
-              if !row.viewOnce {
-                chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
-              }
-              applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
-            } else {
-              let exists = FileManager.default.fileExists(atPath: path)
-              let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-              let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-              chatCellDebugLog(
-                chatCellMediaDebugLogs,
-                "[ChatMediaLoad] local file NO_PREVIEW msgId=%@ type=%@ exists=%@ bytes=%lld path=%@ hasMediaKey=%@ fileName=%@ header=%@",
-                row.messageId ?? "-",
-                row.messageType,
-                exists ? "Y" : "N",
-                bytes,
-                path,
-                (row.mediaKey?.isEmpty == false) ? "Y" : "N",
-                row.fileName ?? "-",
-                chatMediaFileHeaderSummary(at: path)
-              )
-            }
-          } else if !row.viewOnce,
-            let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey),
-            let diskImage = chatMediaPreviewImage(
-              from: diskData,
-              shouldAnimate: shouldAnimateMedia,
-              cacheKey: cacheKey,
-              urlString: urlStr,
-              fileName: row.fileName,
-              messageType: row.messageType,
-              preferVideoPreview: prefersVideoPreview
-            )
-          {
+          let hasPreferredLocal = preferredLocalMediaURL != nil
+          if chatCellMediaDebugLogs {
+            // Built only when logging is on — the vault probe is a stat per media cell.
+            let inMemory = chatMediaImageCache.object(forKey: cacheKey as NSString) != nil
+            let onDisk = isLocal ? false : VibeMediaVault.shared.contains(cacheKey, kind: .image)
             chatCellDebugLog(
               chatCellMediaDebugLogs,
-              "[ChatMediaLoad] disk preview OK msgId=%@ type=%@ bytes=%d url=%@",
-              row.messageId ?? "-", row.messageType, diskData.count, shortUrl
-            )
-            if !row.viewOnce {
-              chatMediaImageCache.setObject(diskImage, forKey: cacheKey as NSString)
-            }
-            applyResolvedMediaPreviewImage(diskImage, for: row, mediaURL: naturalSizeURL)
-          } else if chatMediaFailedURLs.contains(rawURLKey) {
-            chatCellDebugLog(
-              chatCellMediaDebugLogs,
-              "[ChatMediaLoad] skipping previously failed url=%@",
+              "[ChatMediaLoad] RESOLVE msgId=%@ inMemory=%@ isLocal=%@ onDisk=%@ isFailed=%@ animate=%@ url=%@",
+              row.messageId ?? "-",
+              inMemory ? "Y" : "N",
+              isLocal ? "Y" : "N",
+              onDisk ? "Y" : "N",
+              chatMediaFailedURLs.contains(rawURLKey) ? "Y" : "N",
+              shouldAnimateMedia ? "Y" : "N",
               shortUrl
             )
-          } else if skipRemoteMediaLoad && preferredLocalMediaURL == nil {
-            chatCellDebugLog(
-              chatCellMediaDebugLogs,
-              "[ChatMediaLoad] SKIP-REMOTE-PREVIEW msgId=%@ type=%@ url=%@",
-              row.messageId ?? "-",
-              row.messageType,
-              urlStr
-            )
-          } else {
-            chatCellDebugLog(
-              chatCellMediaDebugLogs,
-              "[ChatMediaLoad] network fetch START msgId=%@ url=%@", row.messageId ?? "-", shortUrl)
-            mediaImageTask = VibeHTTP.shared.dataTask(with: url) {
-              [weak self] data, response, error in
-              if let error {
-                let nsErr = error as NSError
-                let isCancelled = nsErr.code == NSURLErrorCancelled
+          }
+          if let cachedImage = chatMediaImageCache.object(forKey: cacheKey as NSString) {
+            applyResolvedMediaPreviewImage(cachedImage, for: row, mediaURL: naturalSizeURL)
+          } else if isLocal {
+            let path = url.isFileURL ? url.path : urlStr
+            let posterIdentity = chatMediaRemoteIdentity(row) ?? cacheKey
+            resolveMediaImageOffMain(
+              for: row,
+              cacheKey: cacheKey,
+              naturalSizeURL: naturalSizeURL,
+              storeKeys: row.viewOnce ? [] : [cacheKey],
+              decode: { maxPixelSize in
+                if let image = chatMediaLoadImageFromFile(
+                  at: path, shouldAnimate: shouldAnimateMedia, maxPixelSize: maxPixelSize,
+                  posterIdentity: posterIdentity)
+                {
+                  return image
+                }
+                // Diagnostics stay on this queue — the header read is file IO.
+                let attrs = try? FileManager.default.attributesOfItem(atPath: path)
                 chatCellDebugLog(
                   chatCellMediaDebugLogs,
-                  "[ChatMediaLoad] network fetch FAIL msgId=%@ error=%@ cancelled=%@",
-                  row.messageId ?? "-", error.localizedDescription, isCancelled ? "Y" : "N")
-                if !isCancelled {
-                  let count = (chatMediaRetryCount[rawURLKey] ?? 0) + 1
-                  chatMediaRetryCount[rawURLKey] = count
-                  if count >= chatMediaMaxRetries {
-                    chatMediaFailedURLs.insert(rawURLKey)
-                  }
-                }
-                return
+                  "[ChatMediaLoad] local file NO_PREVIEW msgId=%@ type=%@ bytes=%lld path=%@ hasMediaKey=%@ fileName=%@ header=%@",
+                  row.messageId ?? "-",
+                  row.messageType,
+                  (attrs?[.size] as? NSNumber)?.int64Value ?? 0,
+                  path,
+                  (row.mediaKey?.isEmpty == false) ? "Y" : "N",
+                  row.fileName ?? "-",
+                  chatMediaFileHeaderSummary(at: path)
+                )
+                return nil
               }
-              guard let self = self, let data = data else {
-                return
-              }
-              // Always try: (1) mediaKey decrypt (2) raw bytes (3) strip any wrapper.
-              // Wrong/stale mediaKey previously left empty cells forever when only (1) ran.
-              let decrypted = chatMediaDecryptedDataIfNeeded(data, mediaKey: effectiveMediaKey)
-              var candidates: [Data] = []
-              if let decrypted { candidates.append(decrypted) }
-              if decrypted == nil || decrypted?.count != data.count || decrypted != data {
-                candidates.append(data)
-              }
-              // Dedup by count+prefix so we don't decode the same buffer twice.
-              var seen = Set<String>()
-              candidates = candidates.filter { d in
-                let sig =
-                  "\(d.count):\(d.prefix(8).map { String(format: "%02x", $0) }.joined())"
-                return seen.insert(sig).inserted
-              }
-              var previewImage: UIImage?
-              var safeData: Data?
-              for candidate in candidates {
-                if let image = chatMediaPreviewImage(
-                  from: candidate,
+            )
+          } else if row.viewOnce {
+            loadRemoteMediaPreviewIfNeeded(
+              for: row, url: url, urlStr: urlStr, cacheKey: cacheKey, rawURLKey: rawURLKey,
+              mediaKey: effectiveMediaKey, shouldAnimate: shouldAnimateMedia,
+              prefersVideoPreview: prefersVideoPreview, naturalSizeURL: naturalSizeURL,
+              hasPreferredLocalMedia: hasPreferredLocal)
+          } else {
+            resolveMediaImageOffMain(
+              for: row,
+              cacheKey: cacheKey,
+              naturalSizeURL: naturalSizeURL,
+              storeKeys: [cacheKey],
+              decode: { maxPixelSize in
+                guard let diskData = chatMediaDiskCacheLoad(cacheKey, legacyRawKey: rawURLKey)
+                else { return nil }
+                return chatMediaPreviewImage(
+                  from: diskData,
                   shouldAnimate: shouldAnimateMedia,
                   cacheKey: cacheKey,
                   urlString: urlStr,
                   fileName: row.fileName,
                   messageType: row.messageType,
-                  preferVideoPreview: prefersVideoPreview
-                ) {
-                  previewImage = image
-                  safeData = candidate
-                  break
-                }
+                  preferVideoPreview: prefersVideoPreview,
+                  maxPixelSize: maxPixelSize
+                )
+              },
+              onMiss: { [weak self] in
+                self?.loadRemoteMediaPreviewIfNeeded(
+                  for: row, url: url, urlStr: urlStr, cacheKey: cacheKey, rawURLKey: rawURLKey,
+                  mediaKey: effectiveMediaKey, shouldAnimate: shouldAnimateMedia,
+                  prefersVideoPreview: prefersVideoPreview, naturalSizeURL: naturalSizeURL,
+                  hasPreferredLocalMedia: hasPreferredLocal)
               }
-              guard let image = previewImage, let safeData else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                let bodyPreview = String(data: data, encoding: .utf8) ?? "nil"
-                chatCellDebugLog(
-                  chatCellMediaDebugLogs,
-                  "[ChatMediaLoad] network fetch NO_PREVIEW msgId=%@ type=%@ dataLen=%d status=%d url=%@ fileName=%@ hasThumb=%@ body=%@ header=%@",
-                  row.messageId ?? "-",
-                  row.messageType,
-                  data.count,
-                  statusCode,
-                  urlStr,
-                  row.fileName ?? "-",
-                  row.thumbnailBase64 == nil ? "N" : "Y",
-                  String(bodyPreview.prefix(200)),
-                  chatMediaHeaderSummary(from: decrypted ?? data))
-                // Don't permanent-fail if we at least have a durable thumb — cell can show it.
-                if row.thumbnailBase64 == nil && row.attachmentThumbnailsB64.isEmpty {
-                  chatMediaFailedURLs.insert(rawURLKey)
-                }
-                return
-              }
-              chatCellDebugLog(
-                chatCellMediaDebugLogs,
-                "[ChatMediaLoad] network fetch OK msgId=%@ type=%@ bytes=%d url=%@",
-                row.messageId ?? "-",
-                row.messageType,
-                safeData.count,
-                shortUrl
-              )
-              if !row.viewOnce {
-                chatMediaImageCache.setObject(image, forKey: cacheKey as NSString)
-                chatMediaDiskCacheSave(safeData, forKey: cacheKey)
-              } else {
-                chatViewOnceCacheSealed(image, key: row.messageId ?? row.key)
-              }
-              DispatchQueue.main.async {
-                guard
-                  let currentRow = self.row,
-                  (currentRow.messageId ?? currentRow.key) == (row.messageId ?? row.key),
-                  currentRow.mediaUrl == row.mediaUrl,
-                  currentRow.localMediaUrl == row.localMediaUrl,
-                  currentRow.mediaKey == row.mediaKey
-                else { return }
-                self.applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
-                self.mediaPrimaryIconView.isHidden = true
-              }
-            }
-            mediaImageTask?.resume()
+            )
           }
         } else {
           chatCellDebugLog(
@@ -14994,6 +15470,227 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     }
     updateStickerAnimationPlayback()
     refreshViewOnceShineCover()
+  }
+
+  /// One file read + decode off main, promoted through the promote-only apply. Callers keep
+  /// the memory lookup synchronous; `onMiss` runs on main after the same identity check.
+  private func resolveMediaImageOffMain(
+    for row: ChatListRow,
+    cacheKey: String,
+    naturalSizeURL: String,
+    storeKeys: [String],
+    decode: @escaping (Int) -> UIImage?,
+    onMiss: (() -> Void)? = nil
+  ) {
+    guard mediaDecodeInFlightKey != cacheKey else { return }
+    mediaDecodeInFlightKey = cacheKey
+    let rowKey = row.messageId ?? row.key
+    let maxPixelSize = chatMediaBubbleDecodeMaxPixelSize()
+    chatMediaDiskCacheQueue.async { [weak self] in
+      let image = decode(maxPixelSize)
+      if let image {
+        for key in storeKeys {
+          chatMediaImageCacheStore(image, forKey: key)
+        }
+      }
+      DispatchQueue.main.async {
+        guard let self else { return }
+        if self.mediaDecodeInFlightKey == cacheKey {
+          self.mediaDecodeInFlightKey = nil
+        }
+        guard let currentRow = self.row,
+          (currentRow.messageId ?? currentRow.key) == rowKey,
+          chatMediaRowsShareRemoteIdentity(currentRow, row)
+        else { return }
+        guard let image else {
+          onMiss?()
+          return
+        }
+        self.applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
+        self.mediaPrimaryIconView.isHidden = true
+      }
+    }
+  }
+
+  /// The on-disk copy could not be decoded — fall back to the remote bytes, if any.
+  private func loadUnreadableDiskMediaFromRemote(for row: ChatListRow) {
+    guard let raw = row.mediaUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+      let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else { return }
+    let cacheKey = chatMediaCacheKey(raw, mediaKey: row.mediaKey)
+    loadRemoteMediaPreviewIfNeeded(
+      for: row,
+      url: url,
+      urlStr: raw,
+      cacheKey: cacheKey,
+      rawURLKey: chatMediaLegacyCacheKey(raw, mediaKey: row.mediaKey),
+      mediaKey: row.mediaKey,
+      shouldAnimate: chatMediaShouldAnimate(urlString: raw, messageType: row.messageType),
+      prefersVideoPreview: row.visualKind == .video || row.visualKind == .videoNote,
+      naturalSizeURL: raw,
+      hasPreferredLocalMedia: false
+    )
+  }
+
+  /// Tail of the preview ladder — reached on main once every on-disk source has missed.
+  /// Decode of the downloaded bytes happens on the session's own queue, never on main.
+  private func loadRemoteMediaPreviewIfNeeded(
+    for row: ChatListRow,
+    url: URL,
+    urlStr: String,
+    cacheKey: String,
+    rawURLKey: String,
+    mediaKey: String?,
+    shouldAnimate: Bool,
+    prefersVideoPreview: Bool,
+    naturalSizeURL: String,
+    hasPreferredLocalMedia: Bool
+  ) {
+    let shortUrl = urlStr.count > 80 ? String(urlStr.prefix(77)) + "..." : urlStr
+    guard !chatMediaFailedURLs.contains(rawURLKey) else {
+      chatCellDebugLog(
+        chatCellMediaDebugLogs,
+        "[ChatMediaLoad] skipping previously failed url=%@",
+        shortUrl
+      )
+      return
+    }
+    guard !(skipRemoteMediaLoad && !hasPreferredLocalMedia) else {
+      chatCellDebugLog(
+        chatCellMediaDebugLogs,
+        "[ChatMediaLoad] SKIP-REMOTE-PREVIEW msgId=%@ type=%@ url=%@",
+        row.messageId ?? "-",
+        row.messageType,
+        urlStr
+      )
+      return
+    }
+    // The same download is never started twice for one cell; a different one replaces it.
+    guard mediaImageTask == nil || mediaImageTaskKey != cacheKey else { return }
+    mediaImageTask?.cancel()
+    chatCellDebugLog(
+      chatCellMediaDebugLogs,
+      "[ChatMediaLoad] network fetch START msgId=%@ url=%@", row.messageId ?? "-", shortUrl)
+    let rowKey = row.messageId ?? row.key
+    let maxPixelSize = chatMediaBubbleDecodeMaxPixelSize()
+    mediaImageTaskKey = cacheKey
+    mediaImageTask = VibeHTTP.shared.dataTask(with: url) {
+      [weak self] data, response, error in
+      func clearTask(_ cell: ChatListCell?) {
+        DispatchQueue.main.async {
+          guard let cell, cell.mediaImageTaskKey == cacheKey else { return }
+          cell.mediaImageTask = nil
+          cell.mediaImageTaskKey = nil
+        }
+      }
+      if let error {
+        let nsErr = error as NSError
+        let isCancelled = nsErr.code == NSURLErrorCancelled
+        chatCellDebugLog(
+          chatCellMediaDebugLogs,
+          "[ChatMediaLoad] network fetch FAIL msgId=%@ error=%@ cancelled=%@",
+          row.messageId ?? "-", error.localizedDescription, isCancelled ? "Y" : "N")
+        if !isCancelled {
+          let count = (chatMediaRetryCount[rawURLKey] ?? 0) + 1
+          chatMediaRetryCount[rawURLKey] = count
+          if count >= chatMediaMaxRetries {
+            chatMediaFailedURLs.insert(rawURLKey)
+          }
+        }
+        clearTask(self)
+        return
+      }
+      guard let self = self, let data = data else {
+        clearTask(self)
+        return
+      }
+      // Always try: (1) mediaKey decrypt (2) raw bytes (3) strip any wrapper.
+      // Wrong/stale mediaKey previously left empty cells forever when only (1) ran.
+      let decrypted = chatMediaDecryptedDataIfNeeded(data, mediaKey: mediaKey)
+      var candidates: [Data] = []
+      if let decrypted { candidates.append(decrypted) }
+      if decrypted == nil || decrypted?.count != data.count || decrypted != data {
+        candidates.append(data)
+      }
+      // Dedup by count+prefix so we don't decode the same buffer twice.
+      var seen = Set<String>()
+      candidates = candidates.filter { d in
+        let sig =
+          "\(d.count):\(d.prefix(8).map { String(format: "%02x", $0) }.joined())"
+        return seen.insert(sig).inserted
+      }
+      var previewImage: UIImage?
+      var safeData: Data?
+      for candidate in candidates {
+        if let image = chatMediaPreviewImage(
+          from: candidate,
+          shouldAnimate: shouldAnimate,
+          cacheKey: cacheKey,
+          urlString: urlStr,
+          fileName: row.fileName,
+          messageType: row.messageType,
+          preferVideoPreview: prefersVideoPreview,
+          maxPixelSize: maxPixelSize
+        ) {
+          previewImage = image
+          safeData = candidate
+          break
+        }
+      }
+      guard let image = previewImage, let safeData else {
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let bodyPreview = String(data: data, encoding: .utf8) ?? "nil"
+        chatCellDebugLog(
+          chatCellMediaDebugLogs,
+          "[ChatMediaLoad] network fetch NO_PREVIEW msgId=%@ type=%@ dataLen=%d status=%d url=%@ fileName=%@ hasThumb=%@ body=%@ header=%@",
+          row.messageId ?? "-",
+          row.messageType,
+          data.count,
+          statusCode,
+          urlStr,
+          row.fileName ?? "-",
+          row.thumbnailBase64 == nil ? "N" : "Y",
+          String(bodyPreview.prefix(200)),
+          chatMediaHeaderSummary(from: decrypted ?? data))
+        // Don't permanent-fail if we at least have a durable thumb — cell can show it.
+        if row.thumbnailBase64 == nil && row.attachmentThumbnailsB64.isEmpty {
+          chatMediaFailedURLs.insert(rawURLKey)
+        }
+        clearTask(self)
+        return
+      }
+      chatCellDebugLog(
+        chatCellMediaDebugLogs,
+        "[ChatMediaLoad] network fetch OK msgId=%@ type=%@ bytes=%d url=%@",
+        row.messageId ?? "-",
+        row.messageType,
+        safeData.count,
+        shortUrl
+      )
+      if !row.viewOnce {
+        chatMediaImageCacheStore(image, forKey: cacheKey)
+        chatMediaDiskCacheSave(safeData, forKey: cacheKey)
+      } else {
+        chatViewOnceCacheSealed(image, key: row.messageId ?? row.key)
+      }
+      DispatchQueue.main.async {
+        if self.mediaImageTaskKey == cacheKey {
+          self.mediaImageTask = nil
+          self.mediaImageTaskKey = nil
+        }
+        guard
+          let currentRow = self.row,
+          (currentRow.messageId ?? currentRow.key) == rowKey,
+          currentRow.mediaUrl == row.mediaUrl,
+          currentRow.localMediaUrl == row.localMediaUrl,
+          currentRow.mediaKey == row.mediaKey
+        else { return }
+        self.applyResolvedMediaPreviewImage(image, for: row, mediaURL: naturalSizeURL)
+        self.mediaPrimaryIconView.isHidden = true
+      }
+    }
+    mediaImageTask?.resume()
   }
 
   private func reportNaturalMediaSizeIfNeeded(
@@ -15550,6 +16247,8 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     guard mediaVideoHasAudio else { return }
     mediaVideoIsMuted.toggle()
     mediaVideoPlayer?.isMuted = mediaVideoIsMuted
+    // An unmute is explicit audio intent, so later refreshes may keep the session set.
+    mediaVideoUserInitiatedPlay = true
     configureInlineVideoAudioSession(muted: mediaVideoIsMuted)
     updateInlineVideoAudioIcon()
   }
@@ -15557,8 +16256,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
   /// Loads album cover onto the compact music play plate (warm cache → network).
   private func loadMusicCoverArtwork(for row: ChatListRow) {
     let warm = chatMusicArtworkImage(for: row)
-    mediaVoiceButtonView.setArtworkImage(warm)
-    mediaImageView.image = nil
+    // A nil cover is "not resolved yet", never "clear the plate".
+    if let warm { mediaVoiceButtonView.setArtworkImage(warm) }
+    clearMediaImageIfNoBetterPixels()
     if warm == nil { recoverArtworkFromAudioFile(for: row) }
     guard let raw = row.musicCoverURL?.trimmingCharacters(in: .whitespacesAndNewlines),
       !raw.isEmpty,
@@ -15573,7 +16273,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         current.musicCoverURL == coverURL
       else { return }
       self.mediaVoiceButtonView.setArtworkImage(image)
-      self.mediaImageView.image = nil
+      self.clearMediaImageIfNoBetterPixels()
     }
   }
 
@@ -15601,7 +16301,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         let artwork = tags.artwork
       else { return }
       self.mediaVoiceButtonView.setArtworkImage(artwork)
-      self.mediaImageView.image = nil
+      self.clearMediaImageIfNoBetterPixels()
     }
   }
 

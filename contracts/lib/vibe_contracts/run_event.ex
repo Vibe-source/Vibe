@@ -8,6 +8,7 @@ defmodule VibeContracts.RunEvent do
     run.queued run.started run.text.delta run.thinking run.progress
     run.tool.started run.tool.completed run.approval.requested run.approval.resolved
     run.ask run.permission.requested run.preview run.handoff
+    run.computer.state run.computer.control
     run.cancelled run.completed run.failed
   )
 
@@ -29,6 +30,8 @@ defmodule VibeContracts.RunEvent do
     "run.permission.requested" => ~w(decisionId capability scope reason),
     "run.preview" => ~w(imageBase64 mime width height label),
     "run.handoff" => ~w(toAgentUsername note childRunId),
+    "run.computer.state" => ~w(url title live),
+    "run.computer.control" => ~w(holder),
     "run.cancelled" => ~w(reason),
     "run.completed" => ~w(summary usage costCents),
     "run.failed" => ~w(error code)

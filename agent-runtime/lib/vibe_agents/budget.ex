@@ -5,24 +5,14 @@ defmodule VibeAgents.Budget do
   uses for its live "thinking" counter — providers do not return exact counts mid-stream.
   """
   import Ecto.Query
+  require Logger
   alias VibeAgents.Repo
   alias VibeAgents.Schemas.AgentUsageLedger
+  alias VibeContracts.ModelRates
 
   defmodule ExceededError do
     defexception [:message, :which]
   end
-
-  # Cents per 1,000 tokens {input, output}. Placeholders — update with real billing.
-  @rates %{
-    {"anthropic", "claude-fable-5"} => {0.5, 2.5},
-    {"anthropic", "claude-opus-4-8"} => {1.5, 7.5},
-    {"anthropic", "claude-sonnet-5"} => {0.3, 1.5},
-    {"anthropic", "claude-haiku-4-5"} => {0.08, 0.4},
-    {"openai", "gpt-5.6-sol"} => {1.5, 6.0},
-    {"openai", "gpt-5.6-terra"} => {0.3, 1.2},
-    {"openai", "gpt-5.6-luna"} => {0.015, 0.06}
-  }
-  @default_rate {0.3, 1.5}
 
   @doc "Raises VibeAgents.Budget.ExceededError when a ceiling is already exceeded."
   def check!(run) do
@@ -32,9 +22,11 @@ defmodule VibeAgents.Budget do
     :ok
   end
 
-  @doc "Records one round's usage against the run + the daily ledger; returns cost in cents."
-  def record_usage(run, input_tokens, output_tokens) do
-    cost = cost_cents(run, input_tokens, output_tokens)
+  @doc "Records one round's usage (+ optional sandbox seconds) against the run + daily ledger; returns cost in cents."
+  def record_usage(run, input_tokens, output_tokens, sandbox_seconds \\ 0) do
+    model_cost = cost_cents(run, input_tokens, output_tokens)
+    sandbox_cost = sandbox_cost_cents(sandbox_seconds)
+    cost = model_cost + sandbox_cost
 
     %AgentUsageLedger{}
     |> AgentUsageLedger.changeset(%{
@@ -43,16 +35,30 @@ defmodule VibeAgents.Budget do
       day: Date.utc_today(),
       input_tokens: input_tokens,
       output_tokens: output_tokens,
+      sandbox_seconds: sandbox_seconds,
       cost_cents: cost
     })
     |> Repo.insert()
+    |> case do
+      {:ok, _entry} ->
+        :ok
+
+      {:error, changeset} ->
+        Logger.warning("[VibeAgents.Budget] usage insert failed run=#{run.id}: #{inspect(changeset.errors)}")
+    end
 
     cost
   end
 
+  defp sandbox_cost_cents(seconds) when is_integer(seconds) and seconds > 0 do
+    per_minute = Application.get_env(:vibe_agents, :sandbox_cents_per_minute, 1)
+    ceil(seconds / 60) * per_minute
+  end
+
+  defp sandbox_cost_cents(_seconds), do: 0
+
   @doc "Rough token count: ~4 chars/token, same heuristic as the streamed thinking counter."
-  def estimate_tokens(text) when is_binary(text), do: text |> String.length() |> div(4) |> max(0)
-  def estimate_tokens(other), do: other |> inspect() |> estimate_tokens()
+  defdelegate estimate_tokens(text), to: ModelRates
 
   defp check_run_tokens!(run) do
     ceiling = Application.get_env(:vibe_agents, :max_run_tokens, 400_000)
@@ -99,9 +105,6 @@ defmodule VibeAgents.Budget do
   defp cost_cents(run, input_tokens, output_tokens) do
     provider = run.agent_profile["modelProvider"] || run.agent_profile[:modelProvider] || "anthropic"
     model = run.agent_profile["modelId"] || run.agent_profile[:modelId]
-    {in_rate, out_rate} = Map.get(@rates, {provider, model}, @default_rate)
-    (input_tokens / 1000 * in_rate + output_tokens / 1000 * out_rate) |> Float.round(4) |> ceil_cents()
+    ModelRates.cost_cents(provider, model, input_tokens, output_tokens)
   end
-
-  defp ceil_cents(cents) when is_float(cents), do: cents |> Float.ceil() |> trunc()
 end

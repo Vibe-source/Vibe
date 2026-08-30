@@ -563,7 +563,7 @@ enum ChatNativeAgentTextRenderer {
       mutable.replaceCharacters(in: match.range, with: NSAttributedString(string: codeText, attributes: codeAttrs))
     }
 
-    // 4) Auto-detect bare URLs — show clean hostname+path instead of raw URL.
+    // 4) Auto-detect bare URLs while preserving their exact visible text.
     if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
       let urlMatches = detector.matches(
         in: mutable.string,
@@ -577,15 +577,11 @@ enum ChatNativeAgentTextRenderer {
           if value != nil { hasLink = true; stop.pointee = true }
         }
         if !hasLink {
-          let display = cleanURLDisplay(url)
-          var linkAttrs = baseAttrs
-          linkAttrs[.link] = url
-          // Same color as bubble body text; single underline marks tappable.
-          linkAttrs[.foregroundColor] = linkColor
-          linkAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-          mutable.replaceCharacters(
-            in: m.range,
-            with: NSAttributedString(string: display, attributes: linkAttrs)
+          mutable.addAttribute(.link, value: url, range: m.range)
+          // Preserve the exact source URL; shortening can remove path identifiers.
+          mutable.addAttribute(.foregroundColor, value: linkColor, range: m.range)
+          mutable.addAttribute(
+            .underlineStyle, value: NSUnderlineStyle.single.rawValue, range: m.range
           )
         }
       }
@@ -3341,5 +3337,76 @@ final class ChatNativeStreamingTextLabel: UITextView {
       }
     }
     return nil
+  }
+}
+
+/// One-line "the agent is browsing X" band under an agent turn (agent-computer-v1 §2).
+/// Fixed height on purpose — see `agentTurnComputerBandHeight` and docs/row-height-formulas.md §1.5.
+final class AgentComputerBandView: UIControl {
+  private let plateView = UIView()
+  private let glyphView = UIImageView()
+  private let hostLabel = UILabel()
+  private let titleLabel = UILabel()
+  private let liveDot = UIView()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    plateView.layer.cornerRadius = 8.0
+    plateView.layer.borderWidth = 1.0
+    plateView.isUserInteractionEnabled = false
+    plateView.clipsToBounds = true
+    addSubview(plateView)
+
+    glyphView.image = UIImage(systemName: "display")
+    glyphView.contentMode = .scaleAspectFit
+    plateView.addSubview(glyphView)
+
+    hostLabel.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    hostLabel.lineBreakMode = .byTruncatingTail
+    plateView.addSubview(hostLabel)
+
+    titleLabel.font = .systemFont(ofSize: 12.0, weight: .regular)
+    titleLabel.lineBreakMode = .byTruncatingTail
+    plateView.addSubview(titleLabel)
+
+    liveDot.layer.cornerRadius = 3.0
+    liveDot.backgroundColor = UIColor(red: 0.16, green: 0.78, blue: 0.45, alpha: 1.0)
+    plateView.addSubview(liveDot)
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  func configure(host: String, title: String, live: Bool, appearance: VibeAgentKitChatAppearance) {
+    plateView.backgroundColor = appearance.surfaceElevated
+    plateView.layer.borderColor = appearance.border.cgColor
+    glyphView.tintColor = appearance.textSecondary
+    hostLabel.textColor = appearance.text
+    hostLabel.text = host
+    titleLabel.textColor = appearance.textTertiary
+    titleLabel.text = title
+    titleLabel.isHidden = title.isEmpty
+    liveDot.isHidden = !live
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    plateView.frame = bounds
+    let inset: CGFloat = 8.0
+    let glyphSide: CGFloat = 13.0
+    let midY = bounds.height / 2.0
+    glyphView.frame = CGRect(
+      x: inset, y: midY - glyphSide / 2.0, width: glyphSide, height: glyphSide)
+    var trailing = bounds.width - inset
+    if !liveDot.isHidden {
+      liveDot.frame = CGRect(x: trailing - 6.0, y: midY - 3.0, width: 6.0, height: 6.0)
+      trailing = liveDot.frame.minX - 6.0
+    }
+    var x = glyphView.frame.maxX + 6.0
+    let hostWidth = min(
+      ceil(hostLabel.intrinsicContentSize.width), max(0.0, trailing - x))
+    hostLabel.frame = CGRect(x: x, y: 0.0, width: hostWidth, height: bounds.height)
+    x = hostLabel.frame.maxX + 6.0
+    titleLabel.frame = CGRect(
+      x: x, y: 0.0, width: max(0.0, trailing - x), height: bounds.height)
   }
 }

@@ -1,16 +1,21 @@
 defmodule VibeAgents.Tools.Browser do
   @moduledoc "browser_open / browser_act / browser_screenshot, via VibeAgents.Sandbox."
   require Logger
+  import Ecto.Query
+  alias VibeAgents.Repo
   alias VibeAgents.Runs.Events
   alias VibeAgents.Sandbox
   alias VibeAgents.Sandbox.Client
+  alias VibeAgents.Schemas.AgentRunEvent
 
   @max_preview_bytes 200_000
 
   def browser_open(run, %{"url" => url}, _callback) when is_binary(url) do
     with {:ok, sandbox_id} <- ensure(run),
          {:ok, result} <- Client.browser_navigate(sandbox_id, %{"url" => url}) do
-      %{"ok" => true, "url" => result["url"] || url, "title" => result["title"]}
+      landed = result["url"] || url
+      emit_computer_state(run, landed, result["title"])
+      %{"ok" => true, "url" => landed, "title" => result["title"]}
     else
       {:error, reason} -> error_result(reason)
     end
@@ -29,7 +34,9 @@ defmodule VibeAgents.Tools.Browser do
 
     with {:ok, sandbox_id} <- ensure(run),
          {:ok, result} <- Client.browser_action(sandbox_id, body) do
-      %{"ok" => result["ok"] != false, "url" => result["url"], "title" => result["title"]}
+      ok = result["ok"] != false
+      if ok, do: emit_computer_state(run, result["url"], result["title"])
+      %{"ok" => ok, "url" => result["url"], "title" => result["title"]}
     else
       {:error, reason} -> error_result(reason)
     end
@@ -61,6 +68,30 @@ defmodule VibeAgents.Tools.Browser do
 
   defp maybe_emit_preview(_run, image, _shot) do
     Logger.warning("[VibeAgents.Tools.Browser] screenshot #{byte_size(image)} bytes exceeds preview cap; skipped")
+  end
+
+  # One event per real navigation: same url+title as the run's last emit means nothing moved.
+  defp emit_computer_state(run, url, title) when is_binary(url) do
+    unless last_computer_state(run.id) == {url, title} do
+      Events.emit(run, "run.computer.state", %{"url" => url, "title" => title, "live" => true})
+    end
+  end
+
+  defp emit_computer_state(_run, _url, _title), do: :ok
+
+  defp last_computer_state(run_id) do
+    query =
+      from(e in AgentRunEvent,
+        where: e.run_id == ^run_id and e.kind == "run.computer.state",
+        order_by: [desc: e.seq],
+        limit: 1,
+        select: e.payload
+      )
+
+    case Repo.one(query) do
+      %{"url" => url, "title" => title} -> {url, title}
+      _ -> nil
+    end
   end
 
   defp ensure(run) do

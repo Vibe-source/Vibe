@@ -1592,12 +1592,35 @@ private func nativePresetAppearance(
   let bubbleMeGradient = parseGradient(
     meStops,
     fallback: fallback.bubbleMeGradient)
+  let rawThemStops = raw["bubbleThemGradient"] as? [String]
+  let rawThemColor = normalizedString(raw["bubbleThemColor"])
+  let hasCustomThemStops =
+    rawThemStops.map { $0.count >= 2 && !isLegacyFactoryIncomingPalette($0) } ?? false
+  let hasCustomThemColor =
+    rawThemColor.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() != "#252936" }
+    ?? false
+  let incomingTint = bubbleMeGradient.first ?? parseColor(variant.bubbleMe) ?? fallback.accent
+  let bubbleThemGradient: [UIColor] = {
+    let factoryFallback = variant.bubbleThemGradient.compactMap(parseColor)
+    if hasCustomThemStops {
+      return parseGradient(rawThemStops, fallback: factoryFallback)
+    }
+    if hasCustomThemColor, let customColor = parseColor(rawThemColor) {
+      return [customColor, blendColor(customColor, with: .black, amount: 0.16)]
+    }
+    if isDark {
+      let neutral = UIColor(white: 0.12, alpha: 1.0)
+      let tinted = blendColor(neutral, with: incomingTint, amount: 0.14)
+      return [tinted, blendColor(tinted, with: .black, amount: 0.18)]
+    }
+    return factoryFallback
+  }()
   let rawBubbleThemColor =
-    parseColor(raw["bubbleThemColor"] as? String)
+    parseColor(rawThemColor)
     ?? parseColor(variant.bubbleThemGradient.first)
     ?? parseColor(variant.bubbleThem)
     ?? fallback.bubbleThemColor
-  let resolvedBubbleThemColor = rawBubbleThemColor
+  let resolvedBubbleThemColor = bubbleThemGradient.first ?? rawBubbleThemColor
   let textColorMe = parseColor(raw["textColorMe"] as? String) ?? parseColor(variant.textColorMe)
     ?? fallback.textColorMe
   let textColorThem =
@@ -1643,10 +1666,7 @@ private func nativePresetAppearance(
       (raw["wallpaperPatternOpacity"] as? NSNumber)?.doubleValue ?? variant.patternOpacity),
     wallpaperMaskKey: normalizedString(raw["wallpaperMaskKey"]) ?? preset.maskedImage,
     bubbleMeGradient: bubbleMeGradient,
-    bubbleThemGradient: parseGradient(
-      raw["bubbleThemGradient"] as? [String],
-      fallback: variant.bubbleThemGradient.compactMap(parseColor)
-    ),
+    bubbleThemGradient: bubbleThemGradient,
     bubbleThemColor: resolvedBubbleThemColor,
     textColorMe: textColorMe,
     textColorThem: textColorThem,
@@ -1680,6 +1700,11 @@ private func isLegacyFactoryOutgoingPalette(_ stops: [String]) -> Bool {
     ["#5DB82E", "#2EB8A3"], ["#28B463", "#1DB8A6"],
   ]
   return legacy.contains { $0.map { $0.uppercased() } == key }
+}
+
+private func isLegacyFactoryIncomingPalette(_ stops: [String]) -> Bool {
+  stops.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+    == ["#252936", "#1A202C"]
 }
 
 private func chatAppearanceDraftPaletteIsSeeded(_ draft: ChatAppearanceDraft) -> Bool {

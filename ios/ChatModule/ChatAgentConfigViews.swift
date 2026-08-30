@@ -2302,3 +2302,477 @@ private struct GroupAgentDocumentsView: View {
     .toolbarBackground(.hidden, for: .navigationBar)
   }
 }
+
+// MARK: - New standalone agent (Grok-Bot role presets)
+
+/// A ready-made role for a new agent: fills the system prompt (the role) and a
+/// sensible control mode. Owner can edit every field before creating.
+enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
+  case marketing, sales, manager, boss, custom
+  var id: String { rawValue }
+
+  var title: String {
+    switch self {
+    case .marketing: return "Marketing"
+    case .sales: return "Sales"
+    case .manager: return "Manager"
+    case .boss: return "Boss"
+    case .custom: return "Custom"
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    case .marketing: return "megaphone.fill"
+    case .sales: return "chart.line.uptrend.xyaxis"
+    case .manager: return "checklist"
+    case .boss: return "crown.fill"
+    case .custom: return "square.and.pencil"
+    }
+  }
+
+  var defaultName: String {
+    switch self {
+    case .marketing: return "Marketing Lead"
+    case .sales: return "Sales Rep"
+    case .manager: return "Team Manager"
+    case .boss: return "Boss"
+    case .custom: return "New Agent"
+    }
+  }
+
+  var persona: String? {
+    switch self {
+    case .marketing: return "Marketing Lead"
+    case .sales: return "Sales Rep"
+    case .manager: return "Manager"
+    case .boss: return "Boss"
+    case .custom: return nil
+    }
+  }
+
+  var systemPrompt: String {
+    switch self {
+    case .marketing:
+      return "You are the Marketing Lead for this team. You own positioning, messaging, campaigns, and copy. Research the market and competitors before you write, keep everything specific and on-brand, and turn briefs into ready-to-ship deliverables. When you have a computer, save your work to files."
+    case .sales:
+      return "You are a Sales Rep for this team. You qualify leads, write outreach, and handle objections to keep the pipeline moving. Personalize every message, stay concise and human, and never over-promise. Any message that reaches a real customer needs approval first."
+    case .manager:
+      return "You are a Manager for this team. You turn goals into plans, break work into tasks, delegate, track progress, and summarize status. Be organized and decisive, surface risks early, and keep everyone unblocked."
+    case .boss:
+      return "You are the Boss. You set strategy, make the final call on big decisions, and hold the team to outcomes. Think in priorities and trade-offs, ask for the numbers, and sign off before anything significant ships."
+    case .custom:
+      return ""
+    }
+  }
+
+  var autonomyMode: String {
+    switch self {
+    case .marketing, .manager: return "safe_auto"
+    case .sales, .boss: return "approval_required"
+    case .custom: return "safe_auto"
+    }
+  }
+
+  /// Whether this role gets an isolated sandbox with computer access by default.
+  var usesComputer: Bool { self == .marketing }
+
+  /// Registry model id this role starts on; nil follows the registry default.
+  /// Step-heavy roles start cheaper, decision roles start on a frontier model.
+  var defaultModelId: String? {
+    switch self {
+    case .marketing: return "claude-sonnet-5"
+    case .sales: return "claude-haiku-4-5-20251001"
+    case .manager: return "claude-sonnet-5"
+    case .boss: return "claude-opus-4-8"
+    case .custom: return nil
+    }
+  }
+
+  var baseTools: [String] {
+    switch self {
+    case .custom: return []
+    default: return ["search_google", "read_url", "create_document"]
+    }
+  }
+}
+
+func chatAgentAutonomyLabel(_ mode: String) -> String {
+  switch mode {
+  case "draft_first": return "Draft first"
+  case "manual": return "Manual"
+  case "safe_auto": return "Safe auto"
+  case "approval_required": return "Approval required"
+  case "full_auto": return "Full auto"
+  default: return mode
+  }
+}
+
+func chatAgentAutonomyDetail(_ mode: String) -> String {
+  switch mode {
+  case "draft_first": return "Prepares work but never sends until you review."
+  case "manual": return "Acts only when you explicitly ask."
+  case "safe_auto": return "Acts on low-risk steps, asks before risky ones."
+  case "approval_required": return "Asks for your approval before every action."
+  case "full_auto": return "Acts on its own without asking."
+  default: return ""
+  }
+}
+
+/// Owner-editable → server create body. `enabled_tools`/`persona` omitted when
+/// empty so the server keeps its defaults; computer roles run isolated.
+func chatAgentCreateAttributes(
+  name: String, persona: String?, systemPrompt: String,
+  autonomyMode: String, baseTools: [String], usesComputer: Bool,
+  modelProvider: String? = nil, modelId: String? = nil
+) -> [String: Any] {
+  var enabled = baseTools
+  if usesComputer && !enabled.contains("computer_run") { enabled.append("computer_run") }
+  var attrs: [String: Any] = [
+    "display_name": name,
+    "system_prompt": systemPrompt,
+    "autonomy_mode": autonomyMode,
+    "output_modes": ["text"],
+    "execution_mode": usesComputer ? "isolated" : "embedded",
+  ]
+  if let persona, !persona.isEmpty { attrs["persona"] = persona }
+  if !enabled.isEmpty { attrs["enabled_tools"] = enabled }
+  // Server validates the pair on create; omitted, it keeps the schema default.
+  if let modelProvider, !modelProvider.isEmpty { attrs["model_provider"] = modelProvider }
+  if let modelId, !modelId.isEmpty { attrs["model_id"] = modelId }
+  return attrs
+}
+
+/// Native create sheet: pick a role, tune the role text + control, create.
+/// `onCreate` runs the POST; its callback carries an error string, nil = done.
+struct ChatNewAgentView: View {
+  var onCancel: () -> Void
+  var onCreate: ([String: Any], @escaping (String?) -> Void) -> Void
+  var onLoadModelRegistry: ((@escaping (ChatAgentModelRegistry) -> Void) -> Void)? = nil
+
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var preset: ChatAgentRolePreset = .marketing
+  @State private var name: String = ChatAgentRolePreset.marketing.defaultName
+  @State private var systemPrompt: String = ChatAgentRolePreset.marketing.systemPrompt
+  @State private var autonomy: String = ChatAgentRolePreset.marketing.autonomyMode
+  @State private var usesComputer: Bool = ChatAgentRolePreset.marketing.usesComputer
+  @State private var registry: ChatAgentModelRegistry = .fallback
+  @State private var didLoadRegistry = false
+  @State private var didPickModel = false
+  @State private var modelProviderId = ChatAgentModelRegistry.fallback.defaultProvider
+  @State private var modelId =
+    ChatAgentRolePreset.marketing.defaultModelId
+    ?? ChatAgentModelRegistry.fallback.defaultModelId
+  @State private var isCreating = false
+  @State private var errorMessage: String?
+
+  private let autonomyOptions = ["draft_first", "manual", "safe_auto", "approval_required", "full_auto"]
+  private var palette: AppThemePalette { AppThemePalette.resolve(for: colorScheme) }
+  private var rowFill: Color {
+    colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.05)
+  }
+  private var selectedFill: Color {
+    palette.text.opacity(colorScheme == .dark ? 0.20 : 0.12)
+  }
+  private var canCreate: Bool {
+    !isCreating
+      && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var body: some View {
+    NavigationStack {
+      List {
+        roleSection
+        nameSection
+        instructionsSection
+        modelSection
+        controlSection
+        if let errorMessage { errorSection(errorMessage) }
+      }
+      .listStyle(.insetGrouped)
+      .scrollContentBackground(.hidden)
+      .background(Color.clear)
+      .onAppear { loadRegistryIfNeeded() }
+      .navigationTitle("New Agent")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(.hidden, for: .navigationBar)
+      .tint(palette.text)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button { onCancel() } label: {
+            Image(systemName: "xmark").font(.system(size: 15, weight: .semibold))
+          }
+          .disabled(isCreating)
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+          if isCreating {
+            ProgressView()
+          } else {
+            Button("Create") { create() }
+              .fontWeight(.semibold)
+              .disabled(!canCreate)
+          }
+        }
+      }
+    }
+    .presentationBackground(.clear)
+  }
+
+  private func applyPreset(_ p: ChatAgentRolePreset) {
+    guard p != preset else { return }
+    preset = p
+    name = p.defaultName
+    systemPrompt = p.systemPrompt
+    autonomy = p.autonomyMode
+    usesComputer = p.usesComputer
+    didPickModel = false
+    applyPresetModel(p)
+  }
+
+  /// Resolves a preset model id against the live registry; unknown or
+  /// unavailable ids fall back to the registry default.
+  private func applyPresetModel(_ p: ChatAgentRolePreset) {
+    if let wanted = p.defaultModelId,
+      let hit = registry.selection(modelId: wanted),
+      hit.provider.available
+    {
+      modelProviderId = hit.provider.id
+      modelId = hit.model.id
+      return
+    }
+    if let fallback = registry.selection(modelId: registry.defaultModelId),
+      fallback.provider.available
+    {
+      modelProviderId = fallback.provider.id
+      modelId = fallback.model.id
+      return
+    }
+    if let provider = registry.providers.first(where: \.available),
+      let model = provider.models.first(where: \.recommended) ?? provider.models.first
+    {
+      modelProviderId = provider.id
+      modelId = model.id
+      return
+    }
+    modelProviderId = registry.defaultProvider
+    modelId = registry.defaultModelId
+  }
+
+  private func loadRegistryIfNeeded() {
+    guard !didLoadRegistry else { return }
+    didLoadRegistry = true
+    guard let onLoadModelRegistry else {
+      applyPresetModel(preset)
+      return
+    }
+    onLoadModelRegistry { loaded in
+      registry = loaded
+      if !didPickModel { applyPresetModel(preset) }
+    }
+  }
+
+  private var selectedModel: ChatAgentModelInfo? {
+    registry.model(providerId: modelProviderId, modelId: modelId)
+  }
+
+  private var modelFooter: String {
+    let detail = selectedModel?.description ?? "Picks which model runs this agent."
+    guard registry.isFallback else { return detail }
+    return "\(detail) Showing the built-in catalog while the live registry is unavailable."
+  }
+
+  private func create() {
+    errorMessage = nil
+    isCreating = true
+    let attrs = chatAgentCreateAttributes(
+      name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+      persona: preset.persona,
+      systemPrompt: systemPrompt,
+      autonomyMode: autonomy,
+      baseTools: preset.baseTools,
+      usesComputer: usesComputer,
+      modelProvider: modelProviderId,
+      modelId: modelId)
+    onCreate(attrs) { error in
+      isCreating = false
+      if let error { errorMessage = error }
+    }
+  }
+
+  private var roleSection: some View {
+    Section {
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 10) {
+          ForEach(ChatAgentRolePreset.allCases) { roleCard($0) }
+        }
+        .padding(.vertical, 4)
+      }
+      .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+      .listRowBackground(Color.clear)
+    } header: {
+      sectionHeader("Role")
+    }
+  }
+
+  private func roleCard(_ p: ChatAgentRolePreset) -> some View {
+    let selected = p == preset
+    return Button {
+      withAnimation(.easeInOut(duration: 0.15)) { applyPreset(p) }
+    } label: {
+      VStack(spacing: 6) {
+        Image(systemName: p.symbol)
+          .font(.system(size: 20, weight: .semibold))
+        Text(p.title)
+          .font(.system(size: 13, weight: .semibold))
+      }
+      .foregroundStyle(selected ? palette.text : palette.secondaryText)
+      .frame(width: 96, height: 78)
+      .background(
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+          .fill(selected ? selectedFill : rowFill)
+          .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+              .stroke(palette.text, lineWidth: selected ? 1.5 : 0)
+          )
+      )
+    }
+    .buttonStyle(.plain)
+  }
+
+  private var nameSection: some View {
+    Section {
+      HStack {
+        Text("Name").font(.system(size: 16)).foregroundStyle(palette.text)
+        Spacer(minLength: 12)
+        TextField(preset.defaultName, text: $name)
+          .multilineTextAlignment(.trailing)
+          .foregroundStyle(palette.secondaryText)
+      }
+      .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+      .listRowBackground(rowFill)
+    } header: {
+      sectionHeader("Name")
+    }
+  }
+
+  private var instructionsSection: some View {
+    Section {
+      ZStack(alignment: .topLeading) {
+        if systemPrompt.isEmpty {
+          Text("Describe the role and the job…")
+            .font(.system(size: 15))
+            .foregroundStyle(palette.secondaryText.opacity(0.7))
+            .padding(.top, 8).padding(.leading, 5)
+        }
+        TextEditor(text: $systemPrompt)
+          .font(.system(size: 15))
+          .foregroundStyle(palette.text)
+          .frame(minHeight: 150)
+          .scrollContentBackground(.hidden)
+      }
+      .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+      .listRowBackground(rowFill)
+    } header: {
+      sectionHeader("Instructions")
+    } footer: {
+      Text("This is the agent's role — what it is and the job it does.")
+        .foregroundStyle(palette.secondaryText)
+    }
+  }
+
+  private var modelSection: some View {
+    Section {
+      Menu {
+        ForEach(registry.providers) { provider in
+          Section {
+            ForEach(provider.models) { model in
+              Button {
+                modelProviderId = provider.id
+                modelId = model.id
+                didPickModel = true
+              } label: {
+                if provider.id == modelProviderId && model.id == modelId {
+                  Label(model.name, systemImage: "checkmark")
+                } else {
+                  Text(model.name)
+                }
+              }
+              .disabled(!provider.available)
+            }
+          } header: {
+            Text(provider.available ? provider.name : "\(provider.name) (unavailable)")
+          }
+        }
+      } label: {
+        HStack {
+          Text("Model").font(.system(size: 16)).foregroundStyle(palette.text)
+          Spacer(minLength: 12)
+          Text(selectedModel?.name ?? modelId)
+            .font(.system(size: 15)).foregroundStyle(palette.secondaryText)
+          Image(systemName: "chevron.up.chevron.down")
+            .font(.system(size: 12, weight: .semibold)).foregroundStyle(palette.secondaryText)
+        }
+      }
+      .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+      .listRowBackground(rowFill)
+    } header: {
+      sectionHeader("Model")
+    } footer: {
+      Text(modelFooter).foregroundStyle(palette.secondaryText)
+    }
+  }
+
+  private var controlSection: some View {
+    Section {
+      Menu {
+        ForEach(autonomyOptions, id: \.self) { mode in
+          Button {
+            autonomy = mode
+          } label: {
+            if mode == autonomy {
+              Label(chatAgentAutonomyLabel(mode), systemImage: "checkmark")
+            } else {
+              Text(chatAgentAutonomyLabel(mode))
+            }
+          }
+        }
+      } label: {
+        HStack {
+          Text("Control").font(.system(size: 16)).foregroundStyle(palette.text)
+          Spacer(minLength: 12)
+          Text(chatAgentAutonomyLabel(autonomy))
+            .font(.system(size: 15)).foregroundStyle(palette.secondaryText)
+          Image(systemName: "chevron.up.chevron.down")
+            .font(.system(size: 12, weight: .semibold)).foregroundStyle(palette.secondaryText)
+        }
+      }
+      .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+      .listRowBackground(rowFill)
+
+      Toggle(isOn: $usesComputer) {
+        Text("Works on its own computer").font(.system(size: 16)).foregroundStyle(palette.text)
+      }
+      .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
+      .listRowBackground(rowFill)
+    } header: {
+      sectionHeader("Control")
+    } footer: {
+      Text("\(chatAgentAutonomyDetail(autonomy)) With its own computer it runs commands and saves files in a private sandbox.")
+        .foregroundStyle(palette.secondaryText)
+    }
+  }
+
+  private func errorSection(_ msg: String) -> some View {
+    Section {
+      Text(msg).font(.system(size: 13)).foregroundStyle(.red).listRowBackground(rowFill)
+    }
+  }
+
+  private func sectionHeader(_ t: String) -> some View {
+    Text(t)
+      .font(.system(size: 13, weight: .semibold))
+      .textCase(.uppercase)
+      .foregroundStyle(palette.secondaryText)
+  }
+}

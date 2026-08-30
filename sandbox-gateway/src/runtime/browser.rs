@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use crate::error::{from_docker_error, GatewayError};
 use crate::models::{
-    BrowserActionRequest, BrowserActionResponse, BrowserNavigateResponse, ScreenshotResponse,
+    BrowserActionRequest, BrowserActionResponse, BrowserNavigateResponse, BrowserStateResponse,
+    ComputerInputRequest, ScreenshotResponse,
 };
 use crate::state::AppState;
 
@@ -159,7 +160,20 @@ pub async fn screenshot(
     container_id: &str,
     max_width: u32,
 ) -> Result<ScreenshotResponse, GatewayError> {
-    let req = serde_json::json!({"kind": "screenshot", "maxWidth": max_width});
+    screenshot_quality(state, container_id, max_width, None).await
+}
+
+/// The computer frame path reuses this so there is only ever one screenshot path.
+pub async fn screenshot_quality(
+    state: &AppState,
+    container_id: &str,
+    max_width: u32,
+    quality: Option<u32>,
+) -> Result<ScreenshotResponse, GatewayError> {
+    let mut req = serde_json::json!({"kind": "screenshot", "maxWidth": max_width});
+    if let Some(q) = quality {
+        req["quality"] = serde_json::json!(q);
+    }
     let v = run_browser_script(state, container_id, req).await?;
     Ok(ScreenshotResponse {
         image_base64: v
@@ -177,9 +191,92 @@ pub async fn screenshot(
     })
 }
 
+pub async fn state(
+    state: &AppState,
+    container_id: &str,
+) -> Result<BrowserStateResponse, GatewayError> {
+    let v = run_browser_script(state, container_id, serde_json::json!({"kind": "state"})).await?;
+    Ok(parse_state(&v))
+}
+
+fn parse_state(v: &Value) -> BrowserStateResponse {
+    BrowserStateResponse {
+        url: v
+            .get("url")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: v
+            .get("title")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        loading: v.get("loading").and_then(|b| b.as_bool()).unwrap_or(false),
+        tab_count: v.get("tabCount").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+/// Raw viewport input for the computer path; `navigate` is re-checked by browser.js's URL guard.
+pub async fn input(
+    state: &AppState,
+    container_id: &str,
+    req: &ComputerInputRequest,
+) -> Result<BrowserActionResponse, GatewayError> {
+    let mut input = serde_json::Map::new();
+    input.insert("kind".to_string(), Value::String(req.kind.clone()));
+    if let Some(v) = req.x {
+        input.insert("x".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = req.y {
+        input.insert("y".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &req.text {
+        input.insert("text".to_string(), Value::String(v.clone()));
+    }
+    if let Some(v) = &req.key {
+        input.insert("key".to_string(), Value::String(v.clone()));
+    }
+    if let Some(v) = req.delta_y {
+        input.insert("deltaY".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &req.url {
+        input.insert("url".to_string(), Value::String(v.clone()));
+    }
+
+    let request = serde_json::json!({"kind": "input", "input": Value::Object(input)});
+    let v = run_browser_script(state, container_id, request).await?;
+    Ok(BrowserActionResponse {
+        ok: v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false),
+        url: v
+            .get("url")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: v
+            .get("title")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_state_with_defaults_for_missing_fields() {
+        let full = serde_json::json!({"url":"https://a.example/","title":"A","loading":true,"tabCount":2});
+        let s = parse_state(&full);
+        assert_eq!(s.url, "https://a.example/");
+        assert!(s.loading);
+        assert_eq!(s.tab_count, 2);
+
+        let empty = parse_state(&serde_json::json!({}));
+        assert_eq!(empty.url, "");
+        assert!(!empty.loading);
+        assert_eq!(empty.tab_count, 0);
+    }
 
     #[test]
     fn parses_single_json_line() {

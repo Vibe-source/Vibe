@@ -1,5 +1,6 @@
 //! Bollard-backed sandbox lifecycle, exec, files and browser operations.
 pub mod browser;
+pub mod computer;
 pub mod containers;
 pub mod exec;
 pub mod files;
@@ -11,4 +12,11 @@ pub fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }

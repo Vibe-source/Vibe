@@ -29,6 +29,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 2

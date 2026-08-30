@@ -25,6 +25,8 @@ config :vibe_agents, :max_run_seconds, parse_int.("VIBE_AGENTS_MAX_RUN_SECONDS",
 config :vibe_agents, :max_run_tokens, parse_int.("VIBE_AGENTS_MAX_RUN_TOKENS", 400_000)
 config :vibe_agents, :max_tool_failures, parse_int.("VIBE_AGENTS_MAX_TOOL_FAILURES", 6)
 config :vibe_agents, :max_handoff_depth, parse_int.("VIBE_AGENTS_MAX_HANDOFF_DEPTH", 4)
+# Live run servers at once; excess runs stay `queued` and the Dispatcher drains them.
+config :vibe_agents, :max_concurrent_runs, parse_int.("VIBE_AGENTS_MAX_CONCURRENT_RUNS", 8)
 
 config :vibe_agents, :voice_model, System.get_env("VIBE_VOICE_MODEL") || "gpt-realtime"
 config :vibe_agents, :voice_voice, System.get_env("VIBE_VOICE_VOICE") || "marin"
@@ -54,9 +56,16 @@ if config_env() == :prod do
     System.get_env("SECRET_KEY_BASE") ||
       raise "environment variable SECRET_KEY_BASE is missing"
 
+  # Ranch's per-listener default is 1024, and it queues past it instead of rejecting.
+  ranch_max_connections = String.to_integer(System.get_env("RANCH_MAX_CONNECTIONS") || "16384")
+
   config :vibe_agents, VibeAgentsWeb.Endpoint,
     url: [host: System.get_env("VIBE_AGENTS_HOST") || "example.com", port: 443, scheme: "https"],
-    http: [ip: {0, 0, 0, 0, 0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4100")],
+    http: [
+      ip: {0, 0, 0, 0, 0, 0, 0, 0},
+      port: String.to_integer(System.get_env("PORT") || "4100"),
+      transport_options: [max_connections: ranch_max_connections]
+    ],
     secret_key_base: secret_key_base,
     server: true
 end

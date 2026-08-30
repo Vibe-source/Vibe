@@ -146,9 +146,9 @@ defmodule Vibe.Scheduler do
   end
 
   defp execute_post(post_id) do
-    case Chat.get_scheduled_post(post_id) do
-      %{status: "pending"} = post ->
-        # Create the message in the channel
+    # Atomic claim first: on 2+ nodes every scheduler fires; only the winner delivers.
+    case Chat.claim_scheduled_post(post_id) do
+      {:ok, post} ->
         message_id = Ecto.UUID.generate()
         timestamp = :os.system_time(:millisecond)
 
@@ -201,9 +201,6 @@ defmodule Vibe.Scheduler do
               end
             end)
 
-            # Mark as posted
-            Chat.mark_post_as_posted(post_id)
-
             Logger.info(
               "[Scheduler] Posted scheduled message #{post_id} to channel #{post.channel_id}"
             )
@@ -212,10 +209,13 @@ defmodule Vibe.Scheduler do
             Logger.error(
               "[Scheduler] Failed to post scheduled message #{post_id}: #{inspect(reason)}"
             )
+
+            # Give the failed delivery back so the next boot retries it.
+            Chat.reopen_scheduled_post(post_id)
         end
 
-      _ ->
-        Logger.warn("[Scheduler] Post #{post_id} no longer pending, skipping")
+      :already_claimed ->
+        Logger.warning("[Scheduler] Post #{post_id} already claimed elsewhere, skipping")
     end
   end
 end

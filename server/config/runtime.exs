@@ -177,8 +177,19 @@ if config_env() == :prod do
   # params, so it is also listed in ignore_startup_parameters there — see deploy/pgbouncer).
   db_statement_timeout_ms = System.get_env("DB_STATEMENT_TIMEOUT_MS") || "30000"
 
+  # `DB_SSL=false` turns TLS off outright; only correct when postgres is unreachable
+  # off-host. DB_SSL_VERIFY=none still means TLS on but unverified — not the same thing.
+  db_ssl? =
+    case System.get_env("DB_SSL") do
+      value when is_binary(value) ->
+        String.downcase(String.trim(value)) not in ["false", "0", "off", "disable", "disabled"]
+
+      _ ->
+        true
+    end
+
   config :vibe, Vibe.Repo,
-    ssl: ssl_opts,
+    ssl: if(db_ssl?, do: ssl_opts, else: false),
     prepare: :unnamed,
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "20"),
@@ -203,6 +214,21 @@ if config_env() == :prod do
   config :vibe, :rate_limit_backend, System.get_env("RATE_LIMIT_BACKEND") || "ets"
   config :vibe, :cluster_strategy, System.get_env("CLUSTER_STRATEGY") || "none"
   config :vibe, :metrics_port, String.to_integer(System.get_env("METRICS_PORT") || "9568")
+
+  config :vibe, :agent_credits, %{
+    "free" => String.to_integer(System.get_env("AGENT_CREDITS_FREE_CENTS") || "100"),
+    "bronze" => String.to_integer(System.get_env("AGENT_CREDITS_BRONZE_CENTS") || "500"),
+    "silver" => String.to_integer(System.get_env("AGENT_CREDITS_SILVER_CENTS") || "2000"),
+    "gold" => String.to_integer(System.get_env("AGENT_CREDITS_GOLD_CENTS") || "10000")
+  }
+
+  config :vibe,
+         :agent_routines_max_per_owner,
+         String.to_integer(System.get_env("AGENT_ROUTINES_MAX_PER_OWNER") || "20")
+
+  config :vibe,
+         :agent_routine_min_minutes,
+         String.to_integer(System.get_env("AGENT_ROUTINE_MIN_MINUTES") || "15")
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
@@ -236,6 +262,15 @@ if config_env() == :prod do
         |> Enum.reject(&(&1 == ""))
     end
 
+  # Ranch defaults to 1024 connections per listener and then QUEUES accepts rather
+  # than rejecting, so the ceiling reads as connect latency, not errors. Must be raised.
+  ranch_max_connections =
+    case System.get_env("RANCH_MAX_CONNECTIONS") do
+      nil -> 65_536
+      "infinity" -> :infinity
+      raw -> String.to_integer(raw)
+    end
+
   config :vibe, VibeWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
@@ -244,7 +279,8 @@ if config_env() == :prod do
       # See the documentation on https://hexdocs.pm/plug_cowboy/Plug.Cowboy.html
       # for details about using IPv6 vs IPv4 and loopback vs public addresses.
       ip: {0, 0, 0, 0, 0, 0, 0, 0},
-      port: port
+      port: port,
+      transport_options: [max_connections: ranch_max_connections, num_acceptors: 100]
     ],
     check_origin: check_origin,
     secret_key_base: secret_key_base

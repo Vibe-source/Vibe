@@ -84,10 +84,59 @@ defmodule VibeAgents.Sandbox do
     end
   end
 
+  @doc """
+  Opens a viewer session, creating the sandbox if this agent has never run a browser tool.
+  Opening the sheet is how a cold agent gets a computer; the touch keeps the reaper off it.
+  """
+  def computer_session(agent_id, body) when is_map(body) do
+    case ensure_computer(agent_id) do
+      {:ok, %AgentComputer{sandbox_id: sandbox_id} = computer} when is_binary(sandbox_id) ->
+        touch(computer)
+        Client.computer_session(sandbox_id, body)
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :not_available}
+    end
+  end
+
+  def close_computer_session(agent_id, session_id),
+    do: with_sandbox(agent_id, &Client.close_computer_session(&1, session_id))
+
+  @doc "`{:ok, :no_change}` when the gateway has nothing newer than `since`."
+  def computer_frame(agent_id, since \\ 0, session \\ nil),
+    do: with_sandbox(agent_id, &Client.computer_frame(&1, since, session))
+
+  def computer_state(agent_id, session \\ nil),
+    do: with_sandbox(agent_id, &Client.computer_state(&1, session))
+
+  def computer_control(agent_id, body) when is_map(body),
+    do: with_sandbox(agent_id, &Client.computer_control(&1, body))
+
+  def computer_input(agent_id, body) when is_map(body),
+    do: with_sandbox(agent_id, &Client.computer_input(&1, body))
+
+  defp with_sandbox(agent_id, fun) do
+    case sandbox_id_for(agent_id) do
+      sandbox_id when is_binary(sandbox_id) -> fun.(sandbox_id)
+      _ -> {:error, :not_available}
+    end
+  end
+
   def sandbox_id_for(agent_id) do
     case Repo.get_by(AgentComputer, agent_id: agent_id) do
       %AgentComputer{sandbox_id: sandbox_id} -> sandbox_id
       nil -> nil
+    end
+  end
+
+  @doc "True when the agent's sandbox was touched at/after `since`. Pure DB read, no gateway call."
+  def used_since?(agent_id, %DateTime{} = since) do
+    case Repo.get_by(AgentComputer, agent_id: agent_id) do
+      %AgentComputer{last_used_at: %DateTime{} = last_used_at} -> DateTime.compare(last_used_at, since) != :lt
+      _ -> false
     end
   end
 end

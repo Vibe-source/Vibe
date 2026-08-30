@@ -447,6 +447,22 @@ final class ChatEngine {
     let updatedAtMs: Int64
   }
 
+  /// Live browser state behind an agent's computer (agent-computer-v1 §3.4).
+  struct AgentComputerState {
+    let url: String
+    let title: String
+    let live: Bool
+    let holder: String?
+    let runId: String
+    let updatedAtMs: Int64
+
+    /// Host without `www.` — what the turn band and the chat-list subtitle show.
+    var host: String {
+      let raw = URL(string: url)?.host ?? ""
+      return raw.hasPrefix("www.") ? String(raw.dropFirst(4)) : raw
+    }
+  }
+
   private struct PendingCallSignal {
     let id: String
     let event: String
@@ -515,6 +531,13 @@ final class ChatEngine {
   /// parallel retry loops.
   private var outboundReplayWorkItemsByMessageId: [String: DispatchWorkItem] = [:]
   private var outboundReplayAttemptsByMessageId: [String: Int] = [:]
+  /// MLS readiness is per chat; message replay starts only after peer confirmation.
+  private var directMlsReadinessInFlightChatIds = Set<String>()
+  private var directMlsRetryWorkItemsByChat: [String: DispatchWorkItem] = [:]
+  private var directMlsKeyRetryAttemptsByChat: [String: Int] = [:]
+  private var directMlsConfirmationRetryAttemptsByChat: [String: Int] = [:]
+  private static let directMlsKeyRetryDelays: [TimeInterval] = [3, 15, 30, 90, 240, 480]
+  private static let directMlsConfirmationRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15]
   private var packetRuntimeStartInFlight = false
   private var activeMediaUploadTasksByMessageId: [String: URLSessionTask] = [:]
   private var canceledOutboundMessageIds = Set<String>()
@@ -556,6 +579,10 @@ final class ChatEngine {
   // the latest "computer" preview frame. Cleared on agent-run-state terminal status.
   private var activeIsolatedRunIdByChatId: [String: String] = [:]
   private var latestAgentPreviewByChatId: [String: AgentPreviewState] = [:]
+  // Computer state is lock-guarded, not queue-owned: the transcript's measure and render
+  // paths read it on main and must never block on the engine queue.
+  private static let agentComputerLock = NSLock()
+  private static var agentComputerByChatId: [String: AgentComputerState] = [:]
   // Per-session terminal latch: chatId -> (sessionId -> the tail item's content signature
   // at the moment we saw the run finish). Presence of a sessionId key == "this session is
   // settled; do NOT re-light its tail cell from the chat-wide running grace." Needed because
@@ -1611,6 +1638,11 @@ final class ChatEngine {
         outboundReplayWorkItemsByMessageId.values.forEach { $0.cancel() }
         outboundReplayWorkItemsByMessageId.removeAll()
         outboundReplayAttemptsByMessageId.removeAll()
+        directMlsRetryWorkItemsByChat.values.forEach { $0.cancel() }
+        directMlsRetryWorkItemsByChat.removeAll()
+        directMlsReadinessInFlightChatIds.removeAll()
+        directMlsKeyRetryAttemptsByChat.removeAll()
+        directMlsConfirmationRetryAttemptsByChat.removeAll()
         pendingOutboundDraftsByMessageId.removeAll()
         pendingOutboundQueueByChat.removeAll()
         store.clearOutboundState()
@@ -1789,6 +1821,11 @@ final class ChatEngine {
       outboundReplayWorkItemsByMessageId.values.forEach { $0.cancel() }
       outboundReplayWorkItemsByMessageId.removeAll()
       outboundReplayAttemptsByMessageId.removeAll()
+      directMlsRetryWorkItemsByChat.values.forEach { $0.cancel() }
+      directMlsRetryWorkItemsByChat.removeAll()
+      directMlsReadinessInFlightChatIds.removeAll()
+      directMlsKeyRetryAttemptsByChat.removeAll()
+      directMlsConfirmationRetryAttemptsByChat.removeAll()
       pendingOutboundDraftsByMessageId.removeAll()
       pendingOutboundQueueByChat.removeAll()
       onlineUsers.removeAll()
@@ -2884,6 +2921,21 @@ final class ChatEngine {
   func latestAgentPreview(chatId rawChatId: String?) -> AgentPreviewState? {
     guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
     return syncOnQueue { latestAgentPreviewByChatId[chatId] }
+  }
+
+  /// Latest agent computer state for a chat, if any. Lock-read, never `syncOnQueue`: the
+  /// row-height path calls this on main and may not wait on the engine.
+  func latestAgentComputer(chatId rawChatId: String?) -> AgentComputerState? {
+    guard let chatId = normalizedString(rawChatId), !chatId.isEmpty else { return nil }
+    Self.agentComputerLock.lock()
+    defer { Self.agentComputerLock.unlock() }
+    return Self.agentComputerByChatId[chatId]
+  }
+
+  private static func storeAgentComputer(_ state: AgentComputerState?, chatId: String) {
+    agentComputerLock.lock()
+    agentComputerByChatId[chatId] = state
+    agentComputerLock.unlock()
   }
 
   /// Atomically claim an ask requestId for sheet presentation. Returns `true` exactly
@@ -4100,6 +4152,8 @@ final class ChatEngine {
       guard !resolvedChatId.isEmpty else {
         return ["accepted": false, "reason": "invalid_chat", "messageId": messageId]
       }
+      cancelDirectMlsReadinessLocked(chatId: resolvedChatId, resetAttempts: true)
+      VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: resolvedChatId)
       upsertLocalStatusLocked(
         chatId: resolvedChatId,
         messageId: messageId,
@@ -4462,159 +4516,77 @@ final class ChatEngine {
         ]
       }
 
-      // ── Now resolve friend public key (may do synchronous HTTP — no longer blocks UI) ──
-      let keyResolveStartMs = nowMs()
       let isSavedMessagesChat = chatId == "saved_messages"
-      // TOFU on the legacy hybrid RSA key: a server that answers "no KeyPackage" could
-      // otherwise substitute its own and read the DM. Only the hybrid branch consults it.
-      var hybridPeerKeyChanged = false
-      let friendPublicKey: String?
-      if isGroup || isSavedMessagesChat {
-        friendPublicKey = nil
-      } else if let peerAgentId, !peerAgentId.isEmpty {
-        friendPublicKey = nil
-      } else {
-        guard
-          let key = resolveFriendPublicKeyLocked(
-            chatId: chatId, peerUserIdHint: peerUserId)
-        else {
-          NSLog(
-            "[ChatEngine] sendMessage queued reason=missing_friend_key chatId=%@ messageId=%@ keyResolveMs=%d",
-            chatId, messageId, Int(nowMs() - keyResolveStartMs))
-          upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
-          pendingOutboundDraftsByMessageId[messageId] = effectivePayload
-          queueOutboundDraftLocked(
-            chatId: chatId, messageId: messageId, payload: effectivePayload,
-            reason: "missing_friend_key")
-          scheduleFriendPublicKeyFetchLocked(
-            chatId: chatId,
-            peerUserIdHint: peerUserId,
-            trigger: "send_missing_friend_key"
-          )
-          // A forced history load used to run here, and it closed a feedback loop:
-          // history completing calls `scheduleReplayQueuedOutboundLocked(trigger:
-          // "history_loaded")`, which replays every queued draft, and each replay that
-          // still has no key lands back on this branch and forces history again.
-          //
-          // It was never the right mechanism either — loading a transcript does not
-          // resolve a friend's public key. `scheduleFriendPublicKeyFetchLocked` above is
-          // what does, and the replay it triggers on success is the one that should send
-          // these drafts.
-          DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.ensureNativeTransport(trigger: "send_missing_friend_key")
-          }
-          appendJournalLocked(
-            event: "native-send-message-error",
-            payload: [
-              "chatId": chatId,
-              "messageId": messageId,
-              "reason": "missing_friend_key",
-            ])
-          postChangeLocked(
-            reason: "messageStatusChanged",
-            userInfo: ["chatId": chatId, "messageId": messageId, "status": "pending"])
-          return [
-            "accepted": true, "queued": true, "reason": "missing_friend_key",
-            "messageId": messageId,
-            "state": "pending",
-          ]
-        }
-        friendPublicKey = key
-        if let peer = normalizedString(peerUserId),
-          case .changed = VibeSecureTrust.evaluateTransport(publicKeyPem: key, userId: peer)
-        {
-          hybridPeerKeyChanged = true
+      let isHumanDirectMessage =
+        !isGroup && !isChannel && !isSavedMessagesChat && !isVolatileBridgeSend
+        && (peerAgentId ?? "").isEmpty
+      if isHumanDirectMessage {
+        effectivePayload["__requiresConfirmedMls"] = true
+        if let mlsPeerUserId = normalizedUpper(peerUserId) {
+          effectivePayload["peerUserId"] = mlsPeerUserId
         }
       }
-      NSLog(
-        "[ChatEngine] sendMessage keyResolved in %dms chatId=%@ messageId=%@ hasKey=%@",
-        Int(nowMs() - keyResolveStartMs), chatId, messageId,
-        friendPublicKey != nil ? "true" : "false")
-
       let apiBase = self.apiBaseURLLocked()
       let token = self.authHeaderTokenLocked()
       let userId = normalizedString(self.getConfigValueLocked("userId"))
-      let myPublicKeyPem = normalizedString(
-        self.getConfigValueLocked("publicKeyPem") ?? self.getConfigValueLocked("publicKey"))
 
-      // ── MLS gate: a DM that can be end-to-end encrypted must be ───────────
-      //
-      // This has to fail closed. The encryption branch further down falls back
-      // to `encryptedContent = fullPayloadString` — the payload in the clear —
-      // so "no MLS session yet" must never reach it. Instead the draft waits,
-      // exactly as it does for a missing friend key above, and establishment
-      // is what releases it.
-      //
-      // Only replay on success: a failed attempt leaves the draft queued for a
-      // later trigger to retry. A message stuck as pending is a bad experience;
-      // a message silently sent unencrypted in a conversation the user believes
-      // is private is a broken promise, and that is the trade being made here.
-      //
-      // Four kinds of chat are excluded, each for its own reason:
-      //   * agent chats — the agent runs server-side and must read the message.
-      //   * saved messages — sealed by the store layer, not this path.
-      //   * channels — a subscriber expects to scroll back through everything
-      //     posted before they joined, and MLS structurally cannot give them
-      //     that: a joiner starts at the current epoch. Channels need the
-      //     epoch-key scheme in `vibe_core::group`, which can hand a new member
-      //     older keys. Until that is wired they keep their existing path.
-      //   * chats already found too large — `VibeSecureSessions.isIneligible`.
-      //   * chats whose peer has published no KeyPackage — there is no key to
-      //     encrypt to, so waiting cannot succeed and the draft would sit
-      //     pending forever rather than for a moment. This one is temporary
-      //     and re-probed; see `VibeSecureSessions.peerKeysUnavailable`. It
-      //     cannot weaken an established chat, because sealing is decided by
-      //     `isPeerConfirmed` below and that is one-way.
-      if VibeSecureSessions.isSendEnabled,
-        !isSavedMessagesChat,
-        !isChannel,
-        (peerAgentId ?? "").isEmpty,
-        !VibeSecureSessions.shared.isIneligible(chatId: chatId),
-        !VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId),
-        let mlsApiBase = apiBase,
-        isGroup || normalizedString(peerUserId) != nil,
-        !VibeSecureSessions.shared.hasSession(chatId: chatId)
+      // Human DMs are MLS-only. The bubble is optimistic, but no network send
+      // occurs until the peer has joined and acknowledged the session.
+      if isHumanDirectMessage,
+        !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
       {
-        NSLog(
-          "[ChatEngine] sendMessage queued reason=mls_establishing chatId=%@ messageId=%@ group=%@",
-          chatId, messageId, isGroup ? "Y" : "N")
+        let mlsPeerUserId = normalizedUpper(effectivePayload["peerUserId"] ?? peerUserId)
+        let waitReason: String
+        if mlsPeerUserId == nil {
+          waitReason = "waiting_for_peer_identity"
+        } else if VibeSecureSessions.shared.hasSession(chatId: chatId) {
+          waitReason = "waiting_for_peer_confirmation"
+        } else if VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId) {
+          waitReason = "waiting_for_peer_keys"
+        } else {
+          waitReason = "mls_establishing"
+        }
         upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
-        pendingOutboundDraftsByMessageId[messageId] = effectivePayload
         queueOutboundDraftLocked(
-          chatId: chatId, messageId: messageId, payload: effectivePayload,
-          reason: "mls_establishing")
+          chatId: chatId, messageId: messageId, payload: effectivePayload, reason: waitReason)
         appendJournalLocked(
           event: "native-send-message-queued",
-          payload: ["chatId": chatId, "messageId": messageId, "reason": "mls_establishing"])
+          payload: ["chatId": chatId, "messageId": messageId, "reason": waitReason])
         postChangeLocked(
           reason: "messageStatusChanged",
           userInfo: ["chatId": chatId, "messageId": messageId, "status": "pending"])
-        // `retry` means "something changed, try the send again" — which is
-        // usually "a session now exists", but is also how an over-cap group
-        // reports that it has been marked ineligible. Either way the replay
-        // re-evaluates the gate above, so this call site does not need to know
-        // which happened. `false` leaves the draft queued for a later trigger.
+        if let mlsPeerUserId {
+          ensureDirectMlsReadinessLocked(chatId: chatId, peerUserId: mlsPeerUserId)
+        }
+        return [
+          "accepted": true, "queued": true, "reason": waitReason,
+          "messageId": messageId,
+          "state": "pending",
+        ]
+      }
+
+      if VibeSecureSessions.isGroupSendEnabled,
+        isGroup,
+        !isChannel,
+        !VibeSecureSessions.shared.isIneligible(chatId: chatId),
+        !VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId),
+        let mlsApiBase = apiBase,
+        !VibeSecureSessions.shared.hasSession(chatId: chatId)
+      {
+        upsertLocalStatusLocked(chatId: chatId, messageId: messageId, status: "pending")
+        queueOutboundDraftLocked(
+          chatId: chatId, messageId: messageId, payload: effectivePayload,
+          reason: "mls_establishing")
         let onSettled: (Bool) -> Void = { [weak self] retry in
-          guard let self = self, retry else { return }
+          guard let self, retry else { return }
           self.queue.async {
             self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_established")
           }
         }
-        if isGroup {
-          if let myUserId = userId {
-            VibeSecureEstablishment.establishGroup(
-              chatId: chatId, myUserId: myUserId, apiBase: mlsApiBase, token: token,
-              completion: onSettled)
-          } else {
-            // No identity means we cannot tell ourselves apart from the other
-            // members, so we would add ourselves to our own group. Leave it
-            // queued rather than build a broken session.
-            VibeLog.error("[VibeSecure] no userId — cannot establish group \(chatId)")
-          }
-        } else if let mlsPeerUserId = normalizedString(peerUserId) {
-          VibeSecureEstablishment.establishDirectMessage(
-            chatId: chatId, peerUserId: mlsPeerUserId, myUserId: userId, apiBase: mlsApiBase,
-            token: token, completion: onSettled)
+        if let myUserId = userId {
+          VibeSecureEstablishment.establishGroup(
+            chatId: chatId, myUserId: myUserId, apiBase: mlsApiBase, token: token,
+            completion: onSettled)
         }
         return [
           "accepted": true, "queued": true, "reason": "mls_establishing",
@@ -4659,7 +4631,7 @@ final class ChatEngine {
       }
 
       DispatchQueue.global(qos: .userInitiated).async {
-        [weak self, friendPublicKey, uploadTargetUrl, myPublicKeyPem] in
+        [weak self, uploadTargetUrl] in
         guard let self = self else { return }
 
         var finalMediaUrl = mediaUrl
@@ -5160,87 +5132,34 @@ final class ChatEngine {
 
         let encryptedContent: String
         do {
-          // MLS first when this chat has a session. A DM that *should* have one
-          // never arrives here without it — the gate earlier in this function
-          // queues it and establishes instead — so reaching the fall-through
-          // below means this chat is one of the kinds listed there, not a
-          // private conversation quietly losing its encryption.
-          //
-          // The send gate matters because a `vmls1.` envelope is unreadable to
-          // any client that has not shipped this code: enabling it early does
-          // not degrade a conversation, it splits it, and that is not
-          // recoverable after the fact. See `VibeSecureSessions.isSendEnabled`.
-          // `isPeerConfirmed` is not belt-and-braces — it is the whole safety
-          // property. MLS tells a sender nothing about whether anyone can read
-          // what it sealed, and a sender cannot check by decrypting its own
-          // message, so without this a chat can go silently unreadable on both
-          // sides at once and still look perfectly healthy. It did, on
-          // 2026-08-06. Until the peer acks the Welcome we use the path that
-          // already works.
-          if VibeSecureSessions.isSendEnabled,
-            VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
-          {
-            // ── One-way ratchet: confirmed means MLS or nothing ─────────────
-            //
-            // A failed seal must NOT fall through to the hybrid branch below.
-            // Letting it would mean a broken session — or a server that simply
-            // stops serving KeyPackages — silently moves an already-private
-            // conversation back onto the older envelope. That is a downgrade
-            // an attacker can *trigger*, and neither participant would see any
-            // sign of it: the message sends, ticks, and renders normally.
-            //
-            // Refusing is visible and recoverable; a silent downgrade is
-            // neither. This is the whole reason `isPeerConfirmed` is one-way —
-            // a chat that has ever been readable end-to-end never quietly
-            // stops being so.
+          let peerConfirmed = VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
+          if isHumanDirectMessage && !peerConfirmed {
+            throw NSError(
+              domain: "VibeSecure", code: 1,
+              userInfo: [
+                NSLocalizedDescriptionKey: "mls_not_ready — human DMs have no fallback transport"
+              ])
+          }
+          let shouldSealWithMls =
+            isHumanDirectMessage
+            || (isGroup && !isChannel && VibeSecureSessions.isGroupSendEnabled && peerConfirmed)
+          if shouldSealWithMls {
             guard
               let mlsSealed = VibeSecureSessions.shared.seal(
                 chatId: chatId, plaintext: fullPayloadString)
             else {
               throw NSError(
-                domain: "VibeSecure", code: 1,
+                domain: "VibeSecure", code: 2,
                 userInfo: [
-                  NSLocalizedDescriptionKey:
-                    "mls_seal_failed_on_confirmed_chat — refusing to send this "
-                    + "message under a weaker envelope than the one this chat "
-                    + "already uses"
+                  NSLocalizedDescriptionKey: "mls_seal_failed — refusing weaker transport"
                 ])
             }
-            // Keep our own plaintext: MLS encrypts to the group's *other*
-            // members, so we cannot decrypt this back when the server echoes it
-            // to us, and the row would render empty. See
-            // `VibeSecureSessions.rememberOwnPlaintext`.
+            // MLS cannot reopen the sender copy, so retain its plaintext locally.
             VibeSecureSessions.shared.rememberOwnPlaintext(
               fullPayloadString, messageId: messageId, envelope: mlsSealed)
             encryptedContent = mlsSealed
-          } else if isGroup || friendPublicKey == nil {
-            // Server-readable, and only these three cases can get here:
-            //   * chats over the MLS member cap — broadcast channels, which
-            //     this layer cannot tell apart from groups. The one genuine
-            //     gap; see `VibeSecureSessions.isIneligible(chatId:)` and
-            //     docs/secure-core-architecture.md §4.
-            //   * agent chats — the agent runs server-side and must read the
-            //     message to answer it. Encrypting it to ourselves would break
-            //     the feature, so this is deliberate, not an oversight.
-            //   * saved messages — sealed by the store layer, not this path.
-            // A human DM or an ordinary group reaching this line would be a
-            // bug in the gate above.
-            encryptedContent = fullPayloadString
           } else {
-            guard !hybridPeerKeyChanged else {
-              throw NSError(
-                domain: "VibeSecure", code: 2,
-                userInfo: [
-                  NSLocalizedDescriptionKey:
-                    "peer_key_changed — this contact's encryption key differs from the one "
-                    + "this device pinned; verify it before sending"
-                ])
-            }
-            encryptedContent = try chatEngineEncryptHybridMessage(
-              recipientPublicKeyPem: friendPublicKey!,
-              message: fullPayloadString,
-              myPublicKeyPem: myPublicKeyPem ?? ""
-            )
+            encryptedContent = fullPayloadString
           }
         } catch {
           self.queue.async {
@@ -5285,10 +5204,8 @@ final class ChatEngine {
         // still shape a push notification / route by kind without reading the message.
         let pushKind: String = supportedTypes.contains(type) ? type : "text"
 
-        // Mirrors the encryptedContent branch above: true only for a 1:1 DM where we
-        // actually hold the peer's public key, i.e. the one path where encryptedContent
-        // is real ciphertext rather than fullPayloadString in the clear.
-        let isRealE2EDM = !isGroup && friendPublicKey != nil
+        // Human direct messages reached this point only after confirmed MLS sealing.
+        let isRealE2EDM = isHumanDirectMessage
 
         // CRITICAL: mediaUrl on the wire must be the durable remote URL after upload.
         // Historically this was always NSNull, so the server persisted media_url=NULL.
@@ -5766,33 +5683,22 @@ final class ChatEngine {
       let peerUserIdHint =
         normalizedUpper(payload["peerUserId"] ?? payload["peer_user_id"])
         ?? chatPeerUserIdsByChatId[chatId]
-      // Agent DMs (Claude/Codex/shadow-agent peers) send cleartext — there is no
-      // friend public key to resolve, and requiring one made every edit (e.g. adding
-      // a caption to a sent image) fail silently with missing_friend_key.
-      let peerAgentId = resolvePeerAgentIdLocked(chatId: chatId, peerUserIdHint: peerUserIdHint)
-      let isAgentPeerChat = (peerAgentId?.isEmpty == false)
-      let friendPublicKey: String?
-      if isAgentPeerChat {
-        friendPublicKey = nil
-      } else {
-        guard
-          let key = resolveFriendPublicKeyLocked(
-            chatId: chatId, peerUserIdHint: peerUserIdHint)
-        else {
-          scheduleFriendPublicKeyFetchLocked(
-            chatId: chatId,
-            peerUserIdHint: peerUserIdHint,
-            trigger: "edit_missing_friend_key"
-          )
-          return ["accepted": false, "reason": "missing_friend_key"]
-        }
-        friendPublicKey = key
-        // Same TOFU pin as the send path: a changed hybrid key blocks until verified.
-        if let peer = peerUserIdHint,
-          case .changed = VibeSecureTrust.evaluateTransport(publicKeyPem: key, userId: peer)
-        {
-          return ["accepted": false, "reason": "peer_key_changed"]
-        }
+      let explicitPeerAgentId = normalizedString(
+        payload["peerAgentId"] ?? payload["peer_agent_id"])
+      let peerAgentId = explicitPeerAgentId
+        ?? resolvePeerAgentIdLocked(chatId: chatId, peerUserIdHint: peerUserIdHint)
+      let isGroup =
+        (payload["isGroup"] as? Bool) == true
+        || (payload["isGroupOrChannel"] as? Bool) == true
+      let isChannel = (payload["isChannel"] as? Bool) == true
+      let isHumanDirectMessage =
+        !isGroup && !isChannel && chatId != "saved_messages"
+        && !isVolatileBridgeAgentChatLocked(chatId: chatId)
+        && (peerAgentId ?? "").isEmpty
+      if isHumanDirectMessage,
+        !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
+      {
+        return ["accepted": false, "reason": "encryption_not_ready"]
       }
 
       let editedAt = Int64(nowMs())
@@ -5834,18 +5740,27 @@ final class ChatEngine {
       else {
         return ["accepted": false, "reason": "payload_encode_failed"]
       }
-      let myPublicKeyPem = normalizedString(
-        getConfigValueLocked("publicKeyPem") ?? getConfigValueLocked("publicKey"))
       let encryptedContent: String
       do {
-        if let friendPublicKey {
-          encryptedContent = try chatEngineEncryptHybridMessage(
-            recipientPublicKeyPem: friendPublicKey,
-            message: payloadString,
-            myPublicKeyPem: myPublicKeyPem
-          )
+        let peerConfirmed = VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId)
+        let shouldSealWithMls =
+          isHumanDirectMessage
+          || (isGroup && !isChannel && VibeSecureSessions.isGroupSendEnabled && peerConfirmed)
+        if shouldSealWithMls {
+          guard
+            let mlsSealed = VibeSecureSessions.shared.seal(
+              chatId: chatId, plaintext: payloadString)
+          else {
+            throw NSError(
+              domain: "VibeSecure", code: 2,
+              userInfo: [
+                NSLocalizedDescriptionKey: "mls_seal_failed — refusing weaker transport"
+              ])
+          }
+          VibeSecureSessions.shared.rememberOwnPlaintext(
+            payloadString, messageId: messageId, envelope: mlsSealed)
+          encryptedContent = mlsSealed
         } else {
-          // Agent-peer chats ride cleartext, same as the send path.
           encryptedContent = payloadString
         }
       } catch {
@@ -6795,8 +6710,16 @@ final class ChatEngine {
       }
       return nil
     }
+    // Home's last-message dict carries the ciphertext under `content`; the row builder reads
+    // only `encryptedContent`, so every such preview came back no-text and drew the fallback.
+    var rawMessage = payload
+    if normalizedString(rawMessage["encryptedContent"] ?? rawMessage["encrypted_content"]) == nil,
+      let content = normalizedString(rawMessage["content"])
+    {
+      rawMessage["encryptedContent"] = content
+    }
     guard
-      let row = buildHistoryRowsLocked(chatId: chatId, rawMessages: [payload]).first,
+      let row = buildHistoryRowsLocked(chatId: chatId, rawMessages: [rawMessage]).first,
       let message = row["message"] as? [String: Any]
     else {
       return giveUp("no-row")
@@ -6908,6 +6831,13 @@ final class ChatEngine {
   /// This intentionally does NOT use `liveBridgeSessionIngestByChatId`: that map also
   /// represents a mounted History transcript subscription, and treating it as "busy"
   /// strands mobile follow-ups in the pending queue for already-settled sessions.
+  /// Whether this chat is holding an outgoing message until the peer joins the secure
+  /// session. Mirror-only: at worst one engine turn stale, corrected by the next publish.
+  func isWaitingForSecureSession(chatId: String?) -> Bool {
+    guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
+    return uiMirror.isWaitingForSecureSession(chatId: chatId) ?? false
+  }
+
   func bridgeRunIsActive(chatId: String?) -> Bool {
     guard let chatId = normalizedString(chatId), !chatId.isEmpty else { return false }
     // Read the mirror first, like every other hot getter on this type.
@@ -9263,6 +9193,12 @@ final class ChatEngine {
         }
       }
 
+      // Pushed on the user topic the moment a peer posts a Welcome, so a first
+      // contact joins now instead of waiting for the next socket_open.
+      if frame.event == "mls_welcome" {
+        self.ensureMlsProvisionedLocked(trigger: "mls_welcome_push", force: true)
+        return
+      }
       if frame.topic.hasPrefix("chat:") {
         let chatId = String(frame.topic.dropFirst(5))
         if frame.event == "agent-progress" {
@@ -9460,6 +9396,7 @@ final class ChatEngine {
           guard !staleRun, ["completed", "failed", "cancelled"].contains(status) else { return }
           self.activeIsolatedRunIdByChatId.removeValue(forKey: chatId)
           self.agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
+          Self.storeAgentComputer(nil, chatId: chatId)
           let settleStatus = status == "completed" ? "done" : (status == "failed" ? "error" : "stopped")
           self.clearAgentProgressLocked(
             chatId: chatId, status: settleStatus, reason: "runState(\(status):\(reason))")
@@ -9478,6 +9415,36 @@ final class ChatEngine {
               image: image, label: label, runId: runId, updatedAtMs: Int64(self.nowMs()))
             self.postChangeLocked(
               reason: "agentPreview", userInfo: ["chatId": chatId, "runId": runId])
+          }
+          return
+        }
+        if frame.event == "agent-computer" {
+          // Live browser state for an isolated run (agent-computer-v1 §3.4). Merged, not
+          // replaced: run.computer.control rides this event carrying only `holder`.
+          let runId = self.normalizedString(frame.payload["runId"] ?? frame.payload["run_id"]) ?? ""
+          let previous = self.latestAgentComputer(chatId: chatId)
+          let live: Bool = {
+            switch frame.payload["live"] {
+            case let value as Bool: return value
+            case let value as NSNumber: return value.boolValue
+            case let value as String: return ["1", "true", "yes"].contains(value.lowercased())
+            default: return previous?.live ?? false
+            }
+          }()
+          let state = AgentComputerState(
+            url: self.normalizedString(frame.payload["url"]) ?? previous?.url ?? "",
+            title: self.normalizedString(frame.payload["title"]) ?? previous?.title ?? "",
+            live: live,
+            holder: self.normalizedString(frame.payload["holder"]) ?? previous?.holder,
+            runId: runId.isEmpty ? (previous?.runId ?? "") : runId,
+            updatedAtMs: Int64(self.nowMs()))
+          Self.storeAgentComputer(state, chatId: chatId)
+          self.postChangeLocked(
+            reason: "agentComputer", userInfo: ["chatId": chatId, "runId": runId, "live": live])
+          // Home row + chat header ride the existing agent-progress subtitle, not a new one.
+          if live, !state.host.isEmpty {
+            self.setAgentProgressLocked(
+              chatId: chatId, label: "Browsing \(state.host)", tool: "computer", status: "running")
           }
           return
         }
@@ -9914,7 +9881,10 @@ final class ChatEngine {
         )
         return
       }
+      let previouslyOnline = self.onlineUsers
       if self.applyPresenceEventLocked(event: frame.event, payload: frame.payload) {
+        self.resumeDirectMlsReadinessLocked(
+          newlyOnlineUserIds: self.onlineUsers.subtracting(previouslyOnline))
         self.state["presenceSource"] = "native"
         self.state["updatedAt"] = self.nowMs()
         let snapshot = self.statusSnapshotLocked()
@@ -13637,6 +13607,18 @@ final class ChatEngine {
 
     guard !drafts.isEmpty else { return }
 
+    if let mlsDraft = drafts.first(where: {
+      ($0["__requiresConfirmedMls"] as? Bool) == true
+    }), !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) {
+      guard
+        let mlsPeerUserId = normalizedUpper(
+          mlsDraft["peerUserId"] ?? mlsDraft["peer_user_id"]
+            ?? chatPeerUserIdsByChatId[chatId])
+      else { return }
+      ensureDirectMlsReadinessLocked(chatId: chatId, peerUserId: mlsPeerUserId)
+      return
+    }
+
     // Resolve the peer key ONCE for the batch, and skip the whole replay if it is
     // not there.
     //
@@ -13657,7 +13639,8 @@ final class ChatEngine {
         || (draft["isGroupOrChannel"] as? Bool) == true
         || normalizedString(draft["peerAgentId"] ?? draft["peer_agent_id"]) != nil
     }
-    if !hasNonPeerDraft, chatId != "saved_messages",
+    let hasMlsDraft = drafts.contains { ($0["__requiresConfirmedMls"] as? Bool) == true }
+    if !hasNonPeerDraft, !hasMlsDraft, chatId != "saved_messages",
       !isVolatileBridgeAgentChatLocked(chatId: chatId),
       resolveFriendPublicKeyLocked(chatId: chatId, peerUserIdHint: nil) == nil
     {
@@ -13806,6 +13789,7 @@ final class ChatEngine {
     }
     if let peerUserId = chatPeerUserIdsByChatId[resolvedChatId] {
       draft["peerUserId"] = peerUserId
+      draft["__requiresConfirmedMls"] = true
     }
     return draft
   }
@@ -14255,16 +14239,130 @@ final class ChatEngine {
   /// it returns immediately once confirmed and never un-confirms, so a bad
   /// network cannot silently downgrade an established chat.
   private func refreshMlsPeerConfirmationLocked(chatId: String) {
-    guard VibeSecureSessions.isSendEnabled else { return }
     guard !VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) else { return }
     guard let apiBase = apiBaseURLLocked() else { return }
     VibeSecureEstablishment.refreshPeerConfirmation(
       chatId: chatId, apiBase: apiBase, token: authHeaderTokenLocked())
   }
 
-  private func ensureMlsProvisionedLocked(trigger: String) {
+  private func ensureDirectMlsReadinessLocked(chatId: String, peerUserId: String) {
+    guard !(pendingOutboundQueueByChat[chatId]?.isEmpty ?? true) else {
+      cancelDirectMlsReadinessLocked(chatId: chatId, resetAttempts: true)
+      return
+    }
+    if VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) {
+      cancelDirectMlsReadinessLocked(chatId: chatId, resetAttempts: true)
+      scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_peer_confirmed")
+      return
+    }
+    guard !directMlsReadinessInFlightChatIds.contains(chatId) else { return }
+    guard let apiBase = apiBaseURLLocked() else { return }
+
+    if !VibeSecureSessions.shared.hasSession(chatId: chatId),
+      VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId)
+    {
+      scheduleDirectMlsRetryLocked(chatId: chatId, peerUserId: peerUserId, waitingForKeys: true)
+      return
+    }
+
+    directMlsReadinessInFlightChatIds.insert(chatId)
+    let settled: (Bool) -> Void = { [weak self] _ in
+      guard let self else { return }
+      self.queue.async {
+        self.directMlsReadinessInFlightChatIds.remove(chatId)
+        guard !(self.pendingOutboundQueueByChat[chatId]?.isEmpty ?? true) else {
+          self.cancelDirectMlsReadinessLocked(chatId: chatId, resetAttempts: true)
+          return
+        }
+        if VibeSecureSessions.shared.isPeerConfirmed(chatId: chatId) {
+          self.cancelDirectMlsReadinessLocked(chatId: chatId, resetAttempts: true)
+          self.scheduleReplayQueuedOutboundLocked(chatId: chatId, trigger: "mls_peer_confirmed")
+        } else if VibeSecureSessions.shared.hasSession(chatId: chatId) {
+          self.scheduleDirectMlsRetryLocked(
+            chatId: chatId, peerUserId: peerUserId, waitingForKeys: false)
+        } else if VibeSecureSessions.shared.peerKeysUnavailable(chatId: chatId) {
+          self.scheduleDirectMlsRetryLocked(
+            chatId: chatId, peerUserId: peerUserId, waitingForKeys: true)
+        }
+      }
+    }
+
+    if VibeSecureSessions.shared.hasSession(chatId: chatId) {
+      VibeSecureEstablishment.refreshPeerConfirmation(
+        chatId: chatId, apiBase: apiBase, token: authHeaderTokenLocked(), completion: settled)
+    } else {
+      VibeSecureEstablishment.establishDirectMessage(
+        chatId: chatId,
+        peerUserId: peerUserId,
+        myUserId: normalizedString(getConfigValueLocked("userId")),
+        apiBase: apiBase,
+        token: authHeaderTokenLocked(),
+        completion: settled
+      )
+    }
+  }
+
+  private func scheduleDirectMlsRetryLocked(
+    chatId: String,
+    peerUserId: String,
+    waitingForKeys: Bool
+  ) {
+    guard directMlsRetryWorkItemsByChat[chatId] == nil else { return }
+    let delays = waitingForKeys
+      ? Self.directMlsKeyRetryDelays : Self.directMlsConfirmationRetryDelays
+    let attempt: Int
+    if waitingForKeys {
+      attempt = (directMlsKeyRetryAttemptsByChat[chatId] ?? 0) + 1
+      guard attempt <= delays.count else { return }
+      directMlsKeyRetryAttemptsByChat[chatId] = attempt
+    } else {
+      attempt = (directMlsConfirmationRetryAttemptsByChat[chatId] ?? 0) + 1
+      directMlsConfirmationRetryAttemptsByChat[chatId] = attempt
+    }
+    let delay = delays[min(attempt - 1, delays.count - 1)]
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.directMlsRetryWorkItemsByChat.removeValue(forKey: chatId)
+      guard !(self.pendingOutboundQueueByChat[chatId]?.isEmpty ?? true) else {
+        self.cancelDirectMlsReadinessLocked(chatId: chatId, resetAttempts: true)
+        return
+      }
+      if waitingForKeys {
+        VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: chatId)
+      }
+      self.ensureDirectMlsReadinessLocked(chatId: chatId, peerUserId: peerUserId)
+    }
+    directMlsRetryWorkItemsByChat[chatId] = workItem
+    queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+  }
+
+  private func cancelDirectMlsReadinessLocked(chatId: String, resetAttempts: Bool) {
+    directMlsRetryWorkItemsByChat.removeValue(forKey: chatId)?.cancel()
+    directMlsReadinessInFlightChatIds.remove(chatId)
+    guard resetAttempts else { return }
+    directMlsKeyRetryAttemptsByChat.removeValue(forKey: chatId)
+    directMlsConfirmationRetryAttemptsByChat.removeValue(forKey: chatId)
+  }
+
+  private func resumeDirectMlsReadinessLocked(newlyOnlineUserIds: Set<String>) {
+    guard !newlyOnlineUserIds.isEmpty else { return }
+    for (chatId, messageIds) in pendingOutboundQueueByChat {
+      guard let messageId = messageIds.first,
+        let draft = pendingOutboundDraftsByMessageId[messageId],
+        (draft["__requiresConfirmedMls"] as? Bool) == true,
+        let peerUserId = normalizedUpper(draft["peerUserId"] ?? draft["peer_user_id"]),
+        newlyOnlineUserIds.contains(peerUserId)
+      else { continue }
+      directMlsRetryWorkItemsByChat.removeValue(forKey: chatId)?.cancel()
+      VibeSecureSessions.shared.clearPeerKeysUnavailable(chatId: chatId)
+      ensureDirectMlsReadinessLocked(chatId: chatId, peerUserId: peerUserId)
+    }
+  }
+
+  private func ensureMlsProvisionedLocked(trigger: String, force: Bool = false) {
     let now = Int64(nowMs())
-    if mlsProvisionedAtMs != 0, now - mlsProvisionedAtMs < 60_000 { return }
+    // A server-pushed welcome is a fact, not a guess, so it outranks the throttle.
+    if !force, mlsProvisionedAtMs != 0, now - mlsProvisionedAtMs < 60_000 { return }
     guard let apiBase = apiBaseURLLocked() else { return }
     let token = authHeaderTokenLocked()
     mlsProvisionedAtMs = now
@@ -16751,6 +16849,18 @@ final class ChatEngine {
       guard let chatId = normalizedString(payload["chatId"]), !chatId.isEmpty else { continue }
       askChatIds.insert(chatId)
     }
+    // Chats holding a draft that cannot leave until the peer joins. The loop only runs
+    // for chats with something already queued, so it is normally a no-op.
+    var secureWait: Set<String> = []
+    for (queuedChatId, ids) in pendingOutboundQueueByChat {
+      guard
+        ids.contains(where: {
+          (pendingOutboundDraftsByMessageId[$0]?["__requiresConfirmedMls"] as? Bool) == true
+        }),
+        !VibeSecureSessions.shared.isPeerConfirmed(chatId: queuedChatId)
+      else { continue }
+      secureWait.insert(queuedChatId)
+    }
     uiMirror.publish(
       typingByChatId: peerTypingUserIdsByChatId,
       agentProgressByChatId: progress,
@@ -16760,7 +16870,8 @@ final class ChatEngine {
       agentTurnRunningAtMsByChatId: agentTurnRunningAtMsByChatId,
       agentAskChatIds: askChatIds,
       receiptIndex: receiptIndex,
-      localStatusIndex: localStatusIndex
+      localStatusIndex: localStatusIndex,
+      secureWaitChatIds: secureWait
     )
     // Sampled, so the export can answer "is the UI still queueing?" without a
     // profiler. `fallback` climbing after launch means the mirror stopped being

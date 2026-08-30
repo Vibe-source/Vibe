@@ -897,11 +897,17 @@ public final class ChatMainView: UIView,
       ?? ""
     let tab = (payload["tab"] as? String)?.lowercased() ?? ""
     let url = (payload["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let senderName =
+      (payload["senderName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let mediaKey =
+      (payload["mediaKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let sourceView = payload["sourceView"] as? UIView
     chatListView.openProfileContent(
       messageId: messageId,
       tab: tab,
       urlString: url,
+      senderName: senderName,
+      mediaKey: mediaKey,
       sourceView: sourceView
     )
   }

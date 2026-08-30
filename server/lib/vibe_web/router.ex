@@ -212,6 +212,7 @@ defmodule VibeWeb.Router do
     get "/agents/model_registry", AgentsController, :model_registry
     get "/agents/tool_registry", AgentsController, :tool_registry
     get "/agents/username_available", AgentsController, :username_available
+    get "/agents/usage", AgentsController, :owner_usage
     post "/agents", AgentsController, :create
     get "/agents/:id", AgentsController, :show
     get "/agents/:id/secret", AgentsController, :secret
@@ -219,6 +220,11 @@ defmodule VibeWeb.Router do
     post "/agents/:id/publish", AgentsController, :publish
     post "/agents/:id/secret/rotate", AgentsController, :rotate_secret
     get "/agents/:id/deliveries", AgentsController, :deliveries
+    get "/agents/:id/usage", AgentsController, :agent_usage
+    get "/agents/:id/routines", AgentsController, :routines
+    post "/agents/:id/routines", AgentsController, :create_routine
+    put "/agents/:id/routines/:routine_id", AgentsController, :update_routine
+    delete "/agents/:id/routines/:routine_id", AgentsController, :delete_routine
     get "/agents/:id/integrations", AgentsController, :integrations
     post "/agents/:id/integrations", AgentsController, :create_integration
     put "/agents/:id/integrations/:integration_id", AgentsController, :update_integration
@@ -232,6 +238,8 @@ defmodule VibeWeb.Router do
     # Isolated-runtime surfaces (docs/agent-platform-v1.md §3.7 / §3.2).
     post "/agents/:id/voice/sessions", AgentsController, :voice_session
     get "/agents/:id/computer/preview", AgentsController, :computer_preview
+    post "/agents/:id/computer/session", AgentsController, :computer_session
+    delete "/agents/:id/computer/session/:session_id", AgentsController, :close_computer_session
     delete "/agents/:id", AgentsController, :delete
 
     # Builder

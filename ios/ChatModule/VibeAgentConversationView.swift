@@ -754,6 +754,11 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       if isViewLoaded { updateComputerPreviewAffordances() }
     }
   }
+  /// Set by a host that already knows the agent; otherwise the session resolves it from
+  /// this chat's peer. Skips one lookup on the way into the Computer sheet.
+  var agentComputerAgentId: String?
+  private var computerSheetOpening = false
+
   var agentBridgeProvider: String? {
     didSet {
       composerView.provider = agentBridgeProvider ?? "codex"
@@ -915,9 +920,46 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     onPresentProfile?()
   }
 
+  /// Opens the LIVE computer sheet when a session can be created; the still-frame sheet
+  /// stays the fallback for no gateway / 429 capacity (agent-computer-v1 §2).
   @objc private func computerPreviewTapped() {
     guard let chatId = agentBridgeChatId, !chatId.isEmpty else { return }
-    present(VibeAgentComputerPreviewViewController(chatId: chatId, appearance: appearance), animated: true)
+    guard !computerSheetOpening else { return }
+    computerSheetOpening = true
+    setComputerAffordancesBusy(true)
+    VibeAgentComputerSession.create(agentId: agentComputerAgentId, chatId: chatId) {
+      [weak self] result in
+      guard let self else { return }
+      self.computerSheetOpening = false
+      self.setComputerAffordancesBusy(false)
+      let canPresent = self.viewIfLoaded?.window != nil && self.presentedViewController == nil
+      guard canPresent else {
+        if case .success(let session) = result { session.stop() }
+        return
+      }
+      switch result {
+      case .success(let session):
+        self.present(
+          VibeAgentComputerViewController(
+            session: session, agentTitle: self.runtimeTitle, appearance: self.appearance),
+          animated: true)
+      case .failure:
+        self.present(
+          VibeAgentComputerPreviewViewController(
+            chatId: chatId, appearance: self.appearance,
+            fallbackNote: "Live view unavailable — showing the latest frame."),
+          animated: true)
+      }
+    }
+  }
+
+  private func setComputerAffordancesBusy(_ busy: Bool) {
+    headerComputerButton.isEnabled = !busy
+    computerThumbnailView.isUserInteractionEnabled = !busy
+    UIView.animate(withDuration: 0.15) {
+      self.headerComputerButton.alpha = busy ? 0.45 : 1.0
+      self.computerThumbnailView.alpha = busy ? 0.6 : 1.0
+    }
   }
 
   /// Show/hide the header button + floating thumbnail once a "computer" preview frame

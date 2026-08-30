@@ -15,9 +15,7 @@ enum VibeSecureTrust {
   }
 
   private static let service = "vibe.secure.trust"
-  private static let transportService = "vibe.secure.trust.transport"
   private static let pendingService = "vibe.secure.trust.pending"
-  private static let pendingTransportService = "vibe.secure.trust.pending.transport"
   private static let queue = DispatchQueue(label: "vibe.secure.trust")
 
 
@@ -49,92 +47,27 @@ enum VibeSecureTrust {
     queue.sync { storeKey(signatureKey, userId: userId) }
   }
 
-  // Legacy RSA transport pin for peers without MLS support.
-
-  /// Compares the peer's hybrid RSA public key against its pin, pinning on first contact.
-  static func evaluateTransport(publicKeyPem: String, userId: String) -> Verdict {
-    let offered = transportKeyBytes(publicKeyPem)
-    guard !offered.isEmpty else { return .matchesPin }
-    return queue.sync {
-      guard let pinned = loadKey(userId: userId, service: transportService) else {
-        _ = storeKey(offered, userId: userId, service: transportService)
-        deleteKey(userId: userId, service: pendingTransportService)
-        return .pinnedOnFirstContact
-      }
-      if pinned == offered {
-        deleteKey(userId: userId, service: pendingTransportService)
-        return .matchesPin
-      }
-      _ = storeKey(offered, userId: userId, service: pendingTransportService)
-      return .changed(pinned: pinned, offered: offered)
-    }
-  }
-
-  /// The hybrid key currently pinned for `userId`, as DER.
-  static func pinnedTransportKey(userId: String) -> Data? {
-    queue.sync { loadKey(userId: userId, service: transportService) }
-  }
-
-  /// Replaces the hybrid pin. Human-accepted changes only, exactly like `acceptChange`.
-  @discardableResult
-  static func acceptTransportChange(publicKeyPem: String, userId: String) -> Bool {
-    let offered = transportKeyBytes(publicKeyPem)
-    guard !offered.isEmpty else { return false }
-    return queue.sync { storeKey(offered, userId: userId, service: transportService) }
-  }
-
-  static func pendingChanges(userId: String) -> (signatureKey: Data?, transportKey: Data?) {
-    queue.sync {
-      (
-        loadKey(userId: userId, service: pendingService),
-        loadKey(userId: userId, service: pendingTransportService)
-      )
-    }
+  static func pendingChange(userId: String) -> Data? {
+    queue.sync { loadKey(userId: userId, service: pendingService) }
   }
 
   /// Promotes only the exact identity keys the user verified.
   @discardableResult
-  static func acceptPendingChanges(
-    userId: String,
-    expectedSignatureKey: Data?,
-    expectedTransportKey: Data?
-  ) -> Bool {
+  static func acceptPendingChange(userId: String, expectedSignatureKey: Data?) -> Bool {
     queue.sync {
-      let signature = loadKey(userId: userId, service: pendingService)
-      let transport = loadKey(userId: userId, service: pendingTransportService)
-      guard expectedSignatureKey != nil || expectedTransportKey != nil else { return false }
-      guard signature == expectedSignatureKey, transport == expectedTransportKey else { return false }
-
-      var succeeded = true
-      if let signature {
-        let stored = storeKey(signature, userId: userId)
-        if stored { deleteKey(userId: userId, service: pendingService) }
-        succeeded = succeeded && stored
-      }
-      if let transport {
-        let stored = storeKey(transport, userId: userId, service: transportService)
-        if stored { deleteKey(userId: userId, service: pendingTransportService) }
-        succeeded = succeeded && stored
-      }
-      return succeeded
+      guard let expectedSignatureKey,
+        loadKey(userId: userId, service: pendingService) == expectedSignatureKey
+      else { return false }
+      let stored = storeKey(expectedSignatureKey, userId: userId)
+      if stored { deleteKey(userId: userId, service: pendingService) }
+      return stored
     }
-  }
-
-  /// DER behind a PEM, so header and line-break drift is not read as a key change.
-  private static func transportKeyBytes(_ pem: String) -> Data {
-    let body = pem.split(whereSeparator: \.isNewline)
-      .filter { !$0.hasPrefix("-----") }
-      .joined()
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    if let der = Data(base64Encoded: body), !der.isEmpty { return der }
-    let raw = pem.trimmingCharacters(in: .whitespacesAndNewlines)
-    return raw.isEmpty ? Data() : Data(raw.utf8)
   }
 
   /// Clears all pins only when this device retires its own identity.
   static func clearAllPins() {
     queue.sync {
-      for pinService in [service, transportService, pendingService, pendingTransportService] {
+      for pinService in [service, pendingService] {
         let query: [String: Any] = [
           kSecClass as String: kSecClassGenericPassword,
           kSecAttrService as String: pinService,

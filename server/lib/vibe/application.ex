@@ -76,6 +76,7 @@ defmodule Vibe.Application do
       Vibe.Scheduler,
       Vibe.AgentDeliveryScheduler,
       Vibe.ChannelAgentScheduler,
+      Vibe.AgentRoutineScheduler,
       # Start the Story Cleaner
       Vibe.StoryCleaner,
       # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)

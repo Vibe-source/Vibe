@@ -17,6 +17,8 @@ defmodule Vibe.Chat.Participant do
     timestamps()
   end
 
+  @roles ["owner", "admin", "member", "subscriber", "agent_admin"]
+
   def changeset(participant, attrs) do
     participant
     |> cast(attrs, [
@@ -26,10 +28,13 @@ defmodule Vibe.Chat.Participant do
       :pinned,
       :marked_unread,
       :archived,
-      :messages_cleared_at,
-      :role
+      :messages_cleared_at
     ])
     |> validate_required([:chat_id, :user_id])
-    |> validate_inclusion(:role, ["owner", "admin", "member", "subscriber", "agent_admin"])
+  end
+
+  # Role never comes from a request map — only explicit code paths may set it.
+  def role_changeset(participant_or_changeset, role) when role in @roles do
+    Ecto.Changeset.change(participant_or_changeset, role: role)
   end
 end

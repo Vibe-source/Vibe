@@ -499,17 +499,114 @@ final class ChatAgentsMainViewController: UIViewController {
   }
 
   @objc private func handleCreate() {
-    // A presented full-screen list should make way for its creation flow. A tab
-    // root has nothing to dismiss and must invoke its callback in place.
-    let isPresented =
-      presentingViewController != nil || navigationController?.presentingViewController != nil
-    guard isPresented else {
-      onCreateAgent?()
+    presentNewAgentSheet()
+  }
+
+  /// Native "New Agent" flow: pick a role preset, then POST + publish so the
+  /// agent is usable right away. Replaces the old web-delegated create.
+  private func presentNewAgentSheet() {
+    let sheet = ChatNewAgentView(
+      onCancel: { [weak self] in self?.dismiss(animated: true) },
+      onCreate: { [weak self] attributes, completion in
+        guard let self else {
+          completion("Missing session")
+          return
+        }
+        self.createAgent(attributes: attributes) { success, message in
+          if success {
+            self.dismiss(animated: true)
+            self.onToast?("Created agent")
+            self.loadAgents()
+            completion(nil)
+          } else {
+            completion(message ?? "Could not create agent")
+          }
+        }
+      },
+      onLoadModelRegistry: { [weak self] completion in
+        guard let self else {
+          completion(.fallback)
+          return
+        }
+        ChatAgentModelRegistryService.load(
+          apiBaseURL: self.apiContext.apiBaseURL,
+          token: self.apiContext.token,
+          completion: completion)
+      })
+    let host = UIHostingController(rootView: sheet)
+    host.modalPresentationStyle = .pageSheet
+    if let controller = host.sheetPresentationController {
+      controller.detents = [.large()]
+      controller.prefersGrabberVisible = true
+    }
+    host.view.backgroundColor = .clear
+    present(host, animated: true)
+  }
+
+  private func createAgent(
+    attributes: [String: Any],
+    completion: @escaping (Bool, String?) -> Void
+  ) {
+    guard let url = agentsURL() else {
+      completion(false, "Missing API session")
       return
     }
-    dismiss(animated: true) { [weak self] in
-      self?.onCreateAgent?()
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(apiContext.token)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: attributes)
+
+    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] data, response, error in
+      DispatchQueue.main.async {
+        guard let self else {
+          completion(false, nil)
+          return
+        }
+        if let error {
+          completion(false, error.localizedDescription)
+          return
+        }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let payload = data.flatMap {
+          (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
+        }
+        guard (200..<300).contains(statusCode) else {
+          completion(false, (payload?["error"] as? String) ?? "Could not create agent")
+          return
+        }
+        guard
+          let agentRaw = payload?["agent"] as? [String: Any],
+          let agentId = agentRaw["id"] as? String,
+          !agentId.isEmpty
+        else {
+          completion(false, "Malformed response")
+          return
+        }
+        self.publishCreatedAgent(agentId)
+        completion(true, nil)
+      }
     }
+    task.resume()
+  }
+
+  /// Best-effort publish so a freshly created agent is live immediately; a
+  /// failure leaves it as a draft the owner can publish from its settings.
+  private func publishCreatedAgent(_ agentId: String) {
+    guard let base = agentsURL(),
+      let url = URL(string: "\(base.absoluteString)/\(agentId)/publish")
+    else { return }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(apiContext.token)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    let task = ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) {
+      [weak self] _, _, _ in
+      DispatchQueue.main.async { self?.loadAgents() }
+    }
+    task.resume()
   }
 
   @objc private func handleToggleEditing() {

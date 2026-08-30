@@ -4,6 +4,8 @@ defmodule VibeWeb.AgentsController do
 
   alias Vibe.AgentCard
   alias Vibe.Agents
+  alias Vibe.AgentRoutines
+  alias Vibe.AgentUsage
   alias Vibe.ProviderContent
   alias Vibe.AI.AgentEventRuntime
   alias Vibe.AI.StandaloneAgent
@@ -63,6 +65,43 @@ defmodule VibeWeb.AgentsController do
       nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
       false -> conn |> put_status(:forbidden) |> json(%{error: "computer_not_available"})
       {:error, _reason} -> conn |> put_status(:not_found) |> json(%{error: "no_preview"})
+    end
+  end
+
+  @doc "POST /api/agents/:id/computer/session — owner-only viewer session (docs/agent-computer-v1.md §3.2)."
+  def computer_session(conn, %{"id" => id} = params) do
+    user = conn.assigns.current_user
+
+    body = %{
+      "viewerId" => user.id,
+      "fps" => params["fps"],
+      "width" => params["width"],
+      "quality" => params["quality"]
+    }
+
+    with %{} = agent <- Agents.get_agent(id, user.id),
+         true <- Vibe.AgentGateway.enabled?(),
+         {:ok, session} when is_map(session) <- Vibe.AgentGateway.computer_session(agent.id, body) do
+      json(conn, Map.put(session, "topic", "computer:#{agent.id}"))
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      false -> conn |> put_status(:forbidden) |> json(%{error: "computer_not_available"})
+      _ -> conn |> put_status(:bad_gateway) |> json(%{error: "runtime_unavailable"})
+    end
+  end
+
+  @doc "DELETE /api/agents/:id/computer/session/:session_id — owner-only close."
+  def close_computer_session(conn, %{"id" => id, "session_id" => session_id}) do
+    user = conn.assigns.current_user
+
+    with %{} = agent <- Agents.get_agent(id, user.id),
+         true <- Vibe.AgentGateway.enabled?(),
+         {:ok, result} when is_map(result) <- Vibe.AgentGateway.close_computer_session(agent.id, session_id) do
+      json(conn, result)
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      false -> conn |> put_status(:forbidden) |> json(%{error: "computer_not_available"})
+      _ -> conn |> put_status(:bad_gateway) |> json(%{error: "runtime_unavailable"})
     end
   end
 
@@ -244,6 +283,102 @@ defmodule VibeWeb.AgentsController do
       nil -> conn |> put_status(:not_found) |> json(%{error: "Agent not found"})
       agent -> json(conn, Agents.list_delivery_data(agent))
     end
+  end
+
+  def owner_usage(conn, _params) do
+    json(conn, AgentUsage.owner_summary(conn.assigns.current_user.id))
+  end
+
+  def agent_usage(conn, %{"id" => id}) do
+    owner_id = conn.assigns.current_user.id
+
+    case Agents.get_agent(id, owner_id) do
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      agent -> json(conn, AgentUsage.agent_summary(agent.id))
+    end
+  end
+
+  def routines(conn, %{"id" => id}) do
+    owner_id = conn.assigns.current_user.id
+
+    case Agents.get_agent(id, owner_id) do
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "not_found"})
+
+      agent ->
+        items = agent.id |> AgentRoutines.list_for_agent(owner_id) |> Enum.map(&AgentRoutines.routine_payload/1)
+        json(conn, %{items: items})
+    end
+  end
+
+  def create_routine(conn, %{"id" => id} = params) do
+    owner_id = conn.assigns.current_user.id
+
+    case Agents.get_agent(id, owner_id) do
+      nil ->
+        conn |> put_status(:not_found) |> json(%{error: "not_found"})
+
+      agent ->
+        case AgentRoutines.create(owner_id, agent, Map.delete(params, "id")) do
+          {:ok, routine} -> json(conn, AgentRoutines.routine_payload(routine))
+          {:error, reason} -> routine_error(conn, reason)
+        end
+    end
+  end
+
+  def update_routine(conn, %{"id" => id, "routine_id" => routine_id} = params) do
+    owner_id = conn.assigns.current_user.id
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         %{} = routine <- AgentRoutines.get(routine_id, owner_id),
+         true <- routine.agent_id == agent.id do
+      case AgentRoutines.update(routine, Map.drop(params, ["id", "routine_id"])) do
+        {:ok, updated} -> json(conn, AgentRoutines.routine_payload(updated))
+        {:error, reason} -> routine_error(conn, reason)
+      end
+    else
+      _ -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+    end
+  end
+
+  def delete_routine(conn, %{"id" => id, "routine_id" => routine_id}) do
+    owner_id = conn.assigns.current_user.id
+
+    with %{} = agent <- Agents.get_agent(id, owner_id),
+         %{} = routine <- AgentRoutines.get(routine_id, owner_id),
+         true <- routine.agent_id == agent.id,
+         {:ok, _} <- AgentRoutines.delete(routine) do
+      json(conn, %{success: true})
+    else
+      _ -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+    end
+  end
+
+  defp routine_error(conn, :agent_not_published),
+    do: conn |> put_status(:unprocessable_entity) |> json(%{error: "agent_not_published"})
+
+  defp routine_error(conn, :not_in_chat),
+    do: conn |> put_status(:unprocessable_entity) |> json(%{error: "not_in_chat"})
+
+  defp routine_error(conn, :routine_limit),
+    do: conn |> put_status(:unprocessable_entity) |> json(%{error: "routine_limit"})
+
+  defp routine_error(conn, :not_found),
+    do: conn |> put_status(:not_found) |> json(%{error: "not_found"})
+
+  defp routine_error(conn, %Ecto.Changeset{} = changeset),
+    do: conn |> put_status(:unprocessable_entity) |> json(%{error: first_changeset_error(changeset)})
+
+  defp routine_error(conn, reason),
+    do: conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+
+  defp first_changeset_error(changeset) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
+      Enum.reduce(opts, msg, fn {key, value}, acc -> String.replace(acc, "%{#{key}}", to_string(value)) end)
+    end)
+    |> Enum.flat_map(fn {field, msgs} -> Enum.map(msgs, &"#{field} #{&1}") end)
+    |> List.first()
   end
 
   def delete(conn, %{"id" => id}) do

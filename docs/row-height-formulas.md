@@ -127,7 +127,7 @@ there is no bottom padding (full-bleed media, sticker).
 |---|---|
 | **Kind** | `bubbleUsesAgentTurnContent(row) == true` (`ChatListViewCells.swift:2153–2175`): agent message, `visualKind == .text`, not native plain prose, not system/error pill; needs progress nodes / runtime / actions / streaming / `agent_progress_tree` / `bridge-` id; group rows only if team-run lead |
 | **Entry** | Shell: `measureMessageBubbleLayout` `:4691–4785`. Content height: `VibeAgentTurnContentView.measuredHeight` `:4702–4711` → `VibeAgentTurnContentView.swift:362–420` |
-| **Inputs** | `rowWidth`; `AgentTurnBubbleState` (`isProgressExpanded`, `isRuntimeExpanded`, `expandedStepIds`, `streamingStartDate`, `tallExpanded`); full agent payload (text, progress nodes, runtime, actions); `agentTurnContentWidth(...)` hug vs workspace width (`:4584–4656`); reaction emoji; liveness (`isStreamingText` / `agentTurnRowCouldBeLive`) |
+| **Inputs** | `rowWidth`; `AgentTurnBubbleState` (`isProgressExpanded`, `isRuntimeExpanded`, `expandedStepIds`, `streamingStartDate`, `tallExpanded`); full agent payload (text, progress nodes, runtime, actions); `agentTurnContentWidth(...)` hug vs workspace width (`:4584–4656`); reaction emoji; liveness (`isStreamingText` / `agentTurnRowCouldBeLive`); **live computer band** (`ChatEngine.latestAgentComputer(chatId:)`) |
 | **Formula (shell, after `previewHeight` from measuredHeight)** | See below |
 | **UIView dependency** | **requires a view**: shared offscreen `VibeAgentTurnContentView` template → `configure` → `layoutIfNeeded` → `systemLayoutSizeFitting` (`VibeAgentTurnContentView.swift:371–420`). Nested body is `VibeAgentKitAssistantMessageBodyView` (stack of loader / steps / text blocks / runtime card). |
 | **Notes** | Tall collapse only when `previewHeight > 560` **and** `agentTurnBubbleShowsWorkedSummary(row)` (`:4718–4723`). Live turns quantize height via `agentTurnStreamingReservedHeight` (`ChatListViewConstants.swift:51–54`). |
@@ -152,12 +152,28 @@ needsHeightFloor = compactThinking
 settledBubbleHeight = needsHeightFloor
   ? max(44, bodyPlusPadding)
   : bodyPlusPadding
-bubbleHeight = isLiveStreaming
+bubbleHeight = (isLiveStreaming
   ? agentTurnStreamingReservedHeight(settledBubbleHeight)
     // max(48, ceil(measured/48)*48)  because block = 24*2 = 48
-  : settledBubbleHeight
+  : settledBubbleHeight)
+  + agentTurnComputerBandReserve(row)          // 0 or 34, OUTSIDE the quantize
 bubbleWidth = max(26, contentWidth + 14*2)
 ```
+
+**Computer band (agent-computer-v1 §2)** — a one-line "browsing `<host>` · `<title>`" plate
+under the turn body, shown while that chat has a live agent computer.
+
+| Field | Value |
+|---|---|
+| **Predicate** | `agentTurnComputerBandState(row)` (`ChatListViewCells.swift`): agent-turn row **and** live (`isStreamingText \|\| agentTurnRowCouldBeLive`) **and** `ChatEngine.latestAgentComputer(chatId:)?.live` with a non-empty host. Scoped to the live turn so a computer going live resizes one row, not the transcript. |
+| **Constant** | `agentTurnComputerBandTopGap (8) + agentTurnComputerBandHeight (26)` = **34**, via `agentTurnComputerBandReserve(row)` |
+| **Applied at** | (1) `measureMessageBubbleLayout` agent-turn arm, added **after** `agentTurnStreamingReservedHeight` so the 48pt block never swallows it. (2) `ChatListView.presentationSeedMessageHeight` settled-agent estimate (`52 + band`, and `min(430, …) + band`) — same helper, so the two paths cannot drift. |
+| **UIView dependency** | none. The band is a **sibling of** `VibeAgentTurnContentView` in `ChatListCell`, not a subview of it, so it never enters the offscreen sizing template and stays a pure constant in both paths. |
+| **Cache key** | folded into `contentVersionForAgentTurn` so a live↔offline flip invalidates the cached height; the `"agentComputer"` engine change reloads that row via `reloadAgentTurnStateRow`. |
+| **Fixed height** | Deliberate — one line, `byTruncatingTail`, never wraps. Wrapping would make it a measure, not a constant. |
+
+Today the band only shows on a **live** turn, so the settled seed estimate's `+ band` term is
+0 by construction; it is called there anyway so widening the predicate cannot desync the paths.
 
 **Seed vs exact for this kind — DISAGREE when settled:**
 
@@ -484,7 +500,12 @@ Every height path that currently depends on a `UIView` (or Auto Layout fitting) 
 - Expanded steps: **N × (variable step row)** + inter-step spacing — **hard case: loop over subviews**.
 - Runtime card: see pure formula in 2.3 if `isExpanded` state known.
 
-**Shell outside the view** (already pure arithmetic in §5): ±20 vertical pad, ±28 reaction, tall min/cap 420/560, streaming quantize to 48, floor 44 under some live conditions.
+**Shell outside the view** (already pure arithmetic in §5): ±20 vertical pad, ±28 reaction, tall min/cap 420/560, streaming quantize to 48, floor 44 under some live conditions, ±34 computer band.
+
+**The computer band is deliberately NOT in this template.** It is a `ChatListCell` sibling
+laid out by frame, so it adds a constant to the shell instead of another `systemLayoutSizeFitting`
+input. Anything added *inside* `VibeAgentTurnContentView` must be configured on the shared
+template identically to the live cell, or measured and rendered heights diverge.
 
 ### 2.2 `AgentIntegrationPackView.measuredHeight`
 
@@ -554,6 +575,9 @@ Not in the first-paint formula but invalidates pure heights later: natural media
 | `agentTurnStreamingLineStep` | 24 | `:30` |
 | `agentTurnStreamingHeightBlock` | 48 (`24*2`) | `:45` |
 | `agentTurnStreamingReservedHeight` | `max(block, ceil(m/block)*block)` | `:51–54` |
+| `agentTurnComputerBandHeight` | 26 | `ChatListViewCells.swift` (before `agentTurnContentWidth`) |
+| `agentTurnComputerBandTopGap` | 8 | same |
+| Computer band reserve | **34** (8 + 26) | `agentTurnComputerBandReserve` |
 | `tallBubbleCollapseTriggerHeight` | 560 | `:67` |
 | `tallBubbleCollapsedContentHeight` | 420 | `:68` |
 | `tallBubbleToggleSpacing` | 6 | `:70` |
@@ -667,6 +691,8 @@ Not in the first-paint formula but invalidates pure heights later: natural media
 | `bubbleUsesBlockLayout` | rich blocks | `:3289` |
 | `bubbleRowPreviewHeight` | link/music card H | `:3392` |
 | `agentTurnContentWidth` | hug vs full | `:4584` |
+| `agentTurnComputerBandState` | live computer for this turn | `ChatListViewCells.swift` |
+| `agentTurnComputerBandReserve` | +0 / +34 in both height paths | same |
 | `agentTurnRowCouldBeLive` | live flag | `:4389` |
 | `groupMeasurementExtras` | width + extraTop | `ChatListView.swift:1925` |
 
