@@ -13,6 +13,11 @@ else
   COMPOSE=(docker compose -f "$COMPOSE_FILE"); ENGINE=docker
 fi
 SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo -n"
+# vibe has no sudo by design, so sshd/ufw probes come back empty rather than false.
+# Reporting that as a FAIL would be the audit lying about what it could not read.
+if [ "$(id -u)" -eq 0 ]; then PRIV=1
+elif [ -n "$SUDO" ] && $SUDO true 2>/dev/null; then PRIV=1
+else PRIV=0; fi
 
 FAILS=0; WARNS=0
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
@@ -25,28 +30,37 @@ sshd_val() { $SUDO sshd -T 2>/dev/null | grep -i "^$1 " | head -1 | cut -d' ' -f
 
 audit_host() {
   head2 "HOST — access"
-  [ "$(sshd_val passwordauthentication)" = "no" ] \
-    && pass "sshd: password auth off" || fail "sshd: password auth is ON"
-  case "$(sshd_val permitrootlogin)" in
-    no) pass "sshd: root login off" ;;
-    *)  fail "sshd: PermitRootLogin=$(sshd_val permitrootlogin)" ;;
-  esac
-  [ -n "$(sshd_val allowusers)" ] \
-    && pass "sshd: AllowUsers $(sshd_val allowusers)" || warn "sshd: no AllowUsers allowlist"
-  for u in ops vibe; do
-    if id "$u" >/dev/null 2>&1; then
-      $SUDO test -s "/home/${u}/.ssh/authorized_keys" \
-        && pass "user ${u}: has an ssh key" || warn "user ${u}: no authorized_keys"
-    else
-      fail "user ${u}: missing"
-    fi
-  done
+  if [ "$PRIV" -eq 1 ]; then
+    [ "$(sshd_val passwordauthentication)" = "no" ] \
+      && pass "sshd: password auth off" || fail "sshd: password auth is ON"
+    case "$(sshd_val permitrootlogin)" in
+      no) pass "sshd: root login off" ;;
+      *)  fail "sshd: PermitRootLogin=$(sshd_val permitrootlogin)" ;;
+    esac
+    [ -n "$(sshd_val allowusers)" ] \
+      && pass "sshd: AllowUsers $(sshd_val allowusers)" || warn "sshd: no AllowUsers allowlist"
+    for u in ops vibe; do
+      if id "$u" >/dev/null 2>&1; then
+        $SUDO test -s "/home/${u}/.ssh/authorized_keys" \
+          && pass "user ${u}: has an ssh key" || warn "user ${u}: no authorized_keys"
+      else
+        fail "user ${u}: missing"
+      fi
+    done
+  else
+    warn "sshd and key state need root — re-run as: sudo $0 host"
+    for u in ops vibe; do
+      id "$u" >/dev/null 2>&1 || fail "user ${u}: missing"
+    done
+  fi
   id -nG vibe 2>/dev/null | grep -qw sudo \
     && fail "vibe is in sudo — a container escape would reach root" \
     || pass "vibe has no sudo (container escape stays unprivileged)"
 
   head2 "HOST — network"
-  if $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
+  if [ "$PRIV" -eq 0 ]; then
+    warn "ufw state needs root — re-run as: sudo $0 host"
+  elif $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
     pass "ufw active"
     open=$($SUDO ufw status 2>/dev/null | awk '/ALLOW|LIMIT/ {print $1}' | cut -d/ -f1 | sort -un | tr '\n' ' ')
     case "$open" in
