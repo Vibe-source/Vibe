@@ -11,6 +11,7 @@ DOMAIN=vibegram.io
 ORIGIN=127.0.0.1:8080
 NO_FIREWALL=""
 FIREWALL_ONLY=""
+RECONFIGURE=""
 REPO=/opt/vibe
 ENV_DIR=$REPO/deploy/env
 CRED=$ENV_DIR/tunnel.json.cred
@@ -21,6 +22,7 @@ while [ $# -gt 0 ]; do
     --origin)      ORIGIN="${2:?--origin needs host:port}"; shift 2 ;;
     --no-firewall) NO_FIREWALL=1; shift ;;
     --firewall-only) FIREWALL_ONLY=1; shift ;;
+    --reconfigure) RECONFIGURE=1; shift ;;
     -h|--help)     sed -n '2,8p' "$0"; exit 0 ;;
     *)             echo "tunnel-install: unknown option: $1" >&2; exit 1 ;;
   esac
@@ -47,6 +49,27 @@ lock_firewall() {
   ufw --force enable >/dev/null
   echo "    inbound: SSH only (rate limited). outbound: DNS, 80, 443, 7844, 587, 465."
 }
+
+render_config() {
+  echo "==> config"
+  install -d -m 0755 /etc/cloudflared
+  sed -e "s|TUNNEL_ID|${TUNNEL_ID}|" -e "s|DOMAIN|${DOMAIN}|g" -e "s|ORIGIN|${ORIGIN}|g" \
+    "$REPO/deploy/cloudflared/config.yml" > /etc/cloudflared/config.yml.new
+  cloudflared --config /etc/cloudflared/config.yml.new tunnel ingress validate
+  chmod 0644 /etc/cloudflared/config.yml.new
+  mv /etc/cloudflared/config.yml.new /etc/cloudflared/config.yml
+}
+
+if [ -n "$RECONFIGURE" ]; then
+  TUNNEL_ID="$(awk "/^tunnel:/ {print \$2}" /etc/cloudflared/config.yml 2>/dev/null)"
+  [ -n "$TUNNEL_ID" ] || { echo "tunnel-install: no installed tunnel to reconfigure" >&2; exit 1; }
+  render_config
+  systemctl restart cloudflared
+  sleep 3
+  systemctl is-active --quiet cloudflared && echo "cloudflared: reloaded" || {
+    echo " !  cloudflared did not come back — journalctl -u cloudflared -n 40" >&2; exit 1; }
+  exit 0
+fi
 
 if [ -n "$FIREWALL_ONLY" ]; then
   command -v ufw >/dev/null || { echo "tunnel-install: ufw is not installed" >&2; exit 1; }
@@ -88,13 +111,9 @@ if ! command -v cloudflared >/dev/null; then
   chmod 0755 /usr/local/bin/cloudflared
 fi
 
-echo "==> config"
-install -d -m 0755 /etc/cloudflared
-sed -e "s|TUNNEL_ID|${TUNNEL_ID}|" -e "s|DOMAIN|${DOMAIN}|g" -e "s|ORIGIN|${ORIGIN}|g" \
-  "$REPO/deploy/cloudflared/config.yml" > /etc/cloudflared/config.yml
-chmod 0644 /etc/cloudflared/config.yml
-cloudflared --config /etc/cloudflared/config.yml tunnel ingress validate
-
+render_config
+install -m 0644 "$REPO/deploy/systemd/cloudflared.service" /etc/systemd/system/cloudflared.service
+systemctl daemon-reload
 echo "==> service"
 install -m 0644 "$REPO/deploy/systemd/cloudflared.service" /etc/systemd/system/cloudflared.service
 systemctl daemon-reload

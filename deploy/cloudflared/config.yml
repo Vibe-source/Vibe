@@ -12,6 +12,8 @@ ingress:
     service: http://ORIGIN
   - hostname: logs.DOMAIN
     service: http://ORIGIN
+  - hostname: www.DOMAIN
+    service: http://ORIGIN
   - hostname: DOMAIN
     service: http://ORIGIN
   - service: http_status:404
