@@ -16,22 +16,24 @@ RUN for i in 1 2 3 4 5; do \
 
 ENV MIX_ENV="prod"
 
-# Install mix dependencies
-COPY mix.exs mix.lock ./
+# Install mix dependencies. Build context is the repo root: contracts/ is a
+# sibling path dep, so it must land at /contracts (../contracts from /app).
+COPY contracts/ /contracts/
+COPY server/mix.exs server/mix.lock ./
 RUN mix deps.get --only $MIX_ENV
 RUN mix deps.compile
 
 # Copy compile-time config
-COPY config/ config/
+COPY server/config/ config/
 
 # Compile source
-COPY lib/ lib/
-COPY priv/ priv/
+COPY server/lib/ lib/
+COPY server/priv/ priv/
 
 RUN mix compile
 
 # Runtime config
-COPY config/runtime.exs config/
+COPY server/config/runtime.exs config/
 
 # Build release
 RUN mix release
@@ -78,15 +80,15 @@ ENV YTDLP_PATH="/usr/local/bin/yt-dlp"
 COPY --from=elixir-build --chown=nobody:root /app/_build/prod/rel/vibe ./
 
 # Copy Python doc renderer
-COPY --chown=nobody:root priv/python/ /app/python/
+COPY --chown=nobody:root server/priv/python/ /app/python/
 # The Supabase pooler's private root CA, at a stable path. It also travels
 # inside the release under the app's priv dir, but that resolves to a
 # version-stamped directory; runtime.exs checks this fixed path too so a
 # version bump can never silently drop DB TLS verification.
-COPY --chown=nobody:root priv/certs/ /app/certs/
+COPY --chown=nobody:root server/priv/certs/ /app/certs/
 
 # Copy startup script
-COPY --chmod=755 start.sh /app/start.sh
+COPY --chmod=755 server/start.sh /app/start.sh
 
 USER nobody
 
