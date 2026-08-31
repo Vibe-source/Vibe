@@ -101,10 +101,12 @@ main() {
     git pull --ff-only
   fi
 
-  # Snapshot what is live before anything replaces :latest, so a failed
-  # readiness gate can put it straight back.
-  for image in vibe-core vibe-agent-runtime; do
-    "$ENGINE_BIN" tag "${image}:latest" "${image}:previous" 2>/dev/null || true
+  # Snapshot from the running container, not the :latest tag — a build that fails
+  # before deploying still moves :latest, and :previous would then be a lie.
+  proj="$(basename "$(dirname "$COMPOSE_FILE")")"
+  for svc in core agent-runtime; do
+    live="$("$ENGINE_BIN" inspect "${proj}_${svc}_1" --format "{{.Image}}" 2>/dev/null || true)"
+    [ -n "$live" ] && "$ENGINE_BIN" tag "$live" "vibe-${svc}:previous" 2>/dev/null || true
   done
 
   log "building images"
