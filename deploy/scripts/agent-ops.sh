@@ -12,11 +12,9 @@ APP_DIR="${APP_DIR:-/opt/vibe}"
 COMPOSE_FILE="${APP_DIR}/deploy/compose.yml"
 SERVICES="caddy core agent-runtime sandbox-gateway egress-proxy postgres pgbouncer valkey doc-renderer backup prometheus grafana node-exporter"
 
-if command -v podman >/dev/null 2>&1; then
-  COMPOSE=(podman compose -f "$COMPOSE_FILE")
-else
-  COMPOSE=(docker compose -f "$COMPOSE_FILE")
-fi
+if command -v podman >/dev/null 2>&1; then ENGINE=podman; else ENGINE=docker; fi
+COMPOSE=("$ENGINE" compose -f "$COMPOSE_FILE")
+PROJECT="$(basename "$(dirname "$COMPOSE_FILE")")"
 
 die() { echo "agent-ops: $*" >&2; exit 2; }
 
@@ -26,6 +24,12 @@ valid_service() {
   case " $SERVICES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
 valid_int() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# podman-compose 1.0.6 has no --format on ps and no --no-color on logs, so every
+# read verb goes to the engine directly and resolves the container by name.
+container_for() {
+  "$ENGINE" ps -a --filter "name=^${PROJECT}_$1_[0-9]+$" --format '{{.Names}}' | head -1
+}
 
 # Redacts anything that looks like a credential before it can reach a transcript.
 scrub() {
@@ -74,7 +78,9 @@ case "$verb" in
   help|"")   usage ;;
 
   status)
-    "${COMPOSE[@]}" ps --format '{{.Name}}\t{{.State}}\t{{.Status}}' 2>/dev/null | scrub
+    # podman-compose 1.0.6 has no --format on ps, so ask the engine by project label.
+    "$ENGINE" ps -a --filter "label=io.podman.compose.project=${PROJECT}" \
+      --format '{{.Names}}\t{{.Status}}' | scrub
     ;;
 
   health)
@@ -108,15 +114,19 @@ case "$verb" in
     valid_service "$arg" || die "unknown service: ${arg:-<none>}"
     n="${3:-200}"; valid_int "$n" || die "line count must be a number"
     [ "$n" -gt 2000 ] && n=2000
-    "${COMPOSE[@]}" logs --tail "$n" --no-color "$arg" 2>&1 | scrub
+    c="$(container_for "$arg")"
+    [ -n "$c" ] || die "service ${arg} has no container"
+    "$ENGINE" logs --tail "$n" "$c" 2>&1 | scrub
     ;;
 
   errors)
     n="${arg:-200}"; valid_int "$n" || die "line count must be a number"
     [ "$n" -gt 2000 ] && n=2000
-    "${COMPOSE[@]}" logs --tail "$n" --no-color 2>&1 \
+    for c in $("$ENGINE" ps -a --filter "label=io.podman.compose.project=${PROJECT}" --format '{{.Names}}'); do
+      "$ENGINE" logs --tail "$n" "$c" 2>&1 | sed "s#^#${c}  #"
+    done \
       | grep -iE '\[error\]|\berror\b|exception|crash|CRASH REPORT|GenServer .* terminating|OOM|killed|panic|fatal' \
-      | scrub | tail -n "$n"
+      | scrub | tail -n "$n" || true
     ;;
 
   db-size)
