@@ -7,6 +7,7 @@
 #   deploy/scripts/set-missing-env.sh TAVILY_API_KEY     just this one, held or not
 #   deploy/scripts/set-missing-env.sh --list             name what is missing, ask nothing
 #   deploy/scripts/set-missing-env.sh --add NAME core.env   register a new name, then ask
+#   deploy/scripts/set-missing-env.sh --from-file NAME ~/AuthKey.p8   a PEM, escaped
 #   deploy/scripts/set-missing-env.sh --restart          recreate the services afterwards
 #   deploy/scripts/set-missing-env.sh --no-ship          store in agix only, touch no box
 #
@@ -18,7 +19,7 @@ MAP="${SECRET_MAP:-${REPO_ROOT}/deploy/env/secret-map.tsv}"
 SYNC="${REPO_ROOT}/deploy/scripts/sync-env.sh"
 SSH_HOST="${SSH_HOST:-vibe-vps-stack}"
 
-LIST=0; SHIP=1; RESTART=""; WANT=""
+LIST=0; SHIP=1; RESTART=""; WANT=""; PRESET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --list)    LIST=1 ;;
@@ -35,7 +36,14 @@ while [ $# -gt 0 ]; do
         echo "mapped: $2 -> $3"
       fi
       WANT="${WANT} $2"; shift 2 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --from-file)
+      [ $# -ge 3 ] || { echo "set-missing-env: --from-file NAME PATH" >&2; exit 1; }
+      [ -f "$3" ] || { echo "set-missing-env: no file at $3" >&2; exit 1; }
+      # A PEM cannot ride an .env line; store the escapes the server turns back into newlines.
+      awk 'NR>1{printf "\\n"} {printf "%s", $0}' "$3" | agix secret set "$2"
+      echo "stored ${2} from ${3##*/}, newlines escaped"
+      PRESET="${PRESET} $2"; shift 2 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     -*)        echo "set-missing-env: unknown option: $1" >&2; exit 1 ;;
     *)         WANT="${WANT} $1" ;;
   esac
@@ -66,6 +74,7 @@ files_for() {
 
 todo=""
 for name in $(awk '!/^[[:space:]]*#/ && NF==3 {print $1}' "$MAP" | awk '!seen[$0]++'); do
+  if printf '%s\n' $PRESET | grep -qx "$name"; then continue; fi
   if [ -n "$WANT" ]; then wanted "$name" || continue
   else is_held "$name" && continue; fi
   todo="${todo} ${name}"
@@ -89,11 +98,14 @@ if [ "$LIST" -eq 1 ]; then
   exit 0
 fi
 
-[ -n "$todo" ] || { echo "nothing to do — every mapped name is already in the agix store"; exit 0; }
+[ -n "$todo" ] || [ -n "$PRESET" ] ||
+  { echo "nothing to do — every mapped name is already in the agix store"; exit 0; }
 
-echo "The prompt below is agix's own: it does not echo, and the value never"
-echo "reaches this script. Enter = set it, s = skip, q = stop."
-echo
+if [ -n "$todo" ]; then
+  echo "The prompt below is agix's own: it does not echo, and the value never"
+  echo "reaches this script. Enter = set it, s = skip, q = stop."
+  echo
+fi
 
 set_names=""; touched=""
 for name in $todo; do
@@ -112,6 +124,10 @@ for name in $todo; do
     echo "  not set" >&2
   fi
   echo
+done
+
+for name in $PRESET; do
+  set_names="${set_names} ${name}"; touched="${touched} $(files_for "$name")"
 done
 
 [ -n "$set_names" ] || { echo "nothing set"; exit 0; }
