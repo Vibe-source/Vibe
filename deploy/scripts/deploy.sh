@@ -30,12 +30,21 @@ build_image() {
 
 # Not `compose run`: podman-compose 1.0.6 crashes in its cleanup path
 # (compose_down: no attribute 'remove_orphans') and tears the stack down with it.
+# Plaintext env lives in tmpfs; the repo copy is the sealed .env.cred and is not readable.
+env_file_for() {
+  local service="$1"
+  if [ -f "/run/vibe/env/${service}.env" ]; then echo "/run/vibe/env/${service}.env"
+  elif [ -f "${REPO_ROOT}/deploy/env/${service}.env" ]; then echo "${REPO_ROOT}/deploy/env/${service}.env"
+  else echo "[deploy] no env for ${service} — is vibe-env.service running?" >&2; return 1; fi
+}
+
 migrate() {
   local service="$1" bin="$2" mod="$3"
   local project; project="$(basename "$(dirname "$COMPOSE_FILE")")"
+  local envf; envf="$(env_file_for "$service")" || exit 1
   log "migrating ${service} (${mod})"
   "$ENGINE_BIN" run --rm --network "${project}_internal" \
-    --env-file "${REPO_ROOT}/deploy/env/${service}.env" \
+    --env-file "$envf" \
     "vibe-${service}:latest" \
     sh -c "DATABASE_URL=\"\${MIGRATION_DATABASE_URL:-\$DATABASE_URL}\" /app/bin/${bin} eval \"${mod}.migrate\""
 }
@@ -111,8 +120,10 @@ main() {
   done
   log "tagged build as ${sha}"
 
+  # --no-recreate or podman-compose 1.0.6 stops the data tier, fails to rm it
+  # (dependents), fails to create it (name taken), and restarts it for nothing.
   log "starting data tier"
-  "${COMPOSE[@]}" up -d postgres pgbouncer valkey
+  "${COMPOSE[@]}" up -d --no-recreate postgres pgbouncer valkey
 
   log "waiting for postgres"
   tries=30
@@ -126,8 +137,13 @@ main() {
   migrate core vibe Vibe.Release
   migrate agent-runtime vibe_agents VibeAgents.Release
 
+  # The image tag is unchanged, so compose would skip these two and keep serving
+  # the old build. Drop them first; --no-recreate then leaves the data tier alone.
+  project="$(basename "$(dirname "$COMPOSE_FILE")")"
+  "$ENGINE_BIN" rm -f "${project}_core_1" "${project}_agent-runtime_1" >/dev/null 2>&1 || true
+
   log "starting remaining services"
-  "${COMPOSE[@]}" up -d
+  "${COMPOSE[@]}" up -d --no-build --no-recreate
 
   if ! wait_ready core "http://127.0.0.1:4000/api/ready" ||
      ! wait_ready agent-runtime "http://127.0.0.1:4100/readyz"; then
