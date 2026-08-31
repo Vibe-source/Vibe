@@ -62,7 +62,7 @@ for file in $files; do
   wanted "$file" || continue
 
   # Build the emitter for this file: one line per mapped name, values by $VAR.
-  only=(--only VPS_HOST); body=""; names=""
+  only=(--net --only VPS_HOST); body=""; names=""
   while read -r src dst_file dst_name; do
     [ "$dst_file" = "$file" ] || continue
     case "$src" in [A-Z_]*[A-Z0-9_]|[A-Z_]) ;; *) echo "sync-env: bad name ${src}" >&2; continue ;; esac
@@ -118,7 +118,7 @@ fi
 # neighbour whose name is still taken, then leaves it running — verified untouched.
 echo
 echo "recreating:${svcs}"
-agix secret run --only VPS_HOST -- sh -c '
+agix secret run --net --only VPS_HOST -- sh -c '
   ssh '"$SSH_OPTS"' "'"${USER_}"'@$VPS_HOST" \
     "cd '"${DEST}"'/deploy
      for s in '"${svcs}"'; do podman rm -f deploy_\${s}_1 >/dev/null 2>&1 || true; done
