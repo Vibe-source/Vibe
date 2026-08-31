@@ -49,7 +49,7 @@ services:
       # tails this file directly — see deploy/scripts/vps-bootstrap.sh.
       - ./caddy-logs:/var/log/caddy
     env_file:
-      - env/caddy.env
+      - /run/vibe/env/caddy.env
     networks:
       - edge
     security_opt:
@@ -81,7 +81,7 @@ services:
       dockerfile: deploy/core/Dockerfile
     restart: unless-stopped
     env_file:
-      - env/core.env
+      - /run/vibe/env/core.env
     depends_on:
       pgbouncer:
         condition: service_started
@@ -124,7 +124,7 @@ services:
       dockerfile: agent-runtime/Dockerfile
     restart: unless-stopped
     env_file:
-      - env/agent-runtime.env
+      - /run/vibe/env/agent-runtime.env
     depends_on:
       pgbouncer:
         condition: service_started
@@ -164,7 +164,7 @@ services:
       context: ../sandbox-gateway
     restart: unless-stopped
     env_file:
-      - env/sandbox-gateway.env
+      - /run/vibe/env/sandbox-gateway.env
     volumes:
       # Docker default; for rootless podman, export CONTAINER_SOCKET_HOST_PATH
       # to ${XDG_RUNTIME_DIR}/podman/podman.sock before `compose up` (see header).
@@ -208,7 +208,7 @@ services:
     cpus: 2.0
     restart: unless-stopped
     env_file:
-      - env/postgres.env
+      - /run/vibe/env/postgres.env
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
@@ -239,7 +239,7 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/etc/pgbouncer/entrypoint.sh"]
     env_file:
-      - env/pgbouncer.env
+      - /run/vibe/env/pgbouncer.env
     volumes:
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./pgbouncer/entrypoint.sh:/etc/pgbouncer/entrypoint.sh:ro
@@ -273,7 +273,7 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/usr/local/etc/valkey/entrypoint.sh"]
     env_file:
-      - env/valkey.env
+      - /run/vibe/env/valkey.env
     volumes:
       - ./valkey/valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
       - ./valkey/entrypoint.sh:/usr/local/etc/valkey/entrypoint.sh:ro
@@ -340,7 +340,7 @@ services:
       context: ./backup
     restart: unless-stopped
     env_file:
-      - env/backup.env
+      - /run/vibe/env/backup.env
     networks:
       - internal
     security_opt:
@@ -360,7 +360,7 @@ services:
     restart: unless-stopped
     command: ["--redis.addr=redis://valkey:6379"]
     env_file:
-      - env/valkey.env
+      - /run/vibe/env/valkey.env
     networks:
       - internal
     security_opt:
@@ -386,7 +386,7 @@ services:
     cpus: 0.5
     restart: unless-stopped
     env_file:
-      - env/monitoring.env
+      - /run/vibe/env/monitoring.env
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

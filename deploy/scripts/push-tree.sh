@@ -33,7 +33,10 @@ rsync -az --delete \
   --exclude 'node_modules' \
   --exclude 'client/dist' \
   --exclude '.DS_Store' \
+  --exclude '.env' \
+  --exclude '.env.*' \
   --exclude 'deploy/env/*.env' \
+  --exclude 'deploy/env/*.cred' \
   --exclude 'deploy/caddy-logs' \
   --exclude 'deploy/agent-ops-logs' \
   ./ "${USER_}@${HOST}:${DEST}/"

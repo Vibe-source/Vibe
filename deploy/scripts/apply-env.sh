@@ -1,5 +1,6 @@
 #!/bin/bash
-# Merge KEY=VALUE lines from stdin into deploy/env/<file>. Values arrive over a
+# Merge KEY=VALUE lines from stdin into the sealed deploy/env/<file>.cred (needs
+# root), or the plaintext file before sealing. Values arrive over a
 # pipe, never argv, so they stay out of `ps` and out of this output.
 #
 #   agix secret run --only R2_SECRET_ACCESS_KEY -- sh -c \
@@ -13,18 +14,30 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_DIR="${REPO_ROOT}/deploy/env"
 TARGET="${1:?usage: apply-env.sh <file.env>}"
 FILE="${ENV_DIR}/${TARGET}"
+CRED="${FILE}.cred"
+RUN_DIR=/run/vibe/env
 
 case "$TARGET" in
   */*|..*) echo "apply-env: name only, not a path" >&2; exit 1 ;;
   *.env) ;;
   *) echo "apply-env: must end in .env" >&2; exit 1 ;;
 esac
-[ -f "$FILE" ] || { echo "apply-env: ${TARGET} does not exist — run init-env.sh first" >&2; exit 1; }
+[ -f "$FILE" ] || [ -f "$CRED" ] || { echo "apply-env: ${TARGET} does not exist — run init-env.sh first" >&2; exit 1; }
+
+SEALED=0
+[ -f "$CRED" ] && SEALED=1
+if [ "$SEALED" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+  exec sudo -n "$0" "$@"
+fi
 
 umask 077
-tmp="$(mktemp "${FILE}.XXXXXX")"
+tmp="$(mktemp /dev/shm/apply-env.XXXXXX)"
 trap 'rm -f "$tmp"' EXIT
-cp "$FILE" "$tmp"
+if [ "$SEALED" -eq 1 ]; then
+  systemd-creds decrypt --name="vibe-env-${TARGET}" "$CRED" "$tmp"
+else
+  cp "$FILE" "$tmp"
+fi
 applied=()
 
 while IFS= read -r line; do
@@ -43,7 +56,13 @@ while IFS= read -r line; do
   applied+=("$name")
 done
 
-mv "$tmp" "$FILE"
-trap - EXIT
-chmod 600 "$FILE"
+if [ "$SEALED" -eq 1 ]; then
+  systemd-creds encrypt --with-key=host --name="vibe-env-${TARGET}" "$tmp" "${CRED}.new"
+  chmod 600 "${CRED}.new"
+  mv "${CRED}.new" "$CRED"
+  [ -d "$RUN_DIR" ] && install -m 400 -o vibe -g vibe "$tmp" "${RUN_DIR}/${TARGET}"
+else
+  mv "$tmp" "$FILE"
+fi
+[ "$SEALED" -eq 1 ] || { trap - EXIT; chmod 600 "$FILE"; }
 echo "${TARGET}: set ${#applied[@]} -> ${applied[*]:-none}"
