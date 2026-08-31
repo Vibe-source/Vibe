@@ -10,9 +10,10 @@ defmodule VibeWeb.Endpoint do
 
   # Content-Length sanity ceiling across all routes, enforced by BodyLimit
   # before parsing. Multipart uploads get their own cap in the router pipeline.
-  @max_upload_body_bytes (case Integer.parse(System.get_env("MAX_UPLOAD_BYTES") || "120000000") do
+  # 99 MB, not 120: Cloudflare rejects bodies over 100 MB at the edge with a 413 we never see.
+  @max_upload_body_bytes (case Integer.parse(System.get_env("MAX_UPLOAD_BYTES") || "99000000") do
                              {value, _} when value > 0 -> value
-                             _ -> 120_000_000
+                             _ -> 99_000_000
                            end)
 
   # The session will be stored in the cookie and signed,

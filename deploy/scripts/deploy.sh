@@ -89,6 +89,12 @@ main() {
     git pull --ff-only
   fi
 
+  # Snapshot what is live before anything replaces :latest, so a failed
+  # readiness gate can put it straight back.
+  for image in vibe-core vibe-agent-runtime; do
+    "$ENGINE_BIN" tag "${image}:latest" "${image}:previous" 2>/dev/null || true
+  done
+
   log "building images"
   build_image vibe-core            "$REPO_ROOT"                 deploy/core/Dockerfile
   build_image vibe-agent-runtime   "$REPO_ROOT"                 agent-runtime/Dockerfile
@@ -123,8 +129,15 @@ main() {
   log "starting remaining services"
   "${COMPOSE[@]}" up -d
 
-  wait_ready core "http://127.0.0.1:4000/api/ready"
-  wait_ready agent-runtime "http://127.0.0.1:4100/readyz"
+  if ! wait_ready core "http://127.0.0.1:4000/api/ready" ||
+     ! wait_ready agent-runtime "http://127.0.0.1:4100/readyz"; then
+    if "$ENGINE_BIN" image inspect vibe-core:previous >/dev/null 2>&1; then
+      log "readiness failed — rolling back to the previous images"
+      rollback previous
+    fi
+    echo "[deploy] failed readiness; retry this build with --rollback ${sha}" >&2
+    exit 1
+  fi
 
   "${COMPOSE[@]}" ps || true
 }

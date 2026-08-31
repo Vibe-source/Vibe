@@ -93,6 +93,13 @@ prose — workers over-report. One verify pass at the end; workers never commit 
 
 Operating guide, worker invocations, routing: `agent-bridge/instructions/team-lead.md`.
 
+## Deploying the server
+
+Merging to `main` deploys. CI gates it; a failed readiness check rolls itself back.
+Rollback restores code, not schema — migrations must be additive.
+
+Contract for what an agent may do alone: [docs/deploy-pipeline.md](docs/deploy-pipeline.md).
+
 ## Shared agent memory
 
 `.vibe/memory.md` is the append-only journal every agent shares. Read it before

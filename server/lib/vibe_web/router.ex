@@ -44,12 +44,12 @@ defmodule VibeWeb.Router do
   end
 
   # Multipart bodies are parsed here, not in the endpoint, so only upload routes pay for
-  # the 120 MB ceiling; every other route is capped by the endpoint's JSON limit.
+  # the ceiling; every other route is capped by the endpoint's JSON limit.
   pipeline :multipart_upload do
     plug Plug.Parsers,
       parsers: [:multipart],
       pass: ["*/*"],
-      length: String.to_integer(System.get_env("MAX_UPLOAD_BYTES") || "120000000")
+      length: String.to_integer(System.get_env("MAX_UPLOAD_BYTES") || "99000000")
   end
 
   # Runtime → core service calls (docs/agent-platform-v1.md §3.1). Never exposed via Caddy.
