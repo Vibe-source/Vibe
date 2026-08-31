@@ -20,4 +20,11 @@ for c in "${creds[@]}"; do
   chmod 400 "$RUN_DIR/$n"
 done
 
+# cloudflared runs as root, so its credential lands beside the env dir, not inside it.
+if [ -f "$ENV_DIR/tunnel.json.cred" ]; then
+  systemd-creds decrypt --name=vibe-tunnel "$ENV_DIR/tunnel.json.cred" /run/vibe/tunnel.json
+  chown root:root /run/vibe/tunnel.json
+  chmod 400 /run/vibe/tunnel.json
+fi
+
 echo "unsealed ${#creds[@]} file(s) into $RUN_DIR"

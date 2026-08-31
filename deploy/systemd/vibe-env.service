@@ -9,7 +9,7 @@ RequiresMountsFor=/run
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/vibe/deploy/scripts/unseal-env.sh
-ExecStop=/bin/rm -rf /run/vibe/env
+ExecStop=/bin/rm -rf /run/vibe/env /run/vibe/tunnel.json
 
 [Install]
 WantedBy=multi-user.target
