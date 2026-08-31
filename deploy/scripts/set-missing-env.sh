@@ -73,12 +73,15 @@ files_for() {
 }
 
 todo=""
+# Only the bare form sweeps for what is missing; naming a key means just that key.
+if [ -z "$PRESET" ] || [ -n "$WANT" ]; then
 for name in $(awk '!/^[[:space:]]*#/ && NF==3 {print $1}' "$MAP" | awk '!seen[$0]++'); do
   if printf '%s\n' $PRESET | grep -qx "$name"; then continue; fi
   if [ -n "$WANT" ]; then wanted "$name" || continue
   else is_held "$name" && continue; fi
   todo="${todo} ${name}"
 done
+fi
 
 for w in $WANT; do
   printf '%s\n' $todo | grep -qx "$w" ||
