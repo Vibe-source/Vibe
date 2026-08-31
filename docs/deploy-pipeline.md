@@ -6,8 +6,8 @@ How a change reaches production, and what an agent may do without a human.
 
 ```
 PR ──► ci.yml ──────────────────────────► review ──► merge to main
-        server · agent-runtime · rust
-        images · scripts
+        server · agent-runtime · gateway
+        images · scripts   (core, lint: advisory)
 
 main ──► deploy-vps.yml
           ci.yml (again, on the merge commit)

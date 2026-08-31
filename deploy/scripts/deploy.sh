@@ -13,6 +13,9 @@ COMPOSE_FILE="${REPO_ROOT}/deploy/compose.yml"
 if command -v podman >/dev/null 2>&1; then
   COMPOSE=(podman compose -f "$COMPOSE_FILE")
   ENGINE_BIN=podman
+  # sandbox-gateway mounts this; unset it resolves to the docker socket, which does
+  # not exist here, and the service silently fails to come back after a recreate.
+  export CONTAINER_SOCKET_HOST_PATH="${CONTAINER_SOCKET_HOST_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock}"
 else
   COMPOSE=(docker compose -f "$COMPOSE_FILE")
   ENGINE_BIN=docker
