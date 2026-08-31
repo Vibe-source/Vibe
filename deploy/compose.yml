@@ -25,10 +25,16 @@ volumes:
   caddy_data:
   caddy_config:
   postgres_data:
+  loki_data:
+  promtail_data:
+  grafana_data:
 
 services:
   caddy:
     image: caddy:2
+    # podman-compose ignores `deploy:` — these are the keys it actually enforces.
+    mem_limit: 256m
+    cpus: 1.0
     restart: unless-stopped
     # No depends_on on purpose: Caddy answers 502 while an upstream is down instead of
     # taking the whole edge offline because the agent runtime is unhealthy.
@@ -68,6 +74,8 @@ services:
 
   core:
     image: vibe-core:latest
+    mem_limit: 1024m
+    cpus: 2.0
     build:
       context: ..
       dockerfile: deploy/core/Dockerfile
@@ -109,6 +117,8 @@ services:
 
   agent-runtime:
     image: vibe-agent-runtime:latest
+    mem_limit: 1024m
+    cpus: 2.0
     build:
       context: ..
       dockerfile: agent-runtime/Dockerfile
@@ -148,6 +158,8 @@ services:
 
   sandbox-gateway:
     image: vibe-sandbox-gateway:latest
+    mem_limit: 256m
+    cpus: 1.0
     build:
       context: ../sandbox-gateway
     restart: unless-stopped
@@ -173,6 +185,8 @@ services:
 
   egress-proxy:
     image: vimagick/tinyproxy:latest
+    mem_limit: 128m
+    cpus: 0.5
     restart: unless-stopped
     volumes:
       - ./egress-proxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
@@ -190,6 +204,8 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    mem_limit: 2048m
+    cpus: 2.0
     restart: unless-stopped
     env_file:
       - env/postgres.env
@@ -218,6 +234,8 @@ services:
 
   pgbouncer:
     image: edoburu/pgbouncer:latest
+    mem_limit: 256m
+    cpus: 1.0
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/etc/pgbouncer/entrypoint.sh"]
     env_file:
@@ -250,6 +268,8 @@ services:
 
   valkey:
     image: valkey/valkey:8-alpine
+    mem_limit: 384m
+    cpus: 1.0
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/usr/local/etc/valkey/entrypoint.sh"]
     env_file:
@@ -282,14 +302,19 @@ services:
   # 512 instead of failing. A limit is a ceiling — a typical render still uses ~200M.
   doc-renderer:
     image: vibe-doc-renderer:latest
+    mem_limit: 1024m
+    cpus: 1.0
     build:
       context: ..
       dockerfile: deploy/doc-renderer/Dockerfile
     restart: unless-stopped
+    # Read-only rootfs: fontconfig needs a writable cache or it errors on every render.
+    environment:
+      XDG_CACHE_HOME: /tmp
     networks:
       - internal
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/health', timeout=3)"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/health', timeout=3)\""]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -309,6 +334,8 @@ services:
 
   backup:
     image: vibe-backup:latest
+    mem_limit: 256m
+    cpus: 1.0
     build:
       context: ./backup
     restart: unless-stopped
@@ -324,9 +351,25 @@ services:
           cpus: "1.0"
           memory: 256M
 
+  # Server-side hit/miss/eviction counters, so cache pressure is visible before
+  # it becomes a latency problem. Reads REDIS_PASSWORD from env/valkey.env.
+  valkey-exporter:
+    image: oliver006/redis_exporter:latest
+    mem_limit: 128m
+    cpus: 0.25
+    restart: unless-stopped
+    command: ["--redis.addr=redis://valkey:6379"]
+    env_file:
+      - env/valkey.env
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
   prometheus:
-    profiles: ["monitoring"]
     image: prom/prometheus:latest
+    mem_limit: 512m
+    cpus: 0.5
     restart: unless-stopped
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -338,21 +381,28 @@ services:
       - no-new-privileges:true
 
   grafana:
-    profiles: ["monitoring"]
     image: grafana/grafana:latest
+    mem_limit: 256m
+    cpus: 0.5
     restart: unless-stopped
     env_file:
       - env/monitoring.env
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "127.0.0.1:3000:3000"
     networks:
+      - edge
       - internal
     security_opt:
       - no-new-privileges:true
 
   node-exporter:
-    profiles: ["monitoring"]
     image: prom/node-exporter:latest
+    mem_limit: 128m
+    cpus: 0.25
     restart: unless-stopped
     volumes:
       - /proc:/host/proc:ro
@@ -363,6 +413,37 @@ services:
       - "--path.sysfs=/host/sys"
       - "--path.rootfs=/rootfs"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
+  loki:
+    image: grafana/loki:3.1.1
+    mem_limit: 512m
+    cpus: 0.5
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    mem_limit: 128m
+    cpus: 0.5
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - promtail_data:/promtail
+      # Single log source: podman is configured with the journald log driver.
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
     networks:
       - internal
     security_opt:

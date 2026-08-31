@@ -30,6 +30,10 @@ defmodule Vibe.Telemetry.Metrics do
       counter("vibe.rate_limit.blocked.count",
         event_name: [:vibe, :rate_limit, :blocked],
         tags: [:type]
+      ),
+      counter("vibe.cache.token.count",
+        event_name: [:vibe, :cache, :token],
+        tags: [:result]
       )
     ]
   end

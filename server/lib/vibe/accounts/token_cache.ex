@@ -52,25 +52,34 @@ defmodule Vibe.Accounts.TokenCache do
   def fetch(token) when is_binary(token) and token != "" do
     case :ets.whereis(@table) do
       :undefined ->
+        emit(:miss)
         :miss
 
       _ ->
         case :ets.lookup(@table, token) do
           [{^token, _user_id, user, expires_at}] ->
             if now_ms() < expires_at do
+              emit(:hit)
               {:ok, user}
             else
               :ets.delete(@table, token)
+              emit(:expired)
               :miss
             end
 
           _ ->
+            emit(:miss)
             :miss
         end
     end
   end
 
   def fetch(_token), do: :miss
+
+  # Hit ratio is the signal that says whether a shared cache is worth adding.
+  defp emit(result) do
+    :telemetry.execute([:vibe, :cache, :token], %{count: 1}, %{result: result})
+  end
 
   @doc "Cache a resolved user for `token` for one TTL window."
   @spec put(String.t(), struct()) :: :ok

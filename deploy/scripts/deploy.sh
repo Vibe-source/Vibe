@@ -20,10 +20,23 @@ fi
 
 log() { echo "[deploy] $*"; }
 
+# Explicit build, not `compose build`: podman-compose cannot resolve a
+# `dockerfile:` key against a parent `context:`, and this is engine-agnostic.
+build_image() {
+  local name="$1" ctx="$2" dockerfile="$3"
+  log "building ${name}"
+  "$ENGINE_BIN" build -t "${name}:latest" -f "${ctx}/${dockerfile}" "$ctx"
+}
+
+# Not `compose run`: podman-compose 1.0.6 crashes in its cleanup path
+# (compose_down: no attribute 'remove_orphans') and tears the stack down with it.
 migrate() {
   local service="$1" bin="$2" mod="$3"
+  local project; project="$(basename "$(dirname "$COMPOSE_FILE")")"
   log "migrating ${service} (${mod})"
-  "${COMPOSE[@]}" run --rm "$service" \
+  "$ENGINE_BIN" run --rm --network "${project}_internal" \
+    --env-file "${REPO_ROOT}/deploy/env/${service}.env" \
+    "vibe-${service}:latest" \
     sh -c "DATABASE_URL=\"\${MIGRATION_DATABASE_URL:-\$DATABASE_URL}\" /app/bin/${bin} eval \"${mod}.migrate\""
 }
 
@@ -44,12 +57,22 @@ wait_ready() {
 
 rollback() {
   local tag="$1"
+  # Both tags are checked before either is moved: a half-rolled-back pair is worse
+  # than a failed rollback. Migrations are forward-only — this restores code, not schema.
+  for image in vibe-core vibe-agent-runtime; do
+    "$ENGINE_BIN" image inspect "${image}:${tag}" >/dev/null 2>&1 ||
+      { echo "[deploy] no ${image}:${tag} — run: ${ENGINE_BIN} images ${image}" >&2; exit 1; }
+  done
   for image in vibe-core vibe-agent-runtime; do
     log "rolling back ${image} to ${tag}"
     "$ENGINE_BIN" tag "${image}:${tag}" "${image}:latest"
   done
-  "${COMPOSE[@]}" up -d --no-build core agent-runtime
-  "${COMPOSE[@]}" ps
+  # podman-compose 1.0.6 ignores --no-deps and would recreate postgres/valkey too.
+  # Dropping only these two and running --no-recreate leaves the data tier alone.
+  local project; project="$(basename "$(dirname "$COMPOSE_FILE")")"
+  "$ENGINE_BIN" rm -f "${project}_core_1" "${project}_agent-runtime_1" >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" up -d --no-build --no-recreate
+  "${COMPOSE[@]}" ps || true
 }
 
 main() {
@@ -67,11 +90,16 @@ main() {
   fi
 
   log "building images"
-  "${COMPOSE[@]}" build
+  build_image vibe-core            "$REPO_ROOT"                 deploy/core/Dockerfile
+  build_image vibe-agent-runtime   "$REPO_ROOT"                 agent-runtime/Dockerfile
+  build_image vibe-sandbox-gateway "$REPO_ROOT/sandbox-gateway" Dockerfile
+  build_image vibe-doc-renderer    "$REPO_ROOT"                 deploy/doc-renderer/Dockerfile
+  build_image vibe-backup          "$REPO_ROOT/deploy/backup"   Dockerfile
 
   # Tag this build with the git SHA before anything replaces :latest, so
   # --rollback <sha> has something to retag back to.
-  sha="$(git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)"
+  sha="${VIBE_BUILD_SHA:-$(cat "${REPO_ROOT}/.vibe-sha" 2>/dev/null \
+        || git rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)}"
   for image in vibe-core vibe-agent-runtime; do
     "$ENGINE_BIN" tag "${image}:latest" "${image}:${sha}" 2>/dev/null || true
   done
@@ -82,16 +110,14 @@ main() {
 
   log "waiting for postgres"
   tries=30
-  until "${COMPOSE[@]}" exec -T postgres pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; do
+  until "$ENGINE_BIN" exec "$(basename "$(dirname "$COMPOSE_FILE")")_postgres_1" \
+          pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; do
     tries=$((tries - 1))
     [ "$tries" -le 0 ] && { echo "[deploy] postgres did not come up" >&2; exit 1; }
     sleep 2
   done
 
   migrate core vibe Vibe.Release
-  # Assumes the agent-runtime release binary/module follow the core's naming
-  # convention (bin/vibe_agents, VibeAgents.Release) — agent-runtime/ had no
-  # Release module yet when this was written; confirm with the runtime worker.
   migrate agent-runtime vibe_agents VibeAgents.Release
 
   log "starting remaining services"
@@ -100,7 +126,7 @@ main() {
   wait_ready core "http://127.0.0.1:4000/api/ready"
   wait_ready agent-runtime "http://127.0.0.1:4100/readyz"
 
-  "${COMPOSE[@]}" ps
+  "${COMPOSE[@]}" ps || true
 }
 
 main "$@"

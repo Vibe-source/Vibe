@@ -56,6 +56,15 @@ agents.{$VIBE_DOMAIN} {
 	reverse_proxy agent-runtime:4100
 }
 
+# Dashboards + log search. Grafana owns auth; Loki and Prometheus stay unpublished.
+logs.{$VIBE_DOMAIN} {
+	import security_headers
+	import access_log
+	encode gzip zstd
+
+	reverse_proxy grafana:3000
+}
+
 # Bare domain — SPA served by core. Same /internal/* block: core's router is
 # host-agnostic, so those routes are reachable here too without it.
 {$VIBE_DOMAIN} {
