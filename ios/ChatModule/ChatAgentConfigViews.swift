@@ -2308,12 +2308,16 @@ private struct GroupAgentDocumentsView: View {
 /// A ready-made role for a new agent: fills the system prompt (the role) and a
 /// sensible control mode. Owner can edit every field before creating.
 enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
-  case marketing, sales, manager, boss, custom
+  case marketing, social, coder, publisher, monitor, sales, manager, boss, custom
   var id: String { rawValue }
 
   var title: String {
     switch self {
     case .marketing: return "Marketing"
+    case .social: return "Social"
+    case .coder: return "Coder"
+    case .publisher: return "Publisher"
+    case .monitor: return "Monitor"
     case .sales: return "Sales"
     case .manager: return "Manager"
     case .boss: return "Boss"
@@ -2324,6 +2328,10 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
   var symbol: String {
     switch self {
     case .marketing: return "megaphone.fill"
+    case .social: return "bubble.left.and.bubble.right.fill"
+    case .coder: return "chevron.left.forwardslash.chevron.right"
+    case .publisher: return "arrow.up.circle.fill"
+    case .monitor: return "waveform.path.ecg"
     case .sales: return "chart.line.uptrend.xyaxis"
     case .manager: return "checklist"
     case .boss: return "crown.fill"
@@ -2334,6 +2342,10 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
   var defaultName: String {
     switch self {
     case .marketing: return "Marketing Lead"
+    case .social: return "Social Manager"
+    case .coder: return "Coder"
+    case .publisher: return "Publisher"
+    case .monitor: return "Monitor"
     case .sales: return "Sales Rep"
     case .manager: return "Team Manager"
     case .boss: return "Boss"
@@ -2344,6 +2356,10 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
   var persona: String? {
     switch self {
     case .marketing: return "Marketing Lead"
+    case .social: return "Social Manager"
+    case .coder: return "Coder"
+    case .publisher: return "Publisher"
+    case .monitor: return "Monitor"
     case .sales: return "Sales Rep"
     case .manager: return "Manager"
     case .boss: return "Boss"
@@ -2355,6 +2371,14 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
     switch self {
     case .marketing:
       return "You are the Marketing Lead for this team. You own positioning, messaging, campaigns, and copy. Research the market and competitors before you write, keep everything specific and on-brand, and turn briefs into ready-to-ship deliverables. When you have a computer, save your work to files."
+    case .social:
+      return "You are the Social Manager for this team. You own the accounts on X, Instagram and anywhere else the team posts. Sign in through the browser on your computer, read the timeline, draft and publish posts, reply to mentions, and watch what competitors ship. When you find something the product should copy or beat, hand it to the Coder with the exact link, a screenshot path and one sentence on why it matters. Never post anything that names a customer without approval."
+    case .coder:
+      return "You are the Coder for this team. You work in a real repository on your own computer. Read before you write: `agix context` and `agix grep` to find the code, `agix body` to read a symbol, then computer_edit_file for a surgical change -- never rewrite a file you have not read. Run the build and the tests yourself and paste the real output. When the change is green, hand it to the Publisher with the branch, the files touched and how to verify it. If a request is vague, ask one sharp question rather than guessing."
+    case .publisher:
+      return "You are the Publisher for this team. You take finished, tested work and ship it. Check the build and the tests are green before anything leaves your machine, deploy, then verify the live thing actually responds. Deploying and publishing are irreversible: ask for approval before every one, and say exactly what you are about to run. If a deploy fails, roll back first and report second."
+    case .monitor:
+      return "You are the Monitor for this team. You watch: uptime, errors, logs, usage, cost, and anything the team asked you to keep an eye on. Check on a schedule, keep a running file of what you saw so you can say what CHANGED rather than what is, and stay quiet when nothing did. When something breaks, say what broke, when it started, what you already checked, and hand it to the Coder with the exact error."
     case .sales:
       return "You are a Sales Rep for this team. You qualify leads, write outreach, and handle objections to keep the pipeline moving. Personalize every message, stay concise and human, and never over-promise. Any message that reaches a real customer needs approval first."
     case .manager:
@@ -2368,20 +2392,34 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
 
   var autonomyMode: String {
     switch self {
-    case .marketing, .manager: return "safe_auto"
-    case .sales, .boss: return "approval_required"
+    case .marketing, .manager, .monitor, .coder: return "safe_auto"
+    case .sales, .boss, .publisher, .social: return "approval_required"
     case .custom: return "safe_auto"
     }
   }
 
-  /// Whether this role gets an isolated sandbox with computer access by default.
-  var usesComputer: Bool { self == .marketing }
+  /// Capabilities this role starts with. Owner can add or remove any of them before creating.
+  var capabilities: Set<ChatAgentCapability> {
+    switch self {
+    case .marketing: return [.computer, .research, .team]
+    case .social: return [.browser, .research, .team]
+    case .coder: return [.computer, .research, .team]
+    case .publisher: return [.computer, .team]
+    case .monitor: return [.computer, .research, .team]
+    case .sales, .manager, .boss: return [.research, .team]
+    case .custom: return []
+    }
+  }
 
   /// Registry model id this role starts on; nil follows the registry default.
   /// Step-heavy roles start cheaper, decision roles start on a frontier model.
   var defaultModelId: String? {
     switch self {
     case .marketing: return "claude-sonnet-5"
+    case .social: return "claude-sonnet-5"
+    case .coder: return "claude-sonnet-5"
+    case .publisher: return "claude-haiku-4-5-20251001"
+    case .monitor: return "claude-haiku-4-5-20251001"
     case .sales: return "claude-haiku-4-5-20251001"
     case .manager: return "claude-sonnet-5"
     case .boss: return "claude-opus-4-8"
@@ -2392,7 +2430,53 @@ enum ChatAgentRolePreset: String, CaseIterable, Identifiable {
   var baseTools: [String] {
     switch self {
     case .custom: return []
-    default: return ["search_google", "read_url", "create_document"]
+    default: return ["create_document"]
+    }
+  }
+}
+
+/// One composable thing an agent can be given. The raw ids are what the server stores; it
+/// expands the coarse ones into whole tool families (VibeContracts.ToolBundles).
+enum ChatAgentCapability: String, CaseIterable, Identifiable {
+  case computer, browser, research, team
+  var id: String { rawValue }
+
+  var toolIds: [String] {
+    switch self {
+    case .computer: return ["computer_run"]
+    case .browser: return ["browser_open"]
+    case .research: return ["search_google", "read_url"]
+    case .team: return ["handoff_to_agent"]
+    }
+  }
+
+  /// Needs the isolated runtime: the embedded loop has no sandbox.
+  var needsSandbox: Bool { self == .computer || self == .browser }
+
+  var title: String {
+    switch self {
+    case .computer: return "Its own computer"
+    case .browser: return "Browser only"
+    case .research: return "Web research"
+    case .team: return "Works with other agents"
+    }
+  }
+
+  var detail: String {
+    switch self {
+    case .computer: return "Linux shell, files, code editing and a real Chromium it stays signed into."
+    case .browser: return "A real Chromium with saved logins, but no shell and no files."
+    case .research: return "Web search and reading pages, without a machine of its own."
+    case .team: return "Can hand a finished piece of work to another agent in this chat."
+    }
+  }
+
+  var symbol: String {
+    switch self {
+    case .computer: return "desktopcomputer"
+    case .browser: return "safari"
+    case .research: return "magnifyingglass"
+    case .team: return "person.2.fill"
     }
   }
 }
@@ -2423,17 +2507,18 @@ func chatAgentAutonomyDetail(_ mode: String) -> String {
 /// empty so the server keeps its defaults; computer roles run isolated.
 func chatAgentCreateAttributes(
   name: String, persona: String?, systemPrompt: String,
-  autonomyMode: String, baseTools: [String], usesComputer: Bool,
+  autonomyMode: String, baseTools: [String], capabilities: Set<ChatAgentCapability>,
   modelProvider: String? = nil, modelId: String? = nil
 ) -> [String: Any] {
   var enabled = baseTools
-  if usesComputer && !enabled.contains("computer_run") { enabled.append("computer_run") }
+  for id in capabilities.flatMap(\.toolIds) where !enabled.contains(id) { enabled.append(id) }
+  let needsSandbox = capabilities.contains { $0.needsSandbox }
   var attrs: [String: Any] = [
     "display_name": name,
     "system_prompt": systemPrompt,
     "autonomy_mode": autonomyMode,
     "output_modes": ["text"],
-    "execution_mode": usesComputer ? "isolated" : "embedded",
+    "execution_mode": needsSandbox ? "isolated" : "embedded",
   ]
   if let persona, !persona.isEmpty { attrs["persona"] = persona }
   if !enabled.isEmpty { attrs["enabled_tools"] = enabled }
@@ -2455,7 +2540,7 @@ struct ChatNewAgentView: View {
   @State private var name: String = ChatAgentRolePreset.marketing.defaultName
   @State private var systemPrompt: String = ChatAgentRolePreset.marketing.systemPrompt
   @State private var autonomy: String = ChatAgentRolePreset.marketing.autonomyMode
-  @State private var usesComputer: Bool = ChatAgentRolePreset.marketing.usesComputer
+  @State private var capabilities: Set<ChatAgentCapability> = ChatAgentRolePreset.marketing.capabilities
   @State private var registry: ChatAgentModelRegistry = .fallback
   @State private var didLoadRegistry = false
   @State private var didPickModel = false
@@ -2488,6 +2573,7 @@ struct ChatNewAgentView: View {
         instructionsSection
         modelSection
         controlSection
+        capabilitySection
         if let errorMessage { errorSection(errorMessage) }
       }
       .listStyle(.insetGrouped)
@@ -2525,7 +2611,7 @@ struct ChatNewAgentView: View {
     name = p.defaultName
     systemPrompt = p.systemPrompt
     autonomy = p.autonomyMode
-    usesComputer = p.usesComputer
+    capabilities = p.capabilities
     didPickModel = false
     applyPresetModel(p)
   }
@@ -2591,7 +2677,7 @@ struct ChatNewAgentView: View {
       systemPrompt: systemPrompt,
       autonomyMode: autonomy,
       baseTools: preset.baseTools,
-      usesComputer: usesComputer,
+      capabilities: capabilities,
       modelProvider: modelProviderId,
       modelId: modelId)
     onCreate(attrs) { error in
@@ -2750,17 +2836,46 @@ struct ChatNewAgentView: View {
       .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
       .listRowBackground(rowFill)
 
-      Toggle(isOn: $usesComputer) {
-        Text("Works on its own computer").font(.system(size: 16)).foregroundStyle(palette.text)
-      }
-      .listRowInsets(EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20))
-      .listRowBackground(rowFill)
     } header: {
       sectionHeader("Control")
     } footer: {
-      Text("\(chatAgentAutonomyDetail(autonomy)) With its own computer it runs commands and saves files in a private sandbox.")
+      Text(chatAgentAutonomyDetail(autonomy)).foregroundStyle(palette.secondaryText)
+    }
+  }
+
+  private var capabilitySection: some View {
+    Section {
+      ForEach(ChatAgentCapability.allCases) { capability in
+        Toggle(isOn: binding(for: capability)) {
+          HStack(spacing: 12) {
+            Image(systemName: capability.symbol)
+              .font(.system(size: 15, weight: .semibold))
+              .foregroundStyle(palette.secondaryText)
+              .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+              Text(capability.title).font(.system(size: 16)).foregroundStyle(palette.text)
+              Text(capability.detail).font(.system(size: 12)).foregroundStyle(palette.secondaryText)
+            }
+          }
+        }
+        .listRowInsets(EdgeInsets(top: 12, leading: 20, bottom: 12, trailing: 20))
+        .listRowBackground(rowFill)
+      }
+    } header: {
+      sectionHeader("What it can do")
+    } footer: {
+      Text("A computer or a browser runs the agent in its own sandbox. Everything else runs inline.")
         .foregroundStyle(palette.secondaryText)
     }
+  }
+
+  private func binding(for capability: ChatAgentCapability) -> Binding<Bool> {
+    Binding(
+      get: { capabilities.contains(capability) },
+      set: { on in
+        if on { capabilities.insert(capability) } else { capabilities.remove(capability) }
+      }
+    )
   }
 
   private func errorSection(_ msg: String) -> some View {

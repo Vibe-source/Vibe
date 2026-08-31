@@ -183,6 +183,54 @@ async function takeScreenshot(page, maxWidth, quality) {
   return { imageBase64: buffer.toString('base64'), mime: 'image/jpeg', width: size.width, height: size.height };
 }
 
+const MAX_PAGE_TEXT = 6000;
+const MAX_ELEMENTS = 60;
+
+// Page text plus the elements worth acting on, each tagged with a stable ref the model can
+// hand straight back as a selector. Cheaper and surer than reading a selector off a picture.
+async function readPage(page) {
+  return page.evaluate((limits) => {
+    const isVisible = (el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return false;
+      const s = window.getComputedStyle(el);
+      return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) > 0.05;
+    };
+    const oneLine = (v) => String(v || "").replace(/\s+/g, " ").trim();
+    const asText = (v) =>
+      String(v || "")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+    const nodes = Array.from(
+      document.querySelectorAll(
+        "a[href], button, input, textarea, select, [role=button], [role=link], [role=tab], [contenteditable=true]"
+      )
+    ).filter(isVisible);
+
+    const elements = nodes.slice(0, limits.maxElements).map((el, i) => {
+      const ref = "e" + (i + 1);
+      el.setAttribute("data-vibe-ref", ref);
+      const tag = el.tagName.toLowerCase();
+      const name = oneLine(
+        el.getAttribute("aria-label") || el.innerText || el.value || el.getAttribute("placeholder") || el.getAttribute("title")
+      ).slice(0, 80);
+      const entry = { ref, selector: `[data-vibe-ref="${ref}"]`, tag, type: el.getAttribute("type") || el.getAttribute("role") || tag, name };
+      if (tag === "a") entry.href = oneLine(el.getAttribute("href")).slice(0, 200);
+      return entry;
+    });
+
+    const text = asText(document.body ? document.body.innerText : "");
+    return {
+      text: text.slice(0, limits.maxText),
+      textTruncated: text.length > limits.maxText,
+      elements,
+      elementsTruncated: nodes.length > limits.maxElements,
+    };
+  }, { maxText: MAX_PAGE_TEXT, maxElements: MAX_ELEMENTS });
+}
+
 async function readState(browser, page) {
   const tabCount = browser.contexts().reduce((total, ctx) => total + ctx.pages().length, 0);
   let loading = false;
@@ -240,6 +288,10 @@ async function handle(request) {
       return { ok: true, url: page.url(), title: await page.title() };
     case 'state':
       return readState(browser, page);
+    case 'read': {
+      const read = await readPage(page);
+      return { url: page.url(), title: await page.title(), ...read };
+    }
     case 'input':
       await runInput(page, request.input || {});
       return { ok: true, url: page.url(), title: await page.title() };

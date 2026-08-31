@@ -127,6 +127,11 @@ Channel `computer:<agentId>` on the existing socket.
 
 Rate limit inbound `input` at 20/s per session; excess is dropped, not queued.
 
+The Terminal and Files tabs are plain owner-only HTTP reads on the same core prefix, not
+channel traffic: `GET /api/agents/:id/computer/exec-log?since=&limit=` (the shell the agent
+ran here), `GET …/computer/tree?path=&depth=` and `GET …/computer/file?path=`. All three are
+read-only — there is no owner-driven exec route.
+
 ### 3.3 Tools (agent-facing)
 
 Replacing pixel-first browsing with structure-first. `browser_screenshot` stays but is

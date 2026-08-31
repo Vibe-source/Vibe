@@ -281,7 +281,8 @@ defmodule Vibe.AI.AgentDecisions do
             "runId" => run_id,
             "decisionId" => decision_id,
             "kind" => kind,
-            "risk" => risk
+            "risk" => risk,
+            "tool" => params["tool"] || params[:tool]
           },
           rationale: "Runtime decision request for run #{run_id}",
           status: "pending",
@@ -328,7 +329,9 @@ defmodule Vibe.AI.AgentDecisions do
             "actionMode" => action_mode,
             "expiresAt" => DateTime.to_iso8601(expires_at),
             "actions" => client_actions,
-            "chosen" => nil
+            "chosen" => nil,
+            "risk" => risk,
+            "tool" => params["tool"] || params[:tool]
           }
         })
 
@@ -842,6 +845,8 @@ defmodule Vibe.AI.AgentDecisions do
         true -> outcome
       end
 
+    if outcome == "approve_always", do: persist_always_allow(task)
+
     AgentGateway.decision(run_id, %{
       decisionId: decision_id,
       kind: kind,
@@ -849,6 +854,27 @@ defmodule Vibe.AI.AgentDecisions do
       actionId: action.action_id,
       actorUserId: actor && actor.id
     })
+  end
+
+  # "Always allow" is a standing rule on the agent, not just a grant for the rest of this run.
+  defp persist_always_allow(%{agent_id: agent_id, requested_action: requested}) do
+    tool = requested["tool"]
+
+    with true <- is_binary(tool) and tool != "",
+         %Agent{} = agent <- Repo.get(Agent, agent_id) do
+      rules = agent.approval_rules || %{}
+      allow = (rules["allow"] || []) |> List.wrap() |> Enum.map(&to_string/1)
+
+      if tool in allow do
+        :ok
+      else
+        agent
+        |> Agent.changeset(%{approval_rules: Map.put(rules, "allow", allow ++ [tool])})
+        |> Repo.update()
+      end
+    else
+      _ -> :ok
+    end
   end
 
   defp maybe_dispatch_callback(%{task: task, action: action, actor: actor}) do

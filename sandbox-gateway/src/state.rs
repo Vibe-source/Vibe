@@ -1,10 +1,12 @@
 //! Shared gateway state: docker client, config, and the in-memory sandbox tracking map.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use bollard::Docker;
 
 use crate::config::Config;
+use crate::models::ExecLogEntry;
 use crate::runtime::computer::Registry;
 
 #[derive(Debug, Clone)]
@@ -15,11 +17,16 @@ pub struct SandboxEntry {
     pub ttl_seconds: Option<u64>,
 }
 
+/// Ring size per sandbox. The log is a live view for the owner, not an audit trail.
+const EXEC_LOG_CAP: usize = 60;
+
 pub struct AppState {
     pub cfg: Config,
     pub docker: Docker,
     pub sandboxes: Mutex<HashMap<String, SandboxEntry>>,
     pub computer: Registry,
+    exec_log: Mutex<HashMap<String, VecDeque<ExecLogEntry>>>,
+    exec_seq: AtomicU64,
 }
 
 impl AppState {
@@ -29,6 +36,8 @@ impl AppState {
             docker,
             sandboxes: Mutex::new(HashMap::new()),
             computer: Registry::new(),
+            exec_log: Mutex::new(HashMap::new()),
+            exec_seq: AtomicU64::new(0),
         }
     }
 
@@ -44,6 +53,7 @@ impl AppState {
 
     pub fn remove(&self, id: &str) {
         self.sandboxes.lock().unwrap().remove(id);
+        self.exec_log.lock().unwrap().remove(id);
     }
 
     pub fn get(&self, id: &str) -> Option<SandboxEntry> {
@@ -52,6 +62,30 @@ impl AppState {
 
     pub fn len(&self) -> usize {
         self.sandboxes.lock().unwrap().len()
+    }
+
+    /// Records one shell run and hands back the seq it was filed under.
+    pub fn record_exec(&self, id: &str, mut entry: ExecLogEntry) -> u64 {
+        let seq = self.exec_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        entry.seq = seq;
+        let mut log = self.exec_log.lock().unwrap();
+        let ring = log.entry(id.to_string()).or_default();
+        if ring.len() >= EXEC_LOG_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+        seq
+    }
+
+    /// Entries newer than `since`, oldest first, capped at `limit`.
+    pub fn exec_log(&self, id: &str, since: u64, limit: usize) -> Vec<ExecLogEntry> {
+        let log = self.exec_log.lock().unwrap();
+        let Some(ring) = log.get(id) else {
+            return Vec::new();
+        };
+        let newer: Vec<ExecLogEntry> = ring.iter().filter(|e| e.seq > since).cloned().collect();
+        let start = newer.len().saturating_sub(limit.max(1));
+        newer[start..].to_vec()
     }
 
     pub fn contains(&self, id: &str) -> bool {

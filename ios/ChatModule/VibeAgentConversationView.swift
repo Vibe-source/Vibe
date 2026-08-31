@@ -550,8 +550,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
     return btn
   }()
 
-  /// "Computer" button — visible only once an isolated-runtime run (agent-platform-v1)
-  /// has posted a live preview frame for this chat. Presents the full-screen preview sheet.
+  /// "Computer" button — visible once this chat has a preview frame or live computer
+  /// state. Presents the live sheet, falling back to the last frame.
   private lazy var headerComputerButton: UIButton = {
     let btn = UIButton(type: .system)
     btn.setImage(UIImage(systemName: "display"), for: .normal)
@@ -966,7 +966,9 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
   /// has arrived for this chat (agent-platform-v1 §3.4).
   private func updateComputerPreviewAffordances() {
     let preview = agentBridgeChatId.flatMap { ChatEngine.shared.latestAgentPreview(chatId: $0) }
-    headerComputerButton.isHidden = preview == nil
+    let computer = agentBridgeChatId.flatMap { ChatEngine.shared.latestAgentComputer(chatId: $0) }
+    // The button rides either signal; the thumbnail needs an actual frame.
+    headerComputerButton.isHidden = preview == nil && computer == nil
     computerThumbnailView.isHidden = preview == nil
     if let preview {
       computerThumbnailView.image = preview.image
@@ -1594,7 +1596,8 @@ final class VibeAgentConversationViewController: UIViewController, UITableViewDa
       if (note.userInfo?["reason"] as? String) == "agentBridgeAsk" {
         self.handleAgentBridgeAsk(note.userInfo ?? [:])
       }
-      if (note.userInfo?["reason"] as? String) == "agentPreview",
+      let reason = note.userInfo?["reason"] as? String
+      if reason == "agentPreview" || reason == "agentComputer",
         (note.userInfo?["chatId"] as? String) == self.agentBridgeChatId
       {
         self.updateComputerPreviewAffordances()

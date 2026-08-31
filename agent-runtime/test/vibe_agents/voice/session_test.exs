@@ -118,7 +118,7 @@ defmodule VibeAgents.Voice.SessionTest do
 
     assert_receive {:voice_frame, "tool.progress", %{status: "running", tool: "computer_run"}}, 1_000
     assert_receive {:voice_frame, "approval.requested", %{decisionId: decision_id} = request}, 1_000
-    assert request.title =~ "computer_run"
+    assert request.title =~ "command" and request.tool == "computer_run"
 
     GenServer.cast(pid, {:frame, "decision", %{"decisionId" => decision_id, "outcome" => "approve"}})
 

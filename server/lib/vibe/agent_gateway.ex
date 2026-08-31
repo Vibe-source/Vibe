@@ -24,10 +24,12 @@ defmodule Vibe.AgentGateway do
 
   @doc "Env override (`VIBE_AGENT_EXECUTION_MODE`) wins over the agent's own column."
   def execution_mode_for(%Agent{} = agent) do
-    case System.get_env("VIBE_AGENT_EXECUTION_MODE") do
-      "isolated" -> "isolated"
-      "embedded" -> "embedded"
-      _ -> agent.execution_mode || "embedded"
+    cond do
+      System.get_env("VIBE_AGENT_EXECUTION_MODE") == "embedded" -> "embedded"
+      System.get_env("VIBE_AGENT_EXECUTION_MODE") == "isolated" -> "isolated"
+      # Computer and browser tools only exist in the isolated runtime; embedded has no sandbox.
+      VibeContracts.ToolBundles.sandbox?(agent.enabled_tools || []) -> "isolated"
+      true -> agent.execution_mode || "embedded"
     end
   end
 
@@ -145,6 +147,23 @@ defmodule Vibe.AgentGateway do
     request(:get, "/internal/v1/agents/#{agent_id}/computer/state", nil)
   end
 
+  @doc "`GET …/computer/exec-log?since=&limit=` — the shell runs the agent made here."
+  def computer_exec_log(agent_id, opts \\ []) do
+    query = URI.encode_query(%{"since" => Keyword.get(opts, :since, 0), "limit" => Keyword.get(opts, :limit, 40)})
+    request(:get, "/internal/v1/agents/#{agent_id}/computer/exec-log?#{query}", nil)
+  end
+
+  @doc "`GET …/computer/tree?path=&depth=` — a directory listing from inside the sandbox."
+  def computer_tree(agent_id, opts \\ []) do
+    query = URI.encode_query(%{"path" => Keyword.get(opts, :path, ""), "depth" => Keyword.get(opts, :depth, 2)})
+    request(:get, "/internal/v1/agents/#{agent_id}/computer/tree?#{query}", nil)
+  end
+
+  @doc "`GET …/computer/file?path=` — one file, base64, capped by the gateway."
+  def computer_file(agent_id, path) do
+    request(:get, "/internal/v1/agents/#{agent_id}/computer/file?#{URI.encode_query(%{"path" => path})}", nil)
+  end
+
   @doc "`POST …/computer/control` — `{action:\"grant\"|\"release\", sessionId, ttlSeconds?}`."
   def computer_control(agent_id, params) when is_map(params) do
     request(:post, "/internal/v1/agents/#{agent_id}/computer/control", compact(params))
@@ -201,9 +220,43 @@ defmodule Vibe.AgentGateway do
   # Names aren't resolved (would be an N+1 per participant); the runtime already
   # has isAgent + userId to cross-reference against context.history.
   defp participants_for(chat_id, agent_user_id) do
-    chat_id
-    |> Chat.get_participant_ids()
-    |> Enum.map(&%{"userId" => &1, "isAgent" => &1 == agent_user_id, "name" => nil})
+    ids = Chat.get_participant_ids(chat_id)
+    agents = teammate_agents(ids)
+    names = participant_names(ids)
+
+    Enum.map(ids, fn id ->
+      teammate = agents[id]
+
+      %{
+        "userId" => id,
+        "isAgent" => not is_nil(teammate),
+        "isSelf" => id == agent_user_id,
+        "username" => names[id],
+        "name" => (teammate && teammate.display_name) || names[id],
+        "role" => teammate && (teammate.persona || teammate.display_name)
+      }
+    end)
+  end
+
+  # Without this an agent cannot name the teammate it is supposed to hand off to.
+  defp teammate_agents(user_ids) do
+    import Ecto.Query
+
+    Vibe.Agent
+    |> where([a], a.agent_user_id in ^user_ids)
+    |> select([a], {a.agent_user_id, a})
+    |> Vibe.Repo.all()
+    |> Map.new()
+  end
+
+  defp participant_names(user_ids) do
+    import Ecto.Query
+
+    Vibe.Accounts.User
+    |> where([u], u.id in ^user_ids)
+    |> select([u], {u.id, u.username})
+    |> Vibe.Repo.all()
+    |> Map.new()
   end
 
   # attachment_context_to_attachments/1 (ChatChannel) uses :type "image"|"file"|"voice";
@@ -233,15 +286,7 @@ defmodule Vibe.AgentGateway do
   # computer_run/browser_open aren't in Vibe.AI.ToolRegistry yet (unowned this run) —
   # honored here once an agent's enabled_tools actually contains them.
   defp capabilities_for(agent) do
-    tools = agent.enabled_tools || []
-    computer? = "computer_run" in tools
-    browser? = "browser_open" in tools
-
-    %{
-      "computer" => computer?,
-      "browser" => browser?,
-      "network" => if(computer? or browser?, do: "allowlist", else: "none")
-    }
+    VibeContracts.ToolBundles.capabilities(agent.enabled_tools || [])
   end
 
   defp request(method, path, body) do

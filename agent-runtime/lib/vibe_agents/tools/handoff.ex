@@ -11,7 +11,7 @@ defmodule VibeAgents.Tools.Handoff do
   @max_depth 4
 
   def handoff_to_agent(run, input) when is_map(input) do
-    username = trimmed(input["username"])
+    username = username(input["username"])
     note = trimmed(input["note"]) || ""
 
     cond do
@@ -42,7 +42,9 @@ defmodule VibeAgents.Tools.Handoff do
            "toAgentUsername" => username,
            "note" => note
          }) do
-      {:ok, %{"dispatched" => dispatched} = body} ->
+      {:ok, body} when is_map(body) ->
+        dispatched = Map.get(body, "dispatched", true)
+
         Events.emit(run, "run.handoff", %{"toAgentUsername" => username, "note" => note, "childRunId" => body["messageId"]})
 
         %{
@@ -73,6 +75,15 @@ defmodule VibeAgents.Tools.Handoff do
     case Repo.get(AgentRun, parent_id) do
       nil -> hops
       parent -> depth(parent, hops + 1)
+    end
+  end
+
+  # The roster writes teammates as @name and the model copies the @ through; core looks the
+  # username up without it, so an unstripped handle silently hands off to nobody.
+  defp username(value) do
+    case trimmed(value) do
+      nil -> nil
+      handle -> handle |> String.trim_leading("@") |> trimmed()
     end
   end
 

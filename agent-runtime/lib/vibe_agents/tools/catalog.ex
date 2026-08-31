@@ -2,14 +2,17 @@ defmodule VibeAgents.Tools.Catalog do
   @moduledoc "Anthropic-style tool specs for every frozen runtime tool name, filtered per run."
 
   @always_on ["ask_user", "request_approval", "remember", "recall"]
-  @computer_tools ["computer_run", "computer_read_file", "computer_write_file"]
-  @browser_tools ["browser_open", "browser_act", "browser_screenshot"]
+
+  # Families and expansion live in contracts so the server gates on the same table.
+  defdelegate expand(enabled_tools), to: VibeContracts.ToolBundles
+  defdelegate computer_tools(), to: VibeContracts.ToolBundles
+  defdelegate browser_tools(), to: VibeContracts.ToolBundles
 
   @doc "agent_profile: map with enabledTools. capabilities: map with computer/browser bools."
   def specs(agent_profile, capabilities) when is_map(agent_profile) do
     enabled =
       (agent_profile["enabledTools"] || agent_profile[:enabledTools] || [])
-      |> Enum.map(&to_string/1)
+      |> expand()
       |> Kernel.++(@always_on)
       |> Enum.uniq()
 
@@ -17,8 +20,8 @@ defmodule VibeAgents.Tools.Catalog do
     browser? = truthy(capabilities["browser"] || capabilities[:browser])
 
     enabled
-    |> Enum.reject(&(&1 in @computer_tools and not computer?))
-    |> Enum.reject(&(&1 in @browser_tools and not browser?))
+    |> Enum.reject(&(&1 in computer_tools() and not computer?))
+    |> Enum.reject(&(&1 in browser_tools() and not browser?))
     |> Enum.map(&spec/1)
     |> Enum.reject(&is_nil/1)
   end
@@ -88,14 +91,14 @@ defmodule VibeAgents.Tools.Catalog do
     %{
       "name" => "request_approval",
       "description" =>
-        "Ask the human to approve a specific consequential action before you take it. " <>
-          "Always use this before anything with an external effect.",
+        "Ask the human to approve an action whose effect leaves this machine. The runtime " <>
+          "already gates dangerous calls, so never use this for work inside your own computer.",
       "input_schema" => %{
         "type" => "object",
         "properties" => %{
           "title" => %{"type" => "string"},
           "detail" => %{"type" => "string"},
-          "risk" => %{"type" => "string", "enum" => ["external_effect", "credential", "write_local", "spend"]}
+          "risk" => %{"type" => "string", "enum" => ["external_effect", "credential", "spend"]}
         },
         "required" => ["title"]
       }
@@ -142,6 +145,49 @@ defmodule VibeAgents.Tools.Catalog do
         },
         "required" => ["path", "content"]
       }
+    }
+  end
+
+  defp spec("computer_edit_file") do
+    %{
+      "name" => "computer_edit_file",
+      "description" =>
+        "Edit a file on your sandboxed computer by replacing an exact snippet. `old` must appear " <>
+          "exactly once unless `replace_all` is true. Prefer this over rewriting a whole file.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "path" => %{"type" => "string"},
+          "old" => %{"type" => "string"},
+          "new" => %{"type" => "string"},
+          "replace_all" => %{"type" => "boolean"}
+        },
+        "required" => ["path", "old", "new"]
+      }
+    }
+  end
+
+  defp spec("computer_list_files") do
+    %{
+      "name" => "computer_list_files",
+      "description" => "List the files and folders under a path on your sandboxed computer.",
+      "input_schema" => %{
+        "type" => "object",
+        "properties" => %{
+          "path" => %{"type" => "string"},
+          "depth" => %{"type" => "integer"}
+        }
+      }
+    }
+  end
+
+  defp spec("browser_read_page") do
+    %{
+      "name" => "browser_read_page",
+      "description" =>
+        "Read the current page in your sandboxed browser as text, with its interactive elements " <>
+          "listed. Cheaper and more reliable than a screenshot when you only need the content.",
+      "input_schema" => %{"type" => "object", "properties" => %{}}
     }
   end
 

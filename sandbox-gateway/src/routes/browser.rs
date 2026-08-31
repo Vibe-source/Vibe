@@ -30,6 +30,13 @@ pub async fn action(
     browser::action(&state, &id, req).await.map(Json)
 }
 
+pub async fn read_page(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, GatewayError> {
+    browser::read_page(&state, &id).await.map(Json)
+}
+
 pub async fn screenshot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

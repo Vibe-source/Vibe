@@ -370,6 +370,95 @@ final class VibeAgentComputerSession {
 
   private var canPush: Bool { !stopped && joined && client != nil }
 
+  // MARK: - Machine views (owner-only, read-only)
+
+  struct ExecEntry {
+    let seq: Int
+    let cmd: String
+    let cwd: String?
+    let exitCode: Int
+    let stdout: String
+    let stderr: String
+    let durationMs: Int
+  }
+
+  struct FileEntry {
+    let path: String
+    let isDirectory: Bool
+    let bytes: Int
+    var name: String { (path as NSString).lastPathComponent }
+  }
+
+  func fetchExecLog(since: Int = 0, completion: @escaping ([ExecEntry]) -> Void) {
+    let path = "/api/agents/\(Self.escape(agentId))/computer/exec-log?since=\(since)&limit=40"
+    get(path: path) { payload in
+      let rows = (payload?["entries"] as? [[String: Any]]) ?? []
+      completion(rows.compactMap(Self.execEntry))
+    }
+  }
+
+  func fetchTree(path directory: String, completion: @escaping ([FileEntry]) -> Void) {
+    let path =
+      "/api/agents/\(Self.escape(agentId))/computer/tree?depth=1&path=\(Self.query(directory))"
+    get(path: path) { payload in
+      let rows = (payload?["entries"] as? [[String: Any]]) ?? []
+      completion(rows.compactMap(Self.fileEntry).filter { $0.path != directory })
+    }
+  }
+
+  func fetchFile(path file: String, completion: @escaping (String?) -> Void) {
+    let path = "/api/agents/\(Self.escape(agentId))/computer/file?path=\(Self.query(file))"
+    get(path: path) { payload in
+      guard let base64 = Self.normalized(payload?["contentBase64"]),
+        let data = Data(base64Encoded: base64)
+      else {
+        completion(nil)
+        return
+      }
+      completion(String(data: data, encoding: .utf8))
+    }
+  }
+
+  private func get(path: String, completion: @escaping ([String: Any]?) -> Void) {
+    guard let url = Self.apiURL(api: api, path: path) else {
+      DispatchQueue.main.async { completion(nil) }
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 12
+    request.setValue("Bearer \(api.authToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    ChatPhoenixClient.makePinnedURLSession().dataTask(with: request) { data, response, _ in
+      let ok = (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0)
+      let payload = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+      DispatchQueue.main.async { completion(ok ? payload : nil) }
+    }.resume()
+  }
+
+  private static func query(_ value: String) -> String {
+    value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+  }
+
+  private static func execEntry(_ row: [String: Any]) -> ExecEntry? {
+    guard let seq = intValue(row["seq"]) else { return nil }
+    return ExecEntry(
+      seq: seq,
+      cmd: (row["cmd"] as? [String])?.joined(separator: " ") ?? "",
+      cwd: normalized(row["cwd"]),
+      exitCode: intValue(row["exitCode"]) ?? 0,
+      stdout: (row["stdout"] as? String) ?? "",
+      stderr: (row["stderr"] as? String) ?? "",
+      durationMs: intValue(row["durationMs"]) ?? 0)
+  }
+
+  private static func fileEntry(_ row: [String: Any]) -> FileEntry? {
+    guard let path = normalized(row["path"]) else { return nil }
+    return FileEntry(
+      path: path,
+      isDirectory: normalized(row["type"]) == "dir",
+      bytes: intValue(row["bytes"]) ?? 0)
+  }
+
   // MARK: - Agent id + URL helpers
 
   private static var agentIdByPeerUserId: [String: String] = [:]

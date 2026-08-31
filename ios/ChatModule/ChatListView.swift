@@ -613,8 +613,19 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // Deliberately does not read `oldValue`: an observer that touches it forces a copy
     // of the whole array on every `rows[i] = …`, and this one runs on the hottest
     // property in the file.
-    didSet { coreRowLookup = nil }
+    didSet {
+      coreRowLookup = nil
+      if rows.isEmpty {
+        updateSecureChatEmptyStateVisibility()
+      } else {
+        secureChatEmptyStateView.isHidden = true
+      }
+    }
   }
+  private let secureChatEmptyStateView = UIStackView()
+  private let secureChatEmptyStateIcon = UIImageView()
+  private let secureChatEmptyStateTitle = UILabel()
+  private let secureChatEmptyStateSubtitle = UILabel()
   /// Identity → row for the core's measurement provider, built on demand.
   ///
   /// The provider used to answer with `rows.first { $0.messageId == id || $0.key == id }`
@@ -2857,6 +2868,13 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       name: UIApplication.willResignActiveNotification,
       object: nil
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAppDidBecomeActiveForPendingReadReceipt),
+      name: UIApplication.didBecomeActiveNotification,
+      object: nil
+    )
+    setupSecureChatEmptyState()
 
   }
 
@@ -2867,6 +2885,70 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     // stamps viewportPersistedForCurrentClose so the pop can't double-record — but the
     // REAL close must still record wherever the viewport actually ends up.
     viewportPersistedForCurrentClose = false
+  }
+
+  @objc private func handleAppDidBecomeActiveForPendingReadReceipt() {
+    // Foregrounding can reveal a message that arrived while backgrounded; that read
+    // receipt was withheld until now, so re-run the viewport tick to send it.
+    guard window != nil else { return }
+    emitViewport(force: true)
+  }
+
+  private func setupSecureChatEmptyState() {
+    secureChatEmptyStateView.translatesAutoresizingMaskIntoConstraints = false
+    secureChatEmptyStateView.axis = .vertical
+    secureChatEmptyStateView.alignment = .center
+    secureChatEmptyStateView.spacing = 8.0
+    secureChatEmptyStateView.isHidden = true
+    secureChatEmptyStateView.isUserInteractionEnabled = false
+
+    secureChatEmptyStateIcon.translatesAutoresizingMaskIntoConstraints = false
+    secureChatEmptyStateIcon.contentMode = .scaleAspectFit
+    secureChatEmptyStateIcon.image = UIImage(systemName: "lock.fill")
+
+    secureChatEmptyStateTitle.numberOfLines = 0
+    secureChatEmptyStateTitle.textAlignment = .center
+    secureChatEmptyStateTitle.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
+    secureChatEmptyStateTitle.text = "Messages here are end-to-end encrypted"
+
+    secureChatEmptyStateSubtitle.numberOfLines = 0
+    secureChatEmptyStateSubtitle.textAlignment = .center
+    secureChatEmptyStateSubtitle.font = UIFont.systemFont(ofSize: 13.5, weight: .regular)
+    secureChatEmptyStateSubtitle.text = "Say hello to start the conversation."
+
+    secureChatEmptyStateView.addArrangedSubview(secureChatEmptyStateIcon)
+    secureChatEmptyStateView.addArrangedSubview(secureChatEmptyStateTitle)
+    secureChatEmptyStateView.addArrangedSubview(secureChatEmptyStateSubtitle)
+    secureChatEmptyStateView.setCustomSpacing(14.0, after: secureChatEmptyStateIcon)
+    secureChatEmptyStateView.setCustomSpacing(4.0, after: secureChatEmptyStateTitle)
+
+    addSubview(secureChatEmptyStateView)
+    NSLayoutConstraint.activate([
+      secureChatEmptyStateIcon.widthAnchor.constraint(equalToConstant: 36),
+      secureChatEmptyStateIcon.heightAnchor.constraint(equalToConstant: 36),
+      secureChatEmptyStateView.centerXAnchor.constraint(equalTo: centerXAnchor),
+      secureChatEmptyStateView.centerYAnchor.constraint(equalTo: centerYAnchor),
+      secureChatEmptyStateView.leadingAnchor.constraint(
+        greaterThanOrEqualTo: leadingAnchor, constant: 40),
+      secureChatEmptyStateView.trailingAnchor.constraint(
+        lessThanOrEqualTo: trailingAnchor, constant: -40),
+    ])
+    applySecureChatEmptyStateTheme()
+  }
+
+  private func applySecureChatEmptyStateTheme() {
+    secureChatEmptyStateIcon.tintColor = appearance.accent
+    secureChatEmptyStateTitle.textColor = appearance.dayTextColor
+    secureChatEmptyStateSubtitle.textColor = appearance.dayTextColor.withAlphaComponent(0.7)
+  }
+
+  // History must have actually loaded (not merely absent) so a fresh chat open
+  // never flashes this before real rows have had a chance to arrive.
+  private func updateSecureChatEmptyStateVisibility() {
+    let shouldShow =
+      !isGroupOrChannel && rows.isEmpty
+      && ChatEngine.shared.isChatHistoryLoaded(chatId: engineChatId)
+    secureChatEmptyStateView.isHidden = !shouldShow
   }
 
   required init?(coder: NSCoder) {
@@ -12762,6 +12844,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
     if !isEphemeralPreview { Self.noteReopenSnapshotOpen(chatId: next) }
     emptyShellCommittedAt = 0
     chatOpenCoverLogged = false
+    secureChatEmptyStateView.isHidden = true
     viewportPersistedForCurrentClose = false
     preloadReopenSnapshotFromDiskIfNeeded()
     progressiveHeightWarmupWorkItem?.cancel()
@@ -13145,6 +13228,7 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
       applyScrollToneTheme()
       updateScrollToneOverlay(offsetY: collectionView.contentOffset.y)
       applyActivityOverlayTheme()
+      applySecureChatEmptyStateTheme()
       collectionView.reloadData()
     }
   }
@@ -19437,7 +19521,9 @@ public final class ChatListView: UIView, UICollectionViewDataSource,
   /// *delivery* receipt on message insert). Best-effort + deduped by message id, so it's safe
   /// to call on every viewport tick.
   private func sendReadReceiptForNewestIncomingIfNeeded() {
-    guard window != nil else { return }
+    // A locked/backgrounded screen still has window != nil, so a viewport tick from a
+    // background socket delta must not auto-ack a message the user never actually saw.
+    guard window != nil, UIApplication.shared.applicationState == .active else { return }
     let chatId = engineChatId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !chatId.isEmpty else { return }
 

@@ -2995,10 +2995,40 @@ func groupSystemNoticeText(for row: ChatListRow, body: String) -> String? {
   return nil
 }
 
-/// Extra height under a centred service notice when live decision actions are present.
+/// Risk class of a pending approval (`external_effect`, `credential`, `write_local`, …).
+/// Rides the socket frame only, so a cold open shows the card without a chip.
+func serviceDecisionRisk(for row: ChatListRow) -> String? {
+  guard let service = row.serviceMessage, service.hasLiveActions else { return nil }
+  if let meta = ChatEngine.shared.agentApprovalMeta(messageId: row.messageId), !meta.risk.isEmpty {
+    return meta.risk
+  }
+  guard let risk = service.risk, !risk.isEmpty else { return nil }
+  return risk
+}
+
+/// The exact command / URL / path the approval is about: host+path for `browser_open`,
+/// the raw command otherwise. Falls back to the decision node's second plain part.
+func serviceDecisionDetailText(for row: ChatListRow) -> String? {
+  guard let service = row.serviceMessage, service.hasLiveActions else { return nil }
+  let meta = ChatEngine.shared.agentApprovalMeta(messageId: row.messageId)
+  let raw = (meta.map { $0.detail } ?? "").isEmpty
+    ? (service.detailText ?? "") : (meta?.detail ?? "")
+  let detail = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !detail.isEmpty else { return nil }
+  guard (meta?.tool ?? "") == "browser_open", let url = URL(string: detail),
+    let host = url.host
+  else { return detail }
+  let stripped = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+  return url.path.isEmpty || url.path == "/" ? stripped : stripped + url.path
+}
+
+/// Extra height under a centred service notice when live decision actions are present:
+/// the risk chip + monospaced detail block, then the action bar.
 func serviceDecisionActionsHeight(for row: ChatListRow) -> CGFloat {
   guard let service = row.serviceMessage, service.hasLiveActions else { return 0 }
   return 40.0
+    + ChatServiceDecisionCardView.height(
+      risk: serviceDecisionRisk(for: row), detail: serviceDecisionDetailText(for: row))
 }
 
 private func bubbleMetaWidths(for row: ChatListRow) -> ChatBubbleMetaWidths {
@@ -5456,15 +5486,57 @@ func agentTurnSingleStepHugWidth(_ row: ChatListRow, maxContentWidth: CGFloat) -
 let agentTurnComputerBandHeight: CGFloat = 26.0
 let agentTurnComputerBandTopGap: CGFloat = 8.0
 
-/// The chat's live computer, but only on the turn that is actually running — so a computer
-/// going live changes one row's height, not every settled turn in the transcript.
-func agentTurnComputerBandState(_ row: ChatListRow) -> ChatEngine.AgentComputerState? {
-  guard bubbleUsesAgentTurnContent(row),
-    row.isStreamingText || agentTurnRowCouldBeLive(row),
-    let state = ChatEngine.shared.latestAgentComputer(chatId: row.chatId),
-    state.live, !state.host.isEmpty
-  else { return nil }
-  return state
+/// What the band shows for one turn: browser host + page, or terminal + command label.
+struct AgentTurnComputerBand: Equatable {
+  let isShell: Bool
+  let primary: String
+  let secondary: String
+  let live: Bool
+  let showsTakeControl: Bool
+}
+
+/// Host without `www.`; empty when the string is not an absolute URL.
+func agentComputerBandHost(_ raw: String) -> String {
+  let host = URL(string: raw)?.host ?? ""
+  return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+}
+
+private func agentTurnLastComputerNode(_ row: ChatListRow) -> ChatListRow.AgentProgressNode? {
+  row.agentProgressNodes.last { node in
+    let tool = node.tool ?? ""
+    return tool.hasPrefix("computer_") || tool.hasPrefix("browser_")
+  }
+}
+
+/// The chat's live computer while the turn is running; once it settles, that turn's own
+/// last computer step — so a finished turn freezes the band instead of losing it.
+func agentTurnComputerBandState(_ row: ChatListRow) -> AgentTurnComputerBand? {
+  guard bubbleUsesAgentTurnContent(row) else { return nil }
+  if agentTurnRowCouldBeLive(row),
+    let state = ChatEngine.shared.latestAgentComputer(chatId: row.chatId)
+  {
+    let primary = state.isShell ? state.title : state.host
+    if !primary.isEmpty {
+      return AgentTurnComputerBand(
+        isShell: state.isShell,
+        primary: primary,
+        secondary: state.isShell ? "" : state.title,
+        live: state.live,
+        showsTakeControl: state.live && state.agentHoldsControl)
+    }
+  }
+  guard let node = agentTurnLastComputerNode(row) else { return nil }
+  let isBrowser = (node.tool ?? "").hasPrefix("browser_")
+  let host = agentComputerBandHost(node.target ?? node.label)
+  let usesHost = isBrowser && !host.isEmpty
+  let primary = usesHost ? host : node.label
+  guard !primary.isEmpty else { return nil }
+  return AgentTurnComputerBand(
+    isShell: !isBrowser,
+    primary: primary,
+    secondary: usesHost ? node.label : (node.target ?? ""),
+    live: false,
+    showsTakeControl: false)
 }
 
 /// Constant the computer band adds to this row's bubble. Applied identically by
@@ -10614,6 +10686,15 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     _agentComputerBandView = view
     return view
   }
+  /// Built the first time a decision row shows a risk chip / detail block.
+  private var _serviceDecisionCardView: ChatServiceDecisionCardView?
+  private var serviceDecisionCardView: ChatServiceDecisionCardView {
+    if let existing = _serviceDecisionCardView { return existing }
+    let view = ChatServiceDecisionCardView()
+    contentView.insertSubview(view, belowSubview: serviceActionBarView)
+    _serviceDecisionCardView = view
+    return view
+  }
   private var agentTurnState = AgentTurnBubbleState()
   // Reconfigure gate for agentTurnContentView: `layoutSubviews` runs on every scroll
   // tick / pin adjustment, but `configure(row:)` re-parses the FULL progress payload
@@ -11905,6 +11986,7 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     isConfiguredServiceDecision = false
     serviceActionBarView.isHidden = true
     serviceActionBarView.configure(actions: [], appearance: appearance)
+    _serviceDecisionCardView?.isHidden = true
     isConfiguredAgentErrorNotice = false
     let activeVoiceSnapshot = VoiceBubblePlaybackCoordinator.shared.currentSnapshot
     self.row = row
@@ -12134,9 +12216,19 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
         if liveActions.isEmpty {
           serviceActionBarView.isHidden = true
           serviceActionBarView.configure(actions: [], appearance: appearance)
+          _serviceDecisionCardView?.isHidden = true
         } else {
           serviceActionBarView.configure(actions: liveActions, appearance: appearance)
           serviceActionBarView.isHidden = false
+          let risk = serviceDecisionRisk(for: row)
+          let detail = serviceDecisionDetailText(for: row)
+          if risk == nil, detail == nil {
+            _serviceDecisionCardView?.isHidden = true
+          } else {
+            let card = serviceDecisionCardView
+            card.configure(risk: risk, detail: detail, appearance: appearance)
+            card.isHidden = false
+          }
         }
         mediaProgressSpinner.stopAnimating()
         mediaProgressOverlayView.isHidden = true
@@ -12727,6 +12819,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
     // Only the agent-turn arm below re-shows the computer band; every other path leaves it off.
     _agentComputerBandView?.isHidden = true
     _agentComputerBandView?.frame = .zero
+    // Only the decision arm below re-shows the approval card.
+    _serviceDecisionCardView?.isHidden = true
+    _serviceDecisionCardView?.frame = .zero
 
     let bounds = contentView.bounds
     if row.kind == .day || isConfiguredAgentDivider {
@@ -12744,11 +12839,20 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
       )
       dayLabel.layer.cornerRadius = height / 2.0
       if isConfiguredServiceDecision {
+        let cardHeight = ChatServiceDecisionCardView.height(
+          risk: serviceDecisionRisk(for: row), detail: serviceDecisionDetailText(for: row))
+        let blockWidth = max(1, bounds.width - 24)
+        if cardHeight > 0 {
+          let card = serviceDecisionCardView
+          card.frame = CGRect(
+            x: 12, y: dayLabel.frame.maxY + 4, width: blockWidth, height: cardHeight)
+          card.isHidden = false
+        }
         serviceActionBarView.frame = CGRect(
           x: 12,
-          y: dayLabel.frame.maxY + 4,
-          width: max(1, bounds.width - 24),
-          height: max(0, actionsHeight - 4)
+          y: dayLabel.frame.maxY + 4 + cardHeight,
+          width: blockWidth,
+          height: max(0, actionsHeight - cardHeight - 4)
         )
         serviceActionBarView.isHidden = false
       } else {
@@ -13232,7 +13336,9 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
           let band = agentComputerBandView
           band.isHidden = false
           band.configure(
-            host: computerBand.host, title: computerBand.title, live: computerBand.live,
+            isShell: computerBand.isShell, primary: computerBand.primary,
+            secondary: computerBand.secondary, live: computerBand.live,
+            showsTakeControl: computerBand.showsTakeControl,
             appearance: VibeAgentKitMap.appearance(for: traitCollection))
           band.frame = pixelAlignedRect(
             CGRect(
@@ -15283,6 +15389,21 @@ final class ChatListCell: UICollectionViewCell, VoicePlayableCell {
               row.messageType,
               row.mediaUrl == nil ? "N" : "Y"
             )
+          } else if !prefersVideoPreview,
+            let diskURL = chatOnDiskMediaFileURL(for: row),
+            !chatMediaShouldAnimate(urlString: diskURL.absoluteString, messageType: row.messageType),
+            let diskThumb = chatMediaLoadImageFromFile(at: diskURL.path, shouldAnimate: false, maxPixelSize: 128)
+          {
+            // No wire thumb yet (older senders / mid-flight uploads): bridge a capped sync
+            // decode from the vault file so first paint is not a solid empty plate.
+            chatMediaImageCacheStore(diskThumb, forKey: thumbCacheKey)
+            applyResolvedMediaPreviewImage(
+              diskThumb,
+              for: row,
+              mediaURL: row.mediaUrl ?? row.key,
+              quality: .microThumb
+            )
+            mediaPrimaryIconView.isHidden = true
           }
         }
       }

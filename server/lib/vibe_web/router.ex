@@ -238,6 +238,9 @@ defmodule VibeWeb.Router do
     # Isolated-runtime surfaces (docs/agent-platform-v1.md §3.7 / §3.2).
     post "/agents/:id/voice/sessions", AgentsController, :voice_session
     get "/agents/:id/computer/preview", AgentsController, :computer_preview
+    get "/agents/:id/computer/exec-log", AgentsController, :computer_exec_log
+    get "/agents/:id/computer/tree", AgentsController, :computer_tree
+    get "/agents/:id/computer/file", AgentsController, :computer_file
     post "/agents/:id/computer/session", AgentsController, :computer_session
     delete "/agents/:id/computer/session/:session_id", AgentsController, :close_computer_session
     delete "/agents/:id", AgentsController, :delete

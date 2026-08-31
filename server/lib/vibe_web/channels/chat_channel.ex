@@ -12,6 +12,7 @@ defmodule VibeWeb.ChatChannel do
   alias Vibe.AI.GroupAgent
   alias Vibe.AI.LocalAgentWorker
   alias Vibe.AI.StandaloneAgent
+  alias Vibe.AI.Transcribe
   require Logger
 
   # Sealed agent image blobs (arte1). They ride the inbound message only to reach the
@@ -915,9 +916,12 @@ defmodule VibeWeb.ChatChannel do
             false
         end
 
+    attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
+
+    # A voice note carries no text: transcribe it or the agent is dispatched an empty prompt.
     dispatch_text =
       case normalize_dispatch_text(agent_text, data) do
-        nil -> nil
+        nil -> Transcribe.voice_text(attachment_context.audio_urls)
         value -> value
       end
 
@@ -941,8 +945,6 @@ defmodule VibeWeb.ChatChannel do
 
     # Guard against an agent's own posted reply re-triggering a default fan-out.
     sender_is_agent? = not is_nil(LocalAgentWorker.resolve_by_agent_user_id(user_id))
-
-    attachment_context = extract_agent_attachment_context(chat_id, data, user_id)
 
     Logger.info(
       "[ChatChannel] dispatch_resolve chat_id=#{chat_id} room_type=#{room_type} reserved=#{length(reserved_workers)} team=#{team_trigger?} team_workers=#{Enum.map_join(team_workers, ",", & &1.handle)} standalone=#{not is_nil(standalone_agent)} local_worker=#{if local_worker, do: local_worker.handle, else: "nil"} dispatch_text?=#{is_binary(dispatch_text)} agent_text?=#{is_binary(agent_text) and String.trim(to_string(agent_text)) != ""} mentioned_username=#{inspect(mentioned_agent_username)} participants=#{inspect(participant_ids)}"
@@ -1763,7 +1765,11 @@ defmodule VibeWeb.ChatChannel do
            parent_run_id: parent_run_id,
            source: if(parent_run_id, do: "handoff", else: "chat")
          }) do
-      {:ok, _run} ->
+      {:ok, run} ->
+        if is_map(run) and reply_output_mode(agent, data, attachments) == "voice" do
+          Vibe.AgentRelay.expect_voice_reply(run["runId"], data["id"])
+        end
+
         Logger.info(
           "[ChatChannel] isolated run started chat_id=#{chat_id} agent_id=#{agent.id}"
         )
@@ -1798,6 +1804,7 @@ defmodule VibeWeb.ChatChannel do
            chat_id,
            dispatch_text,
            attachments: attachments,
+           output_mode: reply_output_mode(agent, data, attachments),
            reply_to_id: data["id"],
            requester_user_id: requester_user_id
          ) do
@@ -2244,6 +2251,15 @@ defmodule VibeWeb.ChatChannel do
       "userId" => agent_user_id,
       "isAgent" => true
     })
+  end
+
+  # Reply in kind: a voice note gets a voice answer when the agent has a voice.
+  defp reply_output_mode(agent, data, attachments) do
+    voice_in? =
+      is_nil(normalize_dispatch_text(data["agentText"], data)) and
+        Enum.any?(attachments, &(&1[:type] == "voice"))
+
+    if voice_in? and "voice" in (agent.output_modes || []), do: "voice"
   end
 
   defp attachment_context_to_attachments(%{

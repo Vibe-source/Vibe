@@ -93,6 +93,9 @@ last 600s (ETS on each service; Valkey when clustered). Implemented once in
 | `POST /internal/v1/runs/:runId/decisions` | `Decision` → `{ok:true}` (`404` unknown, `409` already decided) |
 | `GET  /internal/v1/runs/:runId` | → `{run, events: [RunEvent] (tail ≤ 200)}` |
 | `POST /internal/v1/agents/:agentId/computer` | `{action:"ensure"\|"destroy"}` → `{computerId, status}` |
+| `GET  /internal/v1/agents/:agentId/computer/exec-log?since=&limit=` | → gateway `exec/log` verbatim |
+| `GET  /internal/v1/agents/:agentId/computer/tree?path=&depth=` | → gateway `tree` verbatim |
+| `GET  /internal/v1/agents/:agentId/computer/file?path=` | → gateway `files` verbatim |
 | `GET  /internal/v1/agents/:agentId/computer/preview` | → `{imageBase64, mime:"image/jpeg", width, height, capturedAt}` |
 | `POST /internal/v1/voice/sessions` | `{agentId, userId, chatId, agentProfile}` → `{sessionId, wsUrl, token, expiresAt}` |
 | `POST /internal/v1/provider-invoke` | provider payload (see 3.5) already authenticated by core → same as `POST /runs` with `source:"provider"` |
@@ -219,6 +222,7 @@ rotation) are phase 2 and documented in the gap analysis.
 |---|---|
 | `POST /v1/sandboxes` | `{ownerKey:"agent:<id>", image?, cpus?, memoryMb?, pidsLimit?, network:"none"\|"proxy", ttlSeconds?}` → `{id, status, createdAt}` (returns the existing sandbox for `ownerKey`) |
 | `GET /v1/sandboxes/:id` | → `{id, status, ownerKey, createdAt, lastUsedAt}` |
+| `GET /v1/sandboxes/:id/exec/log?since=&limit=` | → `{entries:[{seq,cmd,cwd,exitCode,stdout,stderr,truncated,durationMs,startedAt}]}` — in-memory ring, newest last |
 | `POST /v1/sandboxes/:id/exec` | `{cmd:[…], cwd?, env?:{}, timeoutMs?, maxOutputBytes?}` → `{exitCode, stdout, stderr, truncated, durationMs}` |
 | `PUT /v1/sandboxes/:id/files` | `{path, contentBase64, mode?}` → `{path, bytes}` |
 | `GET /v1/sandboxes/:id/files?path=` | → `{path, contentBase64, bytes}` (cap 4 MB) |

@@ -26,6 +26,7 @@ Every route but `GET /healthz` requires header `x-sandbox-token: <SANDBOX_GATEWA
 ## Routes
 
 `POST|GET /v1/sandboxes` · `GET|DELETE /v1/sandboxes/:id` · `POST /v1/sandboxes/:id/exec` ·
+`GET /v1/sandboxes/:id/exec/log` ·
 `PUT|GET /v1/sandboxes/:id/files` · `GET /v1/sandboxes/:id/tree` ·
 `POST /v1/sandboxes/:id/browser/{navigate,action}` · `GET /v1/sandboxes/:id/browser/screenshot` ·
 `POST /v1/sandboxes/:id/stop` · `GET /healthz`.

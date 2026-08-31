@@ -232,3 +232,7 @@ scripts/loadtest/*.wav
 scripts/*/out/
 scripts/voice-probe/*.wav
 scripts/voice-probe/*.aiff
+
+# Vendored sandbox binaries: large, rebuilt from the agix dist tree.
+deploy/sandbox/vendor/*.tar.gz
+deploy/sandbox/vendor/*.zip

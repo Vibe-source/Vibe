@@ -298,6 +298,8 @@ defmodule VibeAgents.Voice.Session do
 
     push_to_channel(state, "approval.requested", %{
       decisionId: decision_id,
+      tool: name,
+      risk: request["risk"],
       title: request["title"] || "Run #{name}?",
       detail: request["detail"] || inspect_input(input),
       actions: request["actions"] || default_actions(),

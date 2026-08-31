@@ -97,4 +97,31 @@ defmodule VibeAgentsWeb.InternalControllerComputerTest do
     assert [%{url: url}] = FakeSandboxHTTP.calls()
     assert String.ends_with?(url, "/v1/sandboxes/sb-9/computer/session/s-1")
   end
+
+  test "the exec log query reaches the gateway with since and limit", %{agent_id: agent_id} do
+    FakeSandboxHTTP.stub(fn :get, _url, _body -> {:ok, %{"entries" => [%{"seq" => 4}]}} end)
+
+    conn = signed_get("/internal/v1/agents/#{agent_id}/computer/exec-log?since=3&limit=5")
+    assert json_response(conn, 200)["entries"] == [%{"seq" => 4}]
+
+    assert [%{url: url}] = FakeSandboxHTTP.calls()
+    assert String.ends_with?(url, "/v1/sandboxes/sb-9/exec/log?since=3&limit=5")
+  end
+
+  test "the tree query carries the path it was asked for", %{agent_id: agent_id} do
+    FakeSandboxHTTP.stub(fn :get, _url, _body -> {:ok, %{"entries" => []}} end)
+
+    conn = signed_get("/internal/v1/agents/#{agent_id}/computer/tree?path=/home/agent/proj&depth=1")
+    assert json_response(conn, 200)["entries"] == []
+
+    assert [%{url: url}] = FakeSandboxHTTP.calls()
+    assert String.ends_with?(url, "/v1/sandboxes/sb-9/tree?path=%2Fhome%2Fagent%2Fproj&depth=1")
+  end
+
+  test "reading a file passes the path straight through", %{agent_id: agent_id} do
+    FakeSandboxHTTP.stub(fn :get, _url, _body -> {:ok, %{"path" => "/home/agent/a.txt", "contentBase64" => "aGk="}} end)
+
+    conn = signed_get("/internal/v1/agents/#{agent_id}/computer/file?path=/home/agent/a.txt")
+    assert json_response(conn, 200)["contentBase64"] == "aGk="
+  end
 end

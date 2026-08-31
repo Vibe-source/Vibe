@@ -461,6 +461,23 @@ final class ChatEngine {
       let raw = URL(string: url)?.host ?? ""
       return raw.hasPrefix("www.") ? String(raw.dropFirst(4)) : raw
     }
+
+    /// Shell step: the runtime sends an empty url and a command label in `title`.
+    var isShell: Bool { url.isEmpty }
+
+    /// Nobody took over, so the agent is driving — the band offers "Take control".
+    var agentHoldsControl: Bool {
+      let held = (holder ?? "").lowercased()
+      return held.isEmpty || held == "agent"
+    }
+  }
+
+  /// Approval request detail for one decision message (agent-platform-v1 §3.4).
+  struct AgentApprovalMeta {
+    let kind: String
+    let tool: String
+    let detail: String
+    let risk: String
   }
 
   private struct PendingCallSignal {
@@ -583,6 +600,9 @@ final class ChatEngine {
   // paths read it on main and must never block on the engine queue.
   private static let agentComputerLock = NSLock()
   private static var agentComputerByChatId: [String: AgentComputerState] = [:]
+  // Approval tool/risk/detail ride the socket frame only, never message metadata — the
+  // decision card reads them here, on the same lock-not-queue contract as the computer.
+  private static var agentApprovalMetaByMessageId: [String: AgentApprovalMeta] = [:]
   // Per-session terminal latch: chatId -> (sessionId -> the tail item's content signature
   // at the moment we saw the run finish). Presence of a sessionId key == "this session is
   // settled; do NOT re-light its tail cell from the chat-wide running grace." Needed because
@@ -2935,6 +2955,21 @@ final class ChatEngine {
   private static func storeAgentComputer(_ state: AgentComputerState?, chatId: String) {
     agentComputerLock.lock()
     agentComputerByChatId[chatId] = state
+    agentComputerLock.unlock()
+  }
+
+  /// Tool / risk / exact detail for a pending decision message. Same lock as the computer
+  /// state — the decision card measures on main and must not wait on the engine queue.
+  func agentApprovalMeta(messageId rawMessageId: String?) -> AgentApprovalMeta? {
+    guard let messageId = normalizedString(rawMessageId), !messageId.isEmpty else { return nil }
+    Self.agentComputerLock.lock()
+    defer { Self.agentComputerLock.unlock() }
+    return Self.agentApprovalMetaByMessageId[messageId]
+  }
+
+  private static func storeAgentApprovalMeta(_ meta: AgentApprovalMeta, messageId: String) {
+    agentComputerLock.lock()
+    agentApprovalMetaByMessageId[messageId] = meta
     agentComputerLock.unlock()
   }
 
@@ -9379,6 +9414,17 @@ final class ChatEngine {
           if !runId.isEmpty {
             self.activeIsolatedRunIdByChatId[chatId] = runId
           }
+          if let messageId = self.normalizedString(
+            frame.payload["messageId"] ?? frame.payload["message_id"]), !messageId.isEmpty
+          {
+            Self.storeAgentApprovalMeta(
+              AgentApprovalMeta(
+                kind: self.normalizedString(frame.payload["kind"]) ?? "approval",
+                tool: self.normalizedString(frame.payload["tool"]) ?? "",
+                detail: self.normalizedString(frame.payload["detail"]) ?? "",
+                risk: (self.normalizedString(frame.payload["risk"]) ?? "").lowercased()),
+              messageId: messageId)
+          }
           self.agentTurnRunningAtMsByChatId[chatId] = Int64(self.nowMs())
           self.setAgentProgressLocked(
             chatId: chatId, label: "Waiting for approval", tool: nil, status: "running")
@@ -9396,7 +9442,15 @@ final class ChatEngine {
           guard !staleRun, ["completed", "failed", "cancelled"].contains(status) else { return }
           self.activeIsolatedRunIdByChatId.removeValue(forKey: chatId)
           self.agentTurnRunningAtMsByChatId.removeValue(forKey: chatId)
-          Self.storeAgentComputer(nil, chatId: chatId)
+          // Freeze the computer on its last state instead of dropping it: the band keeps
+          // the final page / command with the live dot off.
+          if let last = self.latestAgentComputer(chatId: chatId), last.live {
+            Self.storeAgentComputer(
+              AgentComputerState(
+                url: last.url, title: last.title, live: false, holder: last.holder,
+                runId: last.runId, updatedAtMs: Int64(self.nowMs())),
+              chatId: chatId)
+          }
           let settleStatus = status == "completed" ? "done" : (status == "failed" ? "error" : "stopped")
           self.clearAgentProgressLocked(
             chatId: chatId, status: settleStatus, reason: "runState(\(status):\(reason))")
@@ -9445,6 +9499,9 @@ final class ChatEngine {
           if live, !state.host.isEmpty {
             self.setAgentProgressLocked(
               chatId: chatId, label: "Browsing \(state.host)", tool: "computer", status: "running")
+          } else if live, state.isShell, !state.title.isEmpty {
+            self.setAgentProgressLocked(
+              chatId: chatId, label: "Running \(state.title)", tool: "computer", status: "running")
           }
           return
         }
@@ -12172,6 +12229,19 @@ final class ChatEngine {
       normalizedString(decryptedFields["fileName"]) == nil
     {
       decryptedFields["fileName"] = fileNameForRow
+    }
+    // Width/height live in encryptedContent; recover from clear-text wire metadata
+    // when decryption fails, so the row skips the provisional-square placeholder.
+    let dimMetadata = payload["metadata"] as? [String: Any]
+    if decryptedFields["width"] == nil,
+      let rawWidth = parseDoubleValue(dimMetadata?["width"] ?? dimMetadata?["media_width"])
+    {
+      decryptedFields["width"] = rawWidth
+    }
+    if decryptedFields["height"] == nil,
+      let rawHeight = parseDoubleValue(dimMetadata?["height"] ?? dimMetadata?["media_height"])
+    {
+      decryptedFields["height"] = rawHeight
     }
     // Opened, but nothing to draw. This is the empty bubble the transcript shows, and
     // it is a different failure from a refused open — which is why it gets its own line.
@@ -16668,6 +16738,18 @@ final class ChatEngine {
         normalizedString(enrichedFields["fileName"]) == nil
       {
         enrichedFields["fileName"] = fileNameForRow
+      }
+      // Same recovery as the live path: width/height can be absent from the
+      // decrypted copy, so fall back to the clear-text metadata replayed with history.
+      if enrichedFields["width"] == nil,
+        let rawWidth = parseDoubleValue(rawMetadata?["width"] ?? rawMetadata?["media_width"])
+      {
+        enrichedFields["width"] = rawWidth
+      }
+      if enrichedFields["height"] == nil,
+        let rawHeight = parseDoubleValue(rawMetadata?["height"] ?? rawMetadata?["media_height"])
+      {
+        enrichedFields["height"] = rawHeight
       }
       // If type collapsed to text but we have media evidence, restore image type for list/profile.
       var resolvedType = type

@@ -34,6 +34,7 @@ pub fn build(state: Arc<AppState>) -> Router {
             get(sandboxes::get).delete(sandboxes::delete),
         )
         .route("/v1/sandboxes/:id/exec", post(sandboxes::exec_cmd))
+        .route("/v1/sandboxes/:id/exec/log", get(sandboxes::exec_log))
         .route(
             "/v1/sandboxes/:id/files",
             put(files::write).get(files::read),
@@ -44,6 +45,7 @@ pub fn build(state: Arc<AppState>) -> Router {
             post(browser::navigate),
         )
         .route("/v1/sandboxes/:id/browser/action", post(browser::action))
+        .route("/v1/sandboxes/:id/browser/read", get(browser::read_page))
         .route(
             "/v1/sandboxes/:id/browser/screenshot",
             get(browser::screenshot),

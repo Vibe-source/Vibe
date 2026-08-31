@@ -97,6 +97,13 @@ async fn run_browser_script(
     })
 }
 
+/// Page text plus actionable elements. Passed through as JSON: the element list is an open
+/// shape owned by browser.js, not a gateway contract.
+pub async fn read_page(state: &AppState, container_id: &str) -> Result<Value, GatewayError> {
+    let req = serde_json::json!({"kind": "read"});
+    run_browser_script(state, container_id, req).await
+}
+
 pub async fn navigate(
     state: &AppState,
     container_id: &str,

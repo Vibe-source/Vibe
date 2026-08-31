@@ -82,7 +82,18 @@ defmodule VibeAgents.CoreClient do
   defmodule Finch do
     @moduledoc "Default HTTP transport for VibeAgents.CoreClient — real Finch requests."
 
+    # An unconfigured core url must read as a transport error: raising here kills the outbox.
+    def request(_method, url, _body, _headers) when not is_binary(url), do: {:error, :core_url_unset}
+
     def request(method, url, body, headers) do
+      if URI.parse(url).scheme == nil do
+        {:error, :core_url_unset}
+      else
+        do_request(method, url, body, headers)
+      end
+    end
+
+    defp do_request(method, url, body, headers) do
       req = Elixir.Finch.build(String.to_existing_atom(String.downcase(method)), url, headers, body)
 
       case Elixir.Finch.request(req, VibeAgents.Finch, receive_timeout: 10_000) do

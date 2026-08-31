@@ -13,6 +13,10 @@ struct ChatServiceMessage: Equatable {
   let chosenActionId: String?
   let chosenActionLabel: String?
   let chosenByName: String?
+  /// Second plain part of a decision node — the exact command / URL / path.
+  let detailText: String?
+  /// Risk class carried in the decision node, so a cold open still shows the chip.
+  let risk: String?
 
   var hasLiveActions: Bool {
     status == "pending" && !actions.isEmpty
@@ -66,8 +70,14 @@ struct ChatServiceMessage: Equatable {
 
     var templateKey: String?
     var templateArgs: [String: String] = [:]
+    var plainParts: [String] = []
     if let parts = map["parts"] as? [[String: Any]] {
       for part in parts {
+        if (part["type"] as? String) == "plain", let value = part["value"] as? String,
+          !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+          plainParts.append(value)
+        }
         let type = (part["type"] as? String) ?? ""
         if type == "template", let key = part["key"] as? String, !key.isEmpty {
           templateKey = key
@@ -105,7 +115,9 @@ struct ChatServiceMessage: Equatable {
       actions: actions,
       chosenActionId: chosenActionId,
       chosenActionLabel: chosenActionLabel,
-      chosenByName: chosenByName
+      chosenByName: chosenByName,
+      detailText: plainParts.count > 1 ? plainParts[1] : nil,
+      risk: decision?["risk"] as? String
     )
   }
 }
@@ -272,5 +284,87 @@ final class ChatServiceActionBarView: UIView {
     default:
       return appearance.timeColorThem.withAlphaComponent(0.12)
     }
+  }
+}
+
+/// Approval-card extras between the decision pill and its action bar: a risk chip and
+/// the exact command / URL in a selectable monospaced block. Fixed height by design.
+final class ChatServiceDecisionCardView: UIView {
+  static let chipHeight: CGFloat = 20.0
+  static let detailHeight: CGFloat = 54.0
+  static let gap: CGFloat = 6.0
+
+  private let riskChip = UILabel()
+  private let detailView = UITextView()
+
+  static func height(risk: String?, detail: String?) -> CGFloat {
+    var total: CGFloat = 0
+    if risk != nil { total += chipHeight + gap }
+    if detail != nil { total += detailHeight + gap }
+    return total
+  }
+
+  static func riskLabel(_ risk: String) -> String {
+    switch risk.lowercased() {
+    case "external_effect": return "External effect"
+    case "credential": return "Credentials"
+    case "write_local": return "Writes files"
+    case "read": return "Read only"
+    default: return risk.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    riskChip.font = .systemFont(ofSize: 11, weight: .semibold)
+    riskChip.textAlignment = .center
+    riskChip.layer.cornerRadius = ChatServiceDecisionCardView.chipHeight / 2.0
+    riskChip.clipsToBounds = true
+    addSubview(riskChip)
+
+    detailView.isEditable = false
+    detailView.isSelectable = true
+    detailView.isScrollEnabled = true
+    detailView.alwaysBounceVertical = false
+    detailView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    detailView.textContainerInset = UIEdgeInsets(top: 7, left: 8, bottom: 7, right: 8)
+    detailView.layer.cornerRadius = 8
+    detailView.clipsToBounds = true
+    addSubview(detailView)
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  func configure(risk: String?, detail: String?, appearance: ChatListAppearance) {
+    let warning = ["external_effect", "credential"].contains((risk ?? "").lowercased())
+    riskChip.isHidden = risk == nil
+    if let risk {
+      let tint = warning ? UIColor.systemOrange : appearance.dayTextColor
+      riskChip.text = Self.riskLabel(risk)
+      riskChip.textColor = tint
+      riskChip.backgroundColor = tint.withAlphaComponent(0.16)
+    }
+    detailView.isHidden = detail == nil
+    detailView.text = detail ?? ""
+    detailView.textColor = appearance.dayTextColor
+    detailView.backgroundColor = appearance.dayBackgroundColor
+    setNeedsLayout()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    var y: CGFloat = 0
+    if riskChip.isHidden {
+      riskChip.frame = .zero
+    } else {
+      let fit = riskChip.sizeThatFits(CGSize(width: bounds.width, height: Self.chipHeight))
+      let width = min(bounds.width, ceil(fit.width) + 20.0)
+      riskChip.frame = CGRect(
+        x: floor((bounds.width - width) * 0.5), y: y, width: width, height: Self.chipHeight)
+      y += Self.chipHeight + Self.gap
+    }
+    detailView.frame =
+      detailView.isHidden
+      ? .zero : CGRect(x: 0, y: y, width: bounds.width, height: Self.detailHeight)
   }
 }

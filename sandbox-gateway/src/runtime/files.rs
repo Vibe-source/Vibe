@@ -157,6 +157,9 @@ pub async fn tree(
             .map_err(|e| GatewayError::Internal(anyhow::anyhow!(e)))?
             .to_string_lossy()
             .to_string();
+        // tar names a directory with a trailing slash, which counted as an extra level and
+        // hid every subdirectory at the depth boundary.
+        let entry_name = entry_name.trim_end_matches('/');
         let entry_depth = entry_name.matches('/').count() as u32;
         if entry_depth > depth {
             continue;

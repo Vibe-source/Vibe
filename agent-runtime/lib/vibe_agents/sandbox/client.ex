@@ -12,11 +12,14 @@ defmodule VibeAgents.Sandbox.Client do
   def create_sandbox(body), do: post("/v1/sandboxes", body)
   def get_sandbox(id), do: get("/v1/sandboxes/#{id}")
   def exec(id, body), do: post("/v1/sandboxes/#{id}/exec", body, @exec_timeout)
+  def exec_log(id, since, limit), do: get(with_query("/v1/sandboxes/#{id}/exec/log", since: since, limit: limit))
   def write_file(id, body), do: put("/v1/sandboxes/#{id}/files", body)
   def read_file(id, path), do: get("/v1/sandboxes/#{id}/files?path=#{URI.encode_www_form(path)}")
   def tree(id, path, depth), do: get("/v1/sandboxes/#{id}/tree?path=#{URI.encode_www_form(path || "")}&depth=#{depth || 2}")
   def browser_navigate(id, body), do: post("/v1/sandboxes/#{id}/browser/navigate", body, @browser_timeout)
   def browser_action(id, body), do: post("/v1/sandboxes/#{id}/browser/action", body, @browser_timeout)
+
+  def browser_read(id), do: request(:get, "/v1/sandboxes/#{id}/browser/read", nil, @browser_timeout)
 
   def browser_screenshot(id, max_width \\ 1024),
     do: request(:get, "/v1/sandboxes/#{id}/browser/screenshot?maxWidth=#{max_width}", nil, @browser_timeout)

@@ -110,6 +110,20 @@ defmodule Vibe.AgentRelay do
     :ok
   end
 
+  @doc "Marks an isolated run whose answer should also come back as a voice note."
+  def expect_voice_reply(run_id, reply_to_id) when is_binary(run_id) do
+    ensure_table()
+
+    put_state(
+      run_id,
+      get_state(run_id) |> Map.put(:voice_reply, true) |> Map.put(:voice_reply_to, reply_to_id)
+    )
+
+    :ok
+  end
+
+  def expect_voice_reply(_run_id, _reply_to_id), do: :ok
+
   defp handle_approval(event, kind) do
     chat_id = event["chatId"]
     run_id = event["runId"]
@@ -129,7 +143,10 @@ defmodule Vibe.AgentRelay do
             "taskId" => task_id,
             "messageId" => message_id,
             "kind" => kind,
+            "tool" => payload["tool"],
             "title" => payload["title"],
+            "detail" => payload["detail"],
+            "risk" => payload["risk"],
             "expiresAt" => payload["expiresAt"]
           })
 
@@ -202,7 +219,39 @@ defmodule Vibe.AgentRelay do
     VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-run-state", run_state_payload)
     Chat.broadcast_user_chat_event(chat_id, "agent-run-state", run_state_payload)
 
+    if kind == "run.completed", do: send_voice_reply(event, state)
+
     clear_state(run_id)
+  end
+
+  # Isolated runs only stream text; a voice answer rides back as its own message.
+  defp send_voice_reply(event, state) do
+    text = state |> Map.get(:text) |> to_string() |> String.trim()
+
+    if state[:voice_reply] == true and text != "" do
+      Task.start(fn -> synthesize_and_deliver(event, state, text) end)
+    end
+  end
+
+  defp synthesize_and_deliver(event, state, text) do
+    with %Agent{} = agent <- Repo.get_by(Agent, agent_user_id: event["agentUserId"]),
+         {:ok, voice} <- Vibe.AI.TTS.synthesize(text, voice: agent.voice_profile || "alloy") do
+      Vibe.AI.StandaloneAgent.deliver_outputs(
+        agent,
+        event["chatId"],
+        [
+          %{
+            type: "voice",
+            text: text,
+            mediaUrl: voice.media_url,
+            metadata: %{"duration" => voice.duration, "mimeType" => "audio/mpeg"}
+          }
+        ],
+        state[:voice_reply_to]
+      )
+    else
+      other -> Logger.warning("[AgentRelay] voice reply skipped: #{inspect(other)}")
+    end
   end
 
   defp maybe_put_reason(map, nil), do: map

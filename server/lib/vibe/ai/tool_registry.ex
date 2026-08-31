@@ -248,7 +248,9 @@ defmodule Vibe.AI.ToolRegistry do
     %{
       id: "computer_run",
       name: "Computer",
-      description: "Run shell/python/node on the agent's own sandboxed computer (isolated runtime).",
+      description:
+        "The agent gets its own Linux computer: shell, python, node, git, file read/write/edit, " <>
+          "and a real Chromium browser. Forces the isolated runtime.",
       category: "computer",
       always_on: false,
       testability: "dry_run"
@@ -256,7 +258,9 @@ defmodule Vibe.AI.ToolRegistry do
     %{
       id: "browser_open",
       name: "Browser",
-      description: "Open and drive a real browser on the agent's computer (isolated runtime).",
+      description:
+        "Browser only: open pages, read them, click and type, screenshot. Sessions and logins " <>
+          "persist. Forces the isolated runtime.",
       category: "computer",
       always_on: false,
       testability: "dry_run"

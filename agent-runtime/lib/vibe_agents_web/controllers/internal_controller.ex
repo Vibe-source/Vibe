@@ -75,6 +75,15 @@ defmodule VibeAgentsWeb.InternalController do
   def computer_state(conn, %{"agent_id" => agent_id} = params),
     do: agent_id |> Sandbox.computer_state(params["session"]) |> passthrough(conn)
 
+  def computer_exec_log(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.exec_log(since_seq(params), int_param(params["limit"], 40)) |> passthrough(conn)
+
+  def computer_tree(conn, %{"agent_id" => agent_id} = params),
+    do: agent_id |> Sandbox.tree(params["path"], int_param(params["depth"], 2)) |> passthrough(conn)
+
+  def computer_file(conn, %{"agent_id" => agent_id, "path" => path}),
+    do: agent_id |> Sandbox.read_file(path) |> passthrough(conn)
+
   def computer_control(conn, %{"agent_id" => agent_id} = params),
     do: agent_id |> Sandbox.computer_control(gateway_body(params)) |> passthrough(conn)
 
@@ -112,6 +121,17 @@ defmodule VibeAgentsWeb.InternalController do
   end
 
   defp since_seq(_params), do: 0
+
+  defp int_param(value, _default) when is_integer(value) and value >= 0, do: value
+
+  defp int_param(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, _rest} when parsed >= 0 -> parsed
+      _ -> default
+    end
+  end
+
+  defp int_param(_value, default), do: default
 
   @doc """
   `VibeAgents.Voice.Sessions` is the voice worker's module — resolved dynamically via

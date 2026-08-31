@@ -91,16 +91,15 @@ defmodule VibeAgents.Tools.Executor do
     name = tool["name"]
     input = tool["input"] || %{}
     run = state.run
+    grants = state[:granted_capabilities] || MapSet.new()
 
     case Broker.required_capability(name) do
       nil ->
-        broker_outcome(run, name, input)
+        broker_outcome(run, name, input, grants)
 
       capability ->
-        granted = MapSet.member?(state[:granted_capabilities] || MapSet.new(), capability)
-
-        if granted or Broker.auto_grant_capability?(run) do
-          broker_outcome(run, name, input)
+        if MapSet.member?(grants, capability) or Broker.auto_grant_capability?(run) do
+          broker_outcome(run, name, input, grants)
         else
           reason = "First use of the #{capability} this run."
           {:decision, "permission", Broker.permission_request(capability, reason), capability}
@@ -108,12 +107,21 @@ defmodule VibeAgents.Tools.Executor do
     end
   end
 
-  defp broker_outcome(run, name, input) do
+  defp broker_outcome(run, name, input, grants) do
     case Broker.authorize(run, name, input) do
-      :run -> :run
-      {:deny, reason} -> {:deny, reason}
-      {:approval, request} -> {:decision, "approval", request, nil}
-      {:ask, questions} -> {:decision, "ask", %{"questions" => VibeContracts.AskQuestion.normalize(questions)}, nil}
+      :run ->
+        :run
+
+      {:deny, reason} ->
+        {:deny, reason}
+
+      {:approval, request} ->
+        if MapSet.member?(grants, "tool:" <> name),
+          do: :run,
+          else: {:decision, "approval", request, nil}
+
+      {:ask, questions} ->
+        {:decision, "ask", %{"questions" => VibeContracts.AskQuestion.normalize(questions)}, nil}
     end
   end
 
@@ -165,6 +173,10 @@ defmodule VibeAgents.Tools.Executor do
 
   defp apply_decision_outcome(tool, "approval", %{outcome: "approve"}, _capability, state, callback),
     do: {execute_single_tool(tool, state, callback), nil}
+
+  # "Always allow" also persists on the agent, in core; this grant only silences the rest of the run.
+  defp apply_decision_outcome(tool, "approval", %{outcome: "approve_always"}, _cap, state, callback),
+    do: {execute_single_tool(tool, state, callback), "tool:" <> tool["name"]}
 
   defp apply_decision_outcome(tool, "permission", %{outcome: outcome}, capability, state, callback)
        when outcome in ["allow_once", "allow_run"] do
@@ -224,7 +236,10 @@ defmodule VibeAgents.Tools.Executor do
         "computer_run" -> Computer.computer_run(state.run, input)
         "computer_read_file" -> Computer.computer_read_file(state.run, input)
         "computer_write_file" -> Computer.computer_write_file(state.run, input)
+        "computer_edit_file" -> Computer.computer_edit_file(state.run, input)
+        "computer_list_files" -> Computer.computer_list_files(state.run, input)
         "browser_open" -> Browser.browser_open(state.run, input, callback)
+        "browser_read_page" -> Browser.browser_read_page(state.run, input, callback)
         "browser_act" -> Browser.browser_act(state.run, input, callback)
         "browser_screenshot" -> Browser.browser_screenshot(state.run, input, callback)
         "handoff_to_agent" -> Handoff.handoff_to_agent(state.run, input)
@@ -238,7 +253,7 @@ defmodule VibeAgents.Tools.Executor do
 
     duration_ms = System.monotonic_time(:millisecond) - start
     failed? = tool_result_error?(result)
-    label = if failed?, do: "#{name} failed", else: "#{name} done"
+    label = if failed?, do: failure_label(name, result), else: "#{name} done"
     on_step.(label)
     emit_result(tool, callback, result, label, duration_ms)
     encoded_tool_result(tool, result)
@@ -311,6 +326,19 @@ defmodule VibeAgents.Tools.Executor do
     encoded_tool_result(tool, result)
   end
 
+  # This label is what the transcript shows, so a bare "failed" leaves the user with nothing.
+  defp failure_label(name, result) do
+    case failure_reason(result) do
+      nil -> "#{name} failed"
+      reason -> "#{name} failed — #{String.slice(reason, 0, 140)}"
+    end
+  end
+
+  defp failure_reason(%{"error" => %{"message" => message}}) when is_binary(message), do: message
+  defp failure_reason(%{"error" => reason}) when is_binary(reason), do: reason
+  defp failure_reason(%{"error" => reason}) when not is_nil(reason), do: inspect(reason)
+  defp failure_reason(_result), do: nil
+
   defp tool_error_envelope(code, message, opts) do
     %{
       "ok" => false,
@@ -381,6 +409,7 @@ defmodule VibeAgents.Tools.Executor do
     Events.emit(run, "run.approval.requested", %{
       "decisionId" => decision.id,
       "kind" => "approval",
+      "tool" => request["tool"],
       "title" => request["title"],
       "detail" => request["detail"],
       "risk" => request["risk"],

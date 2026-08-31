@@ -68,6 +68,41 @@ defmodule VibeWeb.AgentsController do
     end
   end
 
+  @doc "GET /api/agents/:id/computer/exec-log — owner-only terminal transcript."
+  def computer_exec_log(conn, %{"id" => id} = params) do
+    computer_read(conn, id, fn agent ->
+      Vibe.AgentGateway.computer_exec_log(agent.id, since: params["since"] || 0, limit: params["limit"] || 40)
+    end)
+  end
+
+  @doc "GET /api/agents/:id/computer/tree — owner-only directory listing."
+  def computer_tree(conn, %{"id" => id} = params) do
+    computer_read(conn, id, fn agent ->
+      Vibe.AgentGateway.computer_tree(agent.id, path: params["path"] || "", depth: params["depth"] || 2)
+    end)
+  end
+
+  @doc "GET /api/agents/:id/computer/file?path= — owner-only single file."
+  def computer_file(conn, %{"id" => id, "path" => path}) do
+    computer_read(conn, id, fn agent -> Vibe.AgentGateway.computer_file(agent.id, path) end)
+  end
+
+  def computer_file(conn, _params), do: conn |> put_status(:bad_request) |> json(%{error: "path_required"})
+
+  defp computer_read(conn, id, fun) do
+    user = conn.assigns.current_user
+
+    with %{} = agent <- Agents.get_agent(id, user.id),
+         true <- Vibe.AgentGateway.enabled?(),
+         {:ok, body} when is_map(body) <- fun.(agent) do
+      json(conn, body)
+    else
+      nil -> conn |> put_status(:not_found) |> json(%{error: "not_found"})
+      false -> conn |> put_status(:forbidden) |> json(%{error: "computer_not_available"})
+      _ -> conn |> put_status(:bad_gateway) |> json(%{error: "runtime_unavailable"})
+    end
+  end
+
   @doc "POST /api/agents/:id/computer/session — owner-only viewer session (docs/agent-computer-v1.md §3.2)."
   def computer_session(conn, %{"id" => id} = params) do
     user = conn.assigns.current_user

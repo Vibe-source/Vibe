@@ -1,7 +1,7 @@
 import UIKit
 
-/// The live Computer sheet (agent-computer-v1 §2): Screen is live in this slice,
-/// Terminal and Files are labelled placeholders until their phase lands.
+/// The live Computer sheet (agent-computer-v1 §2): Screen streams frames, Terminal replays
+/// the shell the agent ran, Files browses its disk. Terminal and Files are read-only.
 @available(iOS 13.0, *)
 final class VibeAgentComputerViewController: UIViewController {
 
@@ -22,8 +22,8 @@ final class VibeAgentComputerViewController: UIViewController {
   private let tabControl = UISegmentedControl(items: ["Screen", "Terminal", "Files"])
 
   private let screenContainer = UIView()
-  private let terminalPlaceholder = VibeAgentComputerPlaceholderView()
-  private let filesPlaceholder = VibeAgentComputerPlaceholderView()
+  private let terminalView = VibeAgentComputerTerminalView()
+  private let filesView = VibeAgentComputerFilesView()
 
   // Natively drawn browser chrome — a 12pt captured browser control is untappable on a
   // phone, so the URL pill, title, load bar and LIVE dot are real views over the pixels.
@@ -51,6 +51,8 @@ final class VibeAgentComputerViewController: UIViewController {
   private var linkUp = false
   private var endedReason: String?
   private var hasFrame = false
+  private var terminalTimer: Timer?
+  private var loadedFilesOnce = false
 
   init(
     session: VibeAgentComputerSession,
@@ -67,6 +69,7 @@ final class VibeAgentComputerViewController: UIViewController {
   required init?(coder: NSCoder) { return nil }
 
   deinit {
+    terminalTimer?.invalidate()
     for observer in keyboardObservers { NotificationCenter.default.removeObserver(observer) }
   }
 
@@ -75,7 +78,7 @@ final class VibeAgentComputerViewController: UIViewController {
     view.backgroundColor = appearance.background
     buildHeader()
     buildScreenTab()
-    buildPlaceholders()
+    buildTabs()
     layout()
     observeKeyboard()
     wireSession()
@@ -87,6 +90,7 @@ final class VibeAgentComputerViewController: UIViewController {
   override func viewDidDisappear(_ animated: Bool) {
     super.viewDidDisappear(animated)
     // The sheet is the session's whole lifetime: leaving it can never leave a poller up.
+    setTerminalPolling(false)
     if isBeingDismissed || presentingViewController == nil { session.stop() }
   }
 
@@ -223,23 +227,47 @@ final class VibeAgentComputerViewController: UIViewController {
     view.addSubview(screenContainer)
   }
 
-  private func buildPlaceholders() {
-    terminalPlaceholder.configure(
-      appearance: appearance,
-      glyph: "terminal",
-      title: "Terminal",
-      body: "The read-only console of the agent's `computer_run` commands lands with the "
-        + "Terminal phase. Nothing is recorded here yet.")
-    filesPlaceholder.configure(
-      appearance: appearance,
-      glyph: "folder",
-      title: "Files",
-      body: "A read-only browser for the agent's /home/agent volume lands with the Files "
-        + "phase. Nothing is listed here yet.")
-    terminalPlaceholder.translatesAutoresizingMaskIntoConstraints = false
-    filesPlaceholder.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(terminalPlaceholder)
-    view.addSubview(filesPlaceholder)
+  private func buildTabs() {
+    terminalView.apply(appearance: appearance)
+    filesView.apply(appearance: appearance)
+    filesView.onOpenDirectory = { [weak self] path in self?.loadDirectory(path) }
+    filesView.onOpenFile = { [weak self] path in self?.loadFile(path) }
+    terminalView.translatesAutoresizingMaskIntoConstraints = false
+    filesView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(terminalView)
+    view.addSubview(filesView)
+  }
+
+  // MARK: - Terminal + Files
+
+  private func refreshTerminal() {
+    session.fetchExecLog(since: terminalView.latestSeq) { [weak self] entries in
+      self?.terminalView.merge(entries)
+    }
+  }
+
+  private func loadDirectory(_ path: String) {
+    filesView.beginLoading()
+    session.fetchTree(path: path) { [weak self] entries in
+      self?.filesView.apply(directory: path, entries: entries)
+    }
+  }
+
+  private func loadFile(_ path: String) {
+    session.fetchFile(path: path) { [weak self] contents in
+      self?.filesView.showFile(name: (path as NSString).lastPathComponent, contents: contents)
+    }
+  }
+
+  /// Polls only while the Terminal tab is up; the sheet is otherwise a pure push surface.
+  private func setTerminalPolling(_ on: Bool) {
+    terminalTimer?.invalidate()
+    terminalTimer = nil
+    guard on else { return }
+    refreshTerminal()
+    terminalTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+      self?.refreshTerminal()
+    }
   }
 
   private func layout() {
@@ -343,12 +371,12 @@ final class VibeAgentComputerViewController: UIViewController {
       stopButton.widthAnchor.constraint(equalTo: controlButton.widthAnchor, multiplier: 0.55),
     ])
 
-    for placeholder in [terminalPlaceholder, filesPlaceholder] {
+    for panel in [terminalView, filesView] as [UIView] {
       NSLayoutConstraint.activate([
-        placeholder.topAnchor.constraint(equalTo: tabControl.bottomAnchor, constant: 12.0),
-        placeholder.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16.0),
-        placeholder.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16.0),
-        placeholder.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16.0),
+        panel.topAnchor.constraint(equalTo: tabControl.bottomAnchor, constant: 12.0),
+        panel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16.0),
+        panel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16.0),
+        panel.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16.0),
       ])
     }
   }
@@ -473,8 +501,13 @@ final class VibeAgentComputerViewController: UIViewController {
 
   private func applyTab(_ tab: Tab) {
     screenContainer.isHidden = tab != .screen
-    terminalPlaceholder.isHidden = tab != .terminal
-    filesPlaceholder.isHidden = tab != .files
+    terminalView.isHidden = tab != .terminal
+    filesView.isHidden = tab != .files
+    setTerminalPolling(tab == .terminal)
+    if tab == .files, !loadedFilesOnce {
+      loadedFilesOnce = true
+      loadDirectory(filesView.directory)
+    }
     if tab != .screen { viewportView.resignFirstResponder() }
   }
 
@@ -673,57 +706,305 @@ final class VibeAgentComputerViewportView: UIView, UIKeyInput {
   }
 }
 
-/// The Terminal / Files tabs before their phase ships: visible and named, never fake data.
+/// Read-only transcript of the shell the agent ran on this machine, newest last.
 @available(iOS 13.0, *)
-final class VibeAgentComputerPlaceholderView: UIView {
+final class VibeAgentComputerTerminalView: UIView {
 
-  private let glyphView = UIImageView()
-  private let titleLabel = UILabel()
-  private let bodyLabel = UILabel()
-  private let stack = UIStackView()
+  private let textView = UITextView()
+  private let emptyLabel = UILabel()
+  private var appearance: VibeAgentKitChatAppearance?
+  private var entries: [VibeAgentComputerSession.ExecEntry] = []
 
   override init(frame: CGRect) {
     super.init(frame: frame)
-    glyphView.contentMode = .scaleAspectFit
-    glyphView.translatesAutoresizingMaskIntoConstraints = false
-    titleLabel.font = .systemFont(ofSize: 16.0, weight: .semibold)
-    titleLabel.textAlignment = .center
-    bodyLabel.font = .systemFont(ofSize: 13.0, weight: .regular)
-    bodyLabel.textAlignment = .center
-    bodyLabel.numberOfLines = 0
+    layer.cornerRadius = 18.0
+    layer.borderWidth = 1.0
+    clipsToBounds = true
 
-    stack.axis = .vertical
-    stack.alignment = .center
-    stack.spacing = 10.0
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    stack.addArrangedSubview(glyphView)
-    stack.addArrangedSubview(titleLabel)
-    stack.addArrangedSubview(bodyLabel)
-    addSubview(stack)
+    textView.isEditable = false
+    textView.isSelectable = true
+    textView.alwaysBounceVertical = true
+    textView.backgroundColor = .clear
+    textView.textContainerInset = UIEdgeInsets(top: 14.0, left: 12.0, bottom: 14.0, right: 12.0)
+    textView.translatesAutoresizingMaskIntoConstraints = false
 
+    emptyLabel.text = "No commands yet. What the agent runs here shows up live."
+    emptyLabel.font = .systemFont(ofSize: 13.0)
+    emptyLabel.textAlignment = .center
+    emptyLabel.numberOfLines = 0
+    emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(textView)
+    addSubview(emptyLabel)
     NSLayoutConstraint.activate([
-      glyphView.widthAnchor.constraint(equalToConstant: 30.0),
-      glyphView.heightAnchor.constraint(equalToConstant: 30.0),
-      stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24.0),
-      stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24.0),
+      textView.topAnchor.constraint(equalTo: topAnchor),
+      textView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      textView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      emptyLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      emptyLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24.0),
+      emptyLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24.0),
     ])
   }
 
   required init?(coder: NSCoder) { return nil }
 
-  func configure(
-    appearance: VibeAgentKitChatAppearance, glyph: String, title: String, body: String
-  ) {
-    layer.cornerRadius = 18.0
-    layer.borderWidth = 1.0
+  func apply(appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
     layer.borderColor = vibeAgentKitColorWithAlpha(appearance.border, 0.6).cgColor
     backgroundColor = vibeAgentKitColorWithAlpha(appearance.surface, 0.6)
-    glyphView.image = UIImage(systemName: glyph)
-    glyphView.tintColor = vibeAgentKitColorWithAlpha(appearance.textTertiary, 0.9)
-    titleLabel.text = title
-    titleLabel.textColor = appearance.text
-    bodyLabel.text = body
-    bodyLabel.textColor = appearance.textSecondary
+    emptyLabel.textColor = appearance.textSecondary
+    textView.indicatorStyle = appearance.isDark ? .white : .black
+    render()
+  }
+
+  /// Merges by seq so a poll that overlaps the last one never doubles a line.
+  func merge(_ incoming: [VibeAgentComputerSession.ExecEntry]) {
+    guard !incoming.isEmpty else { return }
+    var byId = Dictionary(uniqueKeysWithValues: entries.map { ($0.seq, $0) })
+    for entry in incoming { byId[entry.seq] = entry }
+    entries = byId.values.sorted { $0.seq < $1.seq }
+    render()
+  }
+
+  var latestSeq: Int { entries.last?.seq ?? 0 }
+
+  private func render() {
+    guard let appearance else { return }
+    emptyLabel.isHidden = !entries.isEmpty
+    let mono = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .regular)
+    let bold = UIFont.monospacedSystemFont(ofSize: 12.0, weight: .semibold)
+    let output = NSMutableAttributedString()
+
+    for entry in entries {
+      let failed = entry.exitCode != 0
+      output.append(
+        NSAttributedString(
+          string: "$ \(entry.cmd)\n",
+          attributes: [.font: bold, .foregroundColor: appearance.primary]))
+      let body = [entry.stdout, entry.stderr].filter { !$0.isEmpty }.joined(separator: "\n")
+      if !body.isEmpty {
+        output.append(
+          NSAttributedString(
+            string: body.hasSuffix("\n") ? body : body + "\n",
+            attributes: [
+              .font: mono,
+              .foregroundColor: failed ? UIColor.systemRed : appearance.textSecondary,
+            ]))
+      }
+      output.append(
+        NSAttributedString(
+          string: "exit \(entry.exitCode) · \(entry.durationMs)ms\n\n",
+          attributes: [
+            .font: mono,
+            .foregroundColor: failed ? UIColor.systemRed : appearance.textTertiary,
+          ]))
+    }
+
+    let wasAtBottom = textView.contentOffset.y >= textView.contentSize.height - textView.bounds.height - 40.0
+    textView.attributedText = output
+    if wasAtBottom, output.length > 0 {
+      textView.scrollRangeToVisible(NSRange(location: output.length - 1, length: 1))
+    }
+  }
+}
+
+/// Read-only browser for the machine's disk: one directory at a time, tap a file to read it.
+@available(iOS 13.0, *)
+final class VibeAgentComputerFilesView: UIView, UITableViewDataSource, UITableViewDelegate {
+
+  var onOpenDirectory: ((String) -> Void)?
+  var onOpenFile: ((String) -> Void)?
+
+  private let pathLabel = UILabel()
+  private let upButton = UIButton(type: .system)
+  private let table = UITableView(frame: .zero, style: .plain)
+  private let emptyLabel = UILabel()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let preview = UITextView()
+  private let previewBar = UIView()
+  private let previewName = UILabel()
+  private let previewClose = UIButton(type: .system)
+
+  private var appearance: VibeAgentKitChatAppearance?
+  private var entries: [VibeAgentComputerSession.FileEntry] = []
+  private(set) var directory = "/home/agent"
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    layer.cornerRadius = 18.0
+    layer.borderWidth = 1.0
+    clipsToBounds = true
+
+    pathLabel.font = .monospacedSystemFont(ofSize: 12.0, weight: .medium)
+    pathLabel.lineBreakMode = .byTruncatingHead
+    pathLabel.translatesAutoresizingMaskIntoConstraints = false
+    upButton.setImage(UIImage(systemName: "arrow.up.left"), for: .normal)
+    upButton.accessibilityLabel = "Parent folder"
+    upButton.addTarget(self, action: #selector(upTapped), for: .touchUpInside)
+    upButton.translatesAutoresizingMaskIntoConstraints = false
+
+    table.dataSource = self
+    table.delegate = self
+    table.backgroundColor = .clear
+    table.separatorInset = UIEdgeInsets(top: 0.0, left: 44.0, bottom: 0.0, right: 0.0)
+    table.rowHeight = 44.0
+    table.translatesAutoresizingMaskIntoConstraints = false
+
+    emptyLabel.text = "Nothing here yet."
+    emptyLabel.font = .systemFont(ofSize: 13.0)
+    emptyLabel.textAlignment = .center
+    emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+    spinner.hidesWhenStopped = true
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+
+    previewBar.translatesAutoresizingMaskIntoConstraints = false
+    previewName.font = .monospacedSystemFont(ofSize: 12.0, weight: .semibold)
+    previewName.lineBreakMode = .byTruncatingHead
+    previewName.translatesAutoresizingMaskIntoConstraints = false
+    previewClose.setImage(UIImage(systemName: "xmark"), for: .normal)
+    previewClose.accessibilityLabel = "Close file"
+    previewClose.addTarget(self, action: #selector(closePreview), for: .touchUpInside)
+    previewClose.translatesAutoresizingMaskIntoConstraints = false
+    preview.isEditable = false
+    preview.backgroundColor = .clear
+    preview.font = .monospacedSystemFont(ofSize: 12.0, weight: .regular)
+    preview.textContainerInset = UIEdgeInsets(top: 10.0, left: 12.0, bottom: 14.0, right: 12.0)
+    preview.translatesAutoresizingMaskIntoConstraints = false
+    previewBar.isHidden = true
+    preview.isHidden = true
+
+    for child in [pathLabel, upButton, table, emptyLabel, spinner, previewBar, preview] {
+      addSubview(child)
+    }
+    previewBar.addSubview(previewName)
+    previewBar.addSubview(previewClose)
+
+    NSLayoutConstraint.activate([
+      upButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10.0),
+      upButton.topAnchor.constraint(equalTo: topAnchor, constant: 10.0),
+      upButton.widthAnchor.constraint(equalToConstant: 28.0),
+      upButton.heightAnchor.constraint(equalToConstant: 28.0),
+      pathLabel.leadingAnchor.constraint(equalTo: upButton.trailingAnchor, constant: 8.0),
+      pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12.0),
+      pathLabel.centerYAnchor.constraint(equalTo: upButton.centerYAnchor),
+
+      table.topAnchor.constraint(equalTo: upButton.bottomAnchor, constant: 8.0),
+      table.leadingAnchor.constraint(equalTo: leadingAnchor),
+      table.trailingAnchor.constraint(equalTo: trailingAnchor),
+      table.bottomAnchor.constraint(equalTo: bottomAnchor),
+      emptyLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      emptyLabel.centerYAnchor.constraint(equalTo: table.centerYAnchor),
+      spinner.centerXAnchor.constraint(equalTo: centerXAnchor),
+      spinner.centerYAnchor.constraint(equalTo: table.centerYAnchor),
+
+      previewBar.topAnchor.constraint(equalTo: table.topAnchor),
+      previewBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+      previewBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+      previewBar.heightAnchor.constraint(equalToConstant: 34.0),
+      previewName.leadingAnchor.constraint(equalTo: previewBar.leadingAnchor, constant: 12.0),
+      previewName.centerYAnchor.constraint(equalTo: previewBar.centerYAnchor),
+      previewClose.leadingAnchor.constraint(
+        greaterThanOrEqualTo: previewName.trailingAnchor, constant: 8.0),
+      previewClose.trailingAnchor.constraint(equalTo: previewBar.trailingAnchor, constant: -10.0),
+      previewClose.centerYAnchor.constraint(equalTo: previewBar.centerYAnchor),
+      preview.topAnchor.constraint(equalTo: previewBar.bottomAnchor),
+      preview.leadingAnchor.constraint(equalTo: leadingAnchor),
+      preview.trailingAnchor.constraint(equalTo: trailingAnchor),
+      preview.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) { return nil }
+
+  func apply(appearance: VibeAgentKitChatAppearance) {
+    self.appearance = appearance
+    layer.borderColor = vibeAgentKitColorWithAlpha(appearance.border, 0.6).cgColor
+    backgroundColor = vibeAgentKitColorWithAlpha(appearance.surface, 0.6)
+    pathLabel.textColor = appearance.textSecondary
+    upButton.tintColor = appearance.textSecondary
+    emptyLabel.textColor = appearance.textSecondary
+    spinner.color = appearance.textSecondary
+    table.separatorColor = vibeAgentKitColorWithAlpha(appearance.border, 0.5)
+    previewBar.backgroundColor = vibeAgentKitColorWithAlpha(appearance.surfaceElevated, 0.9)
+    previewName.textColor = appearance.text
+    previewClose.tintColor = appearance.textSecondary
+    preview.textColor = appearance.textSecondary
+    preview.backgroundColor = vibeAgentKitColorWithAlpha(appearance.background, 0.9)
+    table.reloadData()
+  }
+
+  func beginLoading() {
+    spinner.startAnimating()
+    emptyLabel.isHidden = true
+  }
+
+  func apply(directory: String, entries: [VibeAgentComputerSession.FileEntry]) {
+    spinner.stopAnimating()
+    self.directory = directory
+    self.entries = entries.sorted {
+      $0.isDirectory == $1.isDirectory ? $0.name < $1.name : $0.isDirectory
+    }
+    pathLabel.text = directory
+    upButton.isEnabled = directory != "/"
+    emptyLabel.isHidden = !self.entries.isEmpty
+    table.reloadData()
+  }
+
+  func showFile(name: String, contents: String?) {
+    previewName.text = name
+    preview.text = contents ?? "This file is not text, or is too large to show here."
+    previewBar.isHidden = false
+    preview.isHidden = false
+  }
+
+  @objc private func closePreview() {
+    previewBar.isHidden = true
+    preview.isHidden = true
+  }
+
+  @objc private func upTapped() {
+    guard directory != "/" else { return }
+    closePreview()
+    onOpenDirectory?((directory as NSString).deletingLastPathComponent)
+  }
+
+  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    return entries.count
+  }
+
+  func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell =
+      tableView.dequeueReusableCell(withIdentifier: "file")
+      ?? UITableViewCell(style: .value1, reuseIdentifier: "file")
+    let entry = entries[indexPath.row]
+    cell.backgroundColor = .clear
+    cell.textLabel?.text = entry.name
+    cell.textLabel?.font = .systemFont(ofSize: 14.0)
+    cell.textLabel?.textColor = appearance?.text
+    cell.detailTextLabel?.text = entry.isDirectory ? nil : Self.size(entry.bytes)
+    cell.detailTextLabel?.font = .monospacedSystemFont(ofSize: 11.0, weight: .regular)
+    cell.detailTextLabel?.textColor = appearance?.textTertiary
+    cell.imageView?.image = UIImage(systemName: entry.isDirectory ? "folder" : "doc.text")
+    cell.imageView?.tintColor = appearance?.textSecondary
+    cell.accessoryType = entry.isDirectory ? .disclosureIndicator : .none
+    return cell
+  }
+
+  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: true)
+    let entry = entries[indexPath.row]
+    if entry.isDirectory {
+      closePreview()
+      onOpenDirectory?(entry.path)
+    } else {
+      onOpenFile?(entry.path)
+    }
+  }
+
+  private static func size(_ bytes: Int) -> String {
+    if bytes < 1024 { return "\(bytes) B" }
+    if bytes < 1024 * 1024 { return String(format: "%.0f KB", Double(bytes) / 1024.0) }
+    return String(format: "%.1f MB", Double(bytes) / 1024.0 / 1024.0)
   }
 }

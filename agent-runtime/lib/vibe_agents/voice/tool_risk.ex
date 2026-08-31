@@ -9,8 +9,8 @@ defmodule VibeAgents.Voice.ToolRisk do
   @type risk :: :read | :write_local | :external_effect | :credential
   @type outcome :: :run | :approval | :ask_user | :plan_only
 
-  @read ~w(search_google read_url computer_read_file browser_screenshot recall)
-  @write_local ~w(computer_run computer_write_file browser_open browser_act handoff_to_agent remember)
+  @read ~w(search_google read_url computer_read_file computer_list_files browser_screenshot browser_read_page recall)
+  @write_local ~w(computer_run computer_write_file computer_edit_file browser_open browser_act handoff_to_agent remember)
 
   # No frozen tool name is external_effect/credential by name alone (Broker derives those
   # from content); ask_user and request_approval are handled by the caller before this.

@@ -56,7 +56,7 @@ defmodule VibeAgents.Runs.Loop do
       model: model_id(run),
       thinking_level: profile["thinkingLevel"] || "medium",
       max_depth: Application.get_env(:vibe_agents, :max_steps, 24),
-      system_prompt: Policy.system_prompt(profile, capabilities),
+      system_prompt: Policy.system_prompt(profile, capabilities, run.context || %{}),
       tools: Catalog.specs(profile, capabilities),
       execute_tools: &Executor.execute/3,
       state: state,

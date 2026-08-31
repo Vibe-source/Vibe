@@ -145,7 +145,7 @@ pub struct HostConfigOpts<'a> {
 /// read-only rootfs + tmpfs `/tmp`, the owner's named volume at `/home/agent`, resource caps.
 pub fn build_host_config(opts: HostConfigOpts) -> HostConfig {
     let mut tmpfs = HashMap::new();
-    tmpfs.insert("/tmp".to_string(), "size=512m".to_string());
+    tmpfs.insert("/tmp".to_string(), "size=512m,nosuid,nodev".to_string());
 
     let network_mode = match opts.network {
         NetworkMode::None => "none".to_string(),
@@ -376,7 +376,7 @@ mod tests {
             Some(vec!["no-new-privileges:true".to_string()])
         );
         assert_eq!(hc.readonly_rootfs, Some(true));
-        assert_eq!(hc.tmpfs.unwrap().get("/tmp").unwrap(), "size=512m");
+        assert_eq!(hc.tmpfs.unwrap().get("/tmp").unwrap(), "size=512m,nosuid,nodev");
         assert_eq!(
             hc.binds,
             Some(vec!["vibe-sandbox-abc:/home/agent".to_string()])

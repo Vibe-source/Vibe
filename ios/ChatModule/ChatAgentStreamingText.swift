@@ -3340,13 +3340,14 @@ final class ChatNativeStreamingTextLabel: UITextView {
   }
 }
 
-/// One-line "the agent is browsing X" band under an agent turn (agent-computer-v1 §2).
-/// Fixed height on purpose — see `agentTurnComputerBandHeight` and docs/row-height-formulas.md §1.5.
+/// One-line "what the agent's computer is doing" band under an agent turn — browser host
+/// + page, or terminal + command. Fixed height; see docs/row-height-formulas.md §1.5.
 final class AgentComputerBandView: UIControl {
   private let plateView = UIView()
   private let glyphView = UIImageView()
-  private let hostLabel = UILabel()
-  private let titleLabel = UILabel()
+  private let primaryLabel = UILabel()
+  private let secondaryLabel = UILabel()
+  private let controlChip = UILabel()
   private let liveDot = UIView()
 
   override init(frame: CGRect) {
@@ -3361,13 +3362,20 @@ final class AgentComputerBandView: UIControl {
     glyphView.contentMode = .scaleAspectFit
     plateView.addSubview(glyphView)
 
-    hostLabel.font = .systemFont(ofSize: 12.0, weight: .semibold)
-    hostLabel.lineBreakMode = .byTruncatingTail
-    plateView.addSubview(hostLabel)
+    primaryLabel.font = .systemFont(ofSize: 12.0, weight: .semibold)
+    primaryLabel.lineBreakMode = .byTruncatingTail
+    plateView.addSubview(primaryLabel)
 
-    titleLabel.font = .systemFont(ofSize: 12.0, weight: .regular)
-    titleLabel.lineBreakMode = .byTruncatingTail
-    plateView.addSubview(titleLabel)
+    secondaryLabel.font = .systemFont(ofSize: 12.0, weight: .regular)
+    secondaryLabel.lineBreakMode = .byTruncatingTail
+    plateView.addSubview(secondaryLabel)
+
+    controlChip.font = .systemFont(ofSize: 10.0, weight: .semibold)
+    controlChip.text = "Take control"
+    controlChip.textAlignment = .center
+    controlChip.layer.cornerRadius = 8.0
+    controlChip.clipsToBounds = true
+    plateView.addSubview(controlChip)
 
     liveDot.layer.cornerRadius = 3.0
     liveDot.backgroundColor = UIColor(red: 0.16, green: 0.78, blue: 0.45, alpha: 1.0)
@@ -3376,15 +3384,22 @@ final class AgentComputerBandView: UIControl {
 
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-  func configure(host: String, title: String, live: Bool, appearance: VibeAgentKitChatAppearance) {
+  func configure(
+    isShell: Bool, primary: String, secondary: String, live: Bool, showsTakeControl: Bool,
+    appearance: VibeAgentKitChatAppearance
+  ) {
     plateView.backgroundColor = appearance.surfaceElevated
     plateView.layer.borderColor = appearance.border.cgColor
+    glyphView.image = UIImage(systemName: isShell ? "terminal" : "globe")
     glyphView.tintColor = appearance.textSecondary
-    hostLabel.textColor = appearance.text
-    hostLabel.text = host
-    titleLabel.textColor = appearance.textTertiary
-    titleLabel.text = title
-    titleLabel.isHidden = title.isEmpty
+    primaryLabel.textColor = appearance.text
+    primaryLabel.text = primary
+    secondaryLabel.textColor = appearance.textTertiary
+    secondaryLabel.text = secondary
+    secondaryLabel.isHidden = secondary.isEmpty
+    controlChip.isHidden = !showsTakeControl
+    controlChip.textColor = appearance.primary
+    controlChip.backgroundColor = vibeAgentKitColorWithAlpha(appearance.primary, 0.16)
     liveDot.isHidden = !live
   }
 
@@ -3401,12 +3416,20 @@ final class AgentComputerBandView: UIControl {
       liveDot.frame = CGRect(x: trailing - 6.0, y: midY - 3.0, width: 6.0, height: 6.0)
       trailing = liveDot.frame.minX - 6.0
     }
+    if controlChip.isHidden {
+      controlChip.frame = .zero
+    } else {
+      let chipWidth = ceil(controlChip.intrinsicContentSize.width) + 12.0
+      controlChip.frame = CGRect(
+        x: trailing - chipWidth, y: midY - 8.0, width: chipWidth, height: 16.0)
+      trailing = controlChip.frame.minX - 6.0
+    }
     var x = glyphView.frame.maxX + 6.0
-    let hostWidth = min(
-      ceil(hostLabel.intrinsicContentSize.width), max(0.0, trailing - x))
-    hostLabel.frame = CGRect(x: x, y: 0.0, width: hostWidth, height: bounds.height)
-    x = hostLabel.frame.maxX + 6.0
-    titleLabel.frame = CGRect(
+    let primaryWidth = min(
+      ceil(primaryLabel.intrinsicContentSize.width), max(0.0, trailing - x))
+    primaryLabel.frame = CGRect(x: x, y: 0.0, width: primaryWidth, height: bounds.height)
+    x = primaryLabel.frame.maxX + 6.0
+    secondaryLabel.frame = CGRect(
       x: x, y: 0.0, width: max(0.0, trailing - x), height: bounds.height)
   }
 }

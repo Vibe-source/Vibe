@@ -123,6 +123,8 @@ struct ChatListRow {
     /// Plaintext detail body (Grok exposed CoT, compacting notes). Live path may ship
     /// this without encrypted agentActionsEnc; tap thinking opens a sheet with it.
     var detail: String? = nil
+    /// Runtime tool name (`computer_run`, `browser_open`, …) — anchors the computer band.
+    var tool: String? = nil
   }
 
   struct AgentRuntimeCommand: Equatable {
@@ -1970,7 +1972,8 @@ private func parseAgentProgressNodes(_ raw: Any?) -> [ChatListRow.AgentProgressN
       tokens: parseLong(item["tokens"]).map { Int($0) },
       durationMs: parseLong(item["durationMs"]).map { Int($0) },
       action: parseNonEmptyString(item["action"]),
-      detail: detail
+      detail: detail,
+      tool: parseNonEmptyString(item["tool"])?.lowercased()
     )
   }
 

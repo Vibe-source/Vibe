@@ -102,7 +102,7 @@ there is no bottom padding (full-bleed media, sticker).
 | **Kind** | `agentSystemDividerText(for: row) != nil` **or** `agentErrorNoticeText(for: row) != nil` — covers: `agentMsgKind == "summary"` → "Context compacted"; group membership / decision notices (`groupSystemNoticeText`); interrupted turns; `isAgentError` settled humanized error (`ChatListViewCells.swift:2186–2304`) |
 | **Entry** | Seed: `presentationSeedMessageHeight` `:13942–13943`. Exact: `estimateMessageHeight` `:14103–14104`. Both skip `measureMessageBubbleLayout`. |
 | **Inputs** | `row.serviceMessage?.hasLiveActions` |
-| **Formula** | `height = 36.0 + serviceDecisionActionsHeight(row)` where `serviceDecisionActionsHeight` = `40.0` if live decision actions else `0` (`:2301–2304`) → **36** or **76** |
+| **Formula** | `height = 36.0 + serviceDecisionActionsHeight(row)` where `serviceDecisionActionsHeight` = `0` with no live actions, else `40.0 + ChatServiceDecisionCardView.height(risk:detail:)` (risk chip `20+6`, monospaced detail block `54+6`) → **36**, **76**, **102**, **136** or **162** |
 | **UIView dependency** | none |
 | **Notes** | Seed and exact **agree**. Not a bubble. |
 
@@ -160,12 +160,12 @@ bubbleHeight = (isLiveStreaming
 bubbleWidth = max(26, contentWidth + 14*2)
 ```
 
-**Computer band (agent-computer-v1 §2)** — a one-line "browsing `<host>` · `<title>`" plate
-under the turn body, shown while that chat has a live agent computer.
+**Computer band (agent-computer-v1 §2)** — a one-line plate under the turn body: browser
+host + page title, or terminal + command label. Live for the running turn, frozen after.
 
 | Field | Value |
 |---|---|
-| **Predicate** | `agentTurnComputerBandState(row)` (`ChatListViewCells.swift`): agent-turn row **and** live (`isStreamingText \|\| agentTurnRowCouldBeLive`) **and** `ChatEngine.latestAgentComputer(chatId:)?.live` with a non-empty host. Scoped to the live turn so a computer going live resizes one row, not the transcript. |
+| **Predicate** | `agentTurnComputerBandState(row)` (`ChatListViewCells.swift`) → `AgentTurnComputerBand?`. Live arm: agent-turn row **and** `agentTurnRowCouldBeLive` **and** `ChatEngine.latestAgentComputer(chatId:)` with a non-empty host (browser) or title (shell). Frozen arm: the turn's own last `computer_*` / `browser_*` progress node, dot off. |
 | **Constant** | `agentTurnComputerBandTopGap (8) + agentTurnComputerBandHeight (26)` = **34**, via `agentTurnComputerBandReserve(row)` |
 | **Applied at** | (1) `measureMessageBubbleLayout` agent-turn arm, added **after** `agentTurnStreamingReservedHeight` so the 48pt block never swallows it. (2) `ChatListView.presentationSeedMessageHeight` settled-agent estimate (`52 + band`, and `min(430, …) + band`) — same helper, so the two paths cannot drift. |
 | **UIView dependency** | none. The band is a **sibling of** `VibeAgentTurnContentView` in `ChatListCell`, not a subview of it, so it never enters the offscreen sizing template and stays a pure constant in both paths. |
@@ -681,7 +681,7 @@ Not in the first-paint formula but invalidates pure heights later: natural media
 | `bubbleUsesAgentTurnContent` | agent shell vs text | `ChatListViewCells.swift:2153` |
 | `agentTurnRowIsNativePlainProse` | native prose → text path | `:2142` |
 | `agentSystemDividerText` / `agentErrorNoticeText` | pill | `:2186`, `:2224` |
-| `serviceDecisionActionsHeight` | +40 under pill | `:2301` |
+| `serviceDecisionActionsHeight` | +40 under pill, plus the approval card | `:2301` |
 | `usesAudioMetadataVoiceLayout` | music file vs voice | `:1996` |
 | `hasMediaCaptionLayout` | caption under media | `:2076` |
 | `usesFullBleedMediaLayout` | no caption chrome | `:2908` |
@@ -691,7 +691,7 @@ Not in the first-paint formula but invalidates pure heights later: natural media
 | `bubbleUsesBlockLayout` | rich blocks | `:3289` |
 | `bubbleRowPreviewHeight` | link/music card H | `:3392` |
 | `agentTurnContentWidth` | hug vs full | `:4584` |
-| `agentTurnComputerBandState` | live computer for this turn | `ChatListViewCells.swift` |
+| `agentTurnComputerBandState` | live or frozen computer for this turn | `ChatListViewCells.swift` |
 | `agentTurnComputerBandReserve` | +0 / +34 in both height paths | same |
 | `agentTurnRowCouldBeLive` | live flag | `:4389` |
 | `groupMeasurementExtras` | width + extraTop | `ChatListView.swift:1925` |

@@ -79,6 +79,34 @@ pub struct ExecResponse {
     pub error: Option<String>,
 }
 
+/// One recorded shell run, kept in memory so the owner can watch what the agent typed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecLogEntry {
+    pub seq: u64,
+    pub cmd: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(rename = "exitCode")]
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+    #[serde(rename = "durationMs")]
+    pub duration_ms: u64,
+    #[serde(rename = "startedAt")]
+    pub started_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecLogResponse {
+    pub entries: Vec<ExecLogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecLogQuery {
+    pub since: Option<u64>,
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WriteFileRequest {
     pub path: String,
