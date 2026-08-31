@@ -4,12 +4,13 @@
 #
 #   cat ~/.cloudflared/<UUID>.json | ssh vibe-vps 'sudo /opt/vibe/deploy/scripts/tunnel-install.sh'
 #
-# Options: --domain <zone>, --origin <host:port>, --no-firewall
+# Options: --domain <zone>, --origin <host:port>, --no-firewall, --firewall-only
 set -euo pipefail
 
 DOMAIN=vibegram.io
 ORIGIN=127.0.0.1:8080
 NO_FIREWALL=""
+FIREWALL_ONLY=""
 REPO=/opt/vibe
 ENV_DIR=$REPO/deploy/env
 CRED=$ENV_DIR/tunnel.json.cred
@@ -19,12 +20,40 @@ while [ $# -gt 0 ]; do
     --domain)      DOMAIN="${2:?--domain needs a zone}"; shift 2 ;;
     --origin)      ORIGIN="${2:?--origin needs host:port}"; shift 2 ;;
     --no-firewall) NO_FIREWALL=1; shift ;;
+    --firewall-only) FIREWALL_ONLY=1; shift ;;
     -h|--help)     sed -n '2,8p' "$0"; exit 0 ;;
     *)             echo "tunnel-install: unknown option: $1" >&2; exit 1 ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "tunnel-install: run with sudo" >&2; exit 1; }
+
+lock_firewall() {
+  echo "==> firewall"
+  ufw --force default deny incoming >/dev/null
+  # Outbound is denied too: a box that can dial anywhere can be made to dial anywhere.
+  ufw --force default deny outgoing >/dev/null
+  ufw allow out 53 >/dev/null
+  ufw allow out 80/tcp >/dev/null
+  ufw allow out 443/tcp >/dev/null
+  ufw allow out 7844 >/dev/null
+  ufw allow out 587/tcp >/dev/null
+  ufw allow out 465/tcp >/dev/null
+  ufw allow out on lo >/dev/null
+  ufw allow in on lo >/dev/null
+  ufw limit OpenSSH >/dev/null 2>&1 || ufw limit 22/tcp >/dev/null
+  ufw delete allow 80/tcp >/dev/null 2>&1 || true
+  ufw delete allow 443/tcp >/dev/null 2>&1 || true
+  ufw --force enable >/dev/null
+  echo "    inbound: SSH only (rate limited). outbound: DNS, 80, 443, 7844, 587, 465."
+}
+
+if [ -n "$FIREWALL_ONLY" ]; then
+  command -v ufw >/dev/null || { echo "tunnel-install: ufw is not installed" >&2; exit 1; }
+  lock_firewall
+  exit 0
+fi
+
 [ -t 0 ] && { echo "tunnel-install: pipe the tunnel credentials JSON on stdin" >&2; exit 1; }
 
 tmp="$(mktemp -d /dev/shm/tun.XXXXXX)"
@@ -73,23 +102,7 @@ systemctl enable --now cloudflared >/dev/null 2>&1 || true
 systemctl restart cloudflared
 
 if [ -z "$NO_FIREWALL" ] && command -v ufw >/dev/null; then
-  echo "==> firewall"
-  ufw --force default deny incoming >/dev/null
-  # Outbound is denied too: a box that can dial anywhere can be made to dial anywhere.
-  ufw --force default deny outgoing >/dev/null
-  ufw allow out 53 >/dev/null
-  ufw allow out 80/tcp >/dev/null
-  ufw allow out 443/tcp >/dev/null
-  ufw allow out 7844 >/dev/null
-  ufw allow out 587/tcp >/dev/null
-  ufw allow out 465/tcp >/dev/null
-  ufw allow out on lo >/dev/null
-  ufw allow in on lo >/dev/null
-  ufw limit OpenSSH >/dev/null 2>&1 || ufw limit 22/tcp >/dev/null
-  ufw delete allow 80/tcp >/dev/null 2>&1 || true
-  ufw delete allow 443/tcp >/dev/null 2>&1 || true
-  ufw --force enable >/dev/null
-  echo "    inbound: SSH only (rate limited). outbound: DNS, 80, 443, 7844, 587, 465."
+  lock_firewall
 fi
 
 sleep 3
