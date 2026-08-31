@@ -43,6 +43,9 @@ applied=()
 while IFS= read -r line; do
   [ -n "$line" ] || continue
   case "$line" in \#*) continue ;; esac
+  case "$line" in
+    -*) name="${line#-}"; grep -v "^${name}=" "$tmp" >"${tmp}.n" || true; mv "${tmp}.n" "$tmp"; applied+=("-${name}"); continue ;;
+  esac
   name="${line%%=*}"
   [ "$name" != "$line" ] || { echo "apply-env: skipping malformed line" >&2; continue; }
   case "$name" in

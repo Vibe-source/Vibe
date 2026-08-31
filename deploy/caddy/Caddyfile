@@ -1,5 +1,11 @@
 {
 	email {$ACME_EMAIL}
+	# Cloudflare terminates TLS at the edge and cloudflared dials out; nothing listens publicly.
+	auto_https off
+	servers {
+		trusted_proxies static private_ranges
+		client_ip_headers CF-Connecting-IP X-Forwarded-For
+	}
 }
 
 (security_headers) {
@@ -25,7 +31,7 @@
 }
 
 # Chat core — websockets pass through reverse_proxy by default, no extra config.
-api.{$VIBE_DOMAIN} {
+http://api.{$VIBE_DOMAIN} {
 	import security_headers
 	import access_log
 	encode gzip zstd
@@ -41,7 +47,7 @@ api.{$VIBE_DOMAIN} {
 }
 
 # Isolated agent runtime — provider ingress (/v1/*) and voice sockets.
-agents.{$VIBE_DOMAIN} {
+http://agents.{$VIBE_DOMAIN} {
 	import security_headers
 	import access_log
 	encode gzip zstd
@@ -57,7 +63,7 @@ agents.{$VIBE_DOMAIN} {
 }
 
 # Dashboards + log search. Grafana owns auth; Loki and Prometheus stay unpublished.
-logs.{$VIBE_DOMAIN} {
+http://logs.{$VIBE_DOMAIN} {
 	import security_headers
 	import access_log
 	encode gzip zstd
@@ -67,7 +73,7 @@ logs.{$VIBE_DOMAIN} {
 
 # Bare domain — SPA served by core. Same /internal/* block: core's router is
 # host-agnostic, so those routes are reachable here too without it.
-{$VIBE_DOMAIN} {
+http://{$VIBE_DOMAIN} {
 	import security_headers
 	import access_log
 	encode gzip zstd

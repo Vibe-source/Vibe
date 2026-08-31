@@ -42,7 +42,8 @@ defmodule Vibe.Storage do
   end
 
   defp autodetect_backend do
-    if R2Storage.configured?(), do: :r2, else: :supabase
+    # Supabase is gone from the VPS; R2 is the only backend an autodetect can pick.
+    :r2
   end
 
   @doc "Upload a file through the configured backend. See backend/0."
