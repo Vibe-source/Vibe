@@ -16,6 +16,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MAP="${SECRET_MAP:-${REPO_ROOT}/deploy/env/secret-map.tsv}"
 SYNC="${REPO_ROOT}/deploy/scripts/sync-env.sh"
+SSH_HOST="${SSH_HOST:-vibe-vps-stack}"
 
 LIST=0; SHIP=1; RESTART=""; WANT=""
 while [ $# -gt 0 ]; do
@@ -47,6 +48,17 @@ command -v agix >/dev/null || { echo "set-missing-env: agix not on PATH" >&2; ex
 
 held="$(agix secret list 2>/dev/null | awk '{print $1}')"
 is_held() { printf '%s\n' "$held" | grep -qx "$1"; }
+
+# "<file.env> <NAME>" per line. Names carry digits (R2_*), so the class must too.
+box=""
+load_box() {
+  [ -n "$box" ] && return 0
+  box="$(agix secret run --only VPS_HOST -- ssh "$SSH_HOST" \
+    'for f in /run/vibe/env/*.env; do n=${f##*/}; grep -oE "^[A-Z_0-9]+=" "$f" | tr -d "=" | sed "s|^|$n |"; done' \
+    2>/dev/null | grep -E "^[a-z-]+\.env [A-Z_0-9]+$" || true)"
+  [ -n "$box" ] || echo "set-missing-env: could not read the box (ssh $SSH_HOST) — server column omitted" >&2
+}
+on_box() { printf '%s\n' "$box" | grep -qx "$2 $1"; }
 wanted()  { printf '%s\n' $WANT | grep -qx "$1"; }
 files_for() {
   awk -v n="$1" '!/^[[:space:]]*#/ && NF==3 && $1==n {print $2}' "$MAP" | sort -u | tr '\n' ' '
@@ -64,12 +76,20 @@ for w in $WANT; do
     echo "set-missing-env: ${w} is in no map row — add it with: --add ${w} <file.env>" >&2
 done
 
-[ -n "$todo" ] || { echo "nothing to do — every mapped name is already in the agix store"; exit 0; }
-
 if [ "$LIST" -eq 1 ]; then
-  for name in $todo; do printf '  %-28s -> %s\n' "$name" "$(files_for "$name")"; done
+  load_box
+  printf '  %-28s %-7s %-8s %s\n' NAME AGIX SERVER FILES
+  for name in $(awk '!/^[[:space:]]*#/ && NF==3 {print $1}' "$MAP" | awk '!seen[$0]++'); do
+    fs="$(files_for "$name")"; srv="yes"
+    for f in $fs; do on_box "$name" "$f" || srv="NO"; done
+    [ -n "$box" ] || srv="?"
+    is_held "$name" && a="yes" || a="NO"
+    printf '  %-28s %-7s %-8s %s\n' "$name" "$a" "$srv" "$fs"
+  done
   exit 0
 fi
+
+[ -n "$todo" ] || { echo "nothing to do — every mapped name is already in the agix store"; exit 0; }
 
 echo "The prompt below is agix's own: it does not echo, and the value never"
 echo "reaches this script. Enter = set it, s = skip, q = stop."

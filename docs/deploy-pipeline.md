@@ -73,7 +73,8 @@ Without asking:
 
 - open a PR, push to a branch, run CI
 - run `agent-ops.sh status | health | logs | audit` against production
-- read `/run/vibe/env/*.env` **by name only** (`grep -oE '^[A-Z_]+='`)
+- read `/run/vibe/env/*.env` **by name only** (`grep -oE '^[A-Z_0-9]+='` — drop the
+  digits and every `R2_*` name silently vanishes from the answer)
 
 With the human in the loop:
 
