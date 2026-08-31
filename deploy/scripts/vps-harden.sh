@@ -107,7 +107,13 @@ step_fail2ban() {
     printf 'logpath = /opt/vibe/deploy/caddy-logs/access.log\n'
     printf 'maxretry = 20\nfindtime = 60\nbantime = 3600\n'
   } >/etc/fail2ban/jail.d/vibe.local
-  systemctl enable --now fail2ban
+  # "enable --now" no-ops on the service apt just started, so the jails above
+  # never loaded; and a missing logpath makes fail2ban drop the jail at start.
+  mkdir -p /opt/vibe/deploy/caddy-logs
+  [ -e /opt/vibe/deploy/caddy-logs/access.log ] || : >/opt/vibe/deploy/caddy-logs/access.log
+  id vibe >/dev/null 2>&1 && chown -R vibe:vibe /opt/vibe/deploy/caddy-logs
+  systemctl enable fail2ban
+  systemctl restart fail2ban
   log "fail2ban enabled (sshd + caddy-auth jails)"
 }
 

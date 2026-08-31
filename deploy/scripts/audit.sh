@@ -7,11 +7,20 @@ set -uo pipefail
 
 APP_DIR="${APP_DIR:-/opt/vibe}"
 COMPOSE_FILE="${APP_DIR}/deploy/compose.yml"
-if command -v podman >/dev/null 2>&1; then
-  COMPOSE=(podman compose -f "$COMPOSE_FILE"); ENGINE=podman
-else
-  COMPOSE=(docker compose -f "$COMPOSE_FILE"); ENGINE=docker
+if command -v podman >/dev/null 2>&1; then ENGINE=podman; else ENGINE=docker; fi
+# The stack is rootless under 'vibe': root's own engine sees no containers, so
+# from root we ask the stack user's engine rather than report an empty stack.
+STACK_USER="${STACK_USER:-vibe}"
+AS_STACK=()
+if [ "$(id -u)" -eq 0 ] && id "$STACK_USER" >/dev/null 2>&1; then
+  AS_STACK=(sudo -u "$STACK_USER" env \
+    "XDG_RUNTIME_DIR=/run/user/$(id -u "$STACK_USER")" \
+    "HOME=$(getent passwd "$STACK_USER" | cut -d: -f6)")
+  cd / || true  # sudo -u cannot chdir into another user's home
 fi
+COMPOSE=("${AS_STACK[@]}" "$ENGINE" compose -f "$COMPOSE_FILE")
+ENGINE_BIN="$ENGINE"
+ENGINE="${AS_STACK[*]} $ENGINE"
 SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo -n"
 # vibe has no sudo by design, so sshd/ufw probes come back empty rather than false.
 # Reporting that as a FAIL would be the audit lying about what it could not read.
@@ -72,8 +81,17 @@ audit_host() {
   else
     fail "ufw is not active"
   fi
-  systemctl is-active fail2ban >/dev/null 2>&1 \
-    && pass "fail2ban running" || fail "fail2ban not running"
+  if ! systemctl is-active fail2ban >/dev/null 2>&1; then
+    fail "fail2ban not running"
+  elif [ "$PRIV" -eq 0 ]; then
+    warn "fail2ban running — jail list needs root, re-run as: sudo $0 host"
+  else
+    jails=$($SUDO fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ')
+    pass "fail2ban running (jails: ${jails:-none})"
+    for j in sshd caddy-auth; do
+      case ",${jails}," in *",${j},"*) ;; *) fail "fail2ban: ${j} jail is not loaded" ;; esac
+    done
+  fi
 
   # Anything bound to 0.0.0.0 beyond ssh and the two web ports is an accident.
   head2 "HOST — listening sockets"
@@ -210,7 +228,7 @@ audit_agent() {
       esac
     fi
   done
-  if [ "$ENGINE" = podman ]; then
+  if [ "$ENGINE_BIN" = podman ]; then
     pass "engine is rootless podman — a socket holder is uid $(id -u vibe 2>/dev/null || echo vibe), not root"
   else
     warn "engine is docker — the socket is host root; prefer rootless podman"
