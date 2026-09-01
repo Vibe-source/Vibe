@@ -516,8 +516,6 @@ defmodule Vibe.Notifications do
     with {:ok, config} <- apns_message_config(),
          {:ok, jwt} <- apns_voip_jwt(config),
          {:ok, request_body} <- apns_message_payload(data, title, body, badge) do
-      url = "#{config.base_url}/3/device/#{URI.encode(apns_token)}"
-
       headers =
         [
           {"content-type", "application/json"},
@@ -530,30 +528,7 @@ defmodule Vibe.Notifications do
         ]
         |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
 
-      request = Finch.build(:post, url, headers, request_body)
-
-      case Finch.request(request, Vibe.APNsFinch, receive_timeout: 7_000) do
-        {:ok, %Finch.Response{status: 200}} ->
-          Logger.info(
-            "[Notifications] APNs message push accepted to_user=#{to_user_id} topic=#{config.topic} base_url=#{config.base_url}"
-          )
-
-          {:ok, :apns}
-
-        {:ok, %Finch.Response{status: status, body: response_body}} ->
-          Logger.warning(
-            "[Notifications] APNs message push failed status=#{status} to_user=#{to_user_id} topic=#{config.topic} base_url=#{config.base_url} body=#{String.slice(response_body || "", 0, 240)}"
-          )
-
-          :error
-
-        {:error, reason} ->
-          Logger.warning(
-            "[Notifications] APNs message push request failed to_user=#{to_user_id} topic=#{config.topic} base_url=#{config.base_url} reason=#{inspect(reason)}"
-          )
-
-          :error
-      end
+      post_apns_message(apns_token, to_user_id, config, headers, request_body, apns_base_urls())
     else
       {:error, :missing_config} ->
         Logger.info(
@@ -569,6 +544,59 @@ defmodule Vibe.Notifications do
 
         :error
     end
+  end
+
+  # A device token is only valid at the environment that issued it, and one
+  # server serves both Xcode builds (sandbox) and TestFlight/App Store
+  # (production). Try the configured one, then the other on BadDeviceToken.
+  defp post_apns_message(_token, to_user_id, config, _headers, _body, []) do
+    Logger.warning(
+      "[Notifications] APNs message push failed in every environment to_user=#{to_user_id} topic=#{config.topic}"
+    )
+
+    :error
+  end
+
+  defp post_apns_message(token, to_user_id, config, headers, body, [base_url | rest]) do
+    request = Finch.build(:post, "#{base_url}/3/device/#{URI.encode(token)}", headers, body)
+
+    case Finch.request(request, Vibe.APNsFinch, receive_timeout: 7_000) do
+      {:ok, %Finch.Response{status: 200}} ->
+        Logger.info(
+          "[Notifications] APNs message push accepted to_user=#{to_user_id} topic=#{config.topic} base_url=#{base_url}"
+        )
+
+        {:ok, :apns}
+
+      {:ok, %Finch.Response{status: 400, body: response_body}} ->
+        if rest != [] and String.contains?(response_body || "", "BadDeviceToken") do
+          Logger.info(
+            "[Notifications] APNs token is not for #{base_url}, retrying the other environment to_user=#{to_user_id}"
+          )
+
+          post_apns_message(token, to_user_id, config, headers, body, rest)
+        else
+          log_apns_message_failure(to_user_id, config, base_url, 400, response_body)
+          :error
+        end
+
+      {:ok, %Finch.Response{status: status, body: response_body}} ->
+        log_apns_message_failure(to_user_id, config, base_url, status, response_body)
+        :error
+
+      {:error, reason} ->
+        Logger.warning(
+          "[Notifications] APNs message push request failed to_user=#{to_user_id} topic=#{config.topic} base_url=#{base_url} reason=#{inspect(reason)}"
+        )
+
+        :error
+    end
+  end
+
+  defp log_apns_message_failure(to_user_id, config, base_url, status, response_body) do
+    Logger.warning(
+      "[Notifications] APNs message push failed status=#{status} to_user=#{to_user_id} topic=#{config.topic} base_url=#{base_url} body=#{String.slice(response_body || "", 0, 240)}"
+    )
   end
 
   defp send_apns_voip_incoming_call_push(voip_token, _to_user_id, _caller_name, _call_type, _data)
@@ -882,6 +910,14 @@ defmodule Vibe.Notifications do
     case apns_environment() do
       "sandbox" -> @apns_voip_sandbox_base
       _ -> @apns_voip_prod_base
+    end
+  end
+
+  # Configured environment first, the other as the fallback.
+  defp apns_base_urls do
+    case apns_base_url() do
+      @apns_voip_sandbox_base -> [@apns_voip_sandbox_base, @apns_voip_prod_base]
+      base -> [base, @apns_voip_sandbox_base]
     end
   end
 
