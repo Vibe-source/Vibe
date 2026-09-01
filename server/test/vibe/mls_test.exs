@@ -389,6 +389,39 @@ defmodule Vibe.MlsTest do
     assert pending.ratchet_tree == "tree-bytes"
   end
 
+  test "a welcome notifies the recipient's lowercase topic even for an uppercase id", %{
+    user: sender
+  } do
+    recipient = insert_user("mls_upper")
+    chat_id = "chat-case-#{System.unique_integer([:positive])}"
+    {:ok, _} = Chat.create_chat(chat_id, [sender.id, recipient.id])
+    VibeWeb.Endpoint.subscribe("user:#{recipient.id}")
+
+    {:ok, _} =
+      Mls.post_welcome(sender.id, %{
+        "recipientUserId" => String.upcase(recipient.id),
+        "chatId" => chat_id,
+        "welcome" => Base.encode64("welcome-bytes")
+      })
+
+    assert_receive %Phoenix.Socket.Broadcast{event: "mls_welcome", payload: %{chatId: ^chat_id}}
+  end
+
+  test "acking a welcome notifies the sender so their queued message flushes", %{user: sender} do
+    recipient = insert_user("mls_acker")
+    chat_id = "chat-ack-#{System.unique_integer([:positive])}"
+    {:ok, _} = post_welcome(sender.id, recipient.id, chat_id)
+    [pending] = Mls.pending_welcomes(recipient.id)
+    VibeWeb.Endpoint.subscribe("user:#{sender.id}")
+
+    assert :ok = Mls.ack_welcome(recipient.id, pending.id)
+
+    assert_receive %Phoenix.Socket.Broadcast{
+      event: "mls_welcome_acked",
+      payload: %{chatId: ^chat_id}
+    }
+  end
+
   test "a body-supplied senderUserId is ignored in favour of the authenticated user", %{
     user: sender
   } do

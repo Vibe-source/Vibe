@@ -341,7 +341,13 @@ defmodule Vibe.Mls do
         {:ok, row} ->
           # Without this the recipient has no reason to drain: a first-contact DM
           # gives them neither socket_open nor chat_joined for the new chat.
-          VibeWeb.Endpoint.broadcast("user:#{recipient_id}", "mls_welcome", %{chatId: chat_id})
+          # Downcased: clients join user topics with the server-issued lowercase id,
+          # but this id came from the sender's client, which may uppercase it.
+          VibeWeb.Endpoint.broadcast(
+            "user:#{String.downcase(recipient_id)}",
+            "mls_welcome",
+            %{chatId: chat_id}
+          )
           {:ok, row}
 
         {:error, reason} ->
@@ -378,12 +384,24 @@ defmodule Vibe.Mls do
   def ack_welcome(user_id, id) when is_binary(user_id) and is_binary(id) do
     query =
       from(w in MlsWelcome,
-        where: w.id == ^id and w.recipient_user_id == ^user_id and is_nil(w.delivered_at)
+        where: w.id == ^id and w.recipient_user_id == ^user_id and is_nil(w.delivered_at),
+        select: {w.sender_user_id, w.chat_id}
       )
 
     case Repo.update_all(query, set: [delivered_at: DateTime.utc_now() |> DateTime.truncate(:second)]) do
-      {1, _} -> :ok
-      _ -> {:error, :not_found}
+      {1, [{sender_id, chat_id}]} ->
+        # The sender's first message sits queued until the peer confirms; this
+        # push replaces their poll ladder with an immediate flush.
+        VibeWeb.Endpoint.broadcast(
+          "user:#{String.downcase(to_string(sender_id))}",
+          "mls_welcome_acked",
+          %{chatId: chat_id}
+        )
+
+        :ok
+
+      _ ->
+        {:error, :not_found}
     end
   rescue
     # A malformed uuid makes Postgres raise rather than return no rows. That is
