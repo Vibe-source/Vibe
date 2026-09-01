@@ -66,10 +66,6 @@ defmodule VibeWeb.AuthController do
         lookup_value = present_credential(params["credential"]) || password
         secure_id = secure_id_for(hmac_secret!(), lookup_value)
 
-        # SECURITY: Token with expiration
-        login_token = UUID.uuid4()
-        token_expires_at = DateTime.utc_now() |> DateTime.add(@token_validity_seconds, :second)
-
         # SECURITY: Require client-side key generation for v2+ clients
         # Server should NEVER generate private keys - defeats E2E encryption
         identity_version = params["identityKey"] || "v1"
@@ -108,26 +104,15 @@ defmodule VibeWeb.AuthController do
               "encrypted_private_key" => enc_priv_key,
               "identity_key" => identity_version,
               "secure_id" => secure_id,
-              "login_token" => login_token,
-              "token_expires_at" => token_expires_at,
-              "token_issued_at" => DateTime.utc_now() |> DateTime.truncate(:second),
+              # No login_token: whichever branch issue_login_response takes mints its
+              # own, so one written here only reaches the WAL and every backup unused.
               "phone_number" => normalized_phone
             }
 
             case Accounts.create_user(user_params) do
               {:ok, user} ->
                 Vibe.Audit.record(conn, "register", actor_user_id: user.id)
-
-                json(conn, %{
-                  userId: user.id,
-                  username: user.username,
-                  secureId: user.secure_id,
-                  token: user.login_token,
-                  tokenExpiresAt: DateTime.to_iso8601(token_expires_at),
-                  publicKey: user.public_key,
-                  encryptedPrivateKey: user.encrypted_private_key,
-                  phoneNumber: user.phone_number
-                })
+                issue_login_response(conn, user, params)
               {:error, changeset} ->
                 errors = Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} ->
                   Regex.replace(~r"%{(\w+)}", msg, fn _, key ->
@@ -140,7 +125,7 @@ defmodule VibeWeb.AuthController do
     end
   end
 
-  def login(conn, %{"credential" => credential, "password" => password}) do
+  def login(conn, %{"credential" => credential, "password" => password} = params) do
     credential = credential |> to_string() |> String.trim()
     password = to_string(password)
 
@@ -164,7 +149,7 @@ defmodule VibeWeb.AuthController do
           case Accounts.verify_password_with_info(password, u.password_hash) do
             {:ok, :current} ->
               login_succeeded(conn, credential, u)
-              issue_login_response(conn, u)
+              issue_login_response(conn, u, params)
 
             {:ok, :legacy} ->
               user_for_login =
@@ -174,7 +159,7 @@ defmodule VibeWeb.AuthController do
                 end
 
               login_succeeded(conn, credential, u)
-              issue_login_response(conn, user_for_login)
+              issue_login_response(conn, user_for_login, params)
 
             :error ->
               login_failed(conn, credential)
@@ -256,13 +241,14 @@ defmodule VibeWeb.AuthController do
   @doc "POST /api/auth/logout — revokes only the login_token used for this session."
   def logout(conn, _params) do
     user = conn.assigns.current_user
+    token = conn.assigns.current_auth_token
 
-    case Accounts.revoke_login_token(user) do
+    case Accounts.revoke_bearer_token(user, token) do
       {:ok, _updated} ->
         Vibe.Audit.record(conn, "logout", actor_user_id: user.id)
         json(conn, %{ok: true})
 
-      {:error, _changeset} ->
+      {:error, _reason} ->
         conn |> put_status(500) |> json(%{error: "logout_failed"})
     end
   end
@@ -290,31 +276,57 @@ defmodule VibeWeb.AuthController do
 
   defp present_credential(_), do: nil
 
-  defp issue_login_response(conn, %User{} = user) do
-    # SECURITY: Generate new token on each login and set expiration
-    new_token = UUID.uuid4()
-    token_expires_at = DateTime.utc_now() |> DateTime.add(@token_validity_seconds, :second)
+  defp issue_login_response(conn, %User{} = user, params) do
+    case present_credential(params["deviceId"]) do
+      nil ->
+        issue_legacy_login_response(conn, user)
+
+      device_identifier ->
+        attrs = %{
+          "device_identifier" => device_identifier,
+          "name" => present_credential(params["deviceName"]) || "Device",
+          "platform" => present_credential(params["platform"]) || "unknown",
+          "public_key" => user.public_key
+        }
+
+        case Accounts.issue_device_session(user.id, attrs) do
+          {:ok, token, session} ->
+            # The account-wide token is never handed to a device client, and `logout`
+            # now revokes the session instead — so leaving it set strands a credential.
+            Accounts.revoke_login_token(user)
+            render_login_response(conn, user, token, session.expires_at)
+
+          {:error, _} ->
+            conn |> put_status(500) |> json(%{error: "Failed to issue device session"})
+        end
+    end
+  end
+
+  defp issue_legacy_login_response(conn, %User{} = user) do
+    token = UUID.uuid4()
+    expires_at = DateTime.utc_now() |> DateTime.add(@token_validity_seconds, :second)
 
     case Accounts.update_user(user, %{
-           "login_token" => new_token,
-           "token_expires_at" => token_expires_at,
+           "login_token" => token,
+           "token_expires_at" => expires_at,
            "token_issued_at" => DateTime.utc_now() |> DateTime.truncate(:second)
          }) do
-      {:ok, updated_user} ->
-        json(conn, %{
-          userId: updated_user.id,
-          username: updated_user.username,
-          secureId: updated_user.secure_id,
-          token: new_token,
-          tokenExpiresAt: DateTime.to_iso8601(token_expires_at),
-          publicKey: updated_user.public_key,
-          encryptedPrivateKey: updated_user.encrypted_private_key,
-          phoneNumber: updated_user.phone_number
-        })
-
-      {:error, _} ->
-        conn |> put_status(500) |> json(%{error: "Failed to issue session token"})
+      {:ok, updated_user} -> render_login_response(conn, updated_user, token, expires_at)
+      {:error, _} -> conn |> put_status(500) |> json(%{error: "Failed to issue session token"})
     end
+  end
+
+  defp render_login_response(conn, %User{} = user, token, expires_at) do
+    json(conn, %{
+      userId: user.id,
+      username: user.username,
+      secureId: user.secure_id,
+      token: token,
+      tokenExpiresAt: DateTime.to_iso8601(expires_at),
+      publicKey: user.public_key,
+      encryptedPrivateKey: user.encrypted_private_key,
+      phoneNumber: user.phone_number
+    })
   end
 
   defp hmac_secret! do

@@ -27,7 +27,9 @@ defmodule VibeWeb.Plugs.ApiAuth do
       token ->
         case Accounts.get_user_by_token(token) do
           {:ok, user} ->
-            assign(conn, :current_user, user)
+            conn
+            |> assign(:current_user, user)
+            |> assign(:current_auth_token, token)
 
           {:error, :token_expired} ->
             unauthorized(conn, "Token expired")

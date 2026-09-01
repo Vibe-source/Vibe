@@ -164,7 +164,7 @@ defmodule Vibe.R2StorageTest do
   end
 
   describe "Vibe.Storage.backend/0" do
-    test "defaults to :supabase when :vibe, :storage_backend is unset" do
+    test "autodetects :r2 when :vibe, :storage_backend is unset" do
       prev = Application.get_env(:vibe, :storage_backend)
       Application.delete_env(:vibe, :storage_backend)
 
@@ -175,7 +175,7 @@ defmodule Vibe.R2StorageTest do
         end
       end)
 
-      assert Storage.backend() == :supabase
+      assert Storage.backend() == :r2
     end
 
     test "only switches to :r2 when explicitly configured" do

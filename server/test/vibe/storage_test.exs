@@ -5,8 +5,7 @@ defmodule Vibe.StorageTest do
   from. Both are now driven by environment rather than an explicit flag, so
   these tests exist to pin the two ways that can go wrong:
 
-    * selecting `:r2` on *partial* config, which would route uploads at a
-      backend that then refuses every call, and
+    * rewriting a URL before the backend is even reachable, and
     * rewriting a URL onto a host the object does not live on, which turns
       working media into 404s the moment the backend flips.
 
@@ -42,8 +41,9 @@ defmodule Vibe.StorageTest do
   end
 
   describe "backend/0" do
-    test "defaults to supabase with nothing configured" do
-      assert Storage.backend() == :supabase
+    test "autodetects r2 with nothing configured" do
+      # Supabase is gone from the VPS, so autodetect has no second backend to pick.
+      assert Storage.backend() == :r2
     end
 
     test "selects r2 once every required env var is present" do
@@ -64,21 +64,21 @@ defmodule Vibe.StorageTest do
       assert Storage.backend() == :r2
     end
 
-    test "partial config never selects r2" do
+    test "partial config still selects r2, and the refusal moves to call time" do
       for omitted <- ~w(R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET) do
         set_full_r2_env()
         System.delete_env(omitted)
 
-        assert Storage.backend() == :supabase,
-               "expected :supabase with #{omitted} missing — a partial config must not " <>
-                 "route uploads at a backend that will refuse them"
+        assert Storage.backend() == :r2,
+               "with #{omitted} missing there is still no second backend to fall back to; " <>
+                 "R2Storage refuses the call instead of routing it elsewhere"
       end
     end
 
-    test "an empty-string env var counts as absent" do
+    test "an empty-string env var does not change the autodetected backend" do
       set_full_r2_env()
       System.put_env("R2_BUCKET", "   ")
-      assert Storage.backend() == :supabase
+      assert Storage.backend() == :r2
     end
 
     test "the public base URL is not required to select r2" do

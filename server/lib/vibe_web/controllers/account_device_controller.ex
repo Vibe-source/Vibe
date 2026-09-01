@@ -24,7 +24,7 @@ defmodule VibeWeb.AccountDeviceController do
         "public_key" => params["publicKey"]
       }
 
-      case Accounts.register_device(conn.assigns.current_user.id, attrs) do
+      case Accounts.register_device(conn.assigns.current_user.id, attrs, revive: true) do
         {:ok, device} ->
           json(conn, %{device: device_json(device, identifier)})
 

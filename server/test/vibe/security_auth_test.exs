@@ -48,6 +48,48 @@ defmodule Vibe.SecurityAuthTest do
     assert {:error, _} = Accounts.get_user_by_token(user.login_token)
   end
 
+  test "a device session token authenticates, and stops the moment it is revoked", %{user: user} do
+    {:ok, token, session} =
+      Accounts.issue_device_session(user.id, %{
+        "device_identifier" => "dev-#{System.unique_integer([:positive])}",
+        "name" => "Test Device",
+        "platform" => "ios"
+      })
+
+    assert {:ok, %User{id: id}} = Accounts.get_user_by_token(token)
+    assert id == user.id
+
+    # Again, to prove the cached read resolves the same way as the cold one.
+    assert {:ok, %User{id: ^id}} = Accounts.get_user_by_token(token)
+
+    {:ok, _} = Accounts.revoke_session(user.id, session.id)
+    assert {:error, _} = Accounts.get_user_by_token(token)
+  end
+
+  test "logout revokes the device session it was called with", %{user: user} do
+    {:ok, token, _session} =
+      Accounts.issue_device_session(user.id, %{
+        "device_identifier" => "dev-#{System.unique_integer([:positive])}",
+        "name" => "Test Device",
+        "platform" => "ios"
+      })
+
+    {:ok, cached} = Accounts.get_user_by_token(token)
+    assert {:ok, _} = Accounts.revoke_bearer_token(cached, token)
+    assert {:error, _} = Accounts.get_user_by_token(token)
+  end
+
+  test "logout revokes a legacy token even when the cached user has it stripped", %{user: user} do
+    # The first read populates the cache; only the second returns the stripped
+    # struct, which is what a logout following any other request actually holds.
+    {:ok, _cold} = Accounts.get_user_by_token(user.login_token)
+    {:ok, cached} = Accounts.get_user_by_token(user.login_token)
+    refute cached.login_token
+
+    assert {:ok, _} = Accounts.revoke_bearer_token(cached, user.login_token)
+    assert {:error, _} = Accounts.get_user_by_token(user.login_token)
+  end
+
   test "login throttle locks after repeated failures and clears on success" do
     id = "throttle_#{System.unique_integer([:positive])}"
     refute LoginThrottle.locked?(id)

@@ -1,6 +1,6 @@
 defmodule Vibe.Accounts.TokenCache do
   @moduledoc """
-  Short-TTL cache for `bearer token -> %User{}` resolution.
+  Short-TTL cache for `token hash -> sanitized user` resolution.
 
   Every authenticated REST call runs through `VibeWeb.Plugs.ApiAuth`, which
   resolved the bearer token with a `Repo.get_by(User, login_token: ...)` on
@@ -26,6 +26,12 @@ defmodule Vibe.Accounts.TokenCache do
       rotation.
     * Only successful lookups are cached. Unknown tokens always hit the DB, so a
       flood of junk tokens cannot fill this table.
+    * Callers key every read/write by `Accounts.hash_session_token/1`, never the
+      raw bearer — the table is `:public`, so a key derived from the token
+      itself would make the token recoverable from an ETS/heap dump.
+    * The cached struct has `password_hash`, `encrypted_private_key`,
+      `login_token`, `push_token` and `phone_number` stripped before insert, so
+      the same dump cannot hand over those fields for every active session.
 
   The table is created by `Vibe.Application.start/2` (public, owned by the
   application master) alongside the other process-independent ETS caches.
@@ -43,26 +49,26 @@ defmodule Vibe.Accounts.TokenCache do
   def ttl_ms, do: @ttl_ms
 
   @doc """
-  Look up a cached user for `token`.
+  Look up a cached user for `token_hash` (`Accounts.hash_session_token/1` of the bearer).
 
   Returns `{:ok, user}` only for an entry that is present and unexpired;
   `:miss` otherwise (including when the table does not exist yet).
   """
-  @spec fetch(String.t()) :: {:ok, struct()} | :miss
-  def fetch(token) when is_binary(token) and token != "" do
+  @spec fetch(binary()) :: {:ok, struct()} | :miss
+  def fetch(token_hash) when is_binary(token_hash) and token_hash != "" do
     case :ets.whereis(@table) do
       :undefined ->
         emit(:miss)
         :miss
 
       _ ->
-        case :ets.lookup(@table, token) do
-          [{^token, _user_id, user, expires_at}] ->
+        case :ets.lookup(@table, token_hash) do
+          [{^token_hash, _user_id, user, expires_at}] ->
             if now_ms() < expires_at do
               emit(:hit)
               {:ok, user}
             else
-              :ets.delete(@table, token)
+              :ets.delete(@table, token_hash)
               emit(:expired)
               :miss
             end
@@ -74,41 +80,53 @@ defmodule Vibe.Accounts.TokenCache do
     end
   end
 
-  def fetch(_token), do: :miss
+  def fetch(_token_hash), do: :miss
 
   # Hit ratio is the signal that says whether a shared cache is worth adding.
   defp emit(result) do
     :telemetry.execute([:vibe, :cache, :token], %{count: 1}, %{result: result})
   end
 
-  @doc "Cache a resolved user for `token` for one TTL window."
-  @spec put(String.t(), struct()) :: :ok
-  def put(token, %User{id: user_id} = user) when is_binary(token) and token != "" do
+  @doc "Cache a resolved user for `token_hash` for one TTL window."
+  @spec put(binary(), struct()) :: :ok
+  def put(token_hash, %User{id: user_id} = user) when is_binary(token_hash) and token_hash != "" do
     case :ets.whereis(@table) do
       :undefined ->
         :ok
 
       _ ->
         maybe_sweep()
-        :ets.insert(@table, {token, user_id, user, now_ms() + @ttl_ms})
+        :ets.insert(@table, {token_hash, user_id, sanitize(user), now_ms() + @ttl_ms})
         :ok
     end
   end
 
-  def put(_token, _user), do: :ok
+  def put(_token_hash, _user), do: :ok
+
+  # Strips fields a dump of this :public table should never hand over.
+  defp sanitize(%User{} = user) do
+    %{
+      user
+      | password_hash: nil,
+        encrypted_private_key: nil,
+        login_token: nil,
+        push_token: nil,
+        phone_number: nil
+    }
+  end
 
   @doc "Drop a single token's entry."
-  @spec invalidate(String.t()) :: :ok
-  def invalidate(token) when is_binary(token) and token != "" do
+  @spec invalidate(binary()) :: :ok
+  def invalidate(token_hash) when is_binary(token_hash) and token_hash != "" do
     case :ets.whereis(@table) do
       :undefined -> :ok
-      _ -> :ets.delete(@table, token)
+      _ -> :ets.delete(@table, token_hash)
     end
 
     :ok
   end
 
-  def invalidate(_token), do: :ok
+  def invalidate(_token_hash), do: :ok
 
   @doc """
   Drop every cached entry for a user.

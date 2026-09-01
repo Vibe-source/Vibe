@@ -1,6 +1,7 @@
 defmodule Vibe.Accounts do
   import Ecto.Query, warn: false
   import Plug.Crypto, only: [secure_compare: 2]
+  require Logger
   alias Vibe.Repo
   alias Vibe.Accounts.TokenCache
   alias Vibe.Accounts.User
@@ -115,7 +116,7 @@ defmodule Vibe.Accounts do
   # authenticated endpoint. Serve it from a short-TTL cache; see
   # `Vibe.Accounts.TokenCache` for the invalidation rules that keep it honest.
   def get_user_by_token(token) when is_binary(token) and byte_size(token) > 0 do
-    case TokenCache.fetch(token) do
+    case TokenCache.fetch(hash_session_token(token)) do
       {:ok, user} -> {:ok, user}
       :miss -> resolve_user_by_token(token)
     end
@@ -126,7 +127,7 @@ defmodule Vibe.Accounts do
   defp resolve_user_by_token(token) do
     case load_user_by_token(token) do
       {:ok, user} = ok ->
-        TokenCache.put(token, user)
+        TokenCache.put(hash_session_token(token), user)
         ok
 
       other ->
@@ -134,23 +135,29 @@ defmodule Vibe.Accounts do
     end
   end
 
+  # Device sessions resolve first. The legacy column is plaintext and carries no
+  # `revoked_at`, per-device scope or hard expiry, so reaching it first was a downgrade.
   defp load_user_by_token(token) do
+    case get_session_by_token(token) do
+      {:ok, session} ->
+        case get_user(session.user_id) do
+          nil -> {:error, :not_found}
+          %User{is_agent: true} -> {:error, :not_found}
+          user -> {:ok, user}
+        end
+
+      {:error, :expired} ->
+        {:error, :token_expired}
+
+      _ ->
+        load_user_by_legacy_token(token)
+    end
+  end
+
+  defp load_user_by_legacy_token(token) do
     case Repo.get_by(User, login_token: token) do
       nil ->
-        case get_session_by_token(token) do
-          {:ok, session} ->
-            case get_user(session.user_id) do
-              nil -> {:error, :not_found}
-              %User{is_agent: true} -> {:error, :not_found}
-              user -> {:ok, user}
-            end
-
-          {:error, :expired} ->
-            {:error, :token_expired}
-
-          _ ->
-            {:error, :not_found}
-        end
+        {:error, :not_found}
 
       %User{is_agent: true} ->
         {:error, :not_found}
@@ -158,11 +165,18 @@ defmodule Vibe.Accounts do
       user ->
         # SECURITY: Check token expiration
         if token_valid?(user) do
+          legacy_token_hit(user)
           {:ok, maybe_slide_token_expiry(user)}
         else
           {:error, :token_expired}
         end
     end
+  end
+
+  # Dropping the legacy column is gated on this counter reading zero, so every
+  # resolution off it has to be counted.
+  defp legacy_token_hit(%User{id: user_id}) do
+    :telemetry.execute([:vibe, :auth, :legacy_token_hit], %{count: 1}, %{user_id: user_id})
   end
 
   # Push a still-valid token's expiry forward on use, so an actively-used app never
@@ -325,8 +339,10 @@ defmodule Vibe.Accounts do
 
   def delete_user(%User{} = user) do
     TokenCache.invalidate_user(user.id)
-    TokenCache.invalidate(user.login_token)
-    Repo.delete(user)
+    if user.login_token, do: TokenCache.invalidate(hash_session_token(user.login_token))
+    result = Repo.delete(user)
+    if match?({:ok, _}, result), do: broadcast_disconnect(user.id)
+    result
   end
 
   # Any write to the user row (profile edit, token rotation, expiry slide) must
@@ -335,8 +351,19 @@ defmodule Vibe.Accounts do
   # which is keyed by its own value and so cannot be found any other way.
   defp tap_invalidate_token_cache(result, %User{} = previous) do
     TokenCache.invalidate_user(previous.id)
-    TokenCache.invalidate(previous.login_token)
+    if previous.login_token, do: TokenCache.invalidate(hash_session_token(previous.login_token))
     result
+  end
+
+  # Closes every live socket for this user immediately on revocation.
+  # A broadcast failure (endpoint down) must never fail the revocation itself.
+  defp broadcast_disconnect(user_id) do
+    VibeWeb.Endpoint.broadcast("user_socket:#{user_id}", "disconnect", %{})
+    :ok
+  rescue
+    error ->
+      Logger.warning("[Accounts] Failed to broadcast disconnect user_id=#{user_id} error=#{inspect(error)}")
+      :ok
   end
 
   @doc """
@@ -452,8 +479,13 @@ defmodule Vibe.Accounts do
   @session_validity_seconds 30 * 24 * 60 * 60
   @link_request_validity_seconds 5 * 60
 
-  @doc "Registers or refreshes the calling device and returns {:ok, account_device}."
-  def register_device(user_id, attrs) do
+  @doc """
+  Registers or refreshes the calling device and returns {:ok, account_device}.
+
+  `revive: true` clears a revocation, and only an already-authenticated caller may
+  ask for it: a remote sign-out has to outlive the device signing in again by itself.
+  """
+  def register_device(user_id, attrs, opts \\ []) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     identifier = attrs["device_identifier"] || attrs[:device_identifier]
 
@@ -466,10 +498,14 @@ defmodule Vibe.Accounts do
         |> Repo.insert()
 
       existing ->
+        refreshed =
+          case Keyword.get(opts, :revive, false) do
+            true -> %{"last_seen_at" => now, "revoked_at" => nil}
+            false -> %{"last_seen_at" => now}
+          end
+
         existing
-        |> AccountDevice.changeset(
-          Map.merge(stringify_keys(attrs), %{"last_seen_at" => now, "revoked_at" => nil})
-        )
+        |> AccountDevice.changeset(Map.merge(stringify_keys(attrs), refreshed))
         |> Repo.update()
     end
   end
@@ -505,7 +541,7 @@ defmodule Vibe.Accounts do
           Repo.transaction(fn ->
             {:ok, device} =
               device
-              |> AccountDevice.changeset(%{"revoked_at" => now})
+              |> AccountDevice.changeset(%{"revoked_at" => now, "push_token_bundle" => %{}})
               |> Repo.update()
 
             {_count, _} =
@@ -518,6 +554,8 @@ defmodule Vibe.Accounts do
 
         # No conn here (context layer) — controller is out of this brief's scope.
         Vibe.Audit.record(nil, "device.revoke", actor_user_id: user_id, target_id: device_id)
+        TokenCache.invalidate_user(user_id)
+        if match?({:ok, _}, result), do: broadcast_disconnect(user_id)
         result
     end
   end
@@ -537,16 +575,45 @@ defmodule Vibe.Accounts do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, @session_validity_seconds, :second)
 
-    case %DeviceSession{}
-         |> DeviceSession.changeset(%{
-           user_id: user_id,
-           account_device_id: account_device_id,
-           token_hash: token_hash,
-           expires_at: expires_at
-         })
-         |> Repo.insert() do
-      {:ok, session} -> {:ok, token, session}
-      error -> error
+    result =
+      Repo.transaction(fn ->
+        DeviceSession
+        |> where([s], s.account_device_id == ^account_device_id and is_nil(s.revoked_at))
+        |> Repo.update_all(set: [revoked_at: now])
+
+        case %DeviceSession{}
+             |> DeviceSession.changeset(%{
+               user_id: user_id,
+               account_device_id: account_device_id,
+               token_hash: token_hash,
+               expires_at: expires_at
+             })
+             |> Repo.insert() do
+          {:ok, session} -> {token, session}
+          {:error, changeset} -> Repo.rollback(changeset)
+        end
+      end)
+
+    case result do
+      {:ok, {issued_token, session}} ->
+        TokenCache.invalidate_user(user_id)
+        {:ok, issued_token, session}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Registers a device and issues its replacement session token.
+
+  Still revives a revoked device: iOS sends the same `/api/login` for a silent
+  recovery as for a typed sign-in, so refusing here would strand the owner too.
+  """
+  def issue_device_session(user_id, attrs) do
+    with {:ok, device} <- register_device(user_id, attrs, revive: true),
+         {:ok, token, session} <- create_device_session(user_id, device.id) do
+      {:ok, token, session}
     end
   end
 
@@ -644,6 +711,7 @@ defmodule Vibe.Accounts do
         # cached auth entry ages out.
         TokenCache.invalidate_user(user_id)
         Vibe.Audit.record(nil, "session.revoke", actor_user_id: user_id, target_id: session_id)
+        if match?({:ok, _}, result), do: broadcast_disconnect(user_id)
         result
     end
   end
@@ -662,6 +730,24 @@ defmodule Vibe.Accounts do
     end
   end
 
+  @doc "Revokes the device session or legacy token used for this request."
+  def revoke_bearer_token(%User{} = user, token) when is_binary(token) do
+    token_hash = hash_session_token(token)
+
+    case Repo.get_by(DeviceSession, token_hash: token_hash, user_id: user.id) do
+      %DeviceSession{id: session_id} ->
+        revoke_session(user.id, session_id)
+
+      # `user` may be the cached struct, which has `login_token` stripped, so the
+      # legacy branch re-reads rather than comparing a field the cache nils out.
+      nil ->
+        case Repo.get_by(User, id: user.id, login_token: token) do
+          %User{} = holder -> revoke_login_token(holder)
+          nil -> {:error, :not_found}
+        end
+    end
+  end
+
   @doc "Clears the bearer login_token + its expiry/issued-at, and evicts the auth cache."
   def revoke_login_token(%User{} = user) do
     update_user(user, %{
@@ -675,20 +761,24 @@ defmodule Vibe.Accounts do
   def revoke_all_sessions(%User{} = user) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-    Repo.transaction(fn ->
-      case revoke_login_token(user) do
-        {:ok, updated} ->
-          DeviceSession
-          |> where([s], s.user_id == ^user.id and is_nil(s.revoked_at))
-          |> Repo.update_all(set: [revoked_at: now])
+    result =
+      Repo.transaction(fn ->
+        case revoke_login_token(user) do
+          {:ok, updated} ->
+            DeviceSession
+            |> where([s], s.user_id == ^user.id and is_nil(s.revoked_at))
+            |> Repo.update_all(set: [revoked_at: now])
 
-          TokenCache.invalidate_user(user.id)
-          updated
+            TokenCache.invalidate_user(user.id)
+            updated
 
-        {:error, changeset} ->
-          Repo.rollback(changeset)
-      end
-    end)
+          {:error, changeset} ->
+            Repo.rollback(changeset)
+        end
+      end)
+
+    if match?({:ok, _}, result), do: broadcast_disconnect(user.id)
+    result
   end
 
   @doc "Starts a pairing request from a not-yet-authenticated requester device."
@@ -806,12 +896,16 @@ defmodule Vibe.Accounts do
              })
              |> Repo.update(),
            {:ok, device} <-
-             register_device(pending_request.user_id, %{
-               "device_identifier" => pending_request.requester_device_identifier,
-               "name" => pending_request.requester_name,
-               "platform" => pending_request.requester_platform,
-               "public_key" => pending_request.requester_public_key
-             }),
+             register_device(
+               pending_request.user_id,
+               %{
+                 "device_identifier" => pending_request.requester_device_identifier,
+                 "name" => pending_request.requester_name,
+                 "platform" => pending_request.requester_platform,
+                 "public_key" => pending_request.requester_public_key
+               },
+               revive: true
+             ),
            {:ok, token, session} <-
              create_device_session(pending_request.user_id, device.id) do
         %{
