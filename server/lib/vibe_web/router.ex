@@ -160,6 +160,9 @@ defmodule VibeWeb.Router do
     post "/chat/:chat_id/messages/:message_id/report", ChatController, :report_message
     get "/chat/:chat_id/messages/:message_id/reactions", ChatController, :message_reactions
     delete "/chats/:chat_id", ChatController, :delete
+    # Clearing is not deleting: this drops the caller's message history and leaves
+    # the chat, its membership and its encryption in place.
+    post "/chats/:chat_id/clear", ChatController, :clear_messages
 
     # Settings
     post "/chat/:chat_id/mute", ChatController, :mute

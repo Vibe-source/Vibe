@@ -1993,6 +1993,38 @@ defmodule Vibe.Chat do
     result
   end
 
+  @doc """
+  Hide this user's message history for a chat, keeping the chat itself.
+
+  Only `messages_cleared_at` moves: the participant row stays undeleted and
+  unarchived, so membership, the MLS session and the peer's own copy are all
+  untouched. `delete_chat/3` is the other operation — it sets `deleted` as well.
+  """
+  def clear_messages(chat_id, user_id) when is_binary(chat_id) and is_binary(user_id) do
+    if is_participant?(chat_id, user_id) do
+      # Truncated so the returned stamp is the one actually stored — the column keeps
+      # seconds, and clients compare against it.
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+      query =
+        from(p in Participant, where: p.chat_id == ^chat_id and p.user_id == ^user_id)
+
+      case Repo.update_all(query, set: [messages_cleared_at: now]) do
+        {count, _} when count > 0 ->
+          Vibe.Cache.invalidate(participant_cache_key(chat_id, user_id))
+          ChatHomeCache.invalidate_users([user_id])
+          {:ok, %{cleared_at: now}}
+
+        _ ->
+          {:error, "Chat not found"}
+      end
+    else
+      {:error, "Chat not found"}
+    end
+  end
+
+  def clear_messages(_chat_id, _user_id), do: {:error, "Chat not found"}
+
   def delete_chat(chat_id, user_id, opts \\ []) do
     delete_for_everyone = Keyword.get(opts, :delete_for_everyone, false)
 

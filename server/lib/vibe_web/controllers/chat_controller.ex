@@ -337,6 +337,31 @@ defmodule VibeWeb.ChatController do
     end
   end
 
+  @doc """
+  Clear this user's copy of a chat's messages. The chat, its membership and its
+  encryption survive — `delete/2` is the destructive one.
+  """
+  def clear_messages(conn, %{"chat_id" => chat_id}) do
+    user_id = conn.assigns.current_user.id
+
+    case Chat.clear_messages(chat_id, user_id) do
+      {:ok, result} ->
+        # Only this user's devices: clearing is per-participant, and telling the peer
+        # would leak that their history was dropped.
+        Chat.broadcast_user_chat_event(
+          chat_id,
+          "chat-cleared",
+          %{chatId: chat_id, clearedAt: result.cleared_at},
+          [user_id]
+        )
+
+        json(conn, %{success: true, chatId: chat_id, clearedAt: result.cleared_at})
+
+      {:error, reason} ->
+        conn |> put_status(400) |> json(%{error: reason})
+    end
+  end
+
   def delete(conn, %{"chat_id" => chat_id} = params) do
     user_id = conn.assigns.current_user.id
 
