@@ -51,28 +51,58 @@ defmodule Vibe.Chat.GroupAgentMemory do
     acting_user_id = Keyword.get(opts, :acting_user_id)
 
     RepoRLS.with_user(acting_user_id, fn ->
-      case get_or_create(chat_id, acting_user_id: acting_user_id) do
-        {:ok, memory} ->
-          msg =
-            Map.merge(
-              %{
-                "id" => Ecto.UUID.generate(),
-                "timestamp" => :os.system_time(:millisecond)
-              },
-              message
-            )
+      # Team workers commonly settle at the same time. A read/append/update without
+      # a row lock lets both read the same messages array and the last commit erase
+      # its sibling's result. Ensure the row exists, then serialize appends so every
+      # worker completion reaches shared memory.
+      case ensure_memory_row(chat_id, acting_user_id) do
+        :ok ->
+          Repo.transaction(fn ->
+            memory =
+              Repo.one!(
+                from m in __MODULE__,
+                  where: m.chat_id == ^chat_id,
+                  lock: "FOR UPDATE"
+              )
 
-          new_messages = memory.messages ++ [msg]
-          new_total = memory.total_messages_processed + 1
+            msg =
+              Map.merge(
+                %{
+                  "id" => Ecto.UUID.generate(),
+                  "timestamp" => :os.system_time(:millisecond)
+                },
+                message
+              )
 
-          memory
-          |> changeset(%{messages: new_messages, total_messages_processed: new_total})
-          |> Repo.update()
+            memory
+            |> changeset(%{
+              messages: memory.messages ++ [msg],
+              total_messages_processed: memory.total_messages_processed + 1
+            })
+            |> Repo.update!()
+          end)
 
         error ->
           error
       end
     end)
+  end
+
+  defp ensure_memory_row(chat_id, acting_user_id) do
+    case get_or_create(chat_id, acting_user_id: acting_user_id) do
+      {:ok, _memory} ->
+        :ok
+
+      # A concurrent creator can win the unique(chat_id) race. The row now exists,
+      # so continue to the locked read instead of losing this append.
+      {:error, %Ecto.Changeset{}} ->
+        if Repo.exists?(from m in __MODULE__, where: m.chat_id == ^chat_id),
+          do: :ok,
+          else: {:error, :memory_unavailable}
+
+      error ->
+        error
+    end
   end
 
   def update_after_compaction(memory, summary, remaining_messages, opts \\ []) do

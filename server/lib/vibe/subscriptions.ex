@@ -112,12 +112,17 @@ defmodule Vibe.Subscriptions do
     end
   end
 
+  # Per-tier agent caps are lifted for now (product decision, 2026-07-26) while usage-based
+  # limits are designed. Keep the tiered shape so re-enabling a real cap later is a one-line
+  # change instead of re-plumbing quota_for_user/create_agent's :quota_exceeded path.
+  @unlimited_agent_cap 1_000_000
+
   def agent_limit_for_user(user_id) do
     case Accounts.get_user(user_id) do
-      %{tier: "gold"} -> 10
-      %{tier: "silver"} -> 3
-      %{tier: "bronze"} -> 1
-      _ -> 1
+      %{tier: "gold"} -> @unlimited_agent_cap
+      %{tier: "silver"} -> @unlimited_agent_cap
+      %{tier: "bronze"} -> @unlimited_agent_cap
+      _ -> @unlimited_agent_cap
     end
   end
 

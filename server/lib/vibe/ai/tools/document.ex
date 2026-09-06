@@ -12,6 +12,7 @@ defmodule Vibe.AI.Tools.Document do
   """
 
   require Logger
+  alias Vibe.Net.SafeURL
 
   @claude_api "https://api.anthropic.com/v1/messages"
   @claude_model "claude-sonnet-4-20250514"
@@ -35,36 +36,40 @@ defmodule Vibe.AI.Tools.Document do
   end
 
   defp fetch_document(url) do
-    case Finch.build(:get, url) |> Finch.request(Vibe.Finch) do
-      {:ok, %{status: 200, body: body, headers: headers}} ->
-        content_type = get_content_type(headers)
+    with {:ok, _uri} <- SafeURL.validate(url) do
+      case Finch.build(:get, url) |> Finch.request(Vibe.Finch) do
+        {:ok, %{status: 200, body: body, headers: headers}} ->
+          content_type = get_content_type(headers)
 
-        content = case content_type do
-          "application/pdf" ->
-            extract_pdf_text(body)
+          content = case content_type do
+            "application/pdf" ->
+              extract_pdf_text(body)
 
-          "text/html" ->
-            extract_html_text(body)
+            "text/html" ->
+              extract_html_text(body)
 
-          _ ->
-            # Plain text, markdown, etc
-            body
-        end
+            _ ->
+              # Plain text, markdown, etc
+              body
+          end
 
-        # Truncate if too long
-        truncated = if String.length(content) > @max_chars do
-          String.slice(content, 0, @max_chars) <> "\n\n[Document truncated due to length...]"
-        else
-          content
-        end
+          # Truncate if too long
+          truncated = if String.length(content) > @max_chars do
+            String.slice(content, 0, @max_chars) <> "\n\n[Document truncated due to length...]"
+          else
+            content
+          end
 
-        {:ok, truncated, content_type}
+          {:ok, truncated, content_type}
 
-      {:ok, %{status: status}} ->
-        {:error, "HTTP #{status}"}
+        {:ok, %{status: status}} ->
+          {:error, "HTTP #{status}"}
 
-      {:error, reason} ->
-        {:error, inspect(reason)}
+        {:error, reason} ->
+          {:error, inspect(reason)}
+      end
+    else
+      {:error, reason} -> {:error, inspect(reason)}
     end
   end
 

@@ -25,10 +25,10 @@ defmodule Vibe.AgentBridge do
   @pairing_table :agent_bridge_pairings
   @request_table :agent_bridge_requests
   @pending_ask_table :agent_bridge_pending_asks
+  @pending_task_table :agent_bridge_pending_tasks
   @pairing_ttl_ms 10 * 60 * 1000
   @request_ttl_ms 10 * 60 * 1000
-  # Mirrors the bridge's ASK_TIMEOUT_MS — an ask older than this is dead anyway.
-  @pending_ask_ttl_ms 10 * 60 * 1000
+  @pending_task_ttl_ms 30 * 60 * 1000
 
   # ── Scan-to-pair (daemon-initiated; the phone scans the desktop QR) ──
 
@@ -78,10 +78,16 @@ defmodule Vibe.AgentBridge do
     case :ets.lookup(@request_table, request_id) do
       [{^request_id, %{status: :pending, expires_at: exp} = req}] when exp > now ->
         case mint_token(user_id, req.device_label) do
-          {:ok, %{bridge_token: token}} ->
+          {:ok, %{bridge_token: token, computer_id: computer_id, device_label: device_label}} ->
             :ets.insert(
               @request_table,
-              {request_id, %{req | status: :authorized, user_id: user_id, bridge_token: token}}
+              {request_id,
+               req
+               |> Map.put(:status, :authorized)
+               |> Map.put(:user_id, user_id)
+               |> Map.put(:bridge_token, token)
+               |> Map.put(:computer_id, computer_id)
+               |> Map.put(:device_label, device_label)}
             )
 
             :ok
@@ -118,10 +124,17 @@ defmodule Vibe.AgentBridge do
         :ets.delete(@request_table, request_id)
         {:error, :expired}
 
-      [{^request_id, %{status: :authorized, device_hash: dh, user_id: uid, bridge_token: token}}] ->
+      [{^request_id,
+        %{
+          status: :authorized,
+          device_hash: dh,
+          user_id: uid,
+          bridge_token: token,
+          computer_id: computer_id
+        }}] ->
         if Plug.Crypto.secure_compare(hash_token(device_secret), dh) do
           :ets.delete(@request_table, request_id)
-          {:ok, %{user_id: uid, bridge_token: token}}
+          {:ok, %{user_id: uid, bridge_token: token, computer_id: computer_id}}
         else
           {:error, :invalid}
         end
@@ -144,7 +157,7 @@ defmodule Vibe.AgentBridge do
   # or results (re-delivered) there was no second chance, so the run stalls for
   # the full ASK timeout. We buffer the latest unanswered ask per chat here and
   # replay it when the phone (re)joins `chat:<id>`; it's cleared when the phone
-  # answers or after the TTL.
+  # answers or the bridge explicitly cancels it.
 
   @doc """
   Remember the latest unanswered ask for `chat_id` so it can be replayed to a
@@ -154,11 +167,9 @@ defmodule Vibe.AgentBridge do
   def remember_pending_ask(chat_id, request_id, payload)
       when is_binary(chat_id) and chat_id != "" and is_binary(request_id) and is_map(payload) do
     ensure_table(@pending_ask_table)
-    expires_at = System.system_time(:millisecond) + @pending_ask_ttl_ms
-
     :ets.insert(
       @pending_ask_table,
-      {chat_id, %{request_id: request_id, payload: payload, expires_at: expires_at}}
+      {chat_id, %{request_id: request_id, payload: payload}}
     )
 
     :ok
@@ -167,18 +178,12 @@ defmodule Vibe.AgentBridge do
   def remember_pending_ask(_, _, _), do: :ok
 
   @doc """
-  Peek the buffered ask payload for `chat_id` (or `nil` if none / expired).
+  Peek the buffered ask payload for `chat_id` (or `nil` if none).
   Does not consume it — a still-unanswered ask must survive repeated rejoins.
   """
   def pending_ask(chat_id) when is_binary(chat_id) and chat_id != "" do
     ensure_table(@pending_ask_table)
-    now = System.system_time(:millisecond)
-
     case :ets.lookup(@pending_ask_table, chat_id) do
-      [{^chat_id, %{expires_at: expires_at}}] when expires_at <= now ->
-        :ets.delete(@pending_ask_table, chat_id)
-        nil
-
       [{^chat_id, %{payload: payload}}] ->
         payload
 
@@ -266,26 +271,49 @@ defmodule Vibe.AgentBridge do
     })
     |> Repo.insert()
     |> case do
-      {:ok, _connection} -> {:ok, %{user_id: user_id, bridge_token: raw}}
+      {:ok, connection} ->
+        {:ok,
+         %{
+           user_id: user_id,
+           bridge_token: raw,
+           computer_id: to_string(connection.id),
+           device_label: connection.device_label
+         }}
+
       {:error, changeset} -> {:error, changeset}
     end
   end
 
   @doc "Resolve a bridge token to its user id, or `:error`. Updates last_seen_at."
   def verify_token(token) when is_binary(token) and token != "" do
+    case verify_connection(token) do
+      {:ok, %{user_id: user_id}} -> {:ok, user_id}
+      _ -> :error
+    end
+  end
+
+  def verify_token(_), do: :error
+
+  @doc "Resolve a bridge token to its user and stable paired-computer identity."
+  def verify_connection(token) when is_binary(token) and token != "" do
     hash = hash_token(token)
 
     case Repo.one(from(c in Connection, where: c.token_hash == ^hash and is_nil(c.revoked_at))) do
       %Connection{} = connection ->
         touch(connection)
-        {:ok, to_string(connection.user_id)}
+        {:ok,
+         %{
+           user_id: to_string(connection.user_id),
+           computer_id: to_string(connection.id),
+           device_label: connection.device_label || "computer"
+         }}
 
       _ ->
         :error
     end
   end
 
-  def verify_token(_), do: :error
+  def verify_connection(_), do: :error
 
   @doc "Revoke all active bridge tokens for a user (\"disconnect computer\")."
   def revoke_all(user_id) when is_binary(user_id) and user_id != "" do
@@ -305,6 +333,13 @@ defmodule Vibe.AgentBridge do
   @doc "Whether the user has any non-revoked paired computer on record."
   def paired?(user_id) when is_binary(user_id) do
     Repo.exists?(from(c in Connection, where: c.user_id == ^user_id and is_nil(c.revoked_at)))
+  rescue
+    # A malformed user id casts to nothing (`:binary_id`), and a DB blip raises.
+    # Neither is worth an exception: this is now reached from `UserChannel` on every
+    # bridge Presence change, where raising would take down the phone's channel and
+    # disconnect it. "Not provably paired" is the safe answer, and the surrounding
+    # `status` callers already treat it as a plain boolean.
+    _ -> false
   end
 
   def paired?(_), do: false
@@ -330,8 +365,60 @@ defmodule Vibe.AgentBridge do
 
   def online?(_), do: false
 
+  @doc """
+  Status payload for a live push to the phone, built without a DB round trip
+  whenever possible.
+
+  `UserChannel` calls this on every Presence change on the `bridge:<id>` topic,
+  which is what lets the phone stop polling `/api/agent-bridge/status`: a computer
+  coming online, changing repos, or starting/finishing a task all surface as a
+  Presence diff, and the phone is already joined to `user:<id>`.
+
+  While a computer is connected, `paired` is known to be true — a live bridge
+  channel only exists behind an accepted pairing — so the common case costs zero
+  queries. Only the rarer "went offline" edge falls back to the `paired?` lookup,
+  because the phone needs to tell "no computer running" apart from "unpaired".
+  """
+  def status_for_push(user_id) when is_binary(user_id) and user_id != "" do
+    if online?(user_id) do
+      presence_status(user_id, true)
+    else
+      presence_status(user_id, paired?(user_id))
+    end
+  rescue
+    _ -> status(user_id)
+  end
+
+  def status_for_push(_user_id), do: status(nil)
+
   @doc "Public bridge status for the phone UI, including connected devices and repo choices."
   def status(user_id) when is_binary(user_id) and user_id != "" do
+    presence_status(user_id, paired?(user_id))
+  rescue
+    _ ->
+      %{
+        connected: false,
+        paired: paired?(user_id),
+        devices: [],
+        repositories: [],
+        runningTasks: [],
+        models: %{}
+      }
+  end
+
+  def status(_),
+    do: %{
+      connected: false,
+      paired: false,
+      devices: [],
+      repositories: [],
+      runningTasks: [],
+      models: %{}
+    }
+
+  # Presence-derived status. Split out of `status/1` so the broadcast path can
+  # supply `paired` from context instead of paying a DB query per status frame.
+  defp presence_status(user_id, paired) do
     presence = VibeWeb.Presence.list(topic(user_id))
     devices = presence_devices(presence)
 
@@ -345,41 +432,48 @@ defmodule Vibe.AgentBridge do
       |> Enum.flat_map(fn device -> Map.get(device, "runningTasks", []) end)
       |> dedupe_running_tasks()
 
+    # Live model catalogs from the connected bridge (provider CLI/API discovery).
+    models =
+      devices
+      |> Enum.map(fn device -> Map.get(device, "models") end)
+      |> Enum.find(&is_map/1)
+
     %{
       connected: map_size(presence) > 0,
-      paired: paired?(user_id),
+      paired: paired,
       devices: devices,
       repositories: repositories,
-      runningTasks: running_tasks
+      runningTasks: running_tasks,
+      models: models || %{}
     }
-  rescue
-    _ ->
-      %{
-        connected: false,
-        paired: paired?(user_id),
-        devices: [],
-        repositories: [],
-        runningTasks: []
-      }
   end
-
-  def status(_),
-    do: %{connected: false, paired: false, devices: [], repositories: [], runningTasks: []}
 
   @doc "Normalize daemon-reported status before storing it in Presence metadata."
-  def presence_meta(payload) when is_map(payload) do
+  def presence_meta(payload, computer_id \\ nil)
+
+  def presence_meta(payload, computer_id) when is_map(payload) do
+    computer_id = normalize(computer_id || payload["computerId"] || payload["computer_id"])
+
     %{
       "online_at" => System.system_time(:second),
+      "id" => computer_id,
+      "computerId" => computer_id,
       "deviceLabel" => normalize(payload["deviceLabel"] || payload["device_label"]) || "computer",
       "cwd" => normalize(payload["cwd"]),
-      "repositories" => normalize_repositories(payload["repositories"]),
+      "repositories" =>
+        payload["repositories"]
+        |> normalize_repositories()
+        |> attach_computer_identity(computer_id, payload["deviceLabel"] || payload["device_label"]),
       "runningTasks" =>
-        normalize_running_tasks(payload["runningTasks"] || payload["running_tasks"]),
-      "permissions" => normalize_permissions(payload["permissions"])
+        (payload["runningTasks"] || payload["running_tasks"])
+        |> normalize_running_tasks()
+        |> attach_computer_identity(computer_id, payload["deviceLabel"] || payload["device_label"]),
+      "permissions" => normalize_permissions(payload["permissions"]),
+      "models" => normalize_provider_models(payload["models"])
     }
   end
 
-  def presence_meta(_payload) do
+  def presence_meta(_payload, _computer_id) do
     %{"online_at" => System.system_time(:second), "repositories" => []}
   end
 
@@ -388,16 +482,83 @@ defmodule Vibe.AgentBridge do
 
   @doc """
   Push a task to a user's connected bridge daemon. Returns `:ok` if a bridge is
-  online and the task was dispatched, `{:error, :offline}` otherwise.
+  online and the task was dispatched. During a paired bridge's short Presence
+  flap, parks the task by taskId and returns `:ok`; the bridge channel flushes it
+  on rejoin. Repeated dispatches of the same taskId are idempotent.
   """
   def dispatch_task(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "run_task", payload)
-      :ok
-    else
-      {:error, :offline}
+    case dispatch_to_computer(user_id, "run_task", payload) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error when reason in [:offline, :computer_offline] ->
+        if paired?(user_id), do: queue_pending_task(user_id, payload), else: error
+
+      error ->
+        error
     end
   end
+
+  @doc """
+  Flush queued run_task payloads eligible for a bridge that just joined.
+
+  Eligibility respects an explicit computerId. An unscoped task is claimed by
+  the first rejoining computer. `:ets.take/2` atomically removes the dedupe key,
+  so simultaneous joins cannot broadcast the same task twice.
+  """
+  def flush_pending_tasks(user_id, computer_id, device_label)
+      when is_binary(user_id) and is_binary(computer_id) do
+    ensure_table(@pending_task_table)
+    now = System.system_time(:millisecond)
+
+    @pending_task_table
+    |> :ets.tab2list()
+    |> Enum.reduce(0, fn
+      {{^user_id, task_id} = key, entry}, count ->
+        requested = Map.get(entry, :computer_id)
+
+        cond do
+          now - entry.queued_at > @pending_task_ttl_ms ->
+            :ets.delete(@pending_task_table, key)
+            count
+
+          is_binary(requested) and requested != computer_id ->
+            count
+
+          true ->
+            case :ets.take(@pending_task_table, key) do
+              [{^key, claimed}] ->
+                payload =
+                  claimed.payload
+                  |> Map.put("computerId", computer_id)
+                  |> Map.put("computerLabel", normalize(device_label) || "computer")
+
+                VibeWeb.Endpoint.broadcast(topic(user_id), "run_task", payload)
+
+                Logger.info(
+                  "[AgentBridge] flushed queued task user=#{user_id} computer=#{computer_id} task=#{task_id}"
+                )
+
+                count + 1
+
+              _ ->
+                count
+            end
+        end
+
+      {_other_key, _entry}, count ->
+        count
+    end)
+  rescue
+    error ->
+      Logger.warning(
+        "[AgentBridge] pending task flush failed user=#{user_id}: #{Exception.message(error)}"
+      )
+
+      0
+  end
+
+  def flush_pending_tasks(_, _, _), do: 0
 
   @doc """
   Push a control action to the connected bridge daemon for an in-flight task.
@@ -406,12 +567,7 @@ defmodule Vibe.AgentBridge do
   still matches by task id/provider/chat id and refuses unknown tasks.
   """
   def dispatch_control(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "control_task", payload)
-      :ok
-    else
-      {:error, :offline}
-    end
+    dispatch_to_computer(user_id, "control_task", payload)
   end
 
   @doc """
@@ -421,12 +577,7 @@ defmodule Vibe.AgentBridge do
   which the channel relays back to the requesting phone.
   """
   def dispatch_history(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "history_request", payload)
-      :ok
-    else
-      {:error, :offline}
-    end
+    dispatch_to_computer(user_id, "history_request", payload)
   end
 
   @doc """
@@ -436,12 +587,7 @@ defmodule Vibe.AgentBridge do
   `file_result` over the bridge channel, relayed back to the requesting phone.
   """
   def dispatch_file(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "file_request", payload)
-      :ok
-    else
-      {:error, :offline}
-    end
+    dispatch_to_computer(user_id, "file_request", payload)
   end
 
   @doc """
@@ -451,12 +597,7 @@ defmodule Vibe.AgentBridge do
   phone as `agent-bridge-usage`.
   """
   def dispatch_usage(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "usage_request", payload)
-      :ok
-    else
-      {:error, :offline}
-    end
+    dispatch_to_computer(user_id, "usage_request", payload)
   end
 
   @doc """
@@ -465,12 +606,7 @@ defmodule Vibe.AgentBridge do
   blob is sealed with the pairing runtime key — the server never reads it.
   """
   def dispatch_ask_response(user_id, payload) when is_binary(user_id) and is_map(payload) do
-    if online?(user_id) do
-      VibeWeb.Endpoint.broadcast(topic(user_id), "ask_response", payload)
-      :ok
-    else
-      {:error, :offline}
-    end
+    dispatch_to_computer(user_id, "ask_response", payload)
   end
 
   # ── Helpers ─────────────────────────────────────────────────────────
@@ -516,21 +652,82 @@ defmodule Vibe.AgentBridge do
   defp presence_devices(_), do: []
 
   defp public_presence_meta(meta) when is_map(meta) do
+    computer_id = normalize(meta["computerId"] || meta[:computerId] || meta["id"] || meta[:id])
+    device_label =
+      meta["deviceLabel"] || meta[:deviceLabel] || meta["device_label"] || "computer"
+
     %{
+      "id" => computer_id,
+      "computerId" => computer_id,
       "online_at" => meta["online_at"] || meta[:online_at],
-      "deviceLabel" =>
-        meta["deviceLabel"] || meta[:deviceLabel] || meta["device_label"] || "computer",
+      "deviceLabel" => device_label,
       "cwd" => meta["cwd"] || meta[:cwd],
-      "repositories" => normalize_repositories(meta["repositories"] || meta[:repositories]),
+      "repositories" =>
+        (meta["repositories"] || meta[:repositories])
+        |> normalize_repositories()
+        |> attach_computer_identity(computer_id, device_label),
       "runningTasks" =>
-        normalize_running_tasks(
-          meta["runningTasks"] || meta[:runningTasks] || meta["running_tasks"]
-        ),
-      "permissions" => normalize_permissions(meta["permissions"] || meta[:permissions])
+        (meta["runningTasks"] || meta[:runningTasks] || meta["running_tasks"])
+        |> normalize_running_tasks()
+        |> attach_computer_identity(computer_id, device_label),
+      "permissions" => normalize_permissions(meta["permissions"] || meta[:permissions]),
+      "models" => normalize_provider_models(meta["models"] || meta[:models])
     }
   end
 
   defp public_presence_meta(_), do: %{"repositories" => []}
+
+  # %{ "claude" => [ %{"id"=>…,"title"=>…}, … ], … }
+  defp normalize_provider_models(models) when is_map(models) do
+    models
+    |> Enum.reduce(%{}, fn {provider, rows}, acc ->
+      key = provider |> to_string() |> String.downcase()
+
+      list =
+        rows
+        |> List.wrap()
+        |> Enum.map(&normalize_model_choice/1)
+        |> Enum.reject(&is_nil/1)
+
+      if list == [], do: acc, else: Map.put(acc, key, list)
+    end)
+  end
+
+  defp normalize_provider_models(_), do: %{}
+
+  defp normalize_model_choice(row) when is_map(row) do
+    id = normalize(row["id"] || row[:id] || row["value"] || row[:value])
+    title = normalize(row["title"] || row[:title] || row["name"] || row[:name] || id)
+    if is_nil(id) or is_nil(title) do
+      nil
+    else
+      %{
+        "id" => id,
+        "title" => title,
+        "subtitle" => normalize(row["subtitle"] || row[:subtitle]),
+        "isDefault" =>
+          row["isDefault"] == true || row[:isDefault] == true || row["is_default"] == true,
+        "apiId" => normalize(row["apiId"] || row[:apiId] || row["api_id"]),
+        "efforts" => normalize_effort_levels(row["efforts"] || row[:efforts]),
+        "defaultEffort" =>
+          normalize(row["defaultEffort"] || row[:defaultEffort] || row["default_effort"]),
+        "source" => normalize(row["source"] || row[:source])
+      }
+    end
+  end
+
+  defp normalize_model_choice(_), do: nil
+
+  # Provider effort/thinking ladders (e.g. Claude low…max). Pass through unknown
+  # levels so new provider vocabularies reach the phone without a server release.
+  defp normalize_effort_levels(levels) when is_list(levels) do
+    levels
+    |> Enum.map(&normalize/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_effort_levels(_), do: []
 
   defp normalize_repositories(values) when is_list(values) do
     values
@@ -604,6 +801,25 @@ defmodule Vibe.AgentBridge do
           normalize_string_list(
             task["teamWorkers"] || task[:teamWorkers] || task["team_workers"] ||
               task[:team_workers]
+          ),
+        "leadWorker" =>
+          normalize(
+            task["leadWorker"] || task[:leadWorker] || task["lead_worker"] || task[:lead_worker]
+          ),
+        "teamRole" =>
+          normalize(task["teamRole"] || task[:teamRole] || task["team_role"] || task[:team_role]),
+        "suppressVisible" =>
+          task["suppressVisible"] == true or task[:suppressVisible] == true or
+            task["suppress_visible"] == true or task[:suppress_visible] == true,
+        "computerId" =>
+          normalize(
+            task["computerId"] || task[:computerId] || task["computer_id"] ||
+              task[:computer_id]
+          ),
+        "computerLabel" =>
+          normalize(
+            task["computerLabel"] || task[:computerLabel] || task["computer_label"] ||
+              task[:computer_label]
           )
       }
     end
@@ -634,7 +850,17 @@ defmodule Vibe.AgentBridge do
           "path" => path,
           "cwd" => normalize(repo["cwd"] || repo[:cwd]) || path,
           "source" => normalize(repo["source"] || repo[:source]) || "bridge",
-          "git" => truthy?(repo["git"] || repo[:git])
+          "git" => truthy?(repo["git"] || repo[:git]),
+          "computerId" =>
+            normalize(
+              repo["computerId"] || repo[:computerId] || repo["computer_id"] ||
+                repo[:computer_id]
+            ),
+          "computerLabel" =>
+            normalize(
+              repo["computerLabel"] || repo[:computerLabel] || repo["computer_label"] ||
+                repo[:computer_label]
+            )
         }
     end
   end
@@ -650,9 +876,9 @@ defmodule Vibe.AgentBridge do
   defp dedupe_repositories(repositories) do
     repositories
     |> Enum.reduce({MapSet.new(), []}, fn repo, {seen, acc} ->
-      key = repo["id"] || repo["path"]
+      key = {repo["computerId"], repo["id"] || repo["path"]}
 
-      if is_binary(key) and not MapSet.member?(seen, key) do
+      if elem(key, 1) && not MapSet.member?(seen, key) do
         {MapSet.put(seen, key), [repo | acc]}
       else
         {seen, acc}
@@ -679,6 +905,88 @@ defmodule Vibe.AgentBridge do
 
   defp normalize_permissions(value) when is_map(value), do: value
   defp normalize_permissions(_), do: %{}
+
+  defp attach_computer_identity(items, computer_id, device_label) when is_list(items) do
+    label = normalize(device_label) || "computer"
+
+    Enum.map(items, fn item ->
+      item
+      |> Map.put("computerId", computer_id)
+      |> Map.put("computerLabel", label)
+    end)
+  end
+
+  defp attach_computer_identity(items, _computer_id, _device_label), do: items
+
+  defp dispatch_to_computer(user_id, event, payload) do
+    devices = status(user_id).devices
+    requested =
+      normalize(
+        payload["computerId"] || payload["computer_id"] || payload["agentBridgeComputerId"] ||
+          payload["agent_bridge_computer_id"]
+      )
+
+    selected =
+      cond do
+        is_binary(requested) -> Enum.find(devices, &(&1["id"] == requested))
+        length(devices) == 1 -> hd(devices)
+        true -> nil
+      end
+
+    cond do
+      devices == [] ->
+        {:error, :offline}
+
+      is_nil(selected) and is_nil(requested) ->
+        {:error, :computer_required}
+
+      is_nil(selected) ->
+        {:error, :computer_offline}
+
+      true ->
+        computer_id = selected["id"]
+
+        VibeWeb.Endpoint.broadcast(
+          topic(user_id),
+          event,
+          payload
+          |> Map.put("computerId", computer_id)
+          |> Map.put("computerLabel", selected["deviceLabel"] || "computer")
+        )
+
+        :ok
+    end
+  end
+
+  defp queue_pending_task(user_id, payload) do
+    ensure_table(@pending_task_table)
+    task_id = normalize(payload["taskId"] || payload["task_id"])
+
+    if is_binary(task_id) do
+      key = {user_id, task_id}
+
+      entry = %{
+        payload: payload,
+        computer_id:
+          normalize(
+            payload["computerId"] || payload["computer_id"] ||
+              payload["agentBridgeComputerId"] || payload["agent_bridge_computer_id"]
+          ),
+        queued_at: System.system_time(:millisecond)
+      }
+
+      inserted? = :ets.insert_new(@pending_task_table, {key, entry})
+
+      Logger.info(
+        "[AgentBridge] #{if(inserted?, do: "queued", else: "deduped")} task during reconnect " <>
+          "user=#{user_id} task=#{task_id}"
+      )
+
+      :ok
+    else
+      {:error, :offline}
+    end
+  end
 
   defp truthy?(value) when value in [true, "true", "1", 1], do: true
   defp truthy?(_), do: false

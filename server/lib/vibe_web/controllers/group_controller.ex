@@ -8,6 +8,7 @@ defmodule VibeWeb.GroupController do
   def create(conn, %{"name" => name, "memberIds" => member_ids} = params) do
     creator_id = conn.assigns.current_user.id
     avatar_url = params["avatarUrl"]
+    description = params["description"]
     ensure_local_agent_users(member_ids)
 
     invalid_agent =
@@ -21,14 +22,9 @@ defmodule VibeWeb.GroupController do
     if invalid_agent do
       conn |> put_status(:forbidden) |> json(%{error: "Agent not available"})
     else
-      case Chat.create_group(creator_id, name, member_ids, avatar_url) do
+      case Chat.create_group(creator_id, name, member_ids, avatar_url, description) do
         {:ok, room} ->
-          json(conn, %{
-            chatId: room.id,
-            type: "group",
-            name: room.name,
-            creatorId: room.creator_id
-          })
+          json(conn, Chat.canonical_room_summary(room, role: "owner"))
 
         {:error, reason} ->
           conn |> put_status(500) |> json(%{error: "Failed to create group: #{inspect(reason)}"})
@@ -47,7 +43,7 @@ defmodule VibeWeb.GroupController do
           case Accounts.get_user(uid) do
             %{is_agent: true} ->
               if addable_agent_user?(uid) do
-                case Chat.add_member(chat_id, uid, "member") do
+                case Chat.add_member(chat_id, uid, "member", actor_id: requester_id) do
                   {:ok, _} -> %{userId: uid, added: true}
                   _ -> %{userId: uid, added: false}
                 end
@@ -56,7 +52,7 @@ defmodule VibeWeb.GroupController do
               end
 
             _ ->
-              case Chat.add_member(chat_id, uid, "member") do
+              case Chat.add_member(chat_id, uid, "member", actor_id: requester_id) do
                 {:ok, _} -> %{userId: uid, added: true}
                 _ -> %{userId: uid, added: false}
               end
@@ -86,7 +82,7 @@ defmodule VibeWeb.GroupController do
     settings = Chat.get_participant_settings(chat_id, requester_id)
 
     if settings && settings.role in ["owner", "admin"] do
-      case Chat.remove_member(chat_id, user_id) do
+      case Chat.remove_member(chat_id, user_id, actor_id: requester_id) do
         {1, _} -> json(conn, %{success: true})
         _ -> conn |> put_status(400) |> json(%{error: "Failed to remove member"})
       end

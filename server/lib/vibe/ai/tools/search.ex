@@ -1,29 +1,55 @@
 defmodule Vibe.AI.Tools.Search do
   @moduledoc """
-  Web search tool using Gemini with Google Search grounding.
+  Gemini-grounded web search — now the FALLBACK path, not the primary one.
 
-  Uses Gemini 2.0 Flash with built-in Google Search capability for real-time web results.
-  Falls back to direct search APIs if Gemini fails.
+  `Vibe.AI.Tools.Research` owns web search (Tavily). This module survives for the case
+  where `TAVILY_API_KEY` is absent, and because Gemini grounding is the only search we
+  have that needs no key of its own beyond `GEMINI_API_KEY`.
+
+  Its known limits, measured 2026-08-05, are why it is no longer primary: 10–21 s per
+  call, `vertexaisearch.cloud.google.com/grounding-api-redirect/…` URLs that cannot be
+  cited or fetched, and a `finishReason: "RECITATION"` failure on roughly one call in
+  three. See `Vibe.AI.Tools.Research` for the full note.
   """
 
   require Logger
 
-  @gemini_api "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent"
+  # `gemini-3.0-flash` was retired and every web lookup 404'd ("is not found for API version
+  # v1beta") — search_google was simply dead. 2.5-flash is the newest model this project's
+  # key can actually call: measured 2026-07-25, the 3.x flash models return
+  # 429 "free_tier_requests, limit: 0". Override with GEMINI_SEARCH_MODEL after upgrading the
+  # Gemini plan, so a retirement or a plan change is config, not a code edit.
+  @default_gemini_model "gemini-2.5-flash"
 
   @doc """
-  Search the web using Gemini with Google Search grounding and return structured results.
-  """
-  def google(%{"query" => query}) do
-    case search_with_gemini(query) do
-      {:ok, results} -> results
-      {:error, reason} ->
-        Logger.warning("[Search] Gemini search failed: #{reason}")
-        %{error: "Search failed", query: query}
-    end
-  end
+  Web search. Delegates to `Vibe.AI.Tools.Research`, which uses Tavily when a key is
+  configured and falls back to `gemini/1` below when it is not.
 
-  # Handle missing query parameter
+  Kept as the entry point so every existing caller (the agent tool dispatch, the
+  per-agent tool tester, group agents) picks up the better search without a rename —
+  `search_google` is a tool id stored in every agent's `enabled_tools`.
+  """
+  def google(params) when is_map(params), do: Vibe.AI.Tools.Research.search(params)
   def google(_params), do: %{error: "Missing search query"}
+
+  @doc """
+  Raw Gemini-grounded search. `{:ok, result} | {:error, reason}`.
+  """
+  def gemini(query) when is_binary(query), do: search_with_gemini(query)
+  def gemini(_query), do: {:error, "Missing search query"}
+
+  defp gemini_endpoint do
+    model =
+      case System.get_env("GEMINI_SEARCH_MODEL") do
+        value when is_binary(value) ->
+          if String.trim(value) == "", do: @default_gemini_model, else: String.trim(value)
+
+        _ ->
+          @default_gemini_model
+      end
+
+    "https://generativelanguage.googleapis.com/v1beta/models/#{model}:generateContent"
+  end
 
   defp search_with_gemini(query) do
     api_key = System.get_env("GEMINI_API_KEY")
@@ -31,7 +57,7 @@ defmodule Vibe.AI.Tools.Search do
     if is_nil(api_key) do
       {:error, "No Gemini API key configured"}
     else
-      url = "#{@gemini_api}?key=#{api_key}"
+      url = "#{gemini_endpoint()}?key=#{api_key}"
 
       body = Jason.encode!(%{
         contents: [

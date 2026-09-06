@@ -12,6 +12,7 @@ defmodule Vibe.AI.Tools.Vision do
   """
 
   require Logger
+  alias Vibe.Net.SafeURL
 
   @claude_api "https://api.anthropic.com/v1/messages"
   @claude_model "claude-sonnet-4-20250514"
@@ -138,8 +139,9 @@ defmodule Vibe.AI.Tools.Vision do
   Useful for images that Claude can't access directly.
   """
   def fetch_and_encode(url) do
-    case Finch.build(:get, url) |> Finch.request(Vibe.Finch) do
-      {:ok, %{status: 200, body: body, headers: headers}} ->
+    with {:ok, _uri} <- SafeURL.validate(url),
+         {:ok, %{status: 200, body: body, headers: headers}} <-
+           Finch.build(:get, url) |> Finch.request(Vibe.Finch) do
         content_type = Enum.find_value(headers, "image/jpeg", fn
           {"content-type", ct} -> ct
           _ -> nil
@@ -147,9 +149,8 @@ defmodule Vibe.AI.Tools.Vision do
 
         base64 = Base.encode64(body)
         {:ok, "data:#{content_type};base64,#{base64}"}
-
-      _ ->
-        {:error, "Failed to download image"}
+    else
+      _ -> {:error, "Failed to download image"}
     end
   end
 end

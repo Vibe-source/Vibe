@@ -3,6 +3,7 @@ defmodule VibeWeb.UserChannel do
   require Logger
   alias VibeWeb.Presence
   alias Vibe.Accounts
+  alias Vibe.AgentBridge
   alias Vibe.Notifications
 
   @impl true
@@ -21,6 +22,13 @@ defmodule VibeWeb.UserChannel do
   def handle_info(:after_join, socket) do
     user_id = socket.assigns.user_id
     user = Accounts.get_user(user_id)
+
+    # Watch this user's bridge topic so computer-online / repo / running-task
+    # changes reach the phone as a push. Presence emits a diff for joins, leaves
+    # AND metadata updates, so this one subscription replaces the client's poll of
+    # /api/agent-bridge/status. The topic itself is low volume — agent output is
+    # broadcast on chat:<id>, not here.
+    Phoenix.PubSub.subscribe(Vibe.PubSub, AgentBridge.topic(user_id))
 
     # Track this user's presence immediately (fast, no DB)
     if user && user.show_online_status do
@@ -53,15 +61,26 @@ defmodule VibeWeb.UserChannel do
         VibeWeb.Presence.list("user:#{fid}") |> map_size() > 0
       end)
 
+      # Compute the current bridge status ONCE here, off the channel process (this
+      # Task already does DB work). Presence only emits a diff — and thus a
+      # bridge-status push — when a computer is actually connected; a user with NO
+      # paired bridge would otherwise never get a push, so the phone's 20s fallback
+      # poll of /api/agent-bridge/status runs forever (a wall of cheap-but-needless
+      # calls, ~2/10s per surface). Pushing an initial snapshot on join stamps the
+      # client's freshness so the fallback stays quiet as long as the socket is up,
+      # paired or not. `status_for_push/1` rescues internally, so a failure here can
+      # never take down the join.
+      bridge_status = AgentBridge.status_for_push(user_id)
+
       # Send results back to the channel process (push must happen there)
-      send(channel_pid, {:after_join_complete, friend_ids, online_friend_ids})
+      send(channel_pid, {:after_join_complete, friend_ids, online_friend_ids, bridge_status})
     end)
 
     {:noreply, socket}
   end
 
   @impl true
-  def handle_info({:after_join_complete, friend_ids, online_friend_ids}, socket) do
+  def handle_info({:after_join_complete, friend_ids, online_friend_ids, bridge_status}, socket) do
     # Cache friend_ids so terminate/2 doesn't need to re-fetch
     socket = assign(socket, :friend_ids, friend_ids)
 
@@ -70,6 +89,28 @@ defmodule VibeWeb.UserChannel do
       online_friend_ids: online_friend_ids
     })
 
+    # Initial bridge snapshot so the client stops polling while the socket is alive.
+    push(socket, "bridge-status", bridge_status)
+
+    {:noreply, socket}
+  end
+
+  # A computer joined/left the bridge, or updated its repos / running tasks.
+  # Push the fresh status so the phone never has to poll for it.
+  @impl true
+  def handle_info(
+        %Phoenix.Socket.Broadcast{topic: "bridge:" <> _, event: "presence_diff"},
+        socket
+      ) do
+    push(socket, "bridge-status", AgentBridge.status_for_push(socket.assigns.user_id))
+    {:noreply, socket}
+  end
+
+  # Everything else on the bridge topic (run_task fan-out to the daemon) is not
+  # this channel's business — subscribing is how we observe Presence, not a claim
+  # on the topic's other traffic.
+  @impl true
+  def handle_info(%Phoenix.Socket.Broadcast{topic: "bridge:" <> _}, socket) do
     {:noreply, socket}
   end
 
@@ -79,7 +120,21 @@ defmodule VibeWeb.UserChannel do
     # Use cached friend_ids from :after_join_complete (avoids re-running list_chats)
     cached_friend_ids = socket.assigns[:friend_ids]
 
-    # Run all terminate work asynchronously so the process exits immediately
+    # On node shutdown the Repo is stopped before the sockets are drained, so this
+    # work can only raise — one crash report per open connection, every deploy.
+    # Skipping it loses nothing: the client reconnects to the replacement node and
+    # is marked online there, which is what the offline broadcast would race with.
+    if repo_running?() do
+      spawn_offline_broadcast(user_id, cached_friend_ids)
+    end
+
+    :ok
+  end
+
+  defp repo_running?, do: is_pid(Process.whereis(Vibe.Repo))
+
+  # Runs asynchronously so the channel process exits immediately.
+  defp spawn_offline_broadcast(user_id, cached_friend_ids) do
     Task.start(fn ->
       user = Accounts.get_user(user_id)
       last_seen = DateTime.utc_now()

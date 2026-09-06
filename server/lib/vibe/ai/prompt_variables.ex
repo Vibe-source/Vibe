@@ -62,7 +62,8 @@ defmodule Vibe.AI.PromptVariables do
       %{
         "name" => name,
         "description" => trim_string(get(map, "description")) || "",
-        "value" => to_value_string(get(map, "value") || get(map, "default"))
+        "value" => to_value_string(get(map, "value") || get(map, "default")),
+        "secret" => truthy?(get(map, "secret"))
       }
     end
   end
@@ -101,26 +102,41 @@ defmodule Vibe.AI.PromptVariables do
     enriched ++ extra
   end
 
-  @doc "Map of `name => effective value` used for rendering."
-  def effective_values(agent) do
+  @doc """
+  Map of `name => effective value` used for rendering.
+
+  Pass `admin_mode: false` (default `true`, matching every existing caller) to
+  blank out any variable flagged `"secret" => true` instead of its real value —
+  used when the agent is answering someone other than its own owner, so an
+  owner-only variable can never be extracted via prompt injection.
+  """
+  def effective_values(agent, opts \\ []) do
+    admin_mode = Keyword.get(opts, :admin_mode, true)
+
     agent
     |> definitions()
-    |> Enum.into(%{}, fn var -> {var["name"], var["value"]} end)
+    |> Enum.into(%{}, fn var ->
+      value = if not admin_mode and var["secret"], do: "", else: var["value"]
+      {var["name"], value}
+    end)
   end
 
   @doc """
   Replace `{{name}}` placeholders in `text` with effective values. Unknown
-  placeholders are left untouched so authors notice the typo.
+  placeholders are left untouched so authors notice the typo. See
+  `effective_values/2` for the `admin_mode` option.
   """
-  def render(text, agent) when is_binary(text) do
-    values = effective_values(agent)
+  def render(text, agent, opts \\ [])
+
+  def render(text, agent, opts) when is_binary(text) do
+    values = effective_values(agent, opts)
 
     Regex.replace(@placeholder, text, fn whole, name ->
       Map.get(values, name, whole)
     end)
   end
 
-  def render(text, _agent), do: text
+  def render(text, _agent, _opts), do: text
 
   @doc "The code-pinned overrides for an agent as a `name => value` map."
   def overrides_for(agent) do
@@ -166,6 +182,9 @@ defmodule Vibe.AI.PromptVariables do
   defp to_value_string(value) when is_binary(value), do: value
   defp to_value_string(value) when is_number(value) or is_boolean(value), do: to_string(value)
   defp to_value_string(value), do: inspect(value)
+
+  defp truthy?(value) when value in [true, "true", "1", 1], do: true
+  defp truthy?(_), do: false
 
   defp get(map, key), do: Map.get(map, key) || Map.get(map, safe_atom(key))
 

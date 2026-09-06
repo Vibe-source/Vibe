@@ -21,9 +21,18 @@ defmodule VibeWeb.UserController do
   end
 
   def show_by_phone(conn, %{"phone" => phone}) do
+    viewer = conn.assigns.current_user
+
     case Accounts.get_user_by_phone(phone) do
-      nil -> conn |> put_status(404) |> json(%{error: "User not found"})
-      user -> render_user(conn, user, conn.assigns.current_user)
+      nil ->
+        conn |> put_status(404) |> json(%{error: "User not found"})
+
+      user ->
+        if Accounts.viewer_can_see?(user, viewer, :privacy_phone_number) do
+          render_user(conn, user, viewer)
+        else
+          conn |> put_status(404) |> json(%{error: "User not found"})
+        end
     end
   end
 
@@ -90,12 +99,14 @@ defmodule VibeWeb.UserController do
 
         with user when not is_nil(user) <- Accounts.get_user(id),
              merged_update_attrs <- merge_existing_push_token_update(update_attrs, user),
-             {:ok, updated_user} <- Accounts.update_user(user, merged_update_attrs) do
+             {:ok, updated_user} <- apply_profile_update(user, merged_update_attrs) do
           if Map.has_key?(merged_update_attrs, :push_token) do
             Logger.info(
               "[UserController] push_token updated user_id=#{updated_user.id} targets=#{inspect(push_token_target_summary(updated_user.push_token))}"
             )
           end
+
+          Vibe.Audit.record(conn, "profile.update", actor_user_id: updated_user.id)
 
           json(conn, %{
             success: true,
@@ -130,6 +141,29 @@ defmodule VibeWeb.UserController do
     end
   end
 
+  # push_token/username/phone_number aren't in profile_changeset/2's allow-list,
+  # so they still go through the full User.changeset/2; the rest is schema-limited.
+  @identity_keys [:push_token, :phone_number, :username]
+
+  defp apply_profile_update(user, attrs) do
+    {identity_attrs, profile_attrs} = Map.split(attrs, @identity_keys)
+
+    Vibe.Repo.transaction(fn ->
+      with {:ok, user} <- apply_identity_attrs(user, identity_attrs),
+           {:ok, user} <- apply_profile_attrs(user, profile_attrs) do
+        user
+      else
+        {:error, changeset} -> Vibe.Repo.rollback(changeset)
+      end
+    end)
+  end
+
+  defp apply_identity_attrs(user, attrs) when map_size(attrs) == 0, do: {:ok, user}
+  defp apply_identity_attrs(user, attrs), do: Accounts.update_user(user, attrs)
+
+  defp apply_profile_attrs(user, attrs) when map_size(attrs) == 0, do: {:ok, user}
+  defp apply_profile_attrs(user, attrs), do: Accounts.update_profile(user, attrs)
+
   defp resolve_push_token_update(params) when is_map(params) do
     explicit =
       cond do
@@ -141,7 +175,6 @@ defmodule VibeWeb.UserController do
     token_map =
       %{}
       |> merge_push_token_bundle(params["pushTokens"] || params["push_tokens"])
-      |> maybe_put_token("expo", params["expoPushToken"] || params["expo_push_token"])
       |> maybe_put_token("fcm", params["fcmPushToken"] || params["fcm_push_token"])
       |> maybe_put_token("apns", params["apnsPushToken"] || params["apns_push_token"])
       |> maybe_put_token("apns_voip", params["voipPushToken"] || params["voip_push_token"])
@@ -150,9 +183,6 @@ defmodule VibeWeb.UserController do
     cond do
       map_size(token_map) > 0 ->
         Jason.encode!(token_map)
-
-      is_binary(explicit) ->
-        explicit
 
       true ->
         nil
@@ -163,14 +193,16 @@ defmodule VibeWeb.UserController do
 
   defp merge_push_token_bundle(acc, value) when is_map(value) do
     acc
-    |> maybe_put_token("expo", value["expo"] || value["expoPushToken"])
     |> maybe_put_token("fcm", value["fcm"] || value["fcmPushToken"])
     |> maybe_put_token("apns", value["apns"] || value["apnsToken"])
     |> maybe_put_token("apns_voip", value["apns_voip"] || value["voip"] || value["voipPushToken"])
   end
 
   defp merge_push_token_bundle(acc, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    # Unwrapped first for the same reason as above: the client boxed whatever it
+    # held, so the whole JSON bundle can arrive wrapped too, and it would then
+    # fail the `{` test and be dropped whole.
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
 
     cond do
       trimmed == "" ->
@@ -190,7 +222,10 @@ defmodule VibeWeb.UserController do
   defp merge_push_token_bundle(acc, _), do: acc
 
   defp merge_explicit_push_token(acc, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    # Unwrapped before classifying, not after: a wrapped token fails the hex test
+    # and would be dropped here, which is precisely the population the healing
+    # below exists for.
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
 
     cond do
       trimmed == "" ->
@@ -199,8 +234,13 @@ defmodule VibeWeb.UserController do
       String.starts_with?(trimmed, "{") ->
         merge_push_token_bundle(acc, trimmed)
 
+      apns_device_token?(trimmed) ->
+        # Support a direct native APNs token while never persisting a legacy
+        # provider-specific bare token.
+        maybe_put_token(acc, "apns", trimmed)
+
       true ->
-        maybe_put_token(acc, "expo", trimmed)
+        acc
     end
   end
 
@@ -209,11 +249,23 @@ defmodule VibeWeb.UserController do
   defp maybe_put_token(acc, _key, nil), do: acc
 
   defp maybe_put_token(acc, key, value) when is_binary(value) do
-    trimmed = String.trim(value)
+    trimmed = value |> String.trim() |> unwrap_swift_optional()
     if trimmed == "", do: acc, else: Map.put(acc, key, trimmed)
   end
 
   defp maybe_put_token(acc, _key, _value), do: acc
+
+  # iOS shipped a build that registered its token as the literal text
+  # Optional("…") — a String? boxed into Any and then String(describing:)'d.
+  # Unwrapping on the way in keeps the corrupted form out of the database
+  # entirely, so a device self-corrects the moment it re-registers instead of
+  # carrying a broken token until the user updates the app.
+  defp unwrap_swift_optional(value) do
+    case Regex.run(~r/^Optional\("(.*)"\)$/s, value) do
+      [_, inner] -> String.trim(inner)
+      _ -> value
+    end
+  end
 
   defp merge_existing_push_token_update(update_attrs, user) do
     case Map.fetch(update_attrs, :push_token) do
@@ -249,7 +301,6 @@ defmodule VibeWeb.UserController do
         case Jason.decode(trimmed) do
           {:ok, decoded} when is_map(decoded) ->
             %{}
-            |> maybe_put_token("expo", decoded["expo"] || decoded["expoPushToken"])
             |> maybe_put_token("fcm", decoded["fcm"] || decoded["fcmPushToken"])
             |> maybe_put_token("apns", decoded["apns"] || decoded["apnsToken"])
             |> maybe_put_token("apns_voip", decoded["apns_voip"] || decoded["voip"] || decoded["voipPushToken"])
@@ -259,11 +310,26 @@ defmodule VibeWeb.UserController do
         end
 
       true ->
-        %{"expo" => trimmed}
+        # Older rows may contain a bare legacy token. They are intentionally
+        # ignored so a native token bundle can safely overwrite the row.
+        %{}
     end
   end
 
   defp push_token_to_map(_), do: %{}
+
+  # APNs device tokens are hex, but Apple documents the length as variable and
+  # tells clients not to hardcode 32 bytes, so this bounds rather than pins it.
+  # (The 76-character tokens seen in production were not long tokens — they were
+  # 64 hex characters wrapped in `Optional("…")`, healed above.)
+  defp apns_device_token?(token) when is_binary(token) do
+    length = String.length(token)
+
+    length >= 64 and length <= 200 and rem(length, 2) == 0 and
+      String.match?(token, ~r/\A[[:xdigit:]]+\z/)
+  end
+
+  defp apns_device_token?(_), do: false
 
   defp push_token_target_summary(token) do
     token
@@ -323,34 +389,37 @@ defmodule VibeWeb.UserController do
   end
 
   defp render_user(conn, user, viewer) do
-    is_self = viewer && viewer.id == user.id
     is_online = user.show_online_status and user_online?(user.id)
     agent_id = if user.is_agent, do: Agents.agent_id_for_user(user.id), else: nil
-
-    phone_number =
-      cond do
-        is_self -> user.phone_number
-        user.privacy_phone_number == "everybody" -> user.phone_number
-        true -> nil
-      end
 
     json(conn, %{
       userId: user.id,
       username: user.username,
+      # The user's one public link. Server-built so the app never has to guess the share
+      # host (it moves with VIBE_SHARE_BASE_URL — see Vibe.Links).
+      shareLink: Vibe.Links.profile_url(user.username),
       isAgent: user.is_agent || false,
       agentId: agent_id,
       acceptsIncomingChat:
         if(user.is_agent && agent_id, do: agent_accepts_incoming_chat(agent_id, viewer), else: nil),
       name: user.name,
-      phoneNumber: phone_number,
+      phoneNumber:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_phone_number),
+          do: user.phone_number,
+          else: nil
+        ),
       publicKey: user.public_key,
       identityKey: user.identity_key,
-      profileImage: user.profile_image,
+      profileImage:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_profile_photos),
+          do: user.profile_image,
+          else: nil
+        ),
       online: if(user.show_online_status, do: is_online, else: false),
       lastSeen: if(user.show_last_seen, do: user.last_seen, else: nil),
       showLastSeen: user.show_last_seen,
       showOnlineStatus: user.show_online_status,
-      bio: user.bio,
+      bio: if(Accounts.viewer_can_see?(user, viewer, :privacy_bio), do: user.bio, else: nil),
       autoDeleteTimer: user.auto_delete_timer,
       privacyForward: user.privacy_forward,
       privacyCalls: user.privacy_calls,
@@ -360,7 +429,11 @@ defmodule VibeWeb.UserController do
       privacyGifts: user.privacy_gifts,
       privacyBirthday: user.privacy_birthday,
       privacySavedMusic: user.privacy_saved_music,
-      dateOfBirth: user.date_of_birth
+      dateOfBirth:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_birthday),
+          do: user.date_of_birth,
+          else: nil
+        )
     })
   end
 
@@ -381,10 +454,18 @@ defmodule VibeWeb.UserController do
       acceptsIncomingChat:
         if(user.is_agent && agent_id, do: agent_accepts_incoming_chat(agent_id, viewer), else: nil),
       name: user.name,
-      phoneNumber: if(user.privacy_phone_number == "everybody", do: user.phone_number, else: nil),
+      phoneNumber:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_phone_number),
+          do: user.phone_number,
+          else: nil
+        ),
       publicKey: user.public_key,
       identityKey: user.identity_key,
-      profileImage: user.profile_image
+      profileImage:
+        if(Accounts.viewer_can_see?(user, viewer, :privacy_profile_photos),
+          do: user.profile_image,
+          else: nil
+        )
     }
   end
 

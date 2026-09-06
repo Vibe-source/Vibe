@@ -28,9 +28,9 @@ defmodule VibeWeb.AgentBridgeController do
     device_label = params["device_label"] || params["device"] || "computer"
 
     case AgentBridge.redeem_pairing(code, device_label) do
-      {:ok, %{user_id: user_id, bridge_token: token}} ->
+      {:ok, %{user_id: user_id, bridge_token: token, computer_id: computer_id}} ->
         Logger.info("[AgentBridge] paired computer for user=#{user_id} device=#{device_label}")
-        json(conn, %{bridge_token: token, user_id: user_id})
+        json(conn, %{bridge_token: token, user_id: user_id, computer_id: computer_id})
 
       {:error, :invalid_code} ->
         conn |> put_status(:bad_request) |> json(%{error: "invalid_code"})
@@ -79,9 +79,9 @@ defmodule VibeWeb.AgentBridgeController do
     device_secret = params["device_secret"] || params["deviceSecret"] || ""
 
     case AgentBridge.claim_request(request_id, device_secret) do
-      {:ok, %{user_id: user_id, bridge_token: token}} ->
+      {:ok, %{user_id: user_id, bridge_token: token, computer_id: computer_id}} ->
         Logger.info("[AgentBridge] claimed token for user=#{user_id}")
-        json(conn, %{bridge_token: token, user_id: user_id})
+        json(conn, %{bridge_token: token, user_id: user_id, computer_id: computer_id})
 
       {:error, :pending} ->
         conn |> put_status(:accepted) |> json(%{status: "pending"})

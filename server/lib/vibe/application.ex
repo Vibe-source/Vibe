@@ -13,19 +13,46 @@ defmodule Vibe.Application do
     # Create ETS table for rate limiting before starting the endpoint
     # This must happen before any requests can hit the RateLimiter plug
     ensure_ets_table(:rate_limiter)
+    ensure_ets_table(:channel_throttle)
+    # Bearer-token -> user cache; without it every authenticated request pays a
+    # full DB round trip just to authenticate (see Vibe.Accounts.TokenCache).
+    ensure_ets_table(:auth_token_cache)
     ensure_ets_table(:chat_home_cache)
     ensure_ets_table(:local_agent_worker_ratelimit)
     ensure_ets_table(:local_agent_worker_sessions)
     ensure_ets_table(:agent_bridge_pairings)
     ensure_ets_table(:agent_bridge_requests)
+    ensure_ets_table(:agent_bridge_pending_tasks)
+    # MCP tool discovery cache — without it every agent turn pays a tools/list
+    # round trip to each connected server before the model starts thinking.
+    ensure_ets_table(:vibe_mcp_tool_cache)
+    # Per-(claimer, target) KeyPackage claim cap. Owned here so a request
+    # process dying does not drop the table (see Vibe.Mls.check_claim_quota/2).
+    ensure_ets_table(:mls_claim_quota)
+    # Login-failure throttle, internal-auth replay cache, and isolated-run relay state.
+    ensure_ets_table(:login_throttle)
+    ensure_ets_table(:vibe_internal_nonces)
+    ensure_ets_table(:agent_run_seen)
+    ensure_ets_table(:agent_run_state)
 
-    children = [
-      # Start the Telemetry supervisor
-      # VibeWeb.Telemetry,
-      # Start the Ecto repository
-      Vibe.Repo,
-      # Start the PubSub system
-      {Phoenix.PubSub, name: Vibe.PubSub},
+    # Redact credential-shaped substrings from every log line, before anything logs.
+    Vibe.LogScrub.install()
+    Vibe.Telemetry.SlowQuery.attach()
+
+    children =
+      [
+        # Start the Ecto repository
+        Vibe.Repo,
+        # Start the PubSub system
+        {Phoenix.PubSub, name: Vibe.PubSub},
+        # Cross-node cache invalidation relay (docs/agent-platform-v1.md §5, phase 4)
+        Vibe.Cache
+      ] ++
+        Vibe.Cluster.child_specs() ++
+        Vibe.RateLimit.redix_child_specs() ++
+        [Vibe.Telemetry.Metrics.reporter_child_spec()] ++
+        Vibe.Telemetry.MetricsServer.child_specs() ++
+        [
       # Start Presence tracking
       VibeWeb.Presence,
       # Start Finch HTTP client for AI APIs
@@ -48,12 +75,24 @@ defmodule Vibe.Application do
       # Start the scheduled post scheduler
       Vibe.Scheduler,
       Vibe.AgentDeliveryScheduler,
+      Vibe.ChannelAgentScheduler,
+      Vibe.AgentRoutineScheduler,
       # Start the Story Cleaner
       Vibe.StoryCleaner,
       # Bounded pool for @claude / @codex local agent workers (caps concurrency + cost)
       {Task.Supervisor,
-       name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()}
-    ]
+       name: Vibe.AI.WorkerTaskSupervisor, max_children: local_agent_worker_concurrency()},
+      # Unlinked pool for in-turn agent tool calls: a raising tool must surface as an
+      # error the model can read, never take the whole agent turn down with it.
+      {Task.Supervisor, name: Vibe.TaskSupervisor},
+      # Single-flight + failure backoff for music cache fills (runs its work under
+      # Vibe.TaskSupervisor above, so it must start after it).
+      Vibe.MusicCacheFill,
+      # Zero-token watchdogs for coordinated team runs (one transient GenServer
+      # per {chat_id, team_run_id}; docs/team-architecture-v2.md §4)
+      {Registry, keys: :unique, name: Vibe.AI.TeamRunRegistry},
+      {DynamicSupervisor, name: Vibe.AI.TeamRunMonitorSupervisor, strategy: :one_for_one}
+        ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -82,7 +121,9 @@ defmodule Vibe.Application do
   defp local_agent_worker_concurrency do
     case Integer.parse(System.get_env("VIBE_AGENT_WORKER_MAX_CONCURRENCY") || "") do
       {value, _} when value > 0 -> value
-      _ -> 3
+      # Default high enough for full group fan-out (claude+codex+grok+agy = 4)
+      # plus a couple of concurrent DMs. Was 3 → Agy always got "busy" in 4-agent groups.
+      _ -> 8
     end
   end
 
@@ -95,5 +136,4 @@ defmodule Vibe.Application do
         :ok
     end
   end
-
 end

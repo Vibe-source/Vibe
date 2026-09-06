@@ -14,12 +14,35 @@ defmodule VibeWeb.ApiController do
     json(conn, %{pong: System.system_time(:millisecond)})
   end
 
+  @doc "Liveness+DB readiness probe for a load balancer / orchestrator; never raises."
+  def ready(conn, _params) do
+    if db_ok?() do
+      json(conn, %{status: "ready", db: "ok", node: node()})
+    else
+      conn |> put_status(503) |> json(%{status: "not_ready", db: "error", node: node()})
+    end
+  end
+
+  defp db_ok? do
+    case Vibe.Repo.query("SELECT 1", [], timeout: 2_000) do
+      {:ok, _result} -> true
+      {:error, _reason} -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
   def info(conn, _params) do
     json(conn, %{
       name: "Vibe Server (Elixir)",
       version: "1.0.0",
       features: ["e2ee", "p2p", "push", "media"],
-      limits: %{maxFileSize: 52428800}
+      limits: %{maxFileSize: 52428800},
+      # Host that public share links hang off, so clients render the same link the
+      # server hands out even after the domain changes.
+      shareBaseUrl: Vibe.Links.share_base_url()
     })
   end
 
