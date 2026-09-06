@@ -13,23 +13,29 @@ defmodule Vibe.AI.LocalAgentWorker do
   alias Vibe.Repo
   alias Vibe.AI.TeamRun
 
-  # How many recent shared-thread turns to inject as collaboration context when
-  # dispatching a bridge agent inside a group.
+  # How many recent shared-thread turns to inject as collaboration context.
   @group_context_messages 12
 
   @agent_user_id Vibe.AI.GroupAgent.agent_user_id()
-  # Distinct agent user identities so @claude / @codex / @grok / @agy are separate,
-  # searchable users you can DM, each with their own avatar — instead of one
-  # shared bot user.
+  # Distinct agent user identities so @claude / @codex / @grok / @agy are.
   @claude_agent_user_id "11111111-1111-1111-1111-111111111111"
   @codex_agent_user_id "22222222-2222-2222-2222-222222222222"
   @grok_agent_user_id "33333333-3333-3333-3333-333333333333"
   @agy_agent_user_id "44444444-4444-4444-4444-444444444444"
+  # Role agents: own identity, own model, run their CLI on the server (no bridge).
+  @boss_agent_user_id "55555555-5555-5555-5555-555555555555"
+  @monitor_agent_user_id "66666666-6666-6666-6666-666666666666"
+  @coder_agent_user_id "77777777-7777-7777-7777-777777777777"
+  @researcher_agent_user_id "88888888-8888-8888-8888-888888888888"
+  @marketing_agent_user_id "99999999-9999-9999-9999-999999999999"
+  @social_agent_user_id "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+  @media_agent_user_id "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
   @claude_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/claude.png"
   @codex_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/codex.png"
   @grok_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/grok-v2.png"
   @agy_avatar_data_url "https://media.vibegram.io/chat-media/agent-profiles/agy-v3.png"
   @default_timeout_ms 120_000
+  @default_team_timeout_ms 600_000
   @max_prompt_length 8_000
   @max_tool_events 16
   @max_activity_summary_items 6
@@ -39,12 +45,23 @@ defmodule Vibe.AI.LocalAgentWorker do
   @rate_limit_table :local_agent_worker_ratelimit
   @session_table :local_agent_worker_sessions
   @team_run_table :local_agent_worker_team_runs
-  # Suppress double-posts when two bridges both finish the same logical turn
-  # (duplicate daemons both ran run_task for the same reply_to + provider).
+  # Suppress double-posts when two bridges both finish the same logical turn.
   @deliver_dedupe_table :local_agent_worker_deliver_dedupe
   @deliver_dedupe_ttl_ms 90_000
   @default_cooldown_ms 8_000
-  @worker_order ["claude", "codex", "grok", "agy"]
+  # Hop cap for agent-to-agent handoff; a chain cannot outlive this many relays.
+  @team_relay_max_hops 4
+
+  # Role workers answer in a group chat, not a terminal: short, and no side quests.
+  @team_chat_rules """
+  You are answering inside a Vibe group chat, not a terminal session. Give the answer
+  itself in under 150 words — no headings, no plan file, no report template. Do not
+  spawn subagents and do not start a background investigation; if the work needs more
+  than a couple of minutes, say what you would do and stop there. To hand work to a
+  teammate, @mention exactly one of them on the last line.
+  """
+  @worker_order ["claude", "codex", "grok", "agy", "boss", "monitor", "coder", "researcher", "marketing", "social", "media"]
+  @role_worker_order ["boss", "monitor", "coder", "researcher", "marketing", "social", "media"]
 
   @workers %{
     "codex" => %{
@@ -90,6 +107,163 @@ defmodule Vibe.AI.LocalAgentWorker do
       name: "Agy",
       avatar_url: @agy_avatar_data_url,
       tier: "gold"
+    },
+    "boss" => %{
+      handle: "boss",
+      label: "Boss",
+      executor: "claude",
+      runtime: :server,
+      model: "fable",
+      fallback_model: "opus",
+      effort: "xhigh",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @boss_agent_user_id,
+      username: "boss",
+      name: "Boss",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are the Boss (chief of staff) for the Vibe team. You do not do the work
+      yourself: you decide who does, then hand it over by @mentioning exactly one
+      teammate in this chat and stating the outcome you expect. Your team is
+      @monitor and @coder (DevOps), @researcher, @marketing, @social, @media.
+      Keep your own replies to a few lines. If a request is already assigned, say
+      so and stay quiet.
+      """
+    },
+    "monitor" => %{
+      handle: "monitor",
+      label: "Monitor",
+      executor: "claude",
+      runtime: :server,
+      model: "haiku",
+      effort: "low",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @monitor_agent_user_id,
+      username: "monitor",
+      name: "Monitor",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are Monitor, the watch half of the DevOps team. You own security status,
+      logging, health and incident triage, for the SERVER and for the iOS client.
+      Read production logs with deploy/scripts/vibe-logs.sh (never SSH to read;
+      see docs/vps-logs.md). Client crashes arrive as client log reports.
+      You investigate and report; you do NOT patch or deploy. When something needs
+      a code change, hand it to @coder in one message: what broke, the evidence
+      (log lines, file:line), and how to reproduce. Be terse. If nothing is wrong,
+      say so in one line.
+      """
+    },
+    "coder" => %{
+      handle: "coder",
+      label: "Coder",
+      executor: "claude",
+      runtime: :server,
+      model: "opus",
+      effort: "xhigh",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @coder_agent_user_id,
+      username: "coder",
+      name: "Coder",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are Coder, the build half of the DevOps team. You own patching, code
+      review, updating, launching and deploying. @monitor hands you incidents; you
+      diagnose, write the fix, review it, and take it to a deploy.
+      Deploying is gated: follow docs/deploy-pipeline.md and never push or deploy
+      without saying what you are about to do first. If a fix is not obvious,
+      say what you would need instead of guessing. Report back to @monitor when
+      the fix is in so it can confirm the signal cleared.
+      """
+    },
+    "researcher" => %{
+      handle: "researcher",
+      label: "Researcher",
+      executor: "codex",
+      runtime: :server,
+      model: nil,
+      effort: "high",
+      command_env: "VIBE_CODEX_COMMAND",
+      default_command: "codex",
+      agent_user_id: @researcher_agent_user_id,
+      username: "researcher",
+      name: "Researcher",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are Researcher for the Vibe team. You answer questions with sources, not
+      impressions. Every claim you hand back carries a link or a file:line. When
+      you are asked something you cannot verify, say which part is unverified.
+      Hand findings to whoever asked; do not start work of your own.
+      """
+    },
+    "marketing" => %{
+      handle: "marketing",
+      label: "Marketing",
+      executor: "claude",
+      runtime: :server,
+      model: "sonnet",
+      effort: "medium",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @marketing_agent_user_id,
+      username: "marketing",
+      name: "Marketing",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are Marketing for Vibe. You own positioning, launch copy and the story
+      of what shipped. Ask @coder or @monitor what actually changed before you
+      write about it — never describe a feature you have not confirmed exists.
+      Hand finished copy to @social to post.
+      """
+    },
+    "social" => %{
+      handle: "social",
+      label: "Social",
+      executor: "claude",
+      runtime: :server,
+      model: "haiku",
+      effort: "low",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @social_agent_user_id,
+      username: "social",
+      name: "Social",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are the Social Manager for Vibe. You own the accounts and the posting
+      calendar. You write short, you post on approval, and you never publish
+      anything naming a customer without it. Ask @marketing for the angle and
+      @media for the asset.
+      """
+    },
+    "media" => %{
+      handle: "media",
+      label: "Media",
+      executor: "claude",
+      runtime: :server,
+      model: "sonnet",
+      effort: "medium",
+      command_env: "VIBE_CLAUDE_COMMAND",
+      default_command: "claude",
+      agent_user_id: @media_agent_user_id,
+      username: "media",
+      name: "Media",
+      avatar_url: nil,
+      tier: "gold",
+      role_prompt: """
+      You are Media for Vibe. You brief and assemble visual assets — screenshots,
+      captures, cuts — for whatever @social and @marketing are shipping. You
+      specify the asset precisely (size, frame, what is on screen) and say where
+      it lives. If you cannot produce it, say what you need.
+      """
     }
   }
 
@@ -102,6 +276,67 @@ defmodule Vibe.AI.LocalAgentWorker do
   def list_workers do
     @worker_order
     |> Enum.map(&Map.fetch!(@workers, &1))
+  end
+
+  @doc "Role workers only — the job-named team (boss, monitor, coder, ...)."
+  def list_role_workers do
+    Enum.map(@role_worker_order, &Map.fetch!(@workers, &1))
+  end
+
+  @doc "Which CLI actually runs this worker. Role workers borrow claude/codex."
+  def executor_for(worker) do
+    team_executor_override(worker) || declared_executor(worker)
+  end
+
+  defp declared_executor(%{executor: executor}) when is_binary(executor), do: executor
+  defp declared_executor(%{handle: handle}), do: handle
+
+  # One signed-in CLI can stand in for the whole team when the others have no seat.
+  defp team_executor_override(worker) do
+    if server_runtime?(worker) do
+      System.get_env("VIBE_TEAM_EXECUTOR")
+      |> normalize_string()
+      |> case do
+        value when value in ["claude", "codex", "grok"] -> value
+        _ -> nil
+      end
+    end
+  end
+
+  @doc "Role workers run their CLI on the server; the four provider workers need a paired bridge."
+  def server_runtime?(worker), do: Map.get(worker, :runtime) == :server
+
+  # Output is CLI-shaped, so a role worker's reply must be parsed as its executor's.
+  defp parser_worker(%{handle: handle} = worker) do
+    case executor_for(worker) do
+      ^handle -> worker
+      executor -> %{worker | handle: executor}
+    end
+  end
+
+  # A role worker carries its own model so cost tracks the job, not a global env.
+  defp put_worker_model(worker, opts) do
+    metadata = Keyword.get(opts, :bridge_metadata) || %{}
+
+    if executor_for(worker) == declared_executor(worker) do
+      metadata
+      |> put_worker_option("model", Map.get(worker, :model))
+      |> put_worker_option("fallbackModel", Map.get(worker, :fallback_model))
+      |> put_worker_option("reasoningEffort", Map.get(worker, :effort))
+      |> then(&Keyword.put(opts, :bridge_metadata, &1))
+    else
+      opts
+    end
+  end
+
+  # A roster default never overrides what the caller asked for.
+  defp put_worker_option(metadata, key, value) do
+    with true <- is_binary(value) and value != "",
+         nil <- normalize_string(option_value(metadata, key)) do
+      Map.put(metadata, key, value)
+    else
+      _ -> metadata
+    end
   end
 
   @doc "The dedicated agent user id for a worker (claude/codex are distinct users)."
@@ -146,7 +381,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def resolve_from_message(_), do: nil
 
   def extract_reserved_mention(text) when is_binary(text) do
-    case Regex.run(~r/(?:^|\s)@(codex|claude|grok|agy|antigravity)\b/i, text) do
+    case Regex.run(~r/(?:^|\s)@(codex|claude|grok|agy|antigravity|boss|monitor|coder|researcher|marketing|social|media)\b/i, text) do
       [_, handle] ->
         h = String.downcase(handle)
         resolve_handle(if(h == "antigravity", do: "agy", else: h))
@@ -159,7 +394,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def extract_reserved_mention(_), do: nil
 
   def extract_reserved_mentions(text) when is_binary(text) do
-    ~r/(?:^|\s)@(codex|claude|grok|agy|antigravity)\b/i
+    ~r/(?:^|\s)@(codex|claude|grok|agy|antigravity|boss|monitor|coder|researcher|marketing|social|media)\b/i
     |> Regex.scan(text)
     |> Enum.map(fn
       [_, handle] ->
@@ -176,10 +411,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   def extract_reserved_mentions(_), do: []
 
   @doc """
-  Whether a message is a short greeting / acknowledgement / chit-chat with no
-  actionable task. Used to skip the "read AGENTS.md / inspect the repo" operating
-  rules so a plain "hi" doesn't make the agents start crawling the codebase before
-  the user has actually asked for any work.
+  Whether a message is a short greeting / acknowledgement / chit-chat with no actionable task.
   """
   def casual_message?(text) when is_binary(text) do
     normalized = text |> String.downcase() |> String.trim()
@@ -226,9 +458,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Return local workers whose shadow users are participants in the group.
-  This keeps each user's group isolated: the bridge dispatch still uses the
-  requester user id, while the participant list only decides which local agents
-  are allowed to respond in that group.
   """
   def team_workers_for_participants(participant_ids) when is_list(participant_ids) do
     normalized_ids =
@@ -249,9 +478,7 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   @doc """
-  Per-user cooldown gate. Returns `true` and records the timestamp if the user
-  is allowed to dispatch now, `false` if they are still within the cooldown
-  window. Bounds cost and abuse from rapid `@claude` / `@codex` spamming.
+  Per-user cooldown gate.
   """
   def allow_request?(user_id) when is_binary(user_id) and user_id != "" do
     ensure_rate_limit_table()
@@ -311,15 +538,24 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   @doc """
-  Authorization gate. If `VIBE_AGENT_WORKER_ALLOWED_USERS` is set (comma-separated
-  user IDs), only those users may drive the local worker. If unset, all chat
-  participants are allowed (backwards compatible). Set it whenever the worker runs
-  with write/execute permissions so only you can trigger jobs on your machine.
+  Authorization gate.
   """
   def user_allowed?(user_id) do
     case allowed_users() do
       [] -> true
       list -> is_binary(user_id) and user_id in list
+    end
+  end
+
+  @doc """
+  Role workers run a CLI on our own server, so they fail CLOSED: an empty
+  allowlist means nobody, not everybody. Bridge workers keep the old gate.
+  """
+  def dispatch_allowed?(worker, user_id) do
+    if server_runtime?(worker) do
+      is_binary(user_id) and user_id in allowed_users()
+    else
+      user_allowed?(user_id)
     end
   end
 
@@ -371,11 +607,18 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     with {:ok, normalized_prompt} <- normalize_prompt(worker, prompt),
          {:ok, result} <-
-           run(worker, normalized_prompt, progress_callback: progress_callback, chat_id: chat_id) do
+           run(worker, normalized_prompt,
+             progress_callback: progress_callback,
+             chat_id: chat_id,
+             bridge_metadata: Keyword.get(opts, :bridge_metadata)
+           ) do
+      visible = visible_response_text(result.text, result.tool_events)
+      relay_to_teammates(worker, chat_id, visible, requester_user_id, Keyword.get(opts, :hop, 0))
+
       post_worker_message(
         worker,
         chat_id,
-        visible_response_text(result.text, result.tool_events),
+        visible,
         %{
           "agentWorker" => true,
           "agentWorkerProvider" => worker.handle,
@@ -409,6 +652,41 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
+  # Agents hand work over by @mentioning ONE teammate. Bounded to a single target
+  # per reply plus a hop cap, so a mutual mention can neither fan out nor loop.
+  defp relay_to_teammates(worker, chat_id, text, requester_user_id, hop) do
+    with true <- hop < @team_relay_max_hops,
+         true <- server_runtime?(worker),
+         %{} = target <- first_teammate_mention(text, worker) do
+      Task.Supervisor.start_child(Vibe.AI.WorkerTaskSupervisor, fn ->
+        handle_chat_message(target, chat_id, text,
+          requester_user_id: requester_user_id,
+          hop: hop + 1
+        )
+      end)
+    end
+
+    :ok
+  end
+
+  defp first_teammate_mention(text, worker) do
+    self_handle = Map.get(worker, :handle)
+
+    ~r/(?:^|\s)@([a-zA-Z_]{2,20})\b/
+    |> Regex.scan(to_string(text))
+    |> Enum.find_value(fn [_, handle] ->
+      h = String.downcase(handle)
+
+      with true <- h != self_handle,
+           %{} = target <- resolve_handle(h),
+           true <- server_runtime?(target) do
+        target
+      else
+        _ -> nil
+      end
+    end)
+  end
+
   def run(worker, prompt, opts \\ []) when is_map(worker) and is_binary(prompt) do
     cond do
       not enabled?() ->
@@ -437,15 +715,10 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # ── Bridge entrypoints ──────────────────────────────────────────────
-  # The bridge daemon runs claude/codex on the user's own computer and ships the
-  # RAW stream-json output back. The server reuses the full parsing pipeline below
-  # so the daemon stays thin and we have one source of truth for parsing.
 
   @doc """
-  Turn a single raw stream-json line from a bridge daemon into a progress event
-  (or nil if the line carries no tool activity). Used to stream live progress
-  into the chat while the task runs on the user's machine.
+  Turn a single raw stream-json line from a bridge daemon into a progress event (or nil if the
+  line carries no tool activity).
   """
   def bridge_progress_event(provider, line) when is_binary(line) do
     case resolve_handle(provider) do
@@ -457,9 +730,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   def bridge_progress_event(_provider, _line), do: nil
 
   @doc """
-  Parse a completed bridge run (raw output + exit status) and post the result as
-  the agent's message into the chat. Mirrors `handle_chat_message/4`'s success and
-  failure formatting, but for output produced on the user's computer.
+  Parse a completed bridge run (raw output + exit status) and post the result as the agent's
+  message into the chat.
   """
   def deliver_bridge_result(provider, chat_id, output, exit_status, duration_ms, opts \\ [])
       when is_binary(provider) and is_binary(chat_id) and is_binary(output) do
@@ -476,9 +748,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> normalize_runtime_payload()
           |> merge_team_runtime(opts)
 
-        # End-to-end encrypted runtime blob. Opaque to the server: stored and
-        # served verbatim, never decrypted, parsed, or logged. The key lives
-        # only on the user's bridge and phone.
         runtime_enc = normalize_runtime_enc(Keyword.get(opts, :runtime_enc))
         agent_actions_enc = normalize_runtime_enc(Keyword.get(opts, :agent_actions_enc))
         runtime_can_revert = Keyword.get(opts, :can_revert) == true
@@ -498,8 +767,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             )
           end
 
-        # Subscription / rate-limit failures must not become transcript bubbles
-        # (they shift the list). Flag them so iOS routes to the floating usage banner.
         usage_limit_hit? =
           Keyword.get(opts, :usage_limit_hit) == true or
             usage_limit_text?(base_text) or
@@ -516,9 +783,6 @@ defmodule Vibe.AI.LocalAgentWorker do
         team_run_id = normalize_string(Keyword.get(opts, :team_run_id))
         team_mode = normalize_string(Keyword.get(opts, :team_mode))
 
-        # Every successful worker completion, including an under-hood supervisor
-        # slice, is durable shared memory. Keep run/task identity on the entry so
-        # the lead can distinguish concurrent runs in the same group chat.
         if ok or is_binary(team_run_id) do
           note_bridge_agent_turn(chat_id, worker, base_text, requester_user_id,
             team_run_id: team_run_id,
@@ -530,8 +794,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         worker_status_list =
           if is_binary(team_run_id) do
-            # Stale-settle guard: after a watchdog retry/reassign the row carries
-            # a NEW task_id; the old attempt's late result must not clobber it.
             settle_task_id = normalize_string(Keyword.get(opts, :task_id))
 
             stored_entry =
@@ -569,7 +831,6 @@ defmodule Vibe.AI.LocalAgentWorker do
                   "task_id" => Keyword.get(opts, :task_id)
                 })
 
-              # The zero-token watchdog decides retry / usage-limit failover.
               Vibe.AI.TeamRunMonitor.note_settled(
                 chat_id,
                 team_run_id,
@@ -619,8 +880,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           end)
           |> Map.merge(team_metadata)
 
-        # Hard usage-limit: skip posting a chat row entirely — the bridge has already
-        # cached buckets for the usage banner, and a bubble would only shift the list.
         result =
           cond do
             usage_limit_hit? and not ok ->
@@ -628,7 +887,6 @@ defmodule Vibe.AI.LocalAgentWorker do
                 "[AgentBridge] suppress usage-limit row chat=#{chat_id} provider=#{worker.handle}"
               )
 
-              # Still notify clients so the phone can refresh the usage banner.
               VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
                 "provider" => worker.handle,
                 "chatId" => chat_id,
@@ -638,7 +896,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
               {:ok, %{message_id: nil, suppressed: true, usage_limit: true}}
 
-            # Supervisor under-hood workers: memory + team status only, no list bubble.
             suppress_visible? ->
               Logger.info(
                 "[AgentBridge] suppress under-hood worker row chat=#{chat_id} provider=#{worker.handle} run=#{inspect(team_run_id)}"
@@ -656,9 +913,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
               {:ok, %{message_id: nil, suppressed: true, under_hood: true}}
 
-            # Two bridge daemons both finishing the same human message → same provider
-            # would otherwise post two near-identical bubbles. Claim once per
-            # (chat, provider, reply_to, body-fingerprint) within the TTL.
             duplicate_bridge_delivery?(chat_id, worker.handle, reply_to_id, body) ->
               Logger.info(
                 "[AgentBridge] suppress duplicate deliver chat=#{chat_id} provider=#{worker.handle} reply_to=#{inspect(reply_to_id)}"
@@ -700,9 +954,6 @@ defmodule Vibe.AI.LocalAgentWorker do
         if ok do
           maybe_dispatch_next_team_worker(chat_id, worker, requester_user_id, opts)
         else
-          # Usage-limit is not a team-chain failure that needs a list notice — siblings
-          # keep going; the phone shows a banner for the limited agent.
-          # Under-hood supervisor workers also must not fail the whole team run.
           unless usage_limit_hit? or suppress_visible? do
             fail_bridge_team_run(
               chat_id,
@@ -723,9 +974,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp truthy_opt?(1), do: true
   defp truthy_opt?(_), do: false
 
-  # Shell-standard signal exits are external cancellation/termination, not an
-  # agent crash. Retrying them caused cancel → SIGINT/SIGTERM → failed → retry
-  # loops. A genuinely crashing process keeps its non-signal status retryable.
   defp signal_exit_status?(status) when status in [130, 137, 143], do: true
 
   defp signal_exit_status?(status) when is_binary(status) do
@@ -798,7 +1046,6 @@ defmodule Vibe.AI.LocalAgentWorker do
         {:error, :unknown_provider}
 
       worker ->
-        # Rate/usage-limit notices never become list rows — they shift the feed.
         if usage_limit_text?(text) do
           VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-usage-limit", %{
             "provider" => worker.handle,
@@ -814,20 +1061,9 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # ── Shared group memory (Claude + Codex collaborating) ──────────────
-  # Vibe is E2E encrypted, so the server can't read humans' stored messages. But
-  # it CAN see every agent prompt (sent in cleartext as `agentText`) and every
-  # agent reply (generated server-side). That stream IS the agents' shared
-  # collaboration thread: we persist it in `GroupAgentMemory` (keyed by chat) and
-  # re-inject it as context so @claude and @codex can build on each other's work.
-  # In a 1:1 DM the agent keeps its own `--resume` continuity, so we skip all of
-  # this and send the raw prompt unchanged.
 
   @doc """
-  Build the prompt to send to the bridge. In a group, prepend a speaker-labelled
-  collaboration context (recent turns + any summary) plus a short framing so the
-  agent knows it shares the conversation with the other agents and people. In a
-  DM, returns `dispatch_text` unchanged.
+  Build the prompt to send to the bridge.
   """
   def build_bridge_prompt(chat_id, worker, dispatch_text, requester_user_id, opts \\ [])
 
@@ -838,11 +1074,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       repo_line = selected_repo_prompt_line(opts)
 
       if casual_message?(dispatch_text) do
-        # Greeting / chit-chat: no operating rules, no "read AGENTS.md". Vanilla
-        # claude/codex don't touch the repo unprompted — it was our injected rules
-        # that made a plain "hi" kick off file reads. Keep it conversational.
-        # Still name the selected working directory so agents don't invent
-        # "no repo selected" when the phone already picked one.
         """
         #{group_framing(worker)}
         #{repo_line}
@@ -885,7 +1116,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def build_bridge_prompt(_chat_id, _worker, dispatch_text, _requester, _opts), do: dispatch_text
 
-  # One short line so agents know the phone-selected path without being told to open files.
   defp selected_repo_prompt_line(opts) when is_list(opts) do
     meta = Keyword.get(opts, :bridge_metadata) || %{}
 
@@ -920,8 +1150,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Pick the responsible lead for a supervisor team run.
-
-  Preference: Claude → Codex → Grok → Agy among members present.
   """
   def pick_supervisor_lead(workers) when is_list(workers) do
     preferred = ["claude", "codex", "grok", "agy"]
@@ -935,51 +1163,20 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Cheap, repo-agnostic gate on a `@team` request, run BEFORE any provider turn.
-
-  It answers ONE question only — *is this even a work order?* — and never tries to
-  guess the SIZE of the work with keyword heuristics. Sizing (one agent vs a
-  fanned-out team) is a judgement about whether the task decomposes, and the model
-  that will do the work makes that call: a work order is handed to the team lead +
-  advisor, which read the request and decide solo (the lead owns it) vs a team plan.
-  (Per the user: the advisor/model knows whether a task is multi-part — let it route
-  to one or many, instead of a brittle regex that mis-routed short multi-part asks to
-  a lone worker.)
-
-  Two classes:
-
-    * `:chat`    — the user is TALKING, not commissioning work ("can you see this
-                   image?", "what does this do?"). Answered by ONE worker running
-                   with writes HARD-STRIPPED (bridge maps team role `chat` →
-                   `read_only` work mode). No files are touched, ever.
-    * `:complex` — a real work order → team lead + advisor decide solo vs team.
-
-  The fail-safe direction is `:chat`. Getting this wrong toward work is the
-  expensive error: a question misread as work made a worker read AGENTS.md, patch
-  `page.tsx`/`globals.css` and run a full build off "can you see this image?".
-  A question misread as chat only costs one cheap read-only turn. So work must be
-  POSITIVELY signalled (an actual work verb); absent that we chat.
   """
   @spec classify_team_request(any()) :: :chat | :complex
   def classify_team_request(text) when is_binary(text) do
     t = text |> String.trim() |> String.downcase()
 
     cond do
-      # Conversation wins over everything: an explain/inspect opener is never a
-      # commission, even when it name-drops work words ("explain how you'd build
-      # the site" must NOT spawn a team that builds the site).
       conversational_request?(t) -> :chat
-      # No work verb anywhere → the user is not asking for a change. Chat.
       not work_request?(t) -> :chat
-      # A real work order — hand the size decision to the lead + advisor.
       true -> :complex
     end
   end
 
   def classify_team_request(_), do: :chat
 
-  # Openers that mark the message as talk/inspection rather than a work order.
-  # Repo-agnostic, and deliberately greedy — a false :chat costs one read-only
-  # turn, a false :simple edits the user's files.
   defp conversational_request?(t) when is_binary(t) do
     Regex.match?(
       ~r/^\s*(can|could|are|is|do|does|did|will|would|should)\s+(you|it|we|this|that|there)\b[^.!?]*\b(see|read|view|open|access|tell|know|think|understand|explain|describe|remember|handle|support)\b|^\s*(what|why|how come|who|which|when|where|explain|describe|tell me|show me|thoughts|any thoughts|wdyt|opinion)\b|^\s*(hi|hey|hello|yo|thanks|thank you|ok|okay|nice|cool|got it)\b\s*[.!?]*\s*$/,
@@ -989,8 +1186,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp conversational_request?(_), do: false
 
-  # A change is only performed when it is POSITIVELY asked for. Absent one of
-  # these verbs the message is treated as conversation (see fail-safe above).
   defp work_request?(t) when is_binary(t) do
     Regex.match?(
       ~r/\b(build|create|make|add|implement|write|code|fix|patch|change|update|edit|modify|adjust|refactor|rename|move|remove|delete|drop|revert|install|upgrade|migrate|deploy|ship|release|publish|configure|configure|set ?up|setup|wire|integrate|connect|optimi[sz]e|clean ?up|scaffold|generate|port|convert|replace|improve|redesign|restyle|polish|finish|complete|continue|run|test|lint|format|debug|solve|handle|support)\b/,
@@ -1001,15 +1196,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp work_request?(_), do: false
 
   @doc """
-  Did the user EXPLICITLY address the whole team ("call all agents", "what do
-  you all think", "everyone introduce yourselves")? An explicit fan-out
-  directive overrides the solo/one-responder collapse: a `:chat` turn goes to
-  every worker (each hard read-only, each in its own bubble) and a work order
-  goes to the full supervisor team even when it sizes as `:simple`.
-
-  Deliberately biased to false negatives: missing the directive costs one
-  responder instead of four (cheap, user can rephrase); a false positive costs
-  N provider turns on every message that merely mentions the word "agents".
+  Did the user EXPLICITLY address the whole team ("call all agents", "what do you all think",
+  "everyone introduce yourselves")?
   """
   @spec all_agents_request?(any()) :: boolean()
   def all_agents_request?(text) when is_binary(text) do
@@ -1024,17 +1212,12 @@ defmodule Vibe.AI.LocalAgentWorker do
   def all_agents_request?(_), do: false
 
   @doc """
-  Pick the single best-provider worker to handle a SIMPLE `@team` request
-  visibly — its live frames ARE the progress the user sees, so it must be one of
-  the reliable agentic coders the user named for solo work (codex / claude /
-  grok). Gemini/Agy is reserved for supervised, exact-file UI slices inside a
-  full team run (it drifts when left to run a whole task unsupervised), so it is
-  only a last-resort fallback here.
+  Pick the single best-provider worker to handle a SIMPLE `@team` request visibly — its live
+  frames ARE the progress the user sees.
   """
   def pick_solo_worker(workers, text) when is_list(workers) and is_binary(text) do
     preference =
       if ui_flavored_request?(text) do
-        # Grok 4.5 is a strong, reliable choice for self-contained UI work.
         ["grok", "claude", "codex", "agy"]
       else
         ["codex", "claude", "grok", "agy"]
@@ -1049,12 +1232,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Pick the worker that ANSWERS a `:chat` message.
-
-  Every provider is now bridge-enforceable on a chat turn (codex → `read-only`
-  sandbox, claude → disallowed Edit/Write/MultiEdit/NotebookEdit/Bash, grok/agy →
-  CLI plan mode), so this is a quality preference, not a safety gate: codex and
-  claude give the most reliable short answers. The explicit all-agents fan-out
-  dispatches every worker regardless.
   """
   def pick_chat_worker(workers) when is_list(workers) do
     Enum.find_value(["codex", "claude"], fn handle ->
@@ -1185,13 +1362,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       ),
       do: dispatch_text
 
-  # A SIMPLE `@team` request routes to one visible worker (chosen by
-  # pick_solo_worker). It is not a lead and has no under-hood teammates to
-  # coordinate — it just builds the thing fully and visibly. This is the 1-turn
-  # path that keeps usage at the solo baseline while still showing real progress.
-  # A `:chat` turn ANSWERS. It does not work. Writes are hard-stripped at the
-  # bridge (team role `chat` → `read_only`), so this prompt only has to keep the
-  # reply clean — it is not what keeps the files safe.
   defp build_chat_reply_prompt(worker, dispatch_text, context) do
     """
     You are #{worker.label}, replying to the user in a Vibe chat.
@@ -1465,9 +1635,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Persist a coordinated bridge team run and return the lead worker.
-
-  Default mode is supervisor (Claude-preferred lead). Set opts `mode: "sequential"`
-  or env `VIBE_TEAM_MODE=sequential` for the legacy chain.
   """
   def register_bridge_team_run(
         chat_id,
@@ -1512,11 +1679,6 @@ defmodule Vibe.AI.LocalAgentWorker do
         remaining = Enum.reject(handles, &(&1 == lead_handle))
         now_ms = System.system_time(:millisecond)
 
-        # Only the lead is real at registration time. Siblings enter worker_states
-        # when something actually spawns them (team_spawn / a bridge status update —
-        # update_team_worker_state adds unknown handles). Pre-seeding every group
-        # agent as "pending" painted a permanent 4-worker board on runs where the
-        # agent-native lead sizes the team itself and may never spawn most of them.
         worker_states = %{
           lead_handle => %{
             "status" => "running",
@@ -1549,9 +1711,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           :created ->
             :ets.insert(@team_run_table, {{chat_id, team_run_id}, state})
 
-            # "solo" runs are watched too: the monitor's stall/crash retry keeps a
-            # single visible worker from silently dying, and durable worker_states
-            # let the iOS cell survive backgrounding (team-cell-background-wipe).
             if mode in ["supervisor", "solo"] do
               Vibe.AI.TeamRunMonitor.ensure_started(chat_id, team_run_id)
               Vibe.AI.TeamRunMonitor.note_spawned(chat_id, team_run_id, lead_handle, nil)
@@ -1623,9 +1782,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             status = m["status"] || m[:status]
 
             cond do
-              # "starting" is the spawn beat — stamp the start here so the phone's
-              # live elapsed clock ticks from the real call moment, not from the
-              # first tool event. Guarded by is_nil so a later "running" never resets.
               status in ["running", "pending", "starting"] and is_nil(m["started_at"]) ->
                 Map.put(m, "started_at", now_ms)
 
@@ -1900,8 +2056,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> Enum.uniq()
           |> Enum.reject(&(&1 == lead))
           |> Enum.filter(&MapSet.member?(allowed, &1))
-          # A solo-classified plan means the lead owns the whole task — a stray
-          # spawn directive after that is a protocol violation, not a dispatch.
           |> then(fn hs ->
             if plan["classification"] == "solo" do
               Logger.info(
@@ -1930,8 +2084,6 @@ defmodule Vibe.AI.LocalAgentWorker do
               else
                 task_id = "#{team_run_id}:worker:#{handle}"
 
-                # A validated plan row is the authoritative assignment (exact
-                # files + boundaries); a lead VIBE_TEAM_FOCUS line refines it.
                 focus =
                   case {plan_focus_for(plan, handle), Map.get(focus_by, handle)} do
                     {nil, nil} -> team_worker_default_focus(handle)
@@ -1942,10 +2094,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
                 consumed = contracts_for_consumer(contracts, handle)
 
-                # Contract owners must run in wave 0 so they can freeze shapes.
-                # Workers that only consume contracts wait until every required
-                # section is frozen; workers with no consumed contract remain the
-                # existing immediate/parallel path.
                 if contracts != [] and consumed != [] and
                      not MapSet.member?(contract_owners, handle) do
                   waiting_on = List.first(consumed)
@@ -2146,10 +2294,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> Enum.join("\n\n")
   end
 
-  # ── TeamRunMonitor support (team-architecture-v2 §4) ─────────────────────
-  # Storage-backed transitions applied by the zero-token watchdog. Everything
-  # funnels through update_team_worker_state / TeamRun so ets + DB stay the
-  # single source of truth and the monitor process itself stays disposable.
 
   @doc "Monitor: ets-then-DB run state; rewarms the ets cache on DB fallback."
   def fetch_supervisor_run_state(chat_id, team_run_id)
@@ -2188,9 +2332,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   @doc """
-  Monitor: reread the handoff board, freeze explicit/fallback contracts, and
-  release every waiting consumer whose complete contract set is frozen.
-  `fallback_owners` is decided by TeamRunMonitor's terminal/timeout policy.
+  Monitor: reread the handoff board, freeze explicit/fallback contracts, and release every
+  waiting consumer whose complete contract set is frozen. `fallback_owners` is decided by.
   """
   def monitor_contract_barrier(chat_id, team_run_id, fallback_owners)
       when is_binary(chat_id) and is_binary(team_run_id) do
@@ -2438,9 +2581,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   def monitor_retry_worker(chat_id, team_run_id, handle, reason) do
     with state when is_map(state) <- fetch_supervisor_run_state(chat_id, team_run_id),
          worker when not is_nil(worker) <- resolve_handle(handle) do
-      # Stale-stall guard: a settle can land between the sweep's decision and
-      # this call. Re-read the durable row — only a still-running slice may be
-      # stall-retried; resurrected done/failed rows would duplicate work.
       current_status = get_in(state, [:worker_states, handle, "status"])
 
       if reason == "stalled" and current_status != "running" do
@@ -2490,9 +2630,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   @doc """
-  Monitor: a usage-limited worker's slice restarts fresh on an idle provider
-  from the same run roster (never mid-task context handoff). Returns
-  `{:ok, fallback_handle}` or `{:error, :no_fallback}`.
+  Monitor: a usage-limited worker's slice restarts fresh on an idle provider from the same run
+  roster (never mid-task context handoff).
   """
   def monitor_reassign_worker(chat_id, team_run_id, handle) do
     with state when is_map(state) <- fetch_supervisor_run_state(chat_id, team_run_id),
@@ -2501,8 +2640,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       old_task_id = get_in(state, [:worker_states, handle, "task_id"])
       cancel_monitor_task(state, handle, old_task_id)
 
-      # The fallback inherits the limited worker's exact assignment: stored
-      # focus first (plan-derived at spawn), then the plan row, then default.
       focus =
         stored_worker_focus(state, handle) ||
           plan_focus_for(run_state_plan(state), handle) ||
@@ -2577,8 +2714,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     _ -> :ok
   end
 
-  # Dispatch one worker slice on behalf of the monitor. Mirrors the payload
-  # spawn_supervisor_workers builds so the bridge/iOS see an identical task.
   defp monitor_dispatch_worker(state, worker, focus, task_id, cover_note, contract_context) do
     chat_id = state.chat_id
     team_run_id = state.team_run_id
@@ -2682,9 +2817,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     Map.get(state, :team_plan) || get_in(state, [:bridge_metadata, "teamPlan"]) || %{}
   end
 
-  # Idle = a roster member (never the lead) that is not mid-slice right now.
-  # A plan-declared fallback wins when idle; otherwise prefer a provider that
-  # was never spawned, then one that already finished.
   defp pick_idle_fallback(state, limited_handle) do
     lead = Map.get(state, :lead_worker)
     states = Map.get(state, :worker_states) || %{}
@@ -2778,9 +2910,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   @doc """
   Parse and validate a lead-emitted `VIBE_TEAM_PLAN: {json}` directive line
-  (team-architecture-v2 §2). Returns `{:ok, plan}` with string-keyed maps,
-  `{:error, reasons}` when a plan was present but invalid, or `nil` when the
-  line carries no plan directive at all.
+  (team-architecture-v2 §2).
   """
   def parse_team_plan_directive(line, roster_handles) when is_binary(line) do
     case Regex.run(~r/VIBE_TEAM_PLAN\s*:\s*(\{.*\})\s*$/i, line) do
@@ -2797,8 +2927,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   def parse_team_plan_directive(_, _), do: nil
 
-  # A plan must be executable by code: known workers, concrete disjoint file
-  # lists, an integrator from the roster. Solo plans skip the table checks.
   defp validate_team_plan(plan, roster_handles) do
     roster = MapSet.new(roster_handles || [])
     classification = plan["classification"]
@@ -3025,8 +3153,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Row → the exact, self-contained assignment a worker receives. This is the
-  # spec-quality lever: objective + disjoint files + boundaries in one string.
   defp plan_focus_for(plan, handle) do
     plan
     |> Map.get("task_table")
@@ -3127,8 +3253,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     error -> {:error, error}
   end
 
-  # Row locking makes a repeated final result or two Phoenix nodes racing to
-  # continue the same run harmless: only the current owner may advance once.
   defp advance_durable_team_run(chat_id, team_run_id, completed_handle) do
     Repo.transaction(fn ->
       run =
@@ -3290,8 +3414,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       is_nil(team_run_id) ->
         :ok
 
-      # Supervisor mode never chains sequential peer bubbles — workers are
-      # already under-hood (or lead-only). Completing the lead finishes the run.
       team_mode in ["supervisor", "group_supervisor"] ->
         if supervisor_lead?(chat_id, team_run_id, worker.handle) do
           clear_bridge_team_run(chat_id, team_run_id)
@@ -3651,8 +3773,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp truncate_line(_), do: ""
 
-  # Strip reserved @mentions before storing/re-injecting so the daemon's mention
-  # scrubber never mangles our context labels, and labels stay clean.
   defp clean_for_memory(text) when is_binary(text) do
     text
     |> String.replace(~r/(^|\s)@(claude|codex|grok|agy|antigravity|team)\b/iu, "\\1")
@@ -3744,7 +3864,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     ArgumentError -> :ok
   end
 
-  # ── Activity broadcast helpers (shared by chat + bridge channels) ────
 
   @doc "Broadcast a typing/agent-progress event into a chat for an agent."
   def broadcast_activity(chat_id, agent_user_id, label, status, tool \\ nil) do
@@ -3766,10 +3885,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   @doc """
-  Parse the bridge output accumulated so far and broadcast a live `agent-stream`
-  update (partial text + inline progress/tool nodes) into the chat, so the reply
-  appears as it is produced instead of arriving as one final batch. Reuses the
-  same `extract_result/2` parser as the final delivery — one source of truth.
+  Parse the bridge output accumulated so far and broadcast a live `agent-stream` update
+  (partial text + inline progress/tool nodes) into the chat.
   """
   def bridge_stream_update(provider, chat_id, accumulated_output, stream_id) do
     bridge_stream_update(provider, chat_id, accumulated_output, stream_id, %{})
@@ -3784,11 +3901,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       worker ->
         extracted = extract_result(worker, accumulated_output)
         text = normalize_string(extracted.text) || ""
-        # The CLI's init/system event (Claude) or thread.started (Codex) carries the
-        # session id and lands within the first few output lines, so it's available on
-        # nearly every tick. Threading it to the phone lets a reconnect re-arm the same
-        # live-tail path History uses (agent-bridge-history detail request) instead of
-        # only recovering turns the user happened to open History on.
         session_id = session_id_from_output(accumulated_output)
 
         team_run_id = metadata["teamRunId"] || metadata[:team_run_id]
@@ -3811,9 +3923,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         worker_status_list =
           if is_binary(team_run_id) do
-            # Stream frames double as liveness heartbeats for the run watchdog.
-            # Bridge admission-queue frames are tagged (by label) so the monitor
-            # caps queue age instead of trusting them as liveness forever.
             queued? = String.starts_with?(last_label, "Queued — waiting")
 
             progress_bytes =
@@ -3849,12 +3958,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             "isAgent" => true,
             "isAgentMessage" => true,
             "text" => text,
-            # Live feed = ONE interleaved chronological flow (narration text ↔ Read/
-            # Edit/Run steps), exactly like the finished "Worked" card — NOT a tool-only
-            # band detached from a separate streaming-text block. The live agent view
-            # renders this feed as the single source of truth and suppresses the separate
-            # answer body, so the in-progress answer tail must ride here too (hence
-            # live_progress_nodes, which keeps the tail the finished path drops).
             "progressNodes" => live_nodes,
             "toolEvents" => extracted.tool_events,
             "status" => "running"
@@ -3898,8 +4001,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           |> maybe_put("computerId", metadata["computerId"] || metadata[:computer_id])
           |> maybe_put("computerLabel", metadata["computerLabel"] || metadata[:computer_label])
 
-        # Under-hood workers still emit agent-stream so the sheet can show their
-        # full payload when opened, but iOS must not insert a second list cell.
         VibeWeb.Endpoint.broadcast!("chat:#{chat_id}", "agent-stream", payload)
 
         if suppress_visible? and is_binary(team_run_id) do
@@ -3948,11 +4049,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp mark_latest_progress_node_running(nodes), do: nodes
 
-  # Progress nodes for the LIVE stream feed. Same interleaved shape as the finished
-  # "Worked" card (text ↔ tools, chronological) but WITH the in-progress answer tail:
-  # build_progress_nodes drops the block equal to the summary (it re-renders as the
-  # message body once finished), but during the run the live agent view suppresses the
-  # body and shows this feed alone — so passing an empty summary keeps the tail visible.
   defp live_progress_nodes(%{handle: "claude"}, extracted) do
     interleaved_claude_progress_nodes(extracted.decoded, extracted.tool_events, "")
     |> with_live_thinking(extracted.decoded)
@@ -3967,7 +4063,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> with_live_thinking(extracted.decoded)
   end
 
-  # Agy reuses the Grok NDJSON contract (bridge synthesizes thought/text/tool_use).
   defp live_progress_nodes(%{handle: "agy"}, extracted) do
     interleaved_grok_progress_nodes(extracted.decoded, extracted.tool_events, "")
     |> with_live_thinking(extracted.decoded)
@@ -3976,14 +4071,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp live_progress_nodes(_worker, extracted), do: extracted.progress_nodes
 
-  # Real-time thinking token counter. `claude --include-partial-messages` streams the
-  # reasoning as `thinking_delta` events (the persisted JSONL only ever gets the block
-  # once complete, so history can't tick). Forwarding every delta would flood the
-  # server's whole-buffer reparse, so the bridge coalesces them into a throttled
-  # `{"type":"vibe_thinking","tokens":N,"active":bool}` line. Here we fold the LAST such
-  # signal onto the turn's Thinking node so the DM shows "Thinking · N tokens" ticking
-  # live, exactly like the desktop CLI. Only on the live path — the finished/history
-  # render gets its settled token count + duration from the bridge history transcript.
   defp with_live_thinking(nodes, decoded) do
     case last_vibe_thinking(decoded) do
       nil ->
@@ -3994,8 +4081,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
         case last_thinking_index(nodes) do
           nil ->
-            # No completed-message thinking block yet (thinking is still streaming) —
-            # append a live node so the counter shows before the block finalizes.
             nodes ++
               [
                 %{
@@ -4055,9 +4140,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     })
   end
 
-  # Collapse per-provider "models"/"advisors" maps (group fan-out metadata) onto
-  # this worker's single options and drop the maps so they never reach the bridge. Mirrors
-  # VibeWeb.ChatChannel.resolve_provider_model/2 for the chained team dispatch path.
   defp resolve_provider_model(bridge_metadata, provider) do
     {models, rest} = Map.pop(bridge_metadata, "models")
     {advisors, rest} = Map.pop(rest, "advisors")
@@ -4089,7 +4171,11 @@ defmodule Vibe.AI.LocalAgentWorker do
     })
   end
 
-  defp do_run(%{handle: "codex"} = worker, executable, prompt, opts) do
+  defp do_run(worker, executable, prompt, opts) do
+    run_cli(executor_for(worker), worker, executable, prompt, put_worker_model(worker, opts))
+  end
+
+  defp run_cli("codex", worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
     sandbox =
@@ -4117,7 +4203,7 @@ defmodule Vibe.AI.LocalAgentWorker do
         "-c",
         "approval_policy=\"#{approval_policy}\"",
         "--cd",
-        worker_cwd(),
+        worker_cwd(worker),
         "--skip-git-repo-check",
         "--ephemeral"
       ] ++
@@ -4127,7 +4213,23 @@ defmodule Vibe.AI.LocalAgentWorker do
     run_command(worker, executable, args, opts)
   end
 
-  defp do_run(%{handle: "claude"} = worker, executable, prompt, opts) do
+  defp run_cli("claude", worker, executable, prompt, opts) do
+    result = run_claude(worker, executable, prompt, opts)
+
+    with {:ok, %{ok: false, text: text}} <- result,
+         fallback when is_binary(fallback) <- claude_fallback_model(opts),
+         true <- model_unavailable?(text) do
+      Logger.warning(
+        "[LocalAgentWorker] #{worker.handle} model unreachable — retrying on #{fallback}"
+      )
+
+      run_claude(worker, executable, prompt, use_fallback_model(opts, fallback))
+    else
+      _ -> result
+    end
+  end
+
+  defp run_claude(worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
     permission_mode =
@@ -4170,9 +4272,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     run_command(worker, executable, args, opts)
   end
 
-  # Antigravity CLI (`agy -p`): plain final text on stdout; bridge injects full
-  # payload from transcript.jsonl as Grok-shaped NDJSON.
-  defp do_run(%{handle: "agy"} = worker, executable, prompt, opts) do
+  defp run_cli("agy", worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
     args =
@@ -4209,9 +4309,7 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Grok Build TUI headless: `grok -p <prompt> --output-format streaming-json`
-  # emits NDJSON thought/text/end lines (see docs/agent-payload-shapes.md).
-  defp do_run(%{handle: "grok"} = worker, executable, prompt, opts) do
+  defp run_cli("grok", worker, executable, prompt, opts) do
     bridge_options = Keyword.get(opts, :bridge_metadata) || %{}
 
     permission_mode =
@@ -4251,8 +4349,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     run_command(worker, executable, args, opts)
   end
 
-  # Fresh by default: mobile Claude/Codex chats are scratch sessions unless the user
-  # explicitly opens a History session, which carries `agentBridgeResumeSessionId`.
   defp claude_session_args(bridge_options) do
     case explicit_resume_session_id(bridge_options) do
       session_id when is_binary(session_id) -> ["--resume", session_id]
@@ -4281,7 +4377,7 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp run_command(worker, executable, args, opts) do
     start = System.monotonic_time(:millisecond)
-    timeout_ms = timeout_ms()
+    timeout_ms = timeout_ms(worker)
     progress_callback = Keyword.get(opts, :progress_callback, fn _event -> :ok end)
 
     Logger.info(
@@ -4297,7 +4393,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       end
     end
 
-    case collect_command(executable, args, worker_cwd(), timeout_ms, line_callback) do
+    case collect_command(executable, args, worker_cwd(worker), timeout_ms, line_callback) do
       {:ok, status, output} ->
         duration_ms = System.monotonic_time(:millisecond) - start
         extracted = extract_result(worker, output)
@@ -4332,7 +4428,8 @@ defmodule Vibe.AI.LocalAgentWorker do
          }}
 
       {:error, :timeout, output} ->
-        {:error, {:timeout, timeout_ms, fallback_output(output)}}
+        partial = extract_result(worker, output).text || ""
+        {:error, {:timeout, timeout_ms, partial}}
 
       {:error, reason} ->
         {:error, reason}
@@ -4443,8 +4540,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Returns true if this exact delivery was already claimed (caller should suppress).
-  # Returns false and records the claim when this is the first delivery in the TTL window.
   defp duplicate_bridge_delivery?(chat_id, provider, reply_to_id, body) do
     ensure_deliver_dedupe_table()
     body_fp = delivery_body_fingerprint(body)
@@ -4457,7 +4552,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
       _ ->
         :ets.insert(@deliver_dedupe_table, {key, now})
-        # Opportunistic prune so the table doesn't grow without bound.
         if :ets.info(@deliver_dedupe_table, :size) > 512 do
           prune_deliver_dedupe(now)
         end
@@ -4469,7 +4563,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   end
 
   defp delivery_body_fingerprint(body) when is_binary(body) do
-    # Normalize whitespace so trivial formatting drift still collides.
     normalized =
       body
       |> String.trim()
@@ -4523,7 +4616,6 @@ defmodule Vibe.AI.LocalAgentWorker do
          body,
          message_payload
        ) do
-    # Built once and reused for every recipient's user-topic mirror.
     mirrored_message = Chat.mirrored_message_payload(message_payload)
 
     Chat.get_all_participant_settings(chat_id)
@@ -4607,47 +4699,116 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  defp normalize_prompt(_worker, prompt) do
+  defp normalize_prompt(worker, prompt) do
+    handle = Map.get(worker, :handle) || ""
+
     cleaned =
       prompt
       |> to_string()
       |> String.replace(~r/(?:^|\s)@(codex|claude|grok)\b/i, " ")
+      |> String.replace(~r/(?:^|\s)@#{Regex.escape(handle)}\b/i, " ")
       |> String.trim()
 
     cond do
       cleaned == "" -> {:error, :missing_prompt}
       String.length(cleaned) > @max_prompt_length -> {:error, :prompt_too_long}
-      true -> {:ok, cleaned}
+      true -> {:ok, prepend_role_prompt(worker, cleaned)}
+    end
+  end
+
+  # A role worker leads with its standing brief; teammates are addressed by @handle.
+  defp prepend_role_prompt(worker, prompt) do
+    case normalize_string(Map.get(worker, :role_prompt)) do
+      nil -> prompt
+      role -> Enum.join([String.trim(@team_chat_rules), String.trim(role), prompt], "\n\n")
     end
   end
 
   defp command_for(worker) do
-    System.get_env(worker.command_env)
-    |> normalize_string()
-    |> Kernel.||(worker.default_command)
-  end
+    if server_runtime?(worker) do
+      executor = executor_for(worker)
 
-  defp worker_cwd do
-    case normalize_string(System.get_env("VIBE_AGENT_WORKER_CWD")) do
-      nil -> default_workspace_dir()
-      path -> path
+      System.get_env(team_command_env(executor))
+      |> normalize_string()
+      |> Kernel.||(executor)
+    else
+      System.get_env(worker.command_env)
+      |> normalize_string()
+      |> Kernel.||(worker.default_command)
     end
   end
 
-  # Secure default: run the agent in an isolated scratch directory, NOT the live
-  # server repo. Set VIBE_AGENT_WORKER_CWD explicitly to grant access elsewhere.
+  # The team runs on its own compute, so its CLIs are configured separately from
+  # the bridge's — point these at a wrapper to run them in another container.
+  defp team_command_env("codex"), do: "VIBE_TEAM_CODEX_COMMAND"
+  defp team_command_env("grok"), do: "VIBE_TEAM_GROK_COMMAND"
+  defp team_command_env(_executor), do: "VIBE_TEAM_CLAUDE_COMMAND"
+
+  defp worker_cwd(worker) do
+    env = if server_runtime?(worker), do: "VIBE_TEAM_WORKSPACE", else: "VIBE_AGENT_WORKER_CWD"
+
+    case normalize_string(System.get_env(env)) do
+      nil -> default_workspace_dir()
+      path -> if File.dir?(path), do: path, else: default_workspace_dir()
+    end
+  end
+
   defp default_workspace_dir do
     dir = Path.join(System.tmp_dir!() || "/tmp", "vibe-agent-workspace")
     File.mkdir_p(dir)
     dir
   end
 
-  defp timeout_ms do
-    case Integer.parse(System.get_env("VIBE_AGENT_WORKER_TIMEOUT_MS") || "") do
+  # Triage answers in seconds; patching a repo does not, so the team gets its own budget.
+  defp timeout_ms(worker) do
+    {env, fallback} =
+      if server_runtime?(worker),
+        do: {"VIBE_TEAM_TIMEOUT_MS", @default_team_timeout_ms},
+        else: {"VIBE_AGENT_WORKER_TIMEOUT_MS", @default_timeout_ms}
+
+    case Integer.parse(System.get_env(env) || "") do
       {value, _} when value >= 5_000 and value <= 900_000 -> value
-      _ -> @default_timeout_ms
+      _ -> fallback
     end
   end
+
+  defp claude_fallback_model(opts) do
+    (Keyword.get(opts, :bridge_metadata) || %{})
+    |> option_value("fallbackModel")
+    |> normalize_string()
+  end
+
+  defp use_fallback_model(opts, fallback) do
+    metadata =
+      (Keyword.get(opts, :bridge_metadata) || %{})
+      |> Map.drop(["fallbackModel", :fallbackModel])
+      |> Map.put("model", fallback)
+
+    Keyword.put(opts, :bridge_metadata, metadata)
+  end
+
+  # A plan without the model, an exhausted quota and a bad alias all mean the same thing here.
+  defp model_unavailable?(text) when is_binary(text) do
+    downcased = String.downcase(text)
+
+    Enum.any?(
+      [
+        "not_found_error",
+        "invalid model",
+        "unknown model",
+        "model not found",
+        "does not have access",
+        "not available",
+        "rate_limit",
+        "429",
+        "insufficient credit",
+        "credit balance"
+      ],
+      &String.contains?(downcased, &1)
+    )
+  end
+
+  defp model_unavailable?(_), do: false
 
   defp maybe_model_args(options, env_name, flag) do
     case normalize_string(option_value(options, "model")) ||
@@ -4657,9 +4818,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # The installed headless Codex binary rejects the 5.6 family. Keep server-side
-  # fallback runs aligned with the bridge so a mobile-selected model never becomes
-  # an unrecoverable terminal error.
   defp compatible_model("VIBE_CODEX_MODEL", model) do
     case String.downcase(model) |> String.replace("_", "-") do
       value when value in ["gpt-5.6-sol", "gpt-5-6-sol", "gpt-5.6", "gpt-5-6"] -> "gpt-5.5"
@@ -4748,15 +4906,13 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp maybe_claude_verbose_args(_), do: []
 
   defp extract_result(worker, output) do
+    worker = parser_worker(worker)
     decoded = decoded_events(output)
     tool_events = tool_events_from_decoded(worker, decoded)
     text = extract_worker_text(worker, decoded, output)
 
     %{
       text: text,
-      # Kept so the LIVE stream path can rebuild the interleaved feed WITH the
-      # in-progress answer tail (build_progress_nodes drops the summary block —
-      # see live_progress_nodes/2).
       decoded: decoded,
       tool_events: tool_events,
       available_tools: available_tools_from_decoded(worker, decoded),
@@ -4765,11 +4921,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     }
   end
 
-  # Progress nodes for the "Worked …" card. For Claude/Codex we INTERLEAVE the
-  # agent's working text (the running narration it emits between tool calls) with
-  # its tool steps in chronological order, so the collapsed card reads top-down
-  # exactly as the agent worked (text → edit → read → text …). The FINAL summary
-  # block is excluded — it renders as the message body OUTSIDE the card.
   defp build_progress_nodes(%{handle: "claude"}, decoded, tool_events, summary_text) do
     interleaved_claude_progress_nodes(decoded, tool_events, summary_text)
   end
@@ -4804,14 +4955,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp rewrite_progress_node_provider_prefix(nodes, _from, _to), do: nodes
 
-  # Grok live stream is a MIX of:
-  #   stdout streaming-json: {"type":"thought"|"text"|"end", "data":...}
-  #   bridge-injected tools from updates.jsonl: {"type":"tool_use"|"tool_result", ...}
-  #   throttled vibe_thinking ticker lines
-  # Walk chronologically. Text/thinking use *segment* ids (`grok-text-0`,
-  # `grok-thinking-1`, …) so a tool between narrations does not pin later prose
-  # back to the first text slot (the "all tools on top, all text at bottom" bug).
-  # Bump `seg` after each tool so the next thought/text segment appends after it.
   defp interleaved_grok_progress_nodes(decoded, tool_events, summary_text) do
     summary_norm = summary_text |> to_string() |> String.trim()
     tool_by_id = Map.new(tool_events || [], fn ev -> {ev["id"], ev} end)
@@ -4831,9 +4974,7 @@ defmodule Vibe.AI.LocalAgentWorker do
       answer: "",
       used_tools: MapSet.new(),
       thought_flushed: false,
-      # Segment counter: same seg for continuous thought+text; tools bump it.
       seg: 0,
-      # True after a tool/compacting node so the next thought/text starts a new seg.
       need_new_seg: false
     }
 
@@ -4867,7 +5008,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             id = normalize_string(event["tool_use_id"] || event["id"])
             grok_mark_tool_result(st, id, event)
 
-          # Live compacting signals (bridge may inject these from updates.jsonl).
           event["type"] in ["compacting", "auto_compact_started"] ->
             grok_put_compacting_node(st, "running", event)
 
@@ -4888,7 +5028,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             |> Map.update!(:answer, &join_grok_text_chunks([&1, event["text"]]))
 
           true ->
-            # Claude-shaped content blocks injected for tools (optional path).
             blocks = content_blocks_from_event(event)
 
             Enum.reduce(blocks, st, fn block, inner ->
@@ -4926,20 +5065,15 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
 
-    # Keep multi-segment interleave live AND settled. Final summary body (when equal
-    # to summary_norm) is still dropped inside grok_flush_answer_node.
     state
     |> grok_flush_thought_node(think_status)
     |> grok_flush_answer_node(summary_norm, text_status)
     |> Map.get(:nodes)
   end
 
-  # After tools (or when re-entering thought after flushed narration), advance seg
-  # so the next thought/text node appends instead of upserting an earlier slot.
   defp grok_begin_thought_phase(st) do
     st =
       if String.trim(st.answer) != "" do
-        # Thought after open text without a tool — seal text on current seg, then bump.
         st
         |> grok_flush_answer_node("", "done")
         |> Map.put(:answer, "")
@@ -4984,7 +5118,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           "kind" => "thinking",
           "depth" => 0,
           "tokens" => tokens,
-          # Full CoT for the phone thinking sheet (tap compact row → expand/sheet).
           "detail" => clip_text_node(body),
           "output" => clip_text_node(body)
         }
@@ -5002,7 +5135,6 @@ defmodule Vibe.AI.LocalAgentWorker do
         st
 
       body == summary_norm and summary_norm != "" ->
-        # Finished summary re-renders as the message body outside the card.
         st
 
       true ->
@@ -5046,7 +5178,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           )
 
       node = tool_event_to_node(event, length(st.nodes))
-      # Next thought/text must not upsert into the pre-tool segment.
       %{
         st
         | nodes: st.nodes ++ [node],
@@ -5119,7 +5250,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     %{st | nodes: nodes}
   end
 
-  # Replace same-id node in place (stable thinking/text across chunks); append if new.
   defp upsert_progress_node(nodes, node) when is_list(nodes) and is_map(node) do
     id = to_string(node["id"] || "")
 
@@ -5187,9 +5317,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
               true ->
                 id = codex_tool_event_id(event, item, index)
-                # One persisted outer `exec` may fan out to `id:0`, `id:1`, ….
-                # Reinsert all siblings at the original event position so plan +
-                # commands do not drift to the end of the Worked card.
                 matching =
                   tool_events
                   |> Enum.filter(fn tool_event ->
@@ -5234,7 +5361,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     tool_by_id = Map.new(tool_events, fn ev -> {ev["id"], ev} end)
     summary_norm = summary_text |> to_string() |> String.trim()
 
-    # Surface bridge-injected compacting events (Claude /compact headless).
     compact_nodes =
       decoded
       |> Enum.reduce([], fn event, acc ->
@@ -5275,8 +5401,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     {nodes, _used, _text_index} =
       decoded
       |> Enum.flat_map(fn event ->
-        # Keep the per-event parent_tool_use_id so a subagent's narration/thinking
-        # rides depth 1 (its own view), not the main feed.
         parent = normalize_string(event["parent_tool_use_id"])
         event |> content_blocks_from_event() |> Enum.map(fn block -> {block, parent} end)
       end)
@@ -5285,7 +5409,6 @@ defmodule Vibe.AI.LocalAgentWorker do
           %{"type" => "text", "text" => raw_text} when is_binary(raw_text) ->
             trimmed = String.trim(raw_text)
 
-            # Skip empty chatter and the final summary (it's the body, not a step).
             if trimmed == "" or trimmed == summary_norm do
               {nodes, used, ti}
             else
@@ -5336,12 +5459,9 @@ defmodule Vibe.AI.LocalAgentWorker do
         end
       end)
 
-    # Compacting nodes lead (or trail) so the header/cell can show the state.
     compact_nodes ++ Enum.reverse(nodes)
   end
 
-  # The agent's working text can be long; keep enough to read the card without
-  # bloating the (plaintext) progressNodes payload.
   defp clip_text_node(text) do
     text = String.trim(to_string(text))
 
@@ -5362,8 +5482,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       }
       |> copy_node_shape(event)
 
-    # MCP / generic tool results: plaintext detail for the phone sheet when the
-    # encrypted action blob is not yet joined (live stream path).
     case Map.get(event, "outputPreview") || Map.get(event, "output") do
       preview when is_binary(preview) and preview != "" ->
         node
@@ -5424,9 +5542,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       |> normalize_string()
   end
 
-  # Grok's streaming JSON emits token deltas. Their boundaries are arbitrary,
-  # so adding separators here corrupts exact text (for example IDs and code).
-  # Whitespace that belongs in the answer is already present in the deltas.
   defp join_grok_text_chunks([]), do: ""
 
   defp join_grok_text_chunks(chunks) when is_list(chunks) do
@@ -5462,11 +5577,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # The `codex exec --json` stdout is the thread-item streaming format
-  # (thread.started / turn.* / item.{started,updated,completed} / error).
-  # See docs/agent-payload-shapes.md. The assistant reply is the last
-  # `agent_message` item's `text`; on failure the envelope `error`/`turn.failed`
-  # message surfaces instead (e.g. usage-limit caps).
   defp extract_codex_text(decoded) do
     decoded
     |> Enum.reduce(nil, fn event, acc ->
@@ -5486,7 +5596,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     |> normalize_string()
   end
 
-  # Top-level `{"type":"error","message":…}` or `{"type":"turn.failed","error":{"message":…}}`.
   defp codex_envelope_error_message(event) when is_map(event) do
     type = normalize_string(event["type"]) || ""
 
@@ -5568,7 +5677,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp tool_events_from_decoded(_worker, _decoded), do: []
 
-  # Bridge injects tool_use / tool_result NDJSON from the Grok session updates tail.
   defp grok_tool_events(decoded) do
     {events_by_id, order} =
       Enum.reduce(decoded, {%{}, []}, fn event, {events_by_id, order} = acc ->
@@ -5619,7 +5727,6 @@ defmodule Vibe.AI.LocalAgentWorker do
             end
 
           true ->
-            # Also accept Claude-shaped content blocks if the bridge ever emits them.
             event
             |> content_blocks_from_event()
             |> Enum.reduce(acc, fn block, inner ->
@@ -5636,10 +5743,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp claude_tool_events(decoded) do
     {events_by_id, order} =
       Enum.reduce(decoded, {%{}, []}, fn event, acc ->
-        # Claude tags every subagent (`Task` tool) event with the parent Task's
-        # tool_use id; parent-agent events have it nil. Carry it down so a
-        # subagent's own tools land at depth 1 / parentId (grouped under the Task)
-        # instead of being flattened into the main feed.
         parent = normalize_string(event["parent_tool_use_id"])
 
         event
@@ -5715,25 +5818,18 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp accumulate_claude_tool_block(_block, _parent, acc), do: acc
 
-  # Stamp a tool event as a subagent child (depth 1 + parentId) when it carries a
-  # parent_tool_use_id; otherwise it is a depth-0 main-feed step.
   defp put_subagent_shape(event, parent) when is_binary(parent) and parent != "" do
     event |> Map.put("depth", 1) |> Map.put("parentId", parent)
   end
 
   defp put_subagent_shape(event, _parent), do: Map.put_new(event, "depth", 0)
 
-  # Same idea for plain narration/thinking nodes (no tool shape): depth 1 + parentId
-  # when produced inside a subagent, depth 0 otherwise.
   defp put_subagent_depth(node, parent) when is_binary(parent) and parent != "" do
     node |> Map.put("depth", 1) |> Map.put("parentId", parent)
   end
 
   defp put_subagent_depth(node, _parent), do: node
 
-  # Parse the codex thread-item stream into tool events. The discriminator is
-  # `item.item_type` (fall back to `item.type`); envelope `error`/`turn.failed`
-  # become an error node. agent_message/reasoning are excluded (handled as text).
   defp codex_tool_events(decoded) do
     ignored_call_ids =
       decoded
@@ -5907,8 +6003,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_error_tool_event(event, index) do
     message = codex_envelope_error_message(event)
 
-    # Derive a stable id from the message so `error` + `turn.failed` (which carry
-    # the same text) collapse into one node via compact_tool_events.
     id =
       case message do
         text when is_binary(text) ->
@@ -5932,7 +6026,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     }
   end
 
-  # Map a thread-item type to {tool_name, input_map, output} for rendering.
   defp codex_item_fields("command_execution", item) do
     command = codex_command_string(item)
     output = item["aggregated_output"] || item["stdout"] || item["output"]
@@ -5955,7 +6048,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp codex_item_fields("mcp_tool_call", item) do
     tool = normalize_string(item["tool"]) || normalize_string(item["name"]) || "tool"
     server = normalize_string(item["server"]) || "mcp"
-    # Fake mcp__ name so put_node_shape → kind:mcp + "server · tool" target.
     label = "mcp__#{server}__#{tool}"
 
     input =
@@ -6001,7 +6093,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     {"Error", %{}, item["message"] || item["text"]}
   end
 
-  # Unknown / future item types: best-effort generic mapping.
   defp codex_item_fields(type, item) do
     output = item["output"] || item["result"] || item["content"] || item["text"]
 
@@ -6031,9 +6122,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # A function/custom tool call: shell tool names (`exec_command`, …) route through
-  # the shell classifier so `cat`/`rg`/`sed` read like Claude's Read/Grep; everything
-  # else keeps its name-based mapping (apply_patch → Edit, view_image → ViewImage, …).
   defp codex_function_fields(name, input) do
     input = codex_normalize_function_input(name, input)
 
@@ -6083,12 +6171,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Codex only has a raw shell, so a bare `rg …` / `sed -n …` / `cat …` renders as
-  # low-level "Run <shell>" noise — unlike Claude, whose high-level Read/Grep tools
-  # give clean "Read foo.swift" / "Search pattern" rows. Classify the command's lead
-  # program into the SAME Read/Grep tool shapes so a Codex feed reads like Claude's.
-  # Anything unrecognized stays a plain "Run <command>" ({"Bash", …}). Mirrors
-  # codexShellDetail in the bridge (agent-bridge/bin/vibe-bridge.js).
   @codex_read_cmds ~w(cat head tail less more bat nl sed)
   @codex_search_cmds ~w(rg grep egrep fgrep ag ack ripgrep)
   @codex_shell_tool_names ~w(exec exec_command shell local_shell container.exec bash run_command)
@@ -6127,8 +6209,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_shell_tool_name?(name), do: to_string(name) in @codex_shell_tool_names
 
-  # `sed` is a "read" only in its common `-n 'A,Bp'` print form; an editing sed
-  # (e.g. `sed -i …`) stays a plain command.
   defp codex_shell_read_tool("sed", args, bash) do
     has_range = Enum.any?(args, &Regex.match?(~r/^\d+,\d+p?$/, &1))
 
@@ -6153,8 +6233,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Unwrap `bash -lc '<inner>'` / `sh -c "<inner>"` (and strip the inner command's
-  # surrounding quotes) so the wrapped program can be classified.
   defp codex_unwrap_shell(cmd) do
     case Regex.run(~r/^(?:\/\S+\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+(.+)$/i, cmd) do
       [_, inner] -> inner |> String.trim() |> codex_unquote()
@@ -6172,8 +6250,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Minimal shell tokenizer: split on unquoted whitespace, strip one layer of
-  # single/double quotes (so `rg -n "A|B" path` → ["rg", "-n", "A|B", "path"]).
   defp codex_shell_tokens(command) do
     {toks, cur, started, _quote} =
       command
@@ -6199,7 +6275,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     Enum.reverse(toks)
   end
 
-  # Drop leading env assignments (FOO=bar) and `sudo`/`command` prefixes.
   defp codex_strip_shell_prefixes([tok | rest] = tokens) do
     cond do
       Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*=/, tok) -> codex_strip_shell_prefixes(rest)
@@ -6210,7 +6285,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_strip_shell_prefixes([]), do: []
 
-  # Last positional (non-flag, non-numeric-range) argument → the file a read touches.
   defp codex_last_path_arg(args) do
     args
     |> Enum.reverse()
@@ -6220,7 +6294,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end)
   end
 
-  # First positional argument → the pattern a grep/rg searches for (respect `-e PAT`).
   defp codex_search_pattern([], _take_next), do: nil
 
   defp codex_search_pattern([a | rest], take_next) do
@@ -6249,11 +6322,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp codex_decode_arguments(_), do: %{}
 
-  # Codex app persistence currently wraps the real action in generated JavaScript:
-  # `custom_tool_call {name: "exec", input: "...tools.exec_command(...)..."}`.
-  # Recognize that narrow shape without eval/Code.eval_string; History data must
-  # remain inert. `wait`/`write_stdin` only continue an existing command and should
-  # not become duplicate visible progress nodes.
   defp codex_unwrap_function_payloads(name, raw) do
     cond do
       name in @codex_continuation_tools ->
@@ -6756,7 +6824,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # If every change is an add ⇒ Write (create); otherwise Edit.
   defp codex_file_change_tool(item) do
     kinds =
       case item["changes"] do
@@ -6777,8 +6844,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # file_change items carry no inline old/new text, so put_node_shape can't infer
-  # +N/−M. Pin the node kind/target from the change list directly.
   defp codex_apply_file_change_shape(event, "file_change", item) do
     paths = codex_file_change_paths(item)
     target = paths |> List.first() |> codex_basename()
@@ -7013,9 +7078,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp normalize_runtime_payload(_), do: nil
 
-  # The E2E runtime blob is opaque ciphertext (key lives only on the bridge +
-  # phone). Accept only the expected envelope ("arte1.") within a sane size;
-  # never inspect, parse, or log the contents.
   defp normalize_runtime_enc(value) when is_binary(value) do
     if String.starts_with?(value, "arte1.") and byte_size(value) <= 200_000 do
       value
@@ -7166,10 +7228,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp runtime_patch(value) when is_binary(value), do: truncate(value, @max_runtime_patch_bytes)
   defp runtime_patch(_), do: nil
 
-  # ── Claude-Code-style node shape (kind / target / patch stats) ──────
-  # Enrich a tool event with the structured fields the app renders as a live
-  # read/edit/patch feed inside the chat bubble. Computed from the RAW tool
-  # input (before truncation) so patch line counts are accurate.
   defp put_node_shape(event, tool, input) do
     {kind, target} = tool_kind_and_target(tool, input)
 
@@ -7188,8 +7246,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # The parent `Task` node carries the subagent flavor (e.g. "explore") so the
-  # phone can render "🤖 Subagent · explore" and open its read-only view.
   defp maybe_put_subagent_type(event, "task", input) when is_map(input) do
     maybe_put(
       event,
@@ -7200,7 +7256,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp maybe_put_subagent_type(event, _kind, _input), do: event
 
-  # Copy the structured shape fields from a tool event onto a progress node.
   defp copy_node_shape(node, event) do
     ["kind", "target", "added", "removed", "depth", "parentId", "subagentType"]
     |> Enum.reduce(node, fn key, acc ->
@@ -7215,8 +7270,6 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp maybe_put(map, _key, ""), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  # Map a provider tool name + input to a coarse kind and a short target
-  # (file basename, command, pattern, url…) for compact display.
   defp tool_kind_and_target(tool, input) when is_map(input) do
     t = tool |> to_string() |> String.downcase()
 
@@ -7284,7 +7337,6 @@ defmodule Vibe.AI.LocalAgentWorker do
       t in ["todowrite", "todo", "todo_write"] ->
         {"todo", nil}
 
-      # Claude: mcp__vibeask__ask_fable · Grok use_tool → vibeask__ask_fable
       not is_nil(mcp_progress_target(t, input)) ->
         {"mcp", mcp_progress_target(t, input)}
 
@@ -7301,8 +7353,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
   defp tool_kind_and_target(tool, _input), do: {to_string(tool) |> String.downcase(), nil}
 
-  # "vibeask · ask advisor" for mcp__server__tool or server__tool names.
-  # Wire tool id stays ask_fable; only the user-facing label is rewritten.
   defp pretty_mcp_tool_label(tool) when is_binary(tool) do
     pretty = tool |> String.replace("_", " ") |> String.trim()
 
@@ -7366,8 +7416,6 @@ defmodule Vibe.AI.LocalAgentWorker do
     end
   end
 
-  # Approximate added/removed line counts for file-mutating tools, mirroring
-  # Claude Code's +N/−M. nil for non-mutating tools.
   defp patch_stats(tool, input) when is_map(input) do
     t = tool |> to_string() |> String.downcase()
     parsed_patch_stats = apply_patch_stats(input)
@@ -7419,6 +7467,8 @@ defmodule Vibe.AI.LocalAgentWorker do
   defp line_count(_), do: 0
 
   defp progress_event_from_line(line, worker) do
+    worker = parser_worker(worker)
+
     with {:ok, event} when is_map(event) <- Jason.decode(line),
          tool_event when is_map(tool_event) <-
            Enum.find(tool_events_from_decoded(worker, [event]), fn event ->
@@ -7488,7 +7538,6 @@ defmodule Vibe.AI.LocalAgentWorker do
 
     cond do
       is_binary(mcp) and mcp != "" ->
-        # Prefer "MCP · ask advisor" (tool leaf) over "MCP · vibeask · ask advisor".
         leaf =
           mcp
           |> String.split(" · ")
